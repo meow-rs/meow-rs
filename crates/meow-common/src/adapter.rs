@@ -286,6 +286,37 @@ pub trait Proxy: ProxyAdapter {
     fn as_any(&self) -> Option<&dyn std::any::Any> {
         None
     }
+    /// `true` only for a `dialer-proxy` wrapper over a non-transparent
+    /// inner — the one UDP-incapable target a matched rule must stop on
+    /// (`TargetCheck::Unusable`, issue #969): the operator chained every
+    /// flow through the named node, so sliding to a later rule would
+    /// silently reroute what the config pinned. Every other UDP-incapable
+    /// adapter keeps mihomo's `continue` — an `udp: false` node is a
+    /// routing preference, not a chain the flow must die inside.
+    ///
+    /// Two registry shapes answer this: the relay-based
+    /// `DialerProxyAdapter` over a non-transparent inner (`true`), and the
+    /// config layer's `ChainedProxy` marker on a `dialer-proxy` leaf whose
+    /// chain was applied by *injection* (no `DialerProxyAdapter` exists
+    /// there to answer — it reports `!inner.support_udp()`, so an
+    /// injected leaf whose chain still carries UDP, e.g. anytls
+    /// `udp: true`, correctly answers `false`). `DialerProxyAdapter` is
+    /// always the outermost entry when it is used, so this default stays
+    /// unreachable for it; any future wrapper that can sit above one must
+    /// forward it (same contract as `dialer_hop`).
+    ///
+    /// Group adapters forward the verdict to the same member their UDP
+    /// flow would pick — the pick `support_udp` answers for: the
+    /// selector's selected member, the url-test/fallback pick, the
+    /// relay's UDP exit hop, or the load-balance live member set. A
+    /// chained pick pins the flow inside the declared chain just as a
+    /// chained leaf target does, so a group must not answer `false` for
+    /// one. The pick-at-check vs pick-at-dial race is the same one
+    /// `support_udp` already accepts, and a group with no pick answers
+    /// `false` — `Missing`, the slide, is the safe failure side.
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        false
+    }
     /// For group adapters: the ordered list of member proxy names.
     /// Leaf adapters return `None`.
     fn members(&self) -> Option<Vec<String>> {

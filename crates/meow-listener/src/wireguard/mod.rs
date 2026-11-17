@@ -173,7 +173,14 @@ impl WireGuardListener {
         let thread = std::thread::Builder::new()
             .name(thread_name)
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
+                // Two workers, not one: the actor's `service()` pass and the
+                // `CryptoPool` join are synchronous/blocked on the `block_on`
+                // driver thread — on a single-threaded runtime the
+                // `BridgedEndpoint` RX/TX tasks could never be scheduled mid-
+                // pass, so wire bursts overflowed the kernel receive buffer.
+                // One extra worker keeps socket I/O draining independently.
+                let rt = match tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
                     .enable_all()
                     .build()
                 {

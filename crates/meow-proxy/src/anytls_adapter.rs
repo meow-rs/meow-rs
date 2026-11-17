@@ -20,9 +20,9 @@ use anytls_rs::client::Client as AnytlsClient;
 use anytls_rs::client::UDP_OVER_TCP_MAGIC_ADDR;
 use anytls_rs::padding::PaddingFactory;
 use anytls_rs::session::{Session, Stream as AnytlsStream};
-use anytls_rs::{AsyncStream, TlsConnect, TlsConnectFuture};
+use anytls_rs::{AsyncStream, SyncStream, TlsConnect, TlsConnectFuture};
 use async_trait::async_trait;
-use bytes::Bytes;
+use bytes::{Bytes, BytesMut};
 use meow_transport::tls::{TlsConfig, TlsLayer};
 use meow_transport::Transport as _;
 use parking_lot::Mutex;
@@ -30,7 +30,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 
 use meow_common::{
-    AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn, Result,
+    AdapterType, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn,
+    Result, WriteBytes,
 };
 
 use crate::certificate_pin::parse_cert_pin;
@@ -114,7 +115,9 @@ pub struct AnytlsAdapter {
     /// The adapter's own TLS layer, `Arc`-shared with the `TlsConnect` hook
     /// given to the anytls client. `connect_over` runs it directly on the
     /// relay-supplied stream because `TlsConnect::connect` is typed on
-    /// `TcpStream` while a relay stream is a generic `meow_transport::Stream`.
+    /// `TcpStream` while a relay stream is a generic `meow_transport::Stream`;
+    /// an injected `dialer-proxy` reaches the same layer through
+    /// `TlsConnect::connect_stream` inside the client.
     tls_layer: Arc<TlsLayer>,
     udp: bool,
 }
@@ -199,6 +202,27 @@ impl AnytlsAdapter {
             udp,
         })
     }
+
+    /// Inject the `dialer-proxy` dialer every AnyTLS session's transport
+    /// is established through (Batch-2 parity with WireGuard/hysteria2).
+    ///
+    /// The config layer attaches this only for a real chain
+    /// (`dialer.is_proxy()`); the no-op `DirectDialer` keeps the client's
+    /// own `connect_tcp_host` path. The dialer returns the raw chained
+    /// stream — the vendored client then runs its usual TLS handshake
+    /// (`connect_stream`), auth and session setup on top, and the session
+    /// pools like a direct one (the client holds one transport class, so
+    /// pooled sessions can never be mixed across paths). `udp: true`
+    /// UoT rides the same chained session, so injected UDP works — it
+    /// only needs the front to carry TCP.
+    ///
+    /// `connect_over` is unaffected: it bypasses both the dialer and the
+    /// pool, staying the unpooled single-purpose path it always was.
+    pub fn with_dialer(mut self, dialer: Arc<dyn crate::dialer::TcpDialer>) -> Self {
+        self.client
+            .set_transport_dialer(Arc::new(ChainedTransportDialer(dialer)));
+        self
+    }
 }
 
 #[async_trait]
@@ -233,12 +257,14 @@ impl ProxyAdapter for AnytlsAdapter {
     /// Run TLS + the AnyTLS session handshake over an existing stream
     /// (relay chain).
     ///
-    /// The vendored client's `TlsConnect` hook is typed on `TcpStream`, so
-    /// the adapter runs its shared `TlsLayer` itself and hands the
-    /// handshaken stream to `create_proxy_stream_on_tls`. The session that
-    /// comes back is **not** pooled — pooling it would let a later direct
-    /// `dial_tcp` silently reuse the relay channel — so the returned conn
-    /// owns it and closes it on drop.
+    /// The vendored client's pool path dials its own transport, so the
+    /// adapter runs its shared `TlsLayer` itself and hands the handshaken
+    /// stream to `create_proxy_stream_on_tls`. The session that comes
+    /// back is **not** pooled — pooling it would let a later `dial_tcp`
+    /// silently reuse the relay channel — so the returned conn owns it
+    /// and closes it on drop. The injected `dialer-proxy` path is
+    /// different: there the *client* dials the chain itself, so those
+    /// sessions pool normally.
     async fn connect_over(
         &self,
         stream: Box<dyn ProxyConn>,
@@ -349,8 +375,9 @@ fn anytls_tcp_destination(metadata: &Metadata) -> Result<String> {
 /// obtain `&mut Stream`. So we re-implement the traits against its public
 /// reader and cancellation-safe writer-channel APIs.
 // The pending read future is `Send` but not `Sync`; `ProxyConn` requires
-// `Sync`, so it is wrapped in `parking_lot::Mutex`.
-type PendingRead = Pin<Box<dyn std::future::Future<Output = io::Result<Vec<u8>>> + Send>>;
+// `Sync`, so it is wrapped in `parking_lot::Mutex`. Its output is the
+// scratch Vec (returned for reuse) plus the read result.
+type PendingRead = Pin<Box<dyn std::future::Future<Output = (Vec<u8>, io::Result<usize>)> + Send>>;
 
 struct AnytlsConn {
     stream: Arc<AnytlsStream>,
@@ -363,6 +390,9 @@ struct AnytlsConn {
     /// dies (the heartbeat only reaps sessions whose peer stops answering).
     session_owned: bool,
     pending_read: Mutex<Option<PendingRead>>,
+    /// Buffer the contended-path read future fills; it is handed back on
+    /// completion so the next pending read reuses the allocation.
+    read_scratch: Arc<Mutex<Vec<u8>>>,
 }
 
 impl AnytlsConn {
@@ -372,6 +402,7 @@ impl AnytlsConn {
             session,
             session_owned: false,
             pending_read: Mutex::new(None),
+            read_scratch: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -383,6 +414,7 @@ impl AnytlsConn {
             session,
             session_owned: true,
             pending_read: Mutex::new(None),
+            read_scratch: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -404,39 +436,96 @@ impl AsyncRead for AnytlsConn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<io::Result<()>> {
-        let remaining = buf.remaining();
-        if remaining == 0 {
+        if buf.remaining() == 0 {
             return Poll::Ready(Ok(()));
         }
 
         let mut guard = self.pending_read.lock();
         if guard.is_none() {
+            // Fast path: the stream's reader mutex is uncontended (a conn
+            // is its only reader in practice) — poll the StreamReader
+            // straight into the caller's ReadBuf: no scratch alloc, no
+            // boxed future, no copy. The channel waker the reader
+            // registers persists inside the receiver, so an unlock never
+            // loses the wakeup.
+            if let Ok(mut reader) = self.stream.reader().try_lock() {
+                return Pin::new(&mut *reader).poll_read(cx, buf);
+            }
+
+            // Contended (another handle reads this stream): park a
+            // lock+read future, filling the persistent scratch instead of
+            // a per-read `vec![0; n]`.
             let reader = Arc::clone(self.stream.reader());
+            let scratch = Arc::clone(&self.read_scratch);
+            let cap = buf.remaining();
             let fut = async move {
                 let mut g = reader.lock().await;
-                let mut tmp = vec![0u8; remaining];
-                let n = g
-                    .read(&mut tmp)
-                    .await
-                    .map_err(|e| io::Error::other(format!("anytls read: {e}")))?;
-                tmp.truncate(n);
-                Ok(tmp)
+                let mut tmp = std::mem::take(&mut *scratch.lock());
+                tmp.clear();
+                tmp.resize(cap, 0);
+                let result = g.read(&mut tmp).await;
+                (tmp, result)
             };
             *guard = Some(Box::pin(fut));
         }
         let fut = guard.as_mut().expect("just set");
-        match fut.as_mut().poll(cx) {
-            Poll::Ready(Ok(data)) => {
-                *guard = None;
-                buf.put_slice(&data);
-                Poll::Ready(Ok(()))
+        let (mut tmp, result) = std::task::ready!(fut.as_mut().poll(cx));
+        *guard = None;
+        let n = match result {
+            Ok(n) => n.min(tmp.len()),
+            Err(e) => {
+                *self.read_scratch.lock() = tmp;
+                return Poll::Ready(Err(io::Error::other(format!("anytls read: {e}"))));
             }
-            Poll::Ready(Err(e)) => {
-                *guard = None;
-                Poll::Ready(Err(e))
-            }
-            Poll::Pending => Poll::Pending,
+        };
+        let fit = n.min(buf.remaining());
+        buf.put_slice(&tmp[..fit]);
+        if fit < n {
+            // A caller that re-polls a Pending read with a *smaller* buf
+            // must not lose the tail: re-park it as an immediately-ready
+            // pending read.
+            let rest = tmp.split_off(fit);
+            let rest_len = rest.len();
+            *guard = Some(Box::pin(async move { (rest, Ok(rest_len)) }));
         }
+        tmp.clear();
+        *self.read_scratch.lock() = tmp;
+        Poll::Ready(Ok(()))
+    }
+}
+
+/// The relay's owned-buffer write path: the `BytesMut` region moves into
+/// the anytls frame payload via `split_to` — the `copy_from_slice`
+/// `poll_write` would pay is gone on this direction. The conn declares
+/// the frame's headroom want so the relay leads every fill with the
+/// 7-byte reserved prefix the stream overlays its header into: one fill
+/// becomes one contiguous wire frame.
+impl WriteBytes for AnytlsConn {
+    fn poll_write_bytes(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &mut Option<BytesMut>,
+    ) -> Poll<io::Result<()>> {
+        // WriteBytes-contract gate (debug/test builds only): a presented
+        // slot MUST lead with `want_write_headroom()` zero bytes — the
+        // stream tolerates a bare payload via its Split fallback, which
+        // would silently mask the lost contiguity. `None` and empty
+        // slots are the slot protocol's legal early-out shapes, not
+        // violations.
+        let headroom = self.stream.want_write_headroom();
+        debug_assert!(
+            bytes.as_ref().is_none_or(|b| {
+                b.is_empty() || (b.len() >= headroom && b[..headroom].iter().all(|v| *v == 0))
+            }),
+            "WriteBytes slot arrived without the reserved zeroed headroom \
+             prefix — callers must reserve want_write_headroom() bytes; \
+             the stream's Split fallback masks the perf loss"
+        );
+        self.stream.poll_write_bytes_data(cx, bytes)
+    }
+
+    fn want_write_headroom(&self) -> usize {
+        self.stream.want_write_headroom()
     }
 }
 
@@ -490,7 +579,11 @@ impl Drop for AnytlsConn {
     }
 }
 
-impl ProxyConn for AnytlsConn {}
+impl ProxyConn for AnytlsConn {
+    fn write_bytes(&mut self) -> Option<&mut dyn WriteBytes> {
+        Some(self)
+    }
+}
 
 // ─── udp-over-tcp v2 (sing-box `uot`) ────────────────────────────────────────
 //
@@ -761,6 +854,46 @@ impl TlsConnect for MeowTlsConnect {
             Ok(Box::new(stream) as Box<dyn AsyncStream>)
         })
     }
+
+    /// The `dialer-proxy` leg of the same hook: the client's transport
+    /// dialer already connected the stream (through the front proxy), so
+    /// the identical `TlsLayer` handshake runs over it — the exact path
+    /// `connect_over` proves on a relay-supplied stream.
+    fn connect_stream(&self, stream: Box<dyn SyncStream>) -> TlsConnectFuture<'_> {
+        Box::pin(async move {
+            let stream = self
+                .layer
+                .connect(Box::new(stream))
+                .await
+                .map_err(|e| match e {
+                    meow_transport::TransportError::Io(e) => anytls_rs::AnyTlsError::Io(e),
+                    other => anytls_rs::AnyTlsError::Tls(format!("TLS handshake failed: {other}")),
+                })?;
+            Ok(Box::new(stream) as Box<dyn AsyncStream>)
+        })
+    }
+}
+
+/// Bridges the injected `dialer-proxy`
+/// [`TcpDialer`](crate::dialer::TcpDialer) into the vendored client's
+/// per-client `TransportDialer` hook: its `dial` already returns
+/// `Box<dyn meow_transport::Stream>`, which satisfies `SyncStream` (that
+/// stream contract requires `Send + Sync + Unpin`), so the bridge is a
+/// pure repackage — no wrapper stream to frame or downcast through.
+///
+/// `internal` stays `false`: an AnyTLS session is the outbound's shared
+/// long-lived transport — it multiplexes whichever streams the pool hands
+/// it, so its establishment is user-traffic plumbing, not housekeeping
+/// (the front group's usage accounting treats it as the outbound's own).
+struct ChainedTransportDialer(Arc<dyn crate::dialer::TcpDialer>);
+
+impl anytls_rs::TransportDialer for ChainedTransportDialer {
+    fn dial<'a>(&'a self, host: &'a str, port: u16) -> anytls_rs::TransportDialFuture<'a> {
+        Box::pin(async move {
+            let stream = self.0.dial(host, port, false).await?;
+            Ok(Box::new(stream) as Box<dyn SyncStream>)
+        })
+    }
 }
 
 // ─── meow_common ⇄ anytls_rs protector bridge ────────────────────────────────
@@ -825,7 +958,7 @@ fn install_anytls_bridges() {
 mod tests {
     use super::*;
     use crate::uot::UOT_ATYP_IPV4;
-    use anytls_rs::protocol::Command;
+    use anytls_rs::protocol::{Command, HEADER_OVERHEAD_SIZE};
     use meow_common::Network;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
@@ -1428,5 +1561,166 @@ mod tests {
     fn request_falls_back_to_unspecified_without_address() {
         let empty = encode_uot_request(&metadata_for("", None, 1234));
         assert_eq!(empty, vec![0, SOCKS5_ATYP_IPV4, 0, 0, 0, 0, 0x04, 0xd2]);
+    }
+
+    /// `poll_write_bytes_data` slots carrying the 7-byte headroom contract
+    /// must produce wire Push payloads byte-identical to the caller's
+    /// payload — a single stray 0x00 means the headroom prefix leaked
+    /// onto the wire.
+    #[tokio::test]
+    async fn write_bytes_headroom_wire_payload_is_exact() {
+        use std::future::poll_fn;
+
+        let (io, mut peer) = tokio::io::duplex(4 * 1024 * 1024);
+        let (reader, writer) = tokio::io::split(io);
+        let session = Arc::new(anytls_rs::session::Session::new_client(
+            reader,
+            writer,
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let worker = Arc::clone(&session);
+        tokio::spawn(async move { worker.process_stream_data().await });
+        let (stream, _ack) = session.open_stream().await.unwrap();
+        let _ = wire_frame(&mut peer).await; // SYN
+
+        let total = 512 * 1024usize;
+        let mut sent = 0usize;
+        while sent < total {
+            let mut slot = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + 65536);
+            slot.extend_from_slice(&[0u8; HEADER_OVERHEAD_SIZE]);
+            let n = (total - sent).min(65536 - HEADER_OVERHEAD_SIZE);
+            slot.extend_from_slice(&vec![0x41u8; n]);
+            sent += n;
+            let mut opt = Some(slot);
+            poll_fn(|cx| stream.poll_write_bytes_data(cx, &mut opt))
+                .await
+                .unwrap();
+            assert!(opt.is_none(), "slot must be fully drained at <=4MiB");
+        }
+        poll_fn(|cx| stream.poll_flush_data(cx)).await.unwrap();
+        drop(stream);
+        session.close().await.unwrap();
+
+        // Decode every wire frame; every Push payload byte must be 0x41.
+        let mut pushes = 0usize;
+        loop {
+            let mut header = [0u8; HEADER_OVERHEAD_SIZE];
+            match tokio::time::timeout(Duration::from_secs(1), peer.read_exact(&mut header)).await {
+                Ok(Err(_)) | Err(_) => break,
+                Ok(Ok(_)) => {}
+            }
+            let cmd = header[0];
+            let len = u16::from_be_bytes([header[5], header[6]]) as usize;
+            let mut data = vec![0u8; len];
+            peer.read_exact(&mut data).await.unwrap();
+            if cmd == Command::Push as u8 {
+                pushes += 1;
+                assert!(
+                    data.iter().all(|&b| b == 0x41),
+                    "Push frame #{pushes} (len={len}) contains non-0x41 bytes: {:02x?}",
+                    &data[..data.len().min(32)]
+                );
+            }
+        }
+        assert!(pushes > 0, "expected Push frames on the wire");
+    }
+
+    /// Session-writer stress: 4 streams × 1 MiB headroom slots against a
+    /// slow transport (permit contention + batch drains). The peer decodes
+    /// every frame — Push payloads must stay pure 0x41 end to end.
+    struct NonVectored<W>(W);
+    impl<W: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for NonVectored<W> {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn write_bytes_backpressure_payload_is_exact() {
+        use std::future::poll_fn;
+        let (io, mut peer) = tokio::io::duplex(8 * 1024);
+        let (reader, writer) = tokio::io::split(io);
+        let session = Arc::new(anytls_rs::session::Session::new_client(
+            reader,
+            Box::new(NonVectored(writer)) as Box<dyn tokio::io::AsyncWrite + Send + Unpin>,
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let worker = Arc::clone(&session);
+        tokio::spawn(async move { worker.process_stream_data().await });
+
+        // 慢速解码对端：按帧读并校验 payload 纯度
+        let verifier = tokio::spawn(async move {
+            let mut bad = 0usize;
+            let mut pushes = 0usize;
+            let mut payload_total = 0usize;
+            while payload_total < 4 * 1024 * 1024 {
+                let mut header = [0u8; 7];
+                match tokio::time::timeout(Duration::from_secs(30), peer.read_exact(&mut header))
+                    .await
+                {
+                    Ok(Err(_)) | Err(_) => break,
+                    Ok(Ok(_)) => {}
+                }
+                let cmd = header[0];
+                let len = u16::from_be_bytes([header[5], header[6]]) as usize;
+                let mut data = vec![0u8; len];
+                peer.read_exact(&mut data).await.unwrap();
+                if cmd == Command::Push as u8 {
+                    pushes += 1;
+                    payload_total += len;
+                    if !data.iter().all(|&b| b == 0x41) {
+                        bad += 1;
+                        let z = data.iter().filter(|&&b| b != 0x41).count();
+                        eprintln!("CORRUPT push len={len} alien={z} head={:02x?}", &data[..16]);
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            (pushes, bad)
+        });
+
+        let mut feeders = Vec::new();
+        for _ in 0..4 {
+            let s = Arc::clone(&session);
+            feeders.push(tokio::spawn(async move {
+                let (stream, _ack) = s.open_stream().await.unwrap();
+                let mut sent = 0usize;
+                while sent < 1024 * 1024 {
+                    let mut slot = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + 65536);
+                    slot.extend_from_slice(&[0u8; HEADER_OVERHEAD_SIZE]);
+                    let n = (1024 * 1024 - sent).min(65536 - HEADER_OVERHEAD_SIZE);
+                    slot.extend_from_slice(&vec![0x41u8; n]);
+                    sent += n;
+                    let mut opt = Some(slot);
+                    poll_fn(|cx| stream.poll_write_bytes_data(cx, &mut opt))
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        for f in feeders {
+            f.await.unwrap();
+        }
+        let (pushes, bad) = verifier.await.unwrap();
+        session.close().await.unwrap();
+        assert_eq!(bad, 0, "{bad} corrupt push frames of {pushes}");
     }
 }

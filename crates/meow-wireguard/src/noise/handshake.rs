@@ -4,6 +4,7 @@
 use super::{HandshakeInit, HandshakeResponse, PacketCookieReply};
 use crate::noise::errors::WireGuardError;
 use crate::noise::session::Session;
+use crate::noise::timers::REKEY_TIMEOUT;
 #[cfg(not(feature = "mock-instant"))]
 use crate::sleepyinstant::Instant;
 use crate::x25519;
@@ -422,6 +423,18 @@ impl Handshake {
             HandshakeState::InitSent(HandshakeInitSentState { time_sent, .. }) => Some(time_sent),
             _ => None,
         }
+    }
+
+    /// PATCH(20): the kernel's `wg_packet_send_queued_handshake_initiation`
+    /// predicate — an in-flight initiation whose last send is at least
+    /// REKEY_TIMEOUT old is re-armed on packet pressure rather than
+    /// dedup'd on the in-flight state. `timer()` stamps `InitSent`
+    /// only, so this is exactly "in-flight initiation && age >=
+    /// REKEY_TIMEOUT": `InitReceived` carries no send stamp (the
+    /// response already went out) and never counts.
+    pub(crate) fn is_init_stale(&self) -> bool {
+        self.timer()
+            .is_some_and(|sent| sent.elapsed() >= REKEY_TIMEOUT)
     }
 
     pub(crate) fn set_expired(&mut self) {

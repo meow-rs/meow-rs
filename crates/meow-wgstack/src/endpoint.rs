@@ -29,8 +29,10 @@
 //! tokio's cached readiness, so a cold (never-polled) socket still
 //! reaches the kernel; see [`BatchEndpoint::BATCHED_SYSCALLS`].
 
+use std::collections::VecDeque;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -92,6 +94,14 @@ impl BatchEndpoint {
         self.inner.try_recv(buf)
     }
 
+    /// The kernel fd — the bridge thread's blocking `poll` waits on
+    /// it directly rather than on tokio's cached readiness.
+    #[cfg(unix)]
+    pub fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.inner.as_raw_fd()
+    }
+
     /// Nonblocking single-datagram receive, reporting the source.
     pub fn try_recv_from(&self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
         self.inner.try_recv_from(buf)
@@ -124,31 +134,36 @@ impl BatchEndpoint {
         self.inner.local_addr()
     }
 
-    /// Reactor readiness passthroughs the tests await before batch
-    /// calls: every `try_*` gates on the reactor's *cached* readiness,
-    /// so a just-registered socket reads `WouldBlock` until the driver
-    /// has polled it once. Long-lived actors never see that window —
-    /// their select arms poll the socket before any `try_*` runs.
-    #[cfg(test)]
+    /// Reactor readiness passthroughs the bridge tasks and tests await
+    /// before batch calls: every `try_*` gates on the reactor's
+    /// *cached* readiness, so a just-registered socket reads
+    /// `WouldBlock` until the driver has polled it once. Long-lived
+    /// actors never see that window — their select arms poll the
+    /// socket before any `try_*` runs.
     pub async fn readable(&self) -> io::Result<()> {
         self.inner.readable().await
     }
 
     /// See [`readable`](Self::readable).
-    #[cfg(test)]
     pub async fn writable(&self) -> io::Result<()> {
         self.inner.writable().await
+    }
+
+    /// `true` on a peer-bound socket — the bridge's boundary retry
+    /// picks `try_send`/`try_send_to` on it.
+    pub(crate) fn is_connected(&self) -> bool {
+        self.connected
     }
 
     // ── batch calls ──────────────────────────────────────────────
 
     /// Drain up to `min(bufs.len(), budget, WIRE_DRAIN_BUDGET)`
-    /// datagrams — one `recvmmsg` on Linux, one `recvmsg_x` on macOS,
-    /// a `try_recv_buf` loop elsewhere. The third clamp is the
-    /// stack-array bound: a single batched call can never service more
-    /// slots than its arrays hold, and the fallback loop inherits the
-    /// same bound so both paths agree on what one call is allowed to
-    /// do. Every
+    /// datagrams — one `recvmmsg` on Linux, `MSGX_CHUNK`-capped
+    /// `recvmsg_x` rounds on macOS, a `try_recv_buf` loop elsewhere.
+    /// The third clamp is the stack-array bound: a single batched call
+    /// can never service more slots than its arrays hold, and the
+    /// fallback loop inherits the same bound so both paths agree on
+    /// what one call is allowed to do. Every
     /// slot's whole *capacity* is its receive window — never its
     /// current length — so a persistent slot set serves batch after
     /// batch without restaging. On return, each of `bufs[..ret]` is
@@ -197,6 +212,180 @@ impl BatchEndpoint {
             }
             got
         }
+    }
+
+    /// The unconnected twin of [`recv_batch`](Self::recv_batch): same
+    /// batch-syscall drain, but each header's `msg_name` catches the
+    /// datagram's source — the listener demux's key — written into
+    /// `addrs[..ret]` alongside `bufs[..ret]`. `addrs.len()` must cover
+    /// `bufs`.
+    ///
+    /// Unconnected endpoints only: a connected socket only ever
+    /// receives from its bound peer, so the per-datagram name work is
+    /// wasted there (the pump uses `recv_batch`).
+    pub fn recv_batch_from(
+        &self,
+        bufs: &mut [Vec<u8>],
+        addrs: &mut [SocketAddr],
+        budget: usize,
+    ) -> usize {
+        debug_assert!(
+            !self.connected,
+            "recv_batch_from pays per-datagram names — unconnected endpoints only"
+        );
+        debug_assert!(addrs.len() >= bufs.len());
+        let n = bufs.len().min(budget).min(WIRE_DRAIN_BUDGET);
+        #[cfg(target_os = "linux")]
+        {
+            self.recv_batch_mmsg_from(&mut bufs[..n], &mut addrs[..n])
+        }
+        #[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
+        {
+            self.recv_batch_msgx_from(&mut bufs[..n], &mut addrs[..n])
+        }
+        #[cfg(not(any(
+            target_os = "linux",
+            all(target_os = "macos", not(feature = "no-macos-sendmsg-x"))
+        )))]
+        {
+            let mut got = 0;
+            for (buf, addr) in bufs[..n].iter_mut().zip(&mut addrs[..n]) {
+                buf.clear();
+                // Extend over the slot's whole spare capacity so the
+                // kernel's window matches the batch paths' `iov_len`.
+                buf.resize(buf.capacity(), 0);
+                match self.inner.try_recv_from(buf) {
+                    Ok((m, src)) => {
+                        buf.truncate(m);
+                        *addr = src;
+                        got += 1;
+                    }
+                    Err(e) => {
+                        if e.kind() != io::ErrorKind::WouldBlock {
+                            tracing::debug!("wireguard endpoint recv_batch_from error: {e}");
+                        }
+                        break;
+                    }
+                }
+            }
+            got
+        }
+    }
+
+    /// `recv_batch_mmsg` with per-message `msg_name`: each
+    /// `mmsghdr`'s header points at its own `sockaddr_storage`, and
+    /// the kernel reports the source the same way `recvmsg` would.
+    #[cfg(target_os = "linux")]
+    fn recv_batch_mmsg_from(&self, bufs: &mut [Vec<u8>], addrs: &mut [SocketAddr]) -> usize {
+        use std::os::fd::AsRawFd;
+        let n = bufs.len().min(WIRE_DRAIN_BUDGET);
+        let bufs = &mut bufs[..n];
+        if bufs.is_empty() {
+            return 0;
+        }
+        // SAFETY: as in `recv_batch_mmsg` — C POD arrays, all-zero
+        // valid; the extra `sockaddr_storage` array receives the
+        // kernel-written `msg_name` payloads.
+        let mut iov: [libc::iovec; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
+        let mut msgs: [libc::mmsghdr; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
+        let mut sas: [libc::sockaddr_storage; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
+        for (j, buf) in bufs.iter_mut().enumerate() {
+            iov[j] = libc::iovec {
+                iov_base: buf.as_mut_ptr().cast(),
+                iov_len: buf.capacity(),
+            };
+            msgs[j].msg_hdr.msg_iov = &mut iov[j];
+            msgs[j].msg_hdr.msg_iovlen = 1;
+            msgs[j].msg_hdr.msg_name = (&mut sas[j]) as *mut _ as *mut _;
+            msgs[j].msg_hdr.msg_namelen = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        }
+        // SAFETY: as in `recv_batch_mmsg` — `sas` slots are valid for
+        // the kernel's sockaddr writes for the call's duration.
+        let ret = unsafe {
+            libc::recvmmsg(
+                self.inner.as_raw_fd(),
+                msgs.as_mut_ptr(),
+                bufs.len() as libc::c_uint,
+                libc::MSG_DONTWAIT as _,
+                std::ptr::null_mut(),
+            )
+        };
+        if ret <= 0 {
+            if ret < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() != io::ErrorKind::WouldBlock {
+                    tracing::debug!("wireguard endpoint recvmmsg error: {e}");
+                }
+            }
+            return 0;
+        }
+        let got = ret as usize;
+        for (j, buf) in bufs[..got].iter_mut().enumerate() {
+            let len = (msgs[j].msg_len as usize).min(buf.capacity());
+            // SAFETY: as in `recv_batch_mmsg`.
+            unsafe { buf.set_len(len) };
+            addrs[j] = read_sockaddr(&sas[j]);
+        }
+        got
+    }
+
+    /// `recv_batch_msgx` with per-message `msg_name` — the unconnected
+    /// listener's batched drain on Darwin.
+    #[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
+    fn recv_batch_msgx_from(&self, bufs: &mut [Vec<u8>], addrs: &mut [SocketAddr]) -> usize {
+        use std::os::fd::AsRawFd;
+        let mut total = 0usize;
+        while total < bufs.len() {
+            let n = (bufs.len() - total).min(Self::MSGX_CHUNK);
+            let chunk = &mut bufs[total..total + n];
+            // SAFETY: as in `recv_batch_msgx` — C POD arrays, all-zero
+            // valid; `sas` catches each datagram's source.
+            let mut iov: [libc::iovec; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
+            let mut msgs: [msgx::msghdr_x; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
+            let mut sas: [libc::sockaddr_storage; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
+            for (j, buf) in chunk.iter_mut().enumerate() {
+                iov[j] = libc::iovec {
+                    iov_base: buf.as_mut_ptr().cast(),
+                    iov_len: buf.capacity(),
+                };
+                msgs[j].msg_iov = &mut iov[j];
+                msgs[j].msg_iovlen = 1;
+                msgs[j].msg_name = (&mut sas[j]) as *mut _ as *mut _;
+                msgs[j].msg_namelen = size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+            }
+            // SAFETY: as in `recv_batch_msgx`.
+            let ret = unsafe {
+                msgx::recvmsg_x(
+                    self.inner.as_raw_fd(),
+                    msgs.as_mut_ptr(),
+                    n as libc::c_uint,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if ret <= 0 {
+                if ret < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() != io::ErrorKind::WouldBlock {
+                        tracing::debug!("wireguard endpoint recvmsg_x error: {e}");
+                    }
+                }
+                break;
+            }
+            let got = ret as usize;
+            for (j, buf) in chunk[..got].iter_mut().enumerate() {
+                let len = msgs[j].msg_datalen.min(buf.capacity());
+                // SAFETY: as in `recv_batch_msgx`.
+                unsafe { buf.set_len(len) };
+                addrs[total + j] = read_sockaddr(&sas[j]);
+            }
+            total += got;
+            // A short round is the dry-queue report — stop rather than
+            // spend a syscall confirming it.
+            if got < n {
+                break;
+            }
+        }
+        total
     }
 
     /// Send every datagram to `addr` — `send()` semantics on a
@@ -355,9 +544,22 @@ impl BatchEndpoint {
         got
     }
 
+    /// Per-`sendmsg_x`/`recvmsg_x` datagram ceiling: XNU clips each
+    /// call's count at `somaxsendmsgx`/`somaxrecvmsgx` (default 100 —
+    /// see `msgx`), so a [`WIRE_DRAIN_BUDGET`]-sized batch is serviced
+    /// in chunks of at most this many headers where Linux spends one
+    /// `sendmmsg`/`recvmmsg`. The `min` keeps the batch a single call
+    /// should the budget ever drop back under the kernel's ceiling.
+    #[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
+    const MSGX_CHUNK: usize = if WIRE_DRAIN_BUDGET < 100 {
+        WIRE_DRAIN_BUDGET
+    } else {
+        100
+    };
+
     /// macOS: `sendmsg_x` over stack-built `msghdr_x`/`iovec` arrays —
     /// the same shape as the Linux `sendmmsg` path, chunked at
-    /// [`WIRE_DRAIN_BUDGET`]. On a connected UDP socket XNU takes the
+    /// `MSGX_CHUNK`. On a connected UDP socket XNU takes the
     /// `sendit_x`/`sosend_list` fast path (no per-datagram name); on an
     /// unconnected one each header's `msg_name` carries its
     /// destination and the kernel loops `sendit` — still one syscall
@@ -367,16 +569,15 @@ impl BatchEndpoint {
         use std::os::fd::AsRawFd;
         let mut sent = 0usize;
         while sent < pkts.len() {
-            let n = (pkts.len() - sent).min(WIRE_DRAIN_BUDGET);
+            let n = (pkts.len() - sent).min(Self::MSGX_CHUNK);
             // SAFETY: `iovec`, `msghdr_x` and `sockaddr_storage` are C
             // PODs — the all-zero bit pattern is valid for every field
             // (null pointer, zero length, family AF_UNSPEC) and zeroed
             // `msg_flags`/`msg_datalen` are the input values
             // `sendmsg_x` requires.
-            let mut iov: [libc::iovec; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
-            let mut msgs: [msgx::msghdr_x; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
-            let mut sas: [libc::sockaddr_storage; WIRE_DRAIN_BUDGET] =
-                unsafe { std::mem::zeroed() };
+            let mut iov: [libc::iovec; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
+            let mut msgs: [msgx::msghdr_x; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
+            let mut sas: [libc::sockaddr_storage; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
             for (j, t) in pkts[sent..sent + n].iter().enumerate() {
                 let (addr, buf) = get(t);
                 iov[j] = libc::iovec {
@@ -418,72 +619,85 @@ impl BatchEndpoint {
         sent
     }
 
-    /// One `recvmsg_x` into the staged buffers — XNU's batched
-    /// `soreceive_m_list`, which stops when the socket queue runs dry
-    /// under `MSG_DONTWAIT` and reports each datagram's received length
-    /// in `msg_datalen` (bytes actually copied, ≤ the advertised iov
-    /// capacity). `msgs[..got]` is the only span the kernel rewrote.
+    /// One or more `recvmsg_x` rounds into the staged buffers — XNU's
+    /// batched `soreceive_m_list`, which stops when the socket queue
+    /// runs dry under `MSG_DONTWAIT` and reports each datagram's
+    /// received length in `msg_datalen` (bytes actually copied, ≤ the
+    /// advertised iov capacity). Each round is capped at `MSGX_CHUNK`
+    /// headers — XNU's per-call clip — so a batch wider than the clip
+    /// loops until a short round reports the queue dry; `msgs[..got]`
+    /// of each round is the only span the kernel rewrote.
     #[cfg(all(target_os = "macos", not(feature = "no-macos-sendmsg-x")))]
     fn recv_batch_msgx(&self, bufs: &mut [Vec<u8>]) -> usize {
         use std::os::fd::AsRawFd;
-        let n = bufs.len().min(WIRE_DRAIN_BUDGET);
-        let bufs = &mut bufs[..n];
-        if bufs.is_empty() {
-            return 0;
-        }
-        // SAFETY: as in `send_batch_inner` — C POD arrays, all-zero
-        // valid; `recvmsg_x` requires zeroed `msg_flags` on input.
-        let mut iov: [libc::iovec; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
-        let mut msgs: [msgx::msghdr_x; WIRE_DRAIN_BUDGET] = unsafe { std::mem::zeroed() };
-        for (j, buf) in bufs.iter_mut().enumerate() {
-            iov[j] = libc::iovec {
-                iov_base: buf.as_mut_ptr().cast(),
-                iov_len: buf.capacity(),
-            };
-            msgs[j].msg_iov = &mut iov[j];
-            msgs[j].msg_iovlen = 1;
-        }
-        // SAFETY: `fd` is a live nonblocking socket; `msgs` describes
-        // `n` iovecs each covering that Vec's whole allocation,
-        // initialised or not — writes through the raw pointer are
-        // in-bounds and no Rust reference aliases them.
-        let ret = unsafe {
-            msgx::recvmsg_x(
-                self.inner.as_raw_fd(),
-                msgs.as_mut_ptr(),
-                n as libc::c_uint,
-                libc::MSG_DONTWAIT,
-            )
-        };
-        if ret <= 0 {
-            if ret < 0 {
-                let e = io::Error::last_os_error();
-                if e.kind() != io::ErrorKind::WouldBlock {
-                    tracing::debug!("wireguard endpoint recvmsg_x error: {e}");
-                }
+        let mut total = 0usize;
+        while total < bufs.len() {
+            let n = (bufs.len() - total).min(Self::MSGX_CHUNK);
+            let chunk = &mut bufs[total..total + n];
+            // SAFETY: as in `send_batch_inner` — C POD arrays, all-zero
+            // valid; `recvmsg_x` requires zeroed `msg_flags` on input.
+            let mut iov: [libc::iovec; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
+            let mut msgs: [msgx::msghdr_x; Self::MSGX_CHUNK] = unsafe { std::mem::zeroed() };
+            for (j, buf) in chunk.iter_mut().enumerate() {
+                iov[j] = libc::iovec {
+                    iov_base: buf.as_mut_ptr().cast(),
+                    iov_len: buf.capacity(),
+                };
+                msgs[j].msg_iov = &mut iov[j];
+                msgs[j].msg_iovlen = 1;
             }
-            return 0;
+            // SAFETY: `fd` is a live nonblocking socket; `msgs`
+            // describes `n` iovecs each covering that Vec's whole
+            // allocation, initialised or not — writes through the raw
+            // pointer are in-bounds and no Rust reference aliases them.
+            let ret = unsafe {
+                msgx::recvmsg_x(
+                    self.inner.as_raw_fd(),
+                    msgs.as_mut_ptr(),
+                    n as libc::c_uint,
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if ret <= 0 {
+                if ret < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() != io::ErrorKind::WouldBlock {
+                        tracing::debug!("wireguard endpoint recvmsg_x error: {e}");
+                    }
+                }
+                break;
+            }
+            let got = ret as usize;
+            for (j, buf) in chunk[..got].iter_mut().enumerate() {
+                let len = msgs[j].msg_datalen.min(buf.capacity());
+                // SAFETY: the kernel wrote the first `msg_datalen`
+                // bytes of `buf`'s allocation (datalen is the copied
+                // count, ≤ the advertised capacity), so those bytes
+                // are initialised and extending `len` over them is
+                // sound.
+                unsafe { buf.set_len(len) };
+            }
+            total += got;
+            // A short round is the dry-queue report — stop rather than
+            // spend a syscall confirming it.
+            if got < n {
+                break;
+            }
         }
-        let got = ret as usize;
-        for (j, buf) in bufs[..got].iter_mut().enumerate() {
-            let len = msgs[j].msg_datalen.min(buf.capacity());
-            // SAFETY: the kernel wrote the first `msg_datalen` bytes
-            // of `buf`'s allocation (datalen is the copied count, ≤
-            // the advertised capacity), so those bytes are initialised
-            // and extending `len` over them is sound.
-            unsafe { buf.set_len(len) };
-        }
-        got
+        total
     }
 }
 
 /// Bounded queue depth of a [`ProxyEndpoint`]'s two bridge channels, in
-/// datagrams. Sized to two full wire drains so one whole
+/// datagrams. Sized to four full wire drains so one whole
 /// [`Endpoint::recv_batch`] burst — or the symmetric staged
 /// [`Endpoint::send_batch`] flush — never meets a full queue mid-pass:
 /// back-pressure surfaces as `WouldBlock` only past that, exactly where
-/// the socket path's `ENOBUFS`/`EAGAIN` would.
-const PROXY_ENDPOINT_QUEUE: usize = 2 * WIRE_DRAIN_BUDGET;
+/// the socket path's `ENOBUFS`/`EAGAIN` would. Four rather than two:
+/// the bridge is also the front hop's jitter absorber, and a burst
+/// arriving mid-pass must not drop while this pass's drain is still
+/// staged (wg-perf, paired with the `WIRE_DRAIN_BUDGET` raise).
+const PROXY_ENDPOINT_QUEUE: usize = 4 * WIRE_DRAIN_BUDGET;
 
 /// Staging buffer of the [`ProxyEndpoint`] RX bridge — one full UDP
 /// payload. WG wire datagrams stay far below this (outer MTU +
@@ -503,16 +717,17 @@ const BRIDGE_BUF: usize = 65535;
 const PROXY_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The outbound pump's wire endpoint: `Batch` is the direct path (a
-/// connected [`BatchEndpoint`]), `Proxy` a [`ProxyEndpoint`] bridged to a
-/// `dialer-proxy` front's `ProxyPacketConn` (issue #899 — the WG
-/// endpoint's UDP transport rides the front hop's UDP association).
+/// connected kernel socket behind a [`BridgedEndpoint`]'s own I/O
+/// tasks), `Proxy` a [`ProxyEndpoint`] bridged to a `dialer-proxy`
+/// front's `ProxyPacketConn` (issue #899 — the WG endpoint's UDP
+/// transport rides the front hop's UDP association).
 ///
 /// An enum, not a trait object: the method set is closed, both variants
 /// sit on the hot drain/flush path, and enum dispatch keeps the direct
 /// path free of a vtable it never needed.
 pub enum Endpoint {
     /// A connected kernel socket — the direct path.
-    Batch(BatchEndpoint),
+    Batch(BridgedEndpoint),
     /// A channel pair bridged to an async `ProxyPacketConn`.
     Proxy(ProxyEndpoint),
 }
@@ -520,12 +735,11 @@ pub enum Endpoint {
 impl Endpoint {
     /// Nonblocking single-datagram receive — the pump's fast-path drain.
     ///
-    /// `Proxy`: pops the bridge RX queue — `Empty` → `WouldBlock`,
-    /// `Disconnected` → `ConnectionReset` (the conn is dead — terminal
-    /// for a proxy endpoint: the pump's `recv` arm stops the actor, and
-    /// `ensure_pump`'s `is_proxy_dead` check clears the slot and
-    /// redials the front hop. The `Batch` arm's warn+sleep retry does
-    /// not apply here).
+    /// Both arms pop a bridge RX queue — `Empty` → `WouldBlock`,
+    /// `Disconnected` → `ConnectionReset` (the RX bridge exited on a
+    /// dead conn/socket — terminal: the pump's `recv` arm stops the
+    /// actor, and `ensure_pump`'s `is_proxy_dead` check clears the
+    /// slot and redials).
     pub fn try_recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             Endpoint::Batch(e) => e.try_recv(buf),
@@ -608,6 +822,105 @@ struct NotifyOnDrop(Arc<Notify>);
 impl Drop for NotifyOnDrop {
     fn drop(&mut self) {
         self.0.notify_one();
+    }
+}
+
+/// A one-byte wake signal for the RX thread's `poll`: the read end
+/// sits in its fd set, the write end lives in [`RxStop`]. `send` with
+/// `MSG_NOSIGNAL` so a `stop()` landing after the thread already
+/// exited (read end closed) is a harmless `EPIPE`, never a fatal
+/// `SIGPIPE` to the process.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+struct WakeFd(std::os::fd::RawFd);
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+impl WakeFd {
+    /// `(write end, read end)` — write lives in `RxStop`, read is
+    /// handed to the thread (which owns and closes it on exit).
+    fn pair() -> (Arc<Self>, std::os::fd::RawFd) {
+        let mut fds = [0i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+        assert!(rc == 0, "wg-rx wake socketpair");
+        #[cfg(target_os = "macos")]
+        {
+            // Darwin honors `MSG_NOSIGNAL` per-send; `SO_NOSIGPIPE`
+            // on the write end is the platform's canonical knob —
+            // belt-and-suspenders so no call-site flag is load-bearing.
+            let on: i32 = 1;
+            let rc = unsafe {
+                libc::setsockopt(
+                    fds[1],
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    &on as *const _ as *const libc::c_void,
+                    std::mem::size_of_val(&on) as libc::socklen_t,
+                )
+            };
+            assert!(rc == 0, "SO_NOSIGPIPE on wg-rx wake socket");
+        }
+        (Arc::new(Self(fds[1])), fds[0])
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+impl Drop for WakeFd {
+    fn drop(&mut self) {
+        unsafe {
+            libc::close(self.0);
+        }
+    }
+}
+
+/// `BridgedEndpoint`'s RX-leg stop edge — every shape at once so the
+/// struct and its `Drop` never care which leg the platform spawned:
+/// the dedicated OS thread polls `flag` between kernel waits *and* is
+/// woken out of `poll` by a byte on `wake`, the tokio task `select!`s
+/// on `pulse`. `stop()` fires all three.
+#[derive(Clone)]
+struct RxStop {
+    flag: Arc<AtomicBool>,
+    pulse: Arc<Notify>,
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    wake: Option<Arc<WakeFd>>,
+}
+
+impl RxStop {
+    fn new() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+            pulse: Arc::new(Notify::new()),
+            #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+            wake: None,
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn with_wake(wake: Arc<WakeFd>) -> Self {
+        let mut s = Self::new();
+        s.wake = Some(wake);
+        s
+    }
+
+    fn stop(&self) {
+        self.flag.store(true, Ordering::Relaxed);
+        self.pulse.notify_one();
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        if let Some(w) = &self.wake {
+            unsafe {
+                libc::send(w.0, [1u8].as_ptr().cast(), 1, libc::MSG_NOSIGNAL);
+            }
+        }
+    }
+}
+
+/// `NotifyOnDrop`'s sibling for the [`RxStop`] edge the `BridgedEndpoint`
+/// RX leg watches: the TX task holds one so its exit flags the RX
+/// bridge down the same way endpoint `Drop` does.
+struct RxStopOnDrop(RxStop);
+
+impl Drop for RxStopOnDrop {
+    fn drop(&mut self) {
+        self.0.stop();
     }
 }
 
@@ -868,6 +1181,680 @@ impl Drop for ProxyEndpoint {
     }
 }
 
+/// The RX bridge's per-wait drain bound. A still-busy socket reports
+/// `POLLIN` again the moment `poll` re-arms, so the cap only costs a
+/// wait round — and it keeps the `shutdown` edge honest under a
+/// permanent flood. Sized to the bridge queue: one wake can fill the
+/// channel exactly once before backpressure parks the `send` anyway.
+const RX_WAKE_CAP: usize = BRIDGE_RX_QUEUE;
+
+/// The RX channel's depth — deliberately deeper than the TX side's
+/// `PROXY_ENDPOINT_QUEUE`. Channel-buffered datagrams can never be
+/// lost (a full channel just parks the bridge's `send` and pushes
+/// backpressure onto `SO_RCVBUF`), while kernel-buffered ones tail-
+/// drop under a peer burst. The RX window between `drain_wire` calls
+/// is one service pass — milliseconds of smoltcp/crypto/TX work —
+/// and the kernel buffer alone (≤8 MiB) does not always cover a
+/// ~4×`WIRE_DRAIN_BUDGET` channel plus that window's arrivals. The
+/// startup burst is the binding case: N inner flows' first advertised
+/// windows (~1 MiB each) can all land inside one pass-length window,
+/// so the channel is sized `32 * WIRE_DRAIN_BUDGET` (~11.4 MiB staged)
+/// — kernel+channel covers roughly a 19 MiB aggregate burst — moving
+/// absorption out of the droppable kernel buffer into the bounded
+/// channel; TX stays shallow on purpose — a
+/// deeper send queue would just assemble bigger `send_batch` bursts
+/// that overflow the *peer's* kernel buffer the same way.
+const BRIDGE_RX_QUEUE: usize = 32 * WIRE_DRAIN_BUDGET;
+
+/// Receive-slot capacity of the connected RX bridge's `recv_batch`
+/// staging: WG wire datagrams are MTU-bound (~1.5 KiB plus outer
+/// overhead); `BRIDGE_BUF`'s full-datagram bound would make a
+/// [`WIRE_DRAIN_BUDGET`]-slot stage a 16 MiB allocation.
+const BRIDGE_SLOT: usize = 4096;
+
+/// A [`BatchEndpoint`] moved off the actor's service pass into two
+/// dedicated I/O tasks — the [`ProxyEndpoint`] shape applied to the
+/// kernel socket itself, closing the duplex-collapse gap the
+/// front-hop bridge already proved.
+///
+/// Why it exists: a pass spends milliseconds on wire crypto, smoltcp
+/// servicing and TX emission *between* kernel-buffer drains. A peer
+/// burst that outruns the pass keeps `SO_RCVBUF` full for most of that
+/// window, so the kernel tail-drops wire datagrams — each an
+/// unrecoverable inner-TCP hole that costs ≥1 s of RTO. Upload-only
+/// and download-only tests hide it (one direction idles while the
+/// other drains); duplex saturates both, and the pass-serialised
+/// drains on *both* ends overflow simultaneously. The bridge runs the
+/// kernel I/O on readiness — µs-scale drain latency, independent of
+/// pass length:
+///
+/// - **RX thread** — a dedicated OS thread, not a runtime task —
+///   parks on `poll(fd)` then drains the socket into a bounded
+///   channel: `recv_batch` rounds on a connected socket,
+///   `recv_batch_from` on an unconnected one (the listener demux needs
+///   each source). Owning the drain in a thread removes the last
+///   scheduling hop: tokio can queue a woken task behind a
+///   synchronous actor pass on the same worker, and that stall alone
+///   was still overflowing `SO_RCVBUF` under wire bursts with the
+///   channel never full. A full channel parks `blocking_send` —
+///   pressure falls back onto `SO_RCVBUF`, the designed absorber,
+///   instead of unbounded memory.
+/// - **TX task** drains a bounded channel through `send_batch_to`,
+///   replaying the short-count boundary datagram with `try_send*` to
+///   split `WouldBlock` (await `writable`, retry) from a real errno
+///   (log, drop *that* datagram, continue — the kernel-error verdict
+///   `flush_outbox` used to own lives here now, where the error is
+///   actually visible). Channel-full reaches the caller as the same
+///   `WouldBlock` a busy socket reported, so `flush_outbox`'s requeue
+///   path is unchanged.
+///
+/// Datagram ordering is end-to-end FIFO: the socket delivers in order,
+/// the channels are FIFO, and the TX task emits in channel order.
+/// Teardown mirrors [`ProxyEndpoint`]: an `RxStop` edge for the RX
+/// leg, a [`Notify`] edge for the TX task, and the TX task's
+/// `RxStopOnDrop` flags the RX edge so a dead twin never leaves the
+/// leg parked on a quiet socket.
+pub struct BridgedEndpoint {
+    /// Wire RX: `(src, datagram)` pairs the RX bridge pulled off the
+    /// socket. On a connected socket `src` is the bound peer (the
+    /// kernel delivers no other source).
+    rx: mpsc::Receiver<(SocketAddr, Bytes)>,
+    /// Wire TX: `(dst, datagram)` pairs for the TX bridge. `dst` is
+    /// advisory on a connected socket — `send()` semantics ignore it.
+    tx: mpsc::Sender<(SocketAddr, Bytes)>,
+    /// The bound peer stamped on `try_send`/`send_batch` channel items
+    /// and on connected RX sources; `None` on an unconnected endpoint,
+    /// where `try_send` reports `NotConnected` like a std socket.
+    peer: Option<SocketAddr>,
+    /// Drop edge for the RX leg — flag-polled by the dedicated
+    /// thread, `select!`ed by the tokio-task fallback ([`RxStop`]).
+    shutdown_rx: RxStop,
+    /// Drop edge for the TX bridge's parked `recv`/`writable()`.
+    shutdown_tx: Arc<Notify>,
+    /// The kernel socket, shared with both bridge halves — also the
+    /// `local_addr` source.
+    endpoint: Arc<BatchEndpoint>,
+    /// The bridge workers; kept so their lifetime reads as owned by
+    /// the endpoint (each is self-terminating on channel close or the
+    /// shutdown edge). RX is an OS thread where `libc::poll` reaches
+    /// the fd (Linux/Android/macOS — the `libc` dependency platforms)
+    /// and a tokio task everywhere else; TX is a runtime task. `Drop`
+    /// `take`s the RX handle to join it — the socket must actually be
+    /// released when teardown returns, not ~50 ms later.
+    _bridge: (Option<RxJoin>, tokio::task::JoinHandle<()>),
+}
+
+/// The RX leg's join handle — one variant per platform leg:
+/// [`Os`](Self::Os) is the dedicated `poll`-parked thread,
+/// [`Tokio`](Self::Tokio) the `readable().await` task that runs
+/// where `libc` isn't a dependency (the pre-thread behaviour, so
+/// nothing regresses on platforms the thread never reached).
+#[allow(
+    dead_code,
+    reason = "held for ownership only — dropping the \
+    handle detaches the leg, which is intentional; nothing joins it"
+)]
+enum RxJoin {
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    Os(std::thread::JoinHandle<()>),
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    Tokio(tokio::task::JoinHandle<()>),
+}
+
+impl BridgedEndpoint {
+    /// Bridge a socket bound to one peer (the outbound pump).
+    /// `peer` stamps the source reported for every received datagram —
+    /// `recv_batch` discards kernel names, and a connected socket can
+    /// only have received from that peer anyway.
+    pub fn connected(socket: tokio::net::UdpSocket, peer: SocketAddr) -> Self {
+        Self::spawn(BatchEndpoint::connected(socket), Some(peer))
+    }
+
+    /// Bridge an unconnected socket (the inbound listener): every
+    /// datagram's real source rides the RX channel for peer demux.
+    pub fn unconnected(socket: tokio::net::UdpSocket) -> Self {
+        Self::spawn(BatchEndpoint::unconnected(socket), None)
+    }
+
+    /// Build the channel pair and spawn both bridge tasks. Must be
+    /// called from a tokio runtime context — same contract as
+    /// [`ProxyEndpoint::new`].
+    fn spawn(ep: BatchEndpoint, peer: Option<SocketAddr>) -> Self {
+        let ep = Arc::new(ep);
+        let (wire_tx, wire_rx) = mpsc::channel(BRIDGE_RX_QUEUE);
+        let (pump_tx, pump_rx) = mpsc::channel(PROXY_ENDPOINT_QUEUE);
+        let shutdown_tx = Arc::new(Notify::new());
+
+        let (rx_join, shutdown_rx) = Self::spawn_rx(&ep, peer, wire_tx);
+
+        let tx_task = tokio::spawn({
+            let ep = Arc::clone(&ep);
+            let shutdown = Arc::clone(&shutdown_tx);
+            let rx_pulse = RxStopOnDrop(shutdown_rx.clone());
+            async move {
+                // Flags the RX leg after the loop on *every* exit —
+                // see `RxStopOnDrop`.
+                let _rx_pulse = rx_pulse;
+                let mut pump_rx = pump_rx;
+                // Staged flush batch: `sendq` grows only from channel
+                // pops, so it is bounded by `PROXY_ENDPOINT_QUEUE` plus
+                // one in-flight datagram — the channel itself is the
+                // backpressure edge, not this queue.
+                let mut sendq: VecDeque<(SocketAddr, Bytes)> = VecDeque::new();
+                'outer: loop {
+                    if sendq.is_empty() {
+                        match tokio::select! {
+                            biased;
+                            _ = shutdown.notified() => break,
+                            p = pump_rx.recv() => p,
+                        } {
+                            Some(p) => sendq.push_back(p),
+                            // Channel closed — endpoint teardown.
+                            None => break,
+                        }
+                    }
+                    // Top up the staged batch without blocking so one
+                    // `send_batch_to` covers the whole queued burst.
+                    while let Ok(p) = pump_rx.try_recv() {
+                        sendq.push_back(p);
+                    }
+                    while !sendq.is_empty() {
+                        let sent = {
+                            let refs: Vec<(SocketAddr, &[u8])> =
+                                sendq.iter().map(|(a, b)| (*a, &b[..])).collect();
+                            ep.send_batch_to(&refs)
+                        };
+                        if sent > 0 {
+                            sendq.drain(..sent);
+                        }
+                        let Some((addr, pkt)) = sendq.front() else {
+                            break;
+                        };
+                        // The short-count boundary datagram gets the
+                        // per-packet retry — `WouldBlock` parks on
+                        // `writable()` and preserves queue order; any
+                        // real errno drops just this datagram (the
+                        // EMSGSIZE-class rejection `flush_outbox` once
+                        // handled — now reported where it happens).
+                        let boundary = if ep.is_connected() {
+                            ep.try_send(pkt)
+                        } else {
+                            ep.try_send_to(pkt, *addr)
+                        };
+                        match boundary {
+                            Ok(_) => {
+                                sendq.pop_front();
+                            }
+                            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                                let w = tokio::select! {
+                                    biased;
+                                    _ = shutdown.notified() => break 'outer,
+                                    r = ep.writable() => r,
+                                };
+                                if w.is_err() {
+                                    break 'outer;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::debug!(
+                                    "wireguard endpoint send error (datagram dropped): {e}"
+                                );
+                                sendq.pop_front();
+                            }
+                        }
+                    }
+                }
+            }
+        });
+
+        Self {
+            rx: wire_rx,
+            tx: pump_tx,
+            peer,
+            shutdown_rx,
+            shutdown_tx,
+            endpoint: ep,
+            _bridge: (Some(rx_join), tx_task),
+        }
+    }
+
+    /// RX leg, dedicated-thread variant — everywhere `libc` is a
+    /// dependency. A dedicated OS thread owns the kernel drain — not
+    /// a runtime task. Tokio can queue a woken task behind a
+    /// synchronous actor pass on the same worker, and every
+    /// millisecond the socket goes unread is kernel buffer a wire
+    /// burst turns into drops (observed: channel never full, Recv-Q
+    /// still overflowed — the bridge itself, not the channel, was the
+    /// stall). A `poll` on the raw fd parks the thread on kernel
+    /// state directly: no scheduler stands between the wire and the
+    /// drain. `blocking_send` is the same backpressure edge the async
+    /// `send().await` was — the channel-full park moves from executor
+    /// bookkeeping to a plain futex.
+    #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+    fn spawn_rx(
+        ep: &Arc<BatchEndpoint>,
+        peer: Option<SocketAddr>,
+        wire_tx: mpsc::Sender<(SocketAddr, Bytes)>,
+    ) -> (RxJoin, RxStop) {
+        // The wake socketpair lets `stop()` interrupt `poll`
+        // immediately — `Drop` joins the thread and teardown cannot
+        // return while the socket fd is still owned (the
+        // `listener_shutdown_drain` port-rebind contract).
+        let (wake_w, wake_r) = WakeFd::pair();
+        let stop = RxStop::with_wake(wake_w);
+        let shutdown = stop.clone();
+        let join = std::thread::Builder::new()
+            .name("wg-rx-bridge".into())
+            .spawn({
+                let ep = Arc::clone(ep);
+                move || {
+                    // Both socket shapes batch the kernel drain —
+                    // `recv_batch` connected, `recv_batch_from`
+                    // unconnected (the listener's demux keeps every
+                    // real source) — then one `try_recv*` tail confirms
+                    // a short batch really means dry and catches a
+                    // straggler that landed mid-drain.
+                    let mut staged: Vec<Vec<u8>> = (0..WIRE_DRAIN_BUDGET)
+                        .map(|_| Vec::with_capacity(BRIDGE_SLOT))
+                        .collect();
+                    let mut staged_addrs: Vec<SocketAddr> =
+                        vec![
+                            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+                            WIRE_DRAIN_BUDGET
+                        ];
+                    let mut single = vec![0u8; BRIDGE_BUF];
+                    'outer: loop {
+                        // Wait on the fd itself *and* the wake edge;
+                        // the timeout only bounds how often the
+                        // shutdown flag is re-checked if the byte is
+                        // ever lost. `poll` returns early with `-1` on
+                        // a caught signal — re-poll on EINTR instead of
+                        // falling through to a WouldBlock drain
+                        // round-trip. POLLERR/POLLHUP/POLLNVAL
+                        // deliberately fall through: `try_recv*` below
+                        // surfaces a persistent fd error as terminal.
+                        let mut pfds = [
+                            libc::pollfd {
+                                fd: ep.raw_fd(),
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                            libc::pollfd {
+                                fd: wake_r,
+                                events: libc::POLLIN,
+                                revents: 0,
+                            },
+                        ];
+                        while unsafe { libc::poll(pfds.as_mut_ptr(), 2, 50) } < 0 {
+                            if io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
+                                break;
+                            }
+                            for p in &mut pfds {
+                                p.revents = 0;
+                            }
+                        }
+
+                        if shutdown.flag.load(Ordering::Relaxed)
+                            || pfds[1].revents & libc::POLLIN != 0
+                        {
+                            break;
+                        }
+                        let mut spent = 0usize;
+                        while spent < RX_WAKE_CAP {
+                            if shutdown.flag.load(Ordering::Relaxed) {
+                                break 'outer;
+                            }
+                            if let Some(peer) = peer {
+                                let n = ep.recv_batch(&mut staged, WIRE_DRAIN_BUDGET);
+                                spent += n;
+                                for slot in &staged[..n] {
+                                    if wire_tx
+                                        .blocking_send((peer, Bytes::copy_from_slice(slot)))
+                                        .is_err()
+                                    {
+                                        break 'outer;
+                                    }
+                                }
+                                if n < staged.len() {
+                                    match ep.try_recv(&mut single) {
+                                        Ok(m) => {
+                                            spent += 1;
+                                            let pkt = Bytes::copy_from_slice(&single[..m]);
+                                            if wire_tx.blocking_send((peer, pkt)).is_err() {
+                                                break 'outer;
+                                            }
+                                            continue;
+                                        }
+                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                        Err(_) => break 'outer,
+                                    }
+                                }
+                            } else {
+                                let n = ep.recv_batch_from(
+                                    &mut staged,
+                                    &mut staged_addrs,
+                                    WIRE_DRAIN_BUDGET,
+                                );
+                                spent += n;
+                                for (buf, src) in staged[..n].iter().zip(&staged_addrs[..n]) {
+                                    let item = (*src, Bytes::copy_from_slice(buf));
+                                    if wire_tx.blocking_send(item).is_err() {
+                                        break 'outer;
+                                    }
+                                }
+                                if n < staged.len() {
+                                    match ep.try_recv_from(&mut single) {
+                                        Ok((m, src)) => {
+                                            spent += 1;
+                                            let pkt = Bytes::copy_from_slice(&single[..m]);
+                                            if wire_tx.blocking_send((src, pkt)).is_err() {
+                                                break 'outer;
+                                            }
+                                            continue;
+                                        }
+                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                        Err(_) => break 'outer,
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Thread owns the read end — closing it here means
+                    // a later `stop()` write is `EPIPE` (harmless with
+                    // `MSG_NOSIGNAL`), never a stale-fd poll.
+                    unsafe {
+                        libc::close(wake_r);
+                    }
+                }
+            })
+            .expect("spawn wg-rx-bridge");
+        (RxJoin::Os(join), stop)
+    }
+
+    /// RX leg, tokio-task variant — the pre-thread shape, kept for
+    /// platforms without `libc` (Windows, *BSD): the same batch drain
+    /// parked on `readable().await` instead of `poll(fd)`. Scheduling
+    /// starvation can still queue it behind a synchronous actor pass,
+    /// so the channel-full backpressure edge is unchanged — this is a
+    /// carryover, not a regression.
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_os = "macos")))]
+    fn spawn_rx(
+        ep: &Arc<BatchEndpoint>,
+        peer: Option<SocketAddr>,
+        wire_tx: mpsc::Sender<(SocketAddr, Bytes)>,
+    ) -> (RxJoin, RxStop) {
+        let stop = RxStop::new();
+        let shutdown = stop.clone();
+        let task = tokio::spawn({
+            let ep = Arc::clone(ep);
+            async move {
+                // Both socket shapes batch the kernel drain —
+                // `recv_batch` connected, `recv_batch_from`
+                // unconnected (the listener's demux keeps every real
+                // source) — then one gated `try_recv*` tail clears the
+                // cached readiness the raw-fd batch can't touch.
+                let mut staged: Vec<Vec<u8>> = (0..WIRE_DRAIN_BUDGET)
+                    .map(|_| Vec::with_capacity(BRIDGE_SLOT))
+                    .collect();
+                let mut staged_addrs: Vec<SocketAddr> =
+                    vec![SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0); WIRE_DRAIN_BUDGET];
+                let mut single = vec![0u8; BRIDGE_BUF];
+                'outer: loop {
+                    let r = tokio::select! {
+                        biased;
+                        _ = shutdown.pulse.notified() => break,
+                        r = ep.readable() => r,
+                    };
+                    // A dead fd ends the bridge: dropping `wire_tx`
+                    // closes the channel, and the actor's recv sees
+                    // `ConnectionReset` — the terminal verdict.
+                    if r.is_err() {
+                        break;
+                    }
+                    let mut spent = 0usize;
+                    while spent < RX_WAKE_CAP {
+                        if let Some(peer) = peer {
+                            let n = ep.recv_batch(&mut staged, WIRE_DRAIN_BUDGET);
+                            spent += n;
+                            for slot in &staged[..n] {
+                                if wire_tx
+                                    .send((peer, Bytes::copy_from_slice(slot)))
+                                    .await
+                                    .is_err()
+                                {
+                                    break 'outer;
+                                }
+                            }
+                            if n < staged.len() {
+                                // `recv_batch` drains through the raw
+                                // fd, invisible to tokio's readiness
+                                // tracking — a short batch means the
+                                // kernel queue is dry, so finish with
+                                // one gated `try_recv`. It clears the
+                                // cached readable bit so the next
+                                // `readable()` parks on true kernel
+                                // state, delivers a straggler that
+                                // landed mid-drain, and surfaces a
+                                // persistent socket error as terminal.
+                                match ep.try_recv(&mut single) {
+                                    Ok(m) => {
+                                        spent += 1;
+                                        let pkt = Bytes::copy_from_slice(&single[..m]);
+                                        if wire_tx.send((peer, pkt)).await.is_err() {
+                                            break 'outer;
+                                        }
+                                        continue;
+                                    }
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                    Err(_) => break 'outer,
+                                }
+                            }
+                        } else {
+                            let n = ep.recv_batch_from(
+                                &mut staged,
+                                &mut staged_addrs,
+                                WIRE_DRAIN_BUDGET,
+                            );
+                            spent += n;
+                            for (buf, src) in staged[..n].iter().zip(&staged_addrs[..n]) {
+                                if wire_tx
+                                    .send((*src, Bytes::copy_from_slice(buf)))
+                                    .await
+                                    .is_err()
+                                {
+                                    break 'outer;
+                                }
+                            }
+                            if n < staged.len() {
+                                match ep.try_recv_from(&mut single) {
+                                    Ok((m, src)) => {
+                                        spent += 1;
+                                        let pkt = Bytes::copy_from_slice(&single[..m]);
+                                        if wire_tx.send((src, pkt)).await.is_err() {
+                                            break 'outer;
+                                        }
+                                        continue;
+                                    }
+                                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                                    Err(_) => break 'outer,
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        (RxJoin::Tokio(task), stop)
+    }
+
+    /// See [`BatchEndpoint::try_recv`]: channel `Empty` maps to
+    /// `WouldBlock`, `Disconnected` — the RX bridge gone — to
+    /// `ConnectionReset`, the terminal verdict the caller already owns.
+    pub fn try_recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.rx.try_recv() {
+            Ok((_src, pkt)) => {
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                Ok(n)
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(io::Error::from(io::ErrorKind::ConnectionReset))
+            }
+        }
+    }
+
+    /// [`try_recv`](Self::try_recv) with the datagram's source — the
+    /// listener's demux key.
+    pub fn try_recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match self.rx.try_recv() {
+            Ok((src, pkt)) => {
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                Ok((n, src))
+            }
+            Err(mpsc::error::TryRecvError::Empty) => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            Err(mpsc::error::TryRecvError::Disconnected) => {
+                Err(io::Error::from(io::ErrorKind::ConnectionReset))
+            }
+        }
+    }
+
+    /// See [`BatchEndpoint::recv`]: the async form awaits the RX
+    /// channel instead of the kernel socket — a closed channel (RX
+    /// bridge exit) reports `ConnectionReset`.
+    pub async fn recv(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.rx.recv().await {
+            Some((_src, pkt)) => {
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                Ok(n)
+            }
+            None => Err(io::Error::from(io::ErrorKind::ConnectionReset)),
+        }
+    }
+
+    /// [`recv`](Self::recv) with the datagram's source.
+    pub async fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<(usize, SocketAddr)> {
+        match self.rx.recv().await {
+            Some((src, pkt)) => {
+                let n = pkt.len().min(buf.len());
+                buf[..n].copy_from_slice(&pkt[..n]);
+                Ok((n, src))
+            }
+            None => Err(io::Error::from(io::ErrorKind::ConnectionReset)),
+        }
+    }
+
+    /// See [`Endpoint::recv_batch`] / `ProxyEndpoint::recv_batch`:
+    /// pops channel datagrams into the staged slots under the same
+    /// leading-count contract.
+    pub fn recv_batch(&mut self, bufs: &mut [Vec<u8>], budget: usize) -> usize {
+        let n = bufs.len().min(budget).min(WIRE_DRAIN_BUDGET);
+        let mut got = 0;
+        for buf in &mut bufs[..n] {
+            match self.rx.try_recv() {
+                Ok((_src, pkt)) => {
+                    buf.clear();
+                    let take = pkt.len().min(buf.capacity());
+                    buf.extend_from_slice(&pkt[..take]);
+                    got += 1;
+                }
+                Err(_) => break,
+            }
+        }
+        got
+    }
+
+    /// See [`BatchEndpoint::try_send`]. On a connected endpoint the
+    /// channel item's `dst` is the bound peer; an unconnected one has
+    /// no peer to stamp and reports `NotConnected` like a std socket.
+    /// A full channel is `WouldBlock` — the requeue edge
+    /// `flush_outbox` already keys on.
+    pub fn try_send(&self, buf: &[u8]) -> io::Result<usize> {
+        let Some(peer) = self.peer else {
+            return Err(io::Error::from(io::ErrorKind::NotConnected));
+        };
+        self.send_one(peer, buf)
+    }
+
+    /// See [`BatchEndpoint::try_send_to`]: the channel analogue —
+    /// `WouldBlock` on a full queue, `ConnectionReset` when the TX
+    /// bridge is gone.
+    pub fn try_send_to(&self, buf: &[u8], addr: SocketAddr) -> io::Result<usize> {
+        self.send_one(addr, buf)
+    }
+
+    /// The shared `try_send` core.
+    fn send_one(&self, addr: SocketAddr, buf: &[u8]) -> io::Result<usize> {
+        match self.tx.try_send((addr, Bytes::copy_from_slice(buf))) {
+            Ok(()) => Ok(buf.len()),
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(io::Error::from(io::ErrorKind::WouldBlock))
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(io::Error::from(io::ErrorKind::ConnectionReset))
+            }
+        }
+    }
+
+    /// See [`BatchEndpoint::send_batch`]: a `try_send` loop returning
+    /// the leading accepted count — the channel-full boundary behaves
+    /// exactly like the kernel's send stop.
+    pub fn send_batch(&self, pkts: &[&[u8]], addr: SocketAddr) -> usize {
+        let mut sent = 0;
+        for pkt in pkts {
+            match self.tx.try_send((addr, Bytes::copy_from_slice(pkt))) {
+                Ok(()) => sent += 1,
+                Err(_) => break,
+            }
+        }
+        sent
+    }
+
+    /// See [`BatchEndpoint::send_batch_to`]: per-datagram destination
+    /// rides the channel item; connected semantics ignore it downstream.
+    pub fn send_batch_to(&self, pkts: &[(SocketAddr, &[u8])]) -> usize {
+        let mut sent = 0;
+        for (addr, pkt) in pkts {
+            match self.tx.try_send((*addr, Bytes::copy_from_slice(pkt))) {
+                Ok(()) => sent += 1,
+                Err(_) => break,
+            }
+        }
+        sent
+    }
+
+    /// See [`BatchEndpoint::local_addr`].
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        self.endpoint.local_addr()
+    }
+}
+
+impl Drop for BridgedEndpoint {
+    /// The `ProxyEndpoint` contract, extended for the dedicated RX
+    /// thread: `rx.close()` errors any `blocking_send` parked on a
+    /// full channel (the receiver field can't drop until this `Drop`
+    /// returns — the thread would out-wait `join` without this),
+    /// `stop()`'s wake byte pulls the thread out of `poll`
+    /// immediately, and `join` waits it out so the socket fd is
+    /// actually released before teardown returns — the
+    /// port-is-free-on-shutdown contract, not a ~50 ms race.
+    fn drop(&mut self) {
+        self.rx.close();
+        self.shutdown_rx.stop();
+        self.shutdown_tx.notify_one();
+        #[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+        if let Some(RxJoin::Os(join)) = self._bridge.0.take() {
+            let _ = join.join();
+        }
+    }
+}
+
 /// Darwin's batched-datagram SPI: `sendmsg_x`/`recvmsg_x`, declared in
 /// XNU's kernel-side `bsd/sys/socket_private.h` and exported by
 /// libSystem — no `#[link]` attribute needed (libSystem is always in
@@ -928,13 +1915,14 @@ mod msgx {
 
     // `cnt` ceiling pin: XNU clips each call's datagram count at
     // `somaxsendmsgx`/`somaxrecvmsgx` (default 100 — see the module
-    // docs) and EINVALs past `UIO_MAXIOV`. Keeping the wire-drain
-    // budget under the default ceiling means a staged batch always
-    // fits one call on a stock kernel — a budget bump past it would
-    // silently truncate the tail of every chunk.
+    // docs) and EINVALs past `UIO_MAXIOV`. The per-call chunk stays
+    // under the default ceiling even though `WIRE_DRAIN_BUDGET` may
+    // exceed it — a bigger budget is serviced over several calls,
+    // while a chunk sized past the ceiling would silently truncate
+    // the tail of every round.
     const _: () = assert!(
-        crate::WIRE_DRAIN_BUDGET <= 100,
-        "WIRE_DRAIN_BUDGET exceeds XNU's default sendmsg_x/recvmsg_x cnt ceiling (100)"
+        super::BatchEndpoint::MSGX_CHUNK <= 100,
+        "MSGX_CHUNK exceeds XNU's default sendmsg_x/recvmsg_x cnt ceiling (100)"
     );
 
     extern "C" {
@@ -1053,6 +2041,41 @@ fn write_sockaddr(storage: &mut libc::sockaddr_storage, addr: &SocketAddr) -> li
     }
 }
 
+/// Decode a `sockaddr_storage` the kernel wrote through `msg_name` —
+/// the inverse of `write_sockaddr`. Only family/port/addr are read, so
+/// the Darwin `sin_len` byte needs no platform split; an unrecognised
+/// family reports the unspecified wildcard, which the demux's table
+/// simply finds no peer for — the same verdict a non-peer source gets.
+#[cfg(any(
+    target_os = "linux",
+    all(target_os = "macos", not(feature = "no-macos-sendmsg-x"))
+))]
+fn read_sockaddr(storage: &libc::sockaddr_storage) -> SocketAddr {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            // SAFETY: the kernel wrote a `sockaddr_in` — family proved.
+            let sa =
+                unsafe { &*(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in>() };
+            SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::from(sa.sin_addr.s_addr.to_be())),
+                u16::from_be(sa.sin_port),
+            )
+        }
+        libc::AF_INET6 => {
+            // SAFETY: the kernel wrote a `sockaddr_in6` — family proved.
+            let sa = unsafe {
+                &*(storage as *const libc::sockaddr_storage).cast::<libc::sockaddr_in6>()
+            };
+            SocketAddr::new(
+                IpAddr::V6(Ipv6Addr::from(sa.sin6_addr.s6_addr)),
+                u16::from_be(sa.sin6_port),
+            )
+        }
+        _ => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     //! Loopback UDP batch I/O. On Linux these drive the real
@@ -1060,6 +2083,7 @@ mod tests {
     //! (unless `no-macos-sendmsg-x` put the fallback back), elsewhere
     //! the per-datagram loop.
     use super::*;
+    use crate::enlarge_recv_buffer;
 
     fn std_sock() -> std::net::UdpSocket {
         let s = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind");
@@ -1069,6 +2093,10 @@ mod tests {
 
     fn ep(s: std::net::UdpSocket, connected: bool) -> BatchEndpoint {
         let t = tokio::net::UdpSocket::from_std(s).expect("tokio socket");
+        // Production endpoints enlarge `SO_RCVBUF`; a test socket on
+        // the stock ~208 KiB makes every flood assertion a kernel-
+        // capacity coin flip instead of a batch-semantics check.
+        enlarge_recv_buffer(&t);
         if connected {
             BatchEndpoint::connected(t)
         } else {
@@ -1211,9 +2239,9 @@ mod tests {
         got
     }
 
-    /// Chunks past the [`WIRE_DRAIN_BUDGET`] stack-array bound: a
-    /// 130-datagram `send_batch` takes three mmsg rounds on Linux —
-    /// the `pkts[sent..sent + n]` offset must stay exact — and a plain
+    /// Chunks past the per-call stack-array bound: a batch wider than
+    /// two rounds takes ≥3 mmsg/msgx rounds on Linux/macOS — the
+    /// `pkts[sent..sent + n]` offset must stay exact — and a plain
     /// loop elsewhere. The receiver sees every datagram once, in
     /// order.
     #[tokio::test(flavor = "current_thread")]
@@ -1225,8 +2253,12 @@ mod tests {
         let a = ep(a_sock, true);
         let b = ep(b_sock, false);
 
-        const N: usize = 130; // > 2 × WIRE_DRAIN_BUDGET ⇒ ≥3 kernel rounds
-        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8; 8 + i]).collect();
+        // > 2 × the per-call chunk ⇒ ≥3 kernel rounds on either backend
+        // (mmsg chunks at `WIRE_DRAIN_BUDGET`, msgx at `MSGX_CHUNK`).
+        // Payloads stay ≤39 B so the queued batch fits a stock kernel
+        // receive buffer whole.
+        const N: usize = 2 * WIRE_DRAIN_BUDGET + 2;
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8; 8 + i % 32]).collect();
         let refs: Vec<&[u8]> = payloads.iter().map(Vec::as_slice).collect();
         a.writable().await.expect("sender writable");
         assert_eq!(a.send_batch(&refs, b_addr), N, "all chunks sent");
@@ -1244,8 +2276,8 @@ mod tests {
         let b_addr = b_sock.local_addr().expect("addr");
         let b = ep(b_sock, false);
 
-        const N: usize = 130;
-        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8; 8 + i]).collect();
+        const N: usize = 2 * WIRE_DRAIN_BUDGET + 2;
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8; 8 + i % 32]).collect();
         let refs: Vec<(SocketAddr, &[u8])> =
             payloads.iter().map(|p| (b_addr, p.as_slice())).collect();
         a.writable().await.expect("sender writable");
@@ -1905,5 +2937,263 @@ mod tests {
             .expect("RX bridge must exit after TX write timeout — P1 regression")
             .expect_err("a dead front conn reads as ConnectionReset");
         assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    // ── BridgedEndpoint: the kernel socket behind the same bridge ──
+    //
+    // These pin the contract both owners rely on — the pump's
+    // `Endpoint::Batch` and the listener's actor: FIFO wire order, the
+    // unconnected path's per-datagram source, channel backpressure as
+    // `WouldBlock`, per-datagram kernel-error drop, and bridge exit as
+    // `ConnectionReset`.
+
+    /// Build a connected `BridgedEndpoint` whose peer is a plain std
+    /// socket; returns the endpoint and the raw peer socket — it
+    /// `send_to`s the endpoint's `local_addr` to drive RX.
+    fn bridged_pair() -> (BridgedEndpoint, std::net::UdpSocket) {
+        let receiver = std_sock();
+        let peer = receiver.local_addr().expect("receiver addr");
+        let sender = std_sock();
+        sender.connect(peer).expect("connect");
+        let sock = tokio::net::UdpSocket::from_std(sender).expect("tokio socket");
+        // Same as `ep()`: the bridge's drain socket needs production
+        // headroom or a burst past `RX_WAKE_CAP` lands-or-drops on the
+        // runner's ambient `rmem` tuning, not on bridge semantics.
+        enlarge_recv_buffer(&sock);
+        (BridgedEndpoint::connected(sock, peer), receiver)
+    }
+
+    /// Read `expected` datagrams off a peer socket the bridge sends
+    /// toward, in wire order. The `try_clone` rides a tokio socket so
+    /// the test task yields at `readable()` — under `current_thread`
+    /// the TX bridge runs only at await points.
+    async fn drain_peer(receiver: &std::net::UdpSocket, expected: usize) -> Vec<Vec<u8>> {
+        let t = tokio::net::UdpSocket::from_std(receiver.try_clone().expect("clone"))
+            .expect("tokio receiver");
+        let mut got = Vec::new();
+        let mut buf = vec![0u8; 65536];
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while got.len() < expected {
+            match tokio::time::timeout_at(deadline, t.readable()).await {
+                Ok(r) => r.expect("readable"),
+                Err(_) => break,
+            }
+            while let Ok(n) = t.try_recv(&mut buf) {
+                got.push(buf[..n].to_vec());
+            }
+        }
+        got
+    }
+
+    /// Connected RX: a sender burst crosses the bridge into `recv`,
+    /// every datagram in wire order.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridged_connected_rx_fifo() {
+        let (mut ep, receiver) = bridged_pair();
+        let ep_addr = ep.local_addr().expect("endpoint addr");
+        const N: usize = 32;
+        let payloads: Vec<Vec<u8>> = (0..N).map(|i| vec![i as u8; 48 + i]).collect();
+        for p in &payloads {
+            receiver.send_to(p, ep_addr).expect("send");
+        }
+
+        let mut buf = vec![0u8; 2048];
+        for (i, want) in payloads.iter().enumerate() {
+            let n = tokio::time::timeout(Duration::from_secs(5), ep.recv(&mut buf))
+                .await
+                .unwrap_or_else(|_| panic!("datagram {i} never crossed the RX bridge"))
+                .expect("recv");
+            assert_eq!(&buf[..n], want.as_slice(), "datagram {i} in wire order");
+        }
+    }
+
+    /// A flood far past `RX_WAKE_CAP` still arrives complete — the cap
+    /// bounds one wake's drain, not the stream: each re-armed
+    /// `readable()` continues where the last left off.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bridged_rx_burst_past_wake_cap() {
+        let (mut ep, receiver) = bridged_pair();
+        let ep_addr = ep.local_addr().expect("endpoint addr");
+        let n = 3 * RX_WAKE_CAP;
+        let payload = vec![0xABu8; 96];
+        let send_payload = payload.clone();
+        let receiver_thread = std::thread::spawn(move || {
+            for _ in 0..n {
+                receiver.send_to(&send_payload, ep_addr).expect("send");
+            }
+        });
+
+        let mut buf = vec![0u8; 2048];
+        let mut got = 0usize;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        while got < n {
+            match tokio::time::timeout_at(deadline, ep.recv(&mut buf)).await {
+                Ok(Ok(m)) => {
+                    assert_eq!(&buf[..m], payload.as_slice());
+                    got += 1;
+                }
+                Ok(Err(e)) => panic!("recv: {e}"),
+                Err(_) => panic!("RX bridge stalled at {got}/{n}"),
+            }
+        }
+        receiver_thread.join().expect("sender thread");
+    }
+
+    /// Unconnected RX preserves each datagram's real source — the
+    /// listener demux keys on it. Two senders interleave; `recv_from`
+    /// must report the right one per datagram.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridged_unconnected_recv_from_preserves_src() {
+        let ep_sock = std_sock();
+        let ep_addr = ep_sock.local_addr().expect("addr");
+        let sock = tokio::net::UdpSocket::from_std(ep_sock).expect("tokio socket");
+        let mut ep = BridgedEndpoint::unconnected(sock);
+
+        let a = std_sock();
+        let a_addr = a.local_addr().expect("a addr");
+        let b = std_sock();
+        let b_addr = b.local_addr().expect("b addr");
+        a.send_to(b"from-a", ep_addr).expect("a send");
+        b.send_to(b"from-b", ep_addr).expect("b send");
+        a.send_to(b"from-a-2", ep_addr).expect("a send 2");
+
+        let mut seen: Vec<(SocketAddr, Vec<u8>)> = Vec::new();
+        let mut buf = vec![0u8; 256];
+        for _ in 0..3 {
+            let (n, src) = tokio::time::timeout(Duration::from_secs(5), ep.recv_from(&mut buf))
+                .await
+                .expect("datagram never crossed the RX bridge")
+                .expect("recv_from");
+            seen.push((src, buf[..n].to_vec()));
+        }
+        seen.sort_by_key(|(s, _)| *s);
+        let mut want = vec![
+            (a_addr, b"from-a".to_vec()),
+            (a_addr, b"from-a-2".to_vec()),
+            (b_addr, b"from-b".to_vec()),
+        ];
+        want.sort_by_key(|(s, _)| *s);
+        assert_eq!(seen, want, "each datagram keeps its real source");
+    }
+
+    /// Unconnected TX routes each channel item to its stamped
+    /// destination — `try_send_to` reaches two different receivers.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridged_unconnected_send_to_routes_per_peer() {
+        let ep_sock = std_sock();
+        let sock = tokio::net::UdpSocket::from_std(ep_sock).expect("tokio socket");
+        let ep = BridgedEndpoint::unconnected(sock);
+
+        let a = std_sock();
+        let a_addr = a.local_addr().expect("a addr");
+        let b = std_sock();
+        let b_addr = b.local_addr().expect("b addr");
+
+        ep.try_send_to(b"to-a", a_addr).expect("try_send_to a");
+        ep.try_send_to(b"to-b", b_addr).expect("try_send_to b");
+
+        assert_eq!(drain_peer(&a, 1).await, vec![b"to-a".to_vec()]);
+        assert_eq!(drain_peer(&b, 1).await, vec![b"to-b".to_vec()]);
+    }
+
+    /// `try_send` on an unconnected endpoint has no peer to stamp —
+    /// `NotConnected`, the std-socket verdict.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridged_unconnected_try_send_is_not_connected() {
+        let ep_sock = std_sock();
+        let sock = tokio::net::UdpSocket::from_std(ep_sock).expect("tokio socket");
+        let ep = BridgedEndpoint::unconnected(sock);
+        let err = ep.try_send(b"nowhere").expect_err("unconnected try_send");
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+    }
+
+    /// A full TX channel reports `WouldBlock` — the requeue boundary
+    /// `flush_outbox` keys on. `current_thread` never yields between
+    /// sends, so the queue fills at exactly `PROXY_ENDPOINT_QUEUE`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridged_try_send_full_channel_is_wouldblock() {
+        let (ep, _receiver) = bridged_pair();
+        for i in 0..PROXY_ENDPOINT_QUEUE {
+            ep.try_send(&[i as u8; 16])
+                .unwrap_or_else(|e| panic!("queue slot {i}: {e}"));
+        }
+        let err = ep
+            .try_send(b"one too many")
+            .expect_err("a full channel is WouldBlock");
+        assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    /// A kernel send error drops only the offending datagram: an
+    /// oversized payload hits `EMSGSIZE` in the TX bridge and the
+    /// queued datagram behind it still reaches the wire.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridged_tx_oversized_drops_only_that_datagram() {
+        let (ep, receiver) = bridged_pair();
+        let oversized = vec![0xEEu8; 70000];
+        ep.try_send(&oversized).expect("oversized enqueues");
+        ep.try_send(b"survivor").expect("survivor enqueues");
+
+        let got = drain_peer(&receiver, 1).await;
+        assert_eq!(
+            got,
+            vec![b"survivor".to_vec()],
+            "EMSGSIZE drops just itself"
+        );
+    }
+
+    /// RX bridge exit closes the channel: `recv` reports
+    /// `ConnectionReset`, the terminal verdict the pump's error arm
+    /// stops on. The `shutdown_rx` flag is what `Drop` sets.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridged_rx_bridge_exit_is_connection_reset() {
+        let (mut ep, _receiver) = bridged_pair();
+        ep.shutdown_rx.stop();
+        let mut buf = vec![0u8; 64];
+        let err = tokio::time::timeout(Duration::from_secs(5), ep.recv(&mut buf))
+            .await
+            .expect("RX bridge must exit on its shutdown edge")
+            .expect_err("a dead RX bridge reads as ConnectionReset");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+        // `try_recv` sees the same verdict on the closed channel.
+        let err = ep.try_recv(&mut buf).expect_err("try_recv");
+        assert_eq!(err.kind(), io::ErrorKind::ConnectionReset);
+    }
+
+    /// TX bridge exit closes the send channel: `try_send` reports
+    /// `ConnectionReset` rather than queueing into the void.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridged_tx_bridge_exit_is_connection_reset() {
+        let (ep, _receiver) = bridged_pair();
+        ep.shutdown_tx.notify_one();
+        let dead = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match ep.try_send(b"probe") {
+                    Err(e) if e.kind() == io::ErrorKind::ConnectionReset => break,
+                    _ => tokio::task::yield_now().await,
+                }
+            }
+        })
+        .await;
+        dead.expect("TX bridge must exit on its shutdown edge");
+    }
+
+    /// Dropping the endpoint pulses both edges: the RX flag reads set
+    /// the moment `drop` returns, and a `notify_one` stores its TX
+    /// permit when nothing waits, so `notified()` armed after `drop`
+    /// resolves only if `Drop` actually fired the edge — a task
+    /// parked on `writable()`/`recv()` unwinds the same way.
+    #[tokio::test(flavor = "current_thread")]
+    async fn bridged_drop_pulses_both_edges() {
+        let (ep, _receiver) = bridged_pair();
+        let shutdown_rx = ep.shutdown_rx.clone();
+        let shutdown_tx = Arc::clone(&ep.shutdown_tx);
+        drop(ep);
+        assert!(
+            shutdown_rx.flag.load(Ordering::Relaxed),
+            "drop must flag the rx edge"
+        );
+        tokio::time::timeout(Duration::from_secs(5), shutdown_tx.notified())
+            .await
+            .expect("drop must pulse the tx edge");
     }
 }

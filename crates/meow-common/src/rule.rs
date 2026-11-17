@@ -208,10 +208,18 @@ pub struct RuleMatchHelper;
 pub enum TargetCheck {
     /// The adapter resolves and may carry this connection.
     Usable,
-    /// Absent from the registry, or present but incapable for this
-    /// connection class (e.g. no UDP support on a UDP flow) — the rule is
-    /// skipped with a warning, mihomo's `continue`.
+    /// Absent from the registry — the rule is skipped with a warning,
+    /// mihomo's `continue` (issue #513 continue-on-missing semantics).
     Missing,
+    /// Present in the registry but incapable for this connection class —
+    /// today only a `dialer-proxy` chain over a non-transparent inner
+    /// reports it, on a UDP flow. Unlike [`Missing`], the scan stops *on*
+    /// the match rather than sliding past it: a chain the operator pinned
+    /// cannot be silently replaced by a later rule's target, so the
+    /// connection fails at the dial (issue #969).
+    ///
+    /// [`Missing`]: TargetCheck::Missing
+    Unusable,
     /// The adapter unwraps to the `PASS` built-in — the rule is skipped
     /// silently (upstream `continue GetRules` on `C.Pass`).
     Pass,

@@ -43,7 +43,7 @@
 //   64 KiB `BytesMut`: reads fill uninitialised spare capacity, each fill
 //   freezes into a `Bytes` that moves into the writer untouched.
 
-use bytes::{Bytes, BytesMut};
+use bytes::{BufMut, BytesMut};
 use meow_common::{ProxyConn, WriteBytes};
 use std::future::{poll_fn, Future};
 use std::io;
@@ -197,14 +197,20 @@ enum Scratch<'buf> {
     Owned(Box<[u8]>),
     #[cfg(any(target_os = "linux", target_os = "android"))]
     Pipe(splice::Pipe),
-    /// WG zero-copy path: reads land in the `BytesMut`'s uninitialized
-    /// spare capacity; each fill is `split_to().freeze()`d into a `Bytes`
-    /// that moves into the writer via [`WriteBytes::poll_write_bytes`]
-    /// with no `copy_from_slice`. The `Option<Bytes>` slot holds the
-    /// frozen bytes the stream did not accept on the last poll — the
-    /// caller retains ownership across `Pending` (see the `WriteBytes`
-    /// contract), which is what keeps the write arm driving the retry.
-    BytesMut(BytesMut, Option<Bytes>),
+    /// Owned-buffer zero-copy path: reads land in the `BytesMut`'s
+    /// uninitialized spare capacity; each fill is `split_to`'d into a
+    /// `BytesMut` that moves into the writer via
+    /// [`WriteBytes::poll_write_bytes`] with no `copy_from_slice`. The
+    /// `Option<BytesMut>` slot holds the buffer the stream did not
+    /// accept on the last poll — the caller retains ownership across
+    /// `Pending` (see the `WriteBytes` contract), which is what keeps
+    /// the write arm driving the retry. The trailing `usize` is the
+    /// writer's requested headroom
+    /// ([`WriteBytes::want_write_headroom`]): nonzero values reserve
+    /// that many zero bytes ahead of every read so the writer can
+    /// overlay its framing in place (AnyTLS's 7-byte frame header),
+    /// turning each fill into one contiguous wire frame.
+    BytesMut(BytesMut, Option<BytesMut>, usize),
 }
 
 /// The bulk tier for a direction (#386, perf-7 P7-1): a `BytesMut`
@@ -219,8 +225,16 @@ fn bulk_scratch<'buf, R: ?Sized, W: ?Sized>(
     wb_writer: Option<WriteBytesView<W>>,
 ) -> Scratch<'buf> {
     if let Some(view) = wb_writer {
-        if view(writer).is_some() {
-            return Scratch::BytesMut(BytesMut::with_capacity(RELAY_BULK_BUF_SIZE_WG), None);
+        if let Some(wb) = view(writer) {
+            // Probe the writer's headroom want ONCE, at tier setup —
+            // `want_write_headroom` is a static property of the impl,
+            // so per-fill re-polling would only re-pay the view lookup.
+            let headroom = wb.want_write_headroom();
+            return Scratch::BytesMut(
+                BytesMut::with_capacity(RELAY_BULK_BUF_SIZE_WG),
+                None,
+                headroom,
+            );
         }
     }
     #[cfg(any(target_os = "linux", target_os = "android"))]
@@ -327,22 +341,40 @@ impl<'buf> HalfCopy<'buf> {
                     Some(src) => pipe.poll_fill(cx, src),
                     None => Poll::Ready(Err(splice::lost_socket())),
                 },
-                Scratch::BytesMut(bm, _) => {
-                    // Restore the read window to the full buffer: after
-                    // `split_to` moved the last fill's prefix into a
-                    // `Bytes`, `bm` is the empty tail of the same
-                    // allocation. `try_reclaim` re-widens it once every
-                    // shipped `Bytes` is gone downstream (the steady
+                Scratch::BytesMut(bm, _, headroom) => {
+                    // Restore the read window to the full buffer. `bm`
+                    // must be empty before the headroom goes on: a
+                    // `poll_read_buf` `Pending` leaves the headroom
+                    // prefix (and only it) sitting in `bm`, and a queued
+                    // slot sharing the allocation can turn `reserve`'s
+                    // content-preserving copy into a stale-tail prefix
+                    // for the next fill — either way the buffer re-arms
+                    // from scratch. `clear` keeps the allocation so
+                    // `try_reclaim` can still re-widen it once every
+                    // shipped `BytesMut` is gone downstream (the steady
                     // state: one allocation for the whole direction);
-                    // while a `Bytes` is still queued in the stream's
-                    // channel this allocates instead — the same one
-                    // allocation per fill `copy_from_slice` paid, minus
-                    // the copy. `poll_read_buf` fills uninitialized
-                    // spare — no per-fill memset.
-                    if bm.capacity() - bm.len() < RELAY_BULK_BUF_SIZE_WG
+                    // while one is still queued in the stream's channel
+                    // this allocates instead — the same one allocation
+                    // per fill `copy_from_slice` paid, minus the copy.
+                    // `poll_read_buf` fills uninitialized spare — no
+                    // per-fill memset.
+                    bm.clear();
+                    if bm.capacity() < RELAY_BULK_BUF_SIZE_WG
                         && !bm.try_reclaim(RELAY_BULK_BUF_SIZE_WG)
                     {
                         bm.reserve(RELAY_BULK_BUF_SIZE_WG);
+                    }
+                    // The writer's framing headroom leads the fill:
+                    // `poll_read_buf` only fills spare capacity, so the
+                    // payload lands after these reserved bytes — which
+                    // the writer (AnyTLS) overwrites with its frame
+                    // header in place. The reservation shrinks the read
+                    // window to `RELAY_BULK_BUF_SIZE_WG - headroom`,
+                    // which for a 7-byte header is exactly
+                    // `MAX_FRAME_PAYLOAD` — one fill, one frame, no
+                    // tail fragment.
+                    if *headroom > 0 {
+                        bm.put_bytes(0, *headroom);
                     }
                     poll_read_buf(Pin::new(&mut *reader), cx, bm)
                 }
@@ -383,18 +415,23 @@ impl<'buf> HalfCopy<'buf> {
                     Some(dst) => pipe.poll_drain(cx, dst, self.cap - self.pos),
                     None => Poll::Ready(Err(splice::lost_socket())),
                 },
-                Scratch::BytesMut(bm, pending) => {
-                    // Freeze this fill into a `Bytes` — a refcount bump on
-                    // the same allocation, not a copy — then move it into
-                    // the writer. `pos` does NOT advance at freeze time:
-                    // the bytes are unwritten until the stream accepts
-                    // them, and `pos < cap` is what keeps this arm (and so
-                    // the retry) live on later polls while the caller-held
-                    // `pending` slot carries the item across `Pending`s.
+                Scratch::BytesMut(bm, pending, headroom) => {
+                    // Split this fill — headroom prefix and all — into
+                    // the caller-held `BytesMut` slot: an ownership move
+                    // on the same allocation, not a copy. `pos` does NOT
+                    // advance at split time: the bytes are unwritten
+                    // until the stream accepts them, and `pos < cap` is
+                    // what keeps this arm (and so the retry) live on
+                    // later polls while the `pending` slot carries the
+                    // item across `Pending`s.
                     if pending.is_none() {
-                        *pending = Some(bm.split_to(self.cap - self.pos).freeze());
+                        *pending = Some(bm.split_to(*headroom + (self.cap - self.pos)));
                     }
-                    let n = pending.as_ref().map_or(0, Bytes::len);
+                    // Progress counts PAYLOAD only — the headroom prefix
+                    // is the writer's framing space, not relayed data.
+                    let n = pending
+                        .as_ref()
+                        .map_or(0, |p| p.len().saturating_sub(*headroom));
                     // The scratch only exists because the probe answered
                     // `Some` at tier upgrade; like the pipe arm's
                     // `lost_socket()`, a view that stops resolving is a
@@ -413,7 +450,16 @@ impl<'buf> HalfCopy<'buf> {
                         ));
                     };
                     match Pin::new(wb).poll_write_bytes(cx, pending) {
-                        Poll::Ready(Ok(())) => Poll::Ready(Ok(n)),
+                        // `Ready` may leave an unaccepted remainder in
+                        // the slot (AnyTLS's >`QUEUED_FRAMES` fill
+                        // continuation): progress is the payload the
+                        // writer actually took; the `while` re-drives
+                        // the rest.
+                        Poll::Ready(Ok(())) => Poll::Ready(Ok(n.saturating_sub(
+                            pending
+                                .as_ref()
+                                .map_or(0, |p| p.len().saturating_sub(*headroom)),
+                        ))),
                         Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
                         Poll::Pending => Poll::Pending,
                     }
@@ -1617,13 +1663,15 @@ mod tests {
 
     // ── perf-7 P7-1: owned-Bytes (WG) bulk path ─────────────────
 
-    /// A writer double that takes owned `Bytes`: the stand-in for
-    /// `WgStream` on this side of the crate boundary. Everything a
-    /// `poll_write_bytes` accepts lands in `received` — pointer identity
-    /// is what the tests assert on.
+    /// A writer double that takes owned `BytesMut` buffers: the stand-in
+    /// for `WgStream`/`AnytlsConn` on this side of the crate boundary.
+    /// Everything a `poll_write_bytes` accepts lands in `received` —
+    /// pointer identity and the headroom prefix are what the tests
+    /// assert on.
     #[derive(Default)]
     struct BytesSink {
-        received: Vec<Bytes>,
+        received: Vec<BytesMut>,
+        headroom: usize,
     }
 
     impl AsyncWrite for BytesSink {
@@ -1632,7 +1680,7 @@ mod tests {
             _cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            self.received.push(Bytes::copy_from_slice(buf));
+            self.received.push(BytesMut::from(buf));
             Poll::Ready(Ok(buf.len()))
         }
         fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -1647,13 +1695,17 @@ mod tests {
         fn poll_write_bytes(
             mut self: Pin<&mut Self>,
             _cx: &mut Context<'_>,
-            bytes: &mut Option<Bytes>,
+            bytes: &mut Option<BytesMut>,
         ) -> Poll<io::Result<()>> {
             let Some(b) = bytes.take() else {
                 return Poll::Ready(Ok(()));
             };
             self.received.push(b);
             Poll::Ready(Ok(()))
+        }
+
+        fn want_write_headroom(&self) -> usize {
+            self.headroom
         }
     }
 
@@ -1698,9 +1750,25 @@ mod tests {
         let (a_side, _unused) = duplex(64);
         let mut sink = BytesSink::default();
         match bulk_scratch(&a_side, &mut sink, None, Some(bytes_sink_view)) {
-            Scratch::BytesMut(bm, _) => {
+            Scratch::BytesMut(bm, _, headroom) => {
                 assert_eq!(bm.capacity(), RELAY_BULK_BUF_SIZE_WG);
+                assert_eq!(headroom, 0, "a plain Bytes sink asks no headroom");
             }
+            _ => panic!("a WriteBytes writer must get the BytesMut scratch"),
+        }
+    }
+
+    /// B3: `want_write_headroom` is captured ONCE at tier setup and
+    /// stored in the scratch — the read arm reserves it per fill.
+    #[test]
+    fn relay_headroom_writer_scratch_records_want() {
+        let (a_side, _unused) = duplex(64);
+        let mut sink = BytesSink {
+            headroom: 7,
+            ..Default::default()
+        };
+        match bulk_scratch(&a_side, &mut sink, None, Some(bytes_sink_view)) {
+            Scratch::BytesMut(_, _, headroom) => assert_eq!(headroom, 7),
             _ => panic!("a WriteBytes writer must get the BytesMut scratch"),
         }
     }
@@ -1740,18 +1808,141 @@ mod tests {
             .unwrap();
         assert!(matches!(cycle, Cycle::Progress | Cycle::Done));
 
-        assert_eq!(sink.received.len(), 1, "one fill → one Bytes");
+        assert_eq!(sink.received.len(), 1, "one fill → one BytesMut");
         let received = sink.received.pop().unwrap();
         assert_eq!(&received[..], &payload[..], "payload intact");
         match &hc.buf {
-            Scratch::BytesMut(bm, _) => {
+            Scratch::BytesMut(bm, _, _) => {
                 assert_eq!(
                     bm.as_ptr() as usize,
                     received.as_ptr() as usize + received.len(),
-                    "the shipped Bytes and bm's tail share one allocation"
+                    "the shipped buffer and bm's tail share one allocation"
                 );
             }
             _ => unreachable!("checked above"),
         }
+    }
+
+    /// B3: a headroom-declaring writer gets fills whose first
+    /// `want_write_headroom()` bytes are reserved zeros — the space its
+    /// framing overlays in place — while `pos`/`cap` (and so progress
+    /// accounting) still count payload only.
+    #[tokio::test]
+    async fn relay_headroom_fill_carries_reserved_prefix() {
+        use tokio::io::AsyncWriteExt;
+
+        let payload = vec![0xCDu8; 8192];
+        let (mut rd, mut wr) = duplex(payload.len());
+        wr.write_all(&payload).await.unwrap();
+
+        let mut sink = BytesSink {
+            headroom: 7,
+            ..Default::default()
+        };
+        let mut buf = [0u8; RELAY_BUF_SIZE];
+        let mut hc = HalfCopy::new(&mut buf);
+        hc.buf = bulk_scratch(&rd, &mut sink, None, Some(bytes_sink_view));
+
+        let mut progressed = 0u64;
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let cycle = hc
+            .poll_cycle(
+                &mut cx,
+                &mut rd,
+                &mut sink,
+                None,
+                Some(bytes_sink_view),
+                &mut |n| progressed += n,
+            )
+            .unwrap();
+        assert!(matches!(cycle, Cycle::Progress | Cycle::Done));
+
+        assert_eq!(sink.received.len(), 1, "one fill → one slot");
+        let received = sink.received.pop().unwrap();
+        assert_eq!(received.len(), 7 + payload.len());
+        assert_eq!(&received[..7], &[0u8; 7], "the headroom is reserved");
+        assert_eq!(&received[7..], &payload[..], "payload follows it");
+        assert_eq!(progressed, payload.len() as u64, "progress is payload-only");
+        assert_eq!(hc.amt, payload.len() as u64);
+    }
+
+    /// Regression: a `poll_read_buf` `Pending` leaves the headroom
+    /// prefix parked in `bm`. The next fill must re-arm from an empty
+    /// buffer — pre-fix the parked prefix stacked another headroom on
+    /// top (and `reserve`'s content-preserving copy could keep a stale
+    /// payload tail), so the slot the writer received led with foreign
+    /// or zero bytes that rode onto the wire as payload.
+    #[tokio::test]
+    async fn relay_headroom_rearm_after_pending_fill_is_exact() {
+        use tokio::io::AsyncWriteExt;
+
+        let first_fill = vec![0x41u8; 8192];
+        let second_fill = vec![0x42u8; 8192];
+        let (mut rd, mut wr) = duplex(64 * 1024);
+        wr.write_all(&first_fill).await.unwrap();
+
+        let mut sink = BytesSink {
+            headroom: 7,
+            ..Default::default()
+        };
+        let mut buf = [0u8; RELAY_BUF_SIZE];
+        let mut hc = HalfCopy::new(&mut buf);
+        hc.buf = bulk_scratch(&rd, &mut sink, None, Some(bytes_sink_view));
+
+        let mut cx = Context::from_waker(std::task::Waker::noop());
+        let cycle = hc
+            .poll_cycle(
+                &mut cx,
+                &mut rd,
+                &mut sink,
+                None,
+                Some(bytes_sink_view),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(matches!(cycle, Cycle::Progress | Cycle::Done));
+
+        // The reader now idles: this poll parks inside `poll_read_buf`
+        // with the fresh headroom still sitting in `bm`.
+        let cycle = hc
+            .poll_cycle(
+                &mut cx,
+                &mut rd,
+                &mut sink,
+                None,
+                Some(bytes_sink_view),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(matches!(cycle, Cycle::Pending));
+
+        wr.write_all(&second_fill).await.unwrap();
+        let cycle = hc
+            .poll_cycle(
+                &mut cx,
+                &mut rd,
+                &mut sink,
+                None,
+                Some(bytes_sink_view),
+                &mut |_| {},
+            )
+            .unwrap();
+        assert!(matches!(cycle, Cycle::Progress | Cycle::Done));
+
+        assert_eq!(sink.received.len(), 2, "two fills → two slots");
+        let second = sink.received.pop().unwrap();
+        let first = sink.received.pop().unwrap();
+        assert_eq!(first.len(), 7 + first_fill.len());
+        assert_eq!(&first[..7], &[0u8; 7]);
+        assert_eq!(&first[7..], &first_fill[..]);
+        // The parked-headroom slot: exactly one reserved prefix, then
+        // the payload — no stacked zeros, no stale-tail prefix.
+        assert_eq!(
+            second.len(),
+            7 + second_fill.len(),
+            "a Pending-parked headroom must not stack onto the next fill"
+        );
+        assert_eq!(&second[..7], &[0u8; 7]);
+        assert_eq!(&second[7..], &second_fill[..]);
     }
 }

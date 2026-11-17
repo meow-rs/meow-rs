@@ -9,8 +9,9 @@
 //! HTTP/2 and tested over a mock in `protocol/tests.rs`; what is re-asserted
 //! here is only that it reaches the wire unchanged.
 
-use super::QuicConnector;
+use super::{driver, H3Stream, QuicConnector};
 use crate::trusttunnel::protocol::{Client, ExtraHeaders, Options};
+use http::StatusCode;
 use meow_transport::tls::TlsConfig;
 use quiche::h3::{self, NameValue as _};
 use std::{
@@ -18,19 +19,22 @@ use std::{
     io,
     net::SocketAddr,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::{
     io::{AsyncReadExt as _, AsyncWriteExt as _},
     net::UdpSocket,
+    sync::{mpsc, oneshot},
 };
+use tokio_util::sync::CancellationToken;
 
 /// Server→client UDP frames carry no App Name byte (§11.2), unlike the
 /// client's own; both sides share the 36-byte address pair.
 const HEADER: usize = 36;
+const TEST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// One CONNECT request as the endpoint received it, pseudo-headers included.
 #[derive(Clone, Debug)]
@@ -72,12 +76,56 @@ struct Behaviour {
     ip_san: bool,
 }
 
+/// Packet-level knobs the ACK-coalescing and mtu-hint tests reach into the
+/// endpoint with — all inert unless a test arms them. The counters mirror
+/// the hysteria2 driver-tests peer: `small_rx` counts the client's
+/// sub-100-byte packets (ACK-only traffic), `big_tx` the endpoint's payload
+/// packets, `ack_lag_us` the gap between a payload packet leaving and the
+/// first small packet answering it.
+struct Wire {
+    small_rx: AtomicUsize,
+    big_tx: AtomicUsize,
+    /// Largest client datagram the endpoint has seen — the injected-path
+    /// send cap shows up here.
+    max_rx: AtomicUsize,
+    /// Body bytes to push down every open stream, taken (reset to 0) by
+    /// the endpoint.
+    flood: AtomicUsize,
+    /// Yield to the client after every datagram sent, so it sees packets
+    /// one at a time like a paced network instead of one loopback burst.
+    trickle: AtomicBool,
+    /// Set to push one 300-byte body on an open stream (taken by it).
+    lone: AtomicBool,
+    /// Set to send a lone PING — a sub-100-byte ack-eliciting packet that
+    /// carries no stream payload (taken by the endpoint).
+    ping: AtomicBool,
+    /// Microseconds from the last payload datagram sent to the next
+    /// ACK-only datagram received; `u64::MAX` until that ACK arrives.
+    ack_lag_us: AtomicU64,
+}
+
+impl Default for Wire {
+    fn default() -> Self {
+        Self {
+            small_rx: AtomicUsize::new(0),
+            big_tx: AtomicUsize::new(0),
+            max_rx: AtomicUsize::new(0),
+            flood: AtomicUsize::new(0),
+            trickle: AtomicBool::new(false),
+            lone: AtomicBool::new(false),
+            ping: AtomicBool::new(false),
+            ack_lag_us: AtomicU64::new(u64::MAX),
+        }
+    }
+}
+
 struct Endpoint {
     addr: SocketAddr,
     /// The endpoint's self-signed leaf (DER), for a client that trusts it.
     cert: Vec<u8>,
     captured: Arc<Mutex<Vec<Capture>>>,
     connections: Arc<AtomicUsize>,
+    wire: Arc<Wire>,
     task: tokio::task::JoinHandle<()>,
 }
 
@@ -131,18 +179,21 @@ async fn endpoint(behaviour: Behaviour) -> Endpoint {
     let cert = key.cert.der().to_vec();
     let captured = Arc::new(Mutex::new(Vec::new()));
     let connections = Arc::new(AtomicUsize::new(0));
+    let wire = Arc::new(Wire::default());
     let task = tokio::spawn(serve(
         socket,
         behaviour,
         (cert.clone(), key.key_pair.serialize_der()),
         Arc::clone(&captured),
         Arc::clone(&connections),
+        Arc::clone(&wire),
     ));
     Endpoint {
         addr,
         cert,
         captured,
         connections,
+        wire,
         task,
     }
 }
@@ -243,6 +294,8 @@ impl Peer {
         behaviour: Behaviour,
         captured: &Mutex<Vec<Capture>>,
         body: &mut [u8],
+        wire: &Wire,
+        last_data_tx: &mut Instant,
     ) {
         let Self { conn, h3, streams } = self;
         if h3.is_none() && conn.is_established() {
@@ -307,6 +360,25 @@ impl Peer {
                 Err(_) => break,
             }
         }
+        if wire.ping.swap(false, Ordering::Relaxed) {
+            let _ = conn.send_ack_eliciting();
+        }
+        if wire.lone.swap(false, Ordering::Relaxed) {
+            // Re-arm the measurement baseline here: a ≥100-byte packet
+            // sent long ago (handshake, an earlier round) must not leave a
+            // stale `last_data_tx` inflating a sample should a stray small
+            // packet arrive before this payload's ACK.
+            *last_data_tx = Instant::now();
+            if let Some(stream) = streams.values_mut().next() {
+                stream.out.extend_from_slice(&[0x55; 300]);
+            }
+        }
+        let flooded = wire.flood.swap(0, Ordering::Relaxed);
+        if flooded > 0 {
+            for stream in streams.values_mut() {
+                stream.out.extend(std::iter::repeat_n(0x37, flooded));
+            }
+        }
         for (&id, stream) in &mut *streams {
             while !stream.out.is_empty() {
                 match http3.send_body(conn, id, &stream.out, false) {
@@ -359,6 +431,7 @@ async fn serve(
     identity: (Vec<u8>, Vec<u8>),
     captured: Arc<Mutex<Vec<Capture>>>,
     connections: Arc<AtomicUsize>,
+    wire: Arc<Wire>,
 ) {
     let local = socket.local_addr().unwrap();
     let mut config = server_config(behaviour, &identity);
@@ -370,11 +443,20 @@ async fn serve(
     let mut incoming = vec![0u8; 65535];
     let mut outgoing = vec![0u8; 1350];
     let mut body = vec![0u8; 64 * 1024];
+    let mut last_data_tx = Instant::now();
     loop {
         let timeout = peers.values().filter_map(|peer| peer.conn.timeout()).min();
         tokio::select! {
             result = socket.recv_from(&mut incoming) => {
                 let Ok((n, from)) = result else { continue };
+                wire.max_rx.fetch_max(n, Ordering::Relaxed);
+                if n < 100 {
+                    wire.small_rx.fetch_add(1, Ordering::Relaxed);
+                    if wire.ack_lag_us.load(Ordering::Relaxed) == u64::MAX {
+                        wire.ack_lag_us
+                            .store(last_data_tx.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                }
                 if let Entry::Vacant(slot) = peers.entry(from) {
                     if let Some(delay) = behaviour.first_packet_delay {
                         tokio::time::sleep(delay).await;
@@ -401,11 +483,31 @@ async fn serve(
                     peer.conn.on_timeout();
                 }
             }
+            // A quiet connection's only pending timer is the 30 s idle
+            // timeout; the `wire` controls (flood/lone/ping/trickle) would
+            // wait it out. Tick so `step` consumes them promptly.
+            () = tokio::time::sleep(Duration::from_millis(5)) => {}
         }
         for peer in peers.values_mut() {
-            peer.step(&h3_config, behaviour, &captured, &mut body);
+            peer.step(
+                &h3_config,
+                behaviour,
+                &captured,
+                &mut body,
+                &wire,
+                &mut last_data_tx,
+            );
             while let Ok((written, info)) = peer.conn.send(&mut outgoing) {
+                if written > 1000 {
+                    wire.big_tx.fetch_add(1, Ordering::Relaxed);
+                }
+                if written >= 100 {
+                    last_data_tx = Instant::now();
+                }
                 let _ = socket.send_to(&outgoing[..written], info.to).await;
+                if wire.trickle.load(Ordering::Relaxed) {
+                    tokio::task::yield_now().await;
+                }
             }
         }
         peers.retain(|_, peer| !peer.conn.is_closed());
@@ -965,4 +1067,487 @@ async fn retirement_h3_cancelled_second_attempt_stops_and_allows_retry() {
     .await;
     fallback_echo(&client, &healthy).await;
     assert!(bad.captured.lock().unwrap().is_empty());
+}
+
+// ─── dialer-proxy injection (issue #899 follow-up, hysteria2 parity) ────────
+
+/// A `ProxyPacketConn` standing in for the front hop's UDP association:
+/// connected-mode reads and writes against a real socket so the client's
+/// whole QUIC connection actually reaches the endpoint.
+struct BridgedConn {
+    socket: UdpSocket,
+    remote: SocketAddr,
+}
+
+#[async_trait::async_trait]
+impl meow_common::ProxyPacketConn for BridgedConn {
+    async fn read_packet(&self, buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+        let n = self
+            .socket
+            .recv(buf)
+            .await
+            .map_err(meow_common::MeowError::Io)?;
+        Ok((n, self.remote))
+    }
+    async fn write_packet(&self, buf: &[u8], addr: &SocketAddr) -> meow_common::Result<usize> {
+        let _ = addr; // bound-mode arg, inert like a real front conn
+        self.socket
+            .send(buf)
+            .await
+            .map_err(meow_common::MeowError::Io)
+    }
+    fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+        self.socket.local_addr().map_err(meow_common::MeowError::Io)
+    }
+    fn close(&self) -> meow_common::Result<()> {
+        Ok(())
+    }
+}
+
+/// Records every `dial_udp_conn` (`(target, internal)`) and binds each
+/// association to a real socket, so the bridge carries actual datagrams.
+struct BridgingDialer {
+    dials: Mutex<Vec<(crate::dialer::UdpTarget, bool)>>,
+}
+
+#[async_trait::async_trait]
+impl crate::dialer::TcpDialer for BridgingDialer {
+    async fn dial(
+        &self,
+        _host: &str,
+        _port: u16,
+        _internal: bool,
+    ) -> io::Result<Box<dyn meow_transport::Stream>> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "bridge dialer carries UDP only",
+        ))
+    }
+    fn is_proxy(&self) -> bool {
+        true
+    }
+    async fn dial_udp_conn(
+        &self,
+        remote: crate::dialer::UdpTarget,
+        internal: bool,
+    ) -> io::Result<Arc<dyn meow_common::ProxyPacketConn>> {
+        self.dials.lock().unwrap().push((remote.clone(), internal));
+        let crate::dialer::UdpTarget::Addr(remote) = remote else {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "bridge dialer resolves nothing",
+            ));
+        };
+        let socket = UdpSocket::bind("127.0.0.1:0").await?;
+        socket.connect(remote).await?;
+        Ok(Arc::new(BridgedConn { socket, remote }))
+    }
+}
+
+/// `with_dialer` must put the whole QUIC connection — Initial included —
+/// on the front association's `SocketIo` bridge: the CONNECT then echoes
+/// back through it exactly like the direct path, and the `Addr` dial is
+/// non-internal (user traffic keeps a lazy front alive, issue #555).
+#[tokio::test]
+async fn quic_transport_rides_injected_socket_io() {
+    let endpoint = endpoint(Behaviour::default()).await;
+    let dialer = Arc::new(BridgingDialer {
+        dials: Mutex::new(Vec::new()),
+    });
+    #[allow(
+        clippy::clone_on_ref_ptr,
+        reason = "the Arc<BridgingDialer> → Arc<dyn TcpDialer> unsize cannot ride Arc::clone(&_)"
+    )]
+    let dialer_dyn: Arc<dyn crate::dialer::TcpDialer> = dialer.clone();
+    let options = options();
+    let connector = QuicConnector::with_dialer(
+        &endpoint.addr.ip().to_string(),
+        endpoint.addr.port(),
+        &insecure_tls(),
+        options.timeout,
+        dialer_dyn,
+    )
+    .unwrap();
+    let client = Client::new(Arc::new(connector), options).unwrap();
+
+    let mut stream = client.tcp("target.test:443").await.unwrap();
+    stream.write_all(b"winner").await.unwrap();
+    let mut bytes = [0; 6];
+    stream.read_exact(&mut bytes).await.unwrap();
+    assert_eq!(&bytes, b"winner");
+    assert_eq!(
+        endpoint.captures("target.test:443").len(),
+        1,
+        "the CONNECT must ride the injected association"
+    );
+    assert_eq!(
+        dialer.dials.lock().unwrap().as_slice(),
+        &[(crate::dialer::UdpTarget::Addr(endpoint.addr), false)]
+    );
+}
+
+/// A domain endpoint asks the front to carry the name first (issue #657);
+/// `Unsupported` resolves locally and redials each literal — every
+/// attempt `internal = false`, the #555 lazy-front rule — and the bound
+/// peer is a resolved literal, never the `write_dst` placeholder.
+#[tokio::test]
+async fn domain_association_falls_back_to_literal_dials() {
+    let dialer = Arc::new(BridgingDialer {
+        dials: Mutex::new(Vec::new()),
+    });
+    #[allow(
+        clippy::clone_on_ref_ptr,
+        reason = "the Arc<BridgingDialer> → Arc<dyn TcpDialer> unsize cannot ride Arc::clone(&_)"
+    )]
+    let dialer_dyn: Arc<dyn crate::dialer::TcpDialer> = dialer.clone();
+    let mut connector =
+        QuicConnector::new("localhost", 4443, &insecure_tls(), Duration::from_secs(3)).unwrap();
+    connector.dialer = Some(dialer_dyn);
+    let (_, peer) = connector
+        .bind_association()
+        .await
+        .expect("the literal fallback must bind");
+    let dials = dialer.dials.lock().unwrap().clone();
+    let (first, rest) = dials.split_first().unwrap();
+    assert_eq!(
+        *first,
+        (
+            crate::dialer::UdpTarget::Name {
+                host: "localhost".into(),
+                port: 4443,
+            },
+            false
+        ),
+        "the front gets the domain target first, non-internal"
+    );
+    assert!(
+        !rest.is_empty()
+            && rest.iter().all(|(t, internal)| {
+                matches!(t, crate::dialer::UdpTarget::Addr(_)) && !internal
+            }),
+        "every fallback dial is a non-internal literal: {rest:?}"
+    );
+    assert!(
+        peer.port() == 4443 && !peer.ip().is_unspecified(),
+        "the bound peer is a resolved literal, not the placeholder: {peer}"
+    );
+}
+
+// ─── ACK coalescing (hysteria2 driver parity) ────────────────────────────
+//
+// The driver's `AckCoalesce` thresholds are a `spawn` parameter precisely
+// so these tests can pin them — `Client`/`QuicConnector` always take the
+// defaults — which is also why they dial `driver::spawn` directly:
+// `Cmd::Open` plus `H3Stream` is the same surface the pool drives.
+
+/// Dial `endpoint` straight into a driver with the given [`driver::AckCoalesce`]
+/// thresholds and open one CONNECT stream on it. The returned sender must
+/// outlive the stream: dropping it closes the command channel and the
+/// connection.
+async fn open_with_coalesce(
+    endpoint: &Endpoint,
+    coalesce: driver::AckCoalesce,
+) -> (mpsc::Sender<driver::Cmd>, H3Stream) {
+    let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let local = socket.local_addr().unwrap();
+    let mut config = super::tls::build(true, None, &[], Duration::from_secs(30)).unwrap();
+    let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
+    for byte in &mut scid {
+        *byte = rand::random();
+    }
+    let conn = quiche::connect(
+        Some("localhost"),
+        &quiche::ConnectionId::from_ref(&scid),
+        local,
+        endpoint.addr,
+        &mut config,
+    )
+    .unwrap();
+    let (cmd_tx, _shared) = driver::spawn(
+        driver::Socket::Raw(socket),
+        local,
+        conn,
+        coalesce,
+        CancellationToken::new(),
+    )
+    .await
+    .unwrap();
+    let (reply, response) = oneshot::channel();
+    cmd_tx
+        .send(driver::Cmd::Open {
+            headers: vec![
+                h3::Header::new(b":method", b"CONNECT"),
+                h3::Header::new(b":authority", b"download.test:443"),
+            ],
+            fin: false,
+            reply,
+        })
+        .await
+        .unwrap();
+    let (status, stream) = response.await.unwrap().unwrap();
+    assert_eq!(status, StatusCode::OK);
+    (cmd_tx, stream)
+}
+
+/// A pure download: the client writes nothing, so no upstream data carries
+/// its ACKs. With the endpoint's datagrams arriving one per receive wakeup,
+/// held-back ACKs must cut the ACK-only packets well below one per payload
+/// packet (a driver that flushes on every wakeup answers more than half of
+/// them). The hold's wall-clock deadline would tie the ratio to the
+/// runner's speed, so the test pins a deadline longer than the transfer
+/// itself and leaves the 8-datagram rule the only hold-ender. Mirrored
+/// from the hysteria2 driver tests.
+#[tokio::test]
+async fn download_acks_are_coalesced_across_wakeups() {
+    let endpoint = endpoint(Behaviour::default()).await;
+    // Longer than the read timeout below: `delay` can never end a hold, so
+    // at most one ACK-only packet leaves per ACK_COALESCE_PKTS payload
+    // packets — ratio 1/8 against the asserted 1/3, on a runner of any speed.
+    let (_driver, mut stream) = open_with_coalesce(
+        &endpoint,
+        driver::AckCoalesce {
+            delay: Duration::from_secs(60),
+            ..driver::AckCoalesce::default()
+        },
+    )
+    .await;
+    // Let the application-command quiet window pass and the handshake
+    // ACKs drain.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let (small0, big0) = (
+        endpoint.wire.small_rx.load(Ordering::Relaxed),
+        endpoint.wire.big_tx.load(Ordering::Relaxed),
+    );
+    // Below the client's 4 MiB stream window, so the flood needs no
+    // flow-control round trip; still far above 1000 payload packets.
+    let size = 2 * 1024 * 1024;
+    endpoint.wire.trickle.store(true, Ordering::Relaxed);
+    endpoint.wire.flood.store(size, Ordering::Relaxed);
+    let mut got = vec![0u8; size];
+    tokio::time::timeout(Duration::from_secs(15), stream.read_exact(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    let (small, big) = (
+        endpoint.wire.small_rx.load(Ordering::Relaxed) - small0,
+        endpoint.wire.big_tx.load(Ordering::Relaxed) - big0,
+    );
+    eprintln!("H3_DOWNLOAD_ACK_RATIO small_rx={small} big_tx={big}");
+    assert!(big > 1000, "endpoint sent only {big} payload packets");
+    assert!(
+        small * 3 < big,
+        "{small} ACK-only packets for {big} payload packets"
+    );
+}
+
+/// A lone packet must not wait for more packets: its ACK leaves within the
+/// coalescing deadline. quiche keeps no delayed-ACK timer — an ACK rides on
+/// whatever the next `send()` emits — so the fallback this test rules out
+/// is the ACK leaving only when the endpoint's next PTO probe wakes the
+/// driver (~35 ms). Mirrored from the hysteria2 driver tests.
+#[tokio::test]
+async fn lone_packet_is_acked_within_the_coalescing_deadline() {
+    let endpoint = endpoint(Behaviour::default()).await;
+    let (_driver, _stream) = open_with_coalesce(&endpoint, driver::AckCoalesce::default()).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let mut lags = Vec::new();
+    for _ in 0..10 {
+        endpoint.wire.ack_lag_us.store(u64::MAX, Ordering::Relaxed);
+        endpoint.wire.lone.store(true, Ordering::Relaxed);
+        tokio::time::timeout(TEST_TIMEOUT, async {
+            while endpoint.wire.ack_lag_us.load(Ordering::Relaxed) == u64::MAX {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the lone packet was never acknowledged");
+        lags.push(endpoint.wire.ack_lag_us.load(Ordering::Relaxed));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    lags.sort_unstable();
+    let median = lags[lags.len() / 2];
+    eprintln!("H3_LONE_ACK_LAG_US {lags:?}");
+    // The ACK must ride our deadline timer, not the endpoint's ~35 ms PTO
+    // probe. The real bound is the OS timer tick: ~1 ms on Linux, up to
+    // ~16 ms at Windows' default 15.6 ms resolution. 22 ms clears that
+    // with slack while staying under the 25 ms `max_ack_delay` and the
+    // PTO path.
+    assert!(median < 22_000, "median ACK lag {median} us: {lags:?}");
+}
+
+/// The `delivered` gate, pinned with an unreachable hold: `pkts` and
+/// `delay` are set beyond anything the test can wait out, so a hold can
+/// end only through the safety gates — a wakeup that delivered no payload,
+/// queued frames, a command or a closed connection. A lone PING from the
+/// endpoint carries no payload (nothing for `poll_events`/`pump_bodies`
+/// to move): it must end the hold and flush the held ACK, not feed it.
+/// That is the gate the upload regression depends on — an upload's
+/// inbound bare-ACK stream is exactly such traffic, and if it could keep
+/// a hold alive the ACK would wait out the deadline (here, the full
+/// 60 s). Mirrored from the hysteria2 driver tests.
+#[tokio::test]
+async fn non_delivery_wakeup_ends_the_ack_hold() {
+    let endpoint = endpoint(Behaviour::default()).await;
+    let (_driver, mut stream) = open_with_coalesce(
+        &endpoint,
+        driver::AckCoalesce {
+            pkts: u32::MAX,
+            delay: Duration::from_secs(60),
+        },
+    )
+    .await;
+    // Past the 1 ms application-quiet window, with handshake ACKs drained.
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // A delivered body packet opens a hold whose count and deadline rules
+    // cannot end it inside the test window. `ack_lag_us` records the
+    // first sub-100-byte packet the endpoint sees after it: the held ACK
+    // leaving. The payload rides the same stream later reads use, so
+    // drain it.
+    endpoint.wire.ack_lag_us.store(u64::MAX, Ordering::Relaxed);
+    endpoint.wire.lone.store(true, Ordering::Relaxed);
+    let mut lone_payload = [0u8; 300];
+    tokio::time::timeout(TEST_TIMEOUT, stream.read_exact(&mut lone_payload))
+        .await
+        .unwrap()
+        .unwrap();
+    // Let the hold take — and the endpoint's PTO probes come and go —
+    // then land a wakeup that is guaranteed to deliver no payload.
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    endpoint.wire.ping.store(true, Ordering::Relaxed);
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while endpoint.wire.ack_lag_us.load(Ordering::Relaxed) == u64::MAX {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("a wakeup with no delivered payload must end the hold, not feed it");
+
+    // The complementary gate: queued application bytes never wait on a
+    // hold. Open a second hold, then write — the echo returns promptly,
+    // not after `delay`.
+    endpoint.wire.lone.store(true, Ordering::Relaxed);
+    tokio::time::timeout(TEST_TIMEOUT, stream.read_exact(&mut lone_payload))
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    stream.write_all(b"hi").await.unwrap();
+    let mut echoed = [0; 2];
+    tokio::time::timeout(TEST_TIMEOUT, stream.read_exact(&mut echoed))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&echoed, b"hi");
+}
+
+/// `Socket::Io` semantics at the seam: `send_to` ignores `dest` on a bound
+/// endpoint and `recv_from`/`try_recv_from` report the association peer —
+/// never a per-packet source. Mirrored from the hysteria2 driver tests.
+#[tokio::test]
+async fn io_socket_reports_the_bound_peer() {
+    let sink = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let peer_addr = sink.local_addr().unwrap();
+    let raw = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    raw.connect(peer_addr).await.unwrap();
+    let conn_addr = raw.local_addr().unwrap();
+    let conn: Arc<dyn meow_common::ProxyPacketConn> = Arc::new(BridgedConn {
+        socket: raw,
+        remote: peer_addr,
+    });
+    let io = crate::dialer::PacketConnSocket::new(conn, peer_addr);
+    let mut socket = driver::Socket::Io {
+        io: Box::new(io),
+        peer: peer_addr,
+    };
+
+    // Empty queue: the drain pass ends instead of pending.
+    let mut buf = [0u8; 64];
+    assert!(socket.try_recv_from(&mut buf).unwrap().is_none());
+
+    // Inbound: every datagram reports the bound peer as `from`.
+    sink.send_to(b"pong", conn_addr).await.unwrap();
+    let (n, from) = tokio::time::timeout(TEST_TIMEOUT, socket.recv_from(&mut buf))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&buf[..n], b"pong");
+    assert_eq!(from, peer_addr);
+
+    // …and the next queued datagram surfaces through the drain pass.
+    sink.send_to(b"pong2", conn_addr).await.unwrap();
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        loop {
+            if let Some((n, from)) = socket.try_recv_from(&mut buf).unwrap() {
+                assert_eq!(&buf[..n], b"pong2");
+                assert_eq!(from, peer_addr);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    // Outbound: dest is advisory on a bound endpoint — the payload still
+    // reaches the peer.
+    socket.send_to(b"reply", peer_addr).await.unwrap();
+    let mut got = [0u8; 16];
+    let (n, _) = tokio::time::timeout(TEST_TIMEOUT, sink.recv_from(&mut got))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(&got[..n], b"reply");
+}
+
+/// The injected endpoint's `SocketIo::mtu_hint` reaches quiche:
+/// `QuicConnector::dial` clamps `set_max_send_udp_payload_size` to the
+/// front-path cap, so on the wire a chained client's datagrams stay ≤1280
+/// instead of the raw-path 1452 that fragments once the front's
+/// per-packet overhead pushes them past a 1500 MTU. Mirrored from the
+/// hysteria2 driver tests.
+#[tokio::test]
+async fn injected_socket_mtu_hint_caps_client_datagrams() {
+    let endpoint = endpoint(Behaviour::default()).await;
+    let dialer = Arc::new(BridgingDialer {
+        dials: Mutex::new(Vec::new()),
+    });
+    #[allow(
+        clippy::clone_on_ref_ptr,
+        reason = "the Arc<BridgingDialer> → Arc<dyn TcpDialer> unsize cannot ride Arc::clone(&_)"
+    )]
+    let dialer_dyn: Arc<dyn crate::dialer::TcpDialer> = dialer.clone();
+    let options = options();
+    let connector = QuicConnector::with_dialer(
+        &endpoint.addr.ip().to_string(),
+        endpoint.addr.port(),
+        &insecure_tls(),
+        options.timeout,
+        dialer_dyn,
+    )
+    .unwrap();
+    let client = Client::new(Arc::new(connector), options).unwrap();
+
+    let mut stream = client.tcp("target.test:443").await.unwrap();
+    // Enough stream data to emit full-size datagrams; the endpoint records
+    // the largest client datagram it sees.
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        stream.write_all(&[0x55; 64 * 1024]).await.unwrap();
+        stream.flush().await.unwrap();
+    })
+    .await
+    .unwrap();
+
+    tokio::time::timeout(TEST_TIMEOUT, async {
+        while endpoint.wire.max_rx.load(Ordering::Relaxed) <= 1000 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the endpoint must see full-size client datagrams");
+    assert!(
+        endpoint.wire.max_rx.load(Ordering::Relaxed) <= 1280,
+        "client datagrams on a front association must stay at the 1280 hint: {}",
+        endpoint.wire.max_rx.load(Ordering::Relaxed)
+    );
 }

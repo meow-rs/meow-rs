@@ -2,10 +2,12 @@
 //! CONNECT-per-flow protocol over QUIC instead of TLS-over-TCP.
 //!
 //! Unlike the HTTP/2 transport this one owns its socket — QUIC has no stream
-//! seam a dialer could sit in — so it binds through `meow_common::bind_udp`,
-//! which applies the TUN interface binding and the Android `protect()` hook
-//! (issue #695). That is also why `dialer-proxy` is refused for a `quic`
-//! node at config load: there is no TCP connection to route through it.
+//! seam a dialer could sit in — so the direct path binds through
+//! `meow_common::bind_udp_for_peer`, which applies the TUN interface binding
+//! and the Android `protect()` hook (issue #695). A `dialer-proxy` chain is
+//! honoured differently: the whole QUIC connection rides one front UDP
+//! association (issue #899 parity with hysteria2), bridged into the driver
+//! by `PacketConnSocket` as a connected [`driver::Socket::Io`].
 
 mod driver;
 mod stream;
@@ -16,18 +18,22 @@ mod tls;
 pub(super) use stream::H3Stream;
 
 use super::{Admission, Connection, Opener, StreamKind};
+use crate::dialer::{PacketConnSocket, TcpDialer, UdpTarget};
 use async_trait::async_trait;
-use driver::{Cmd, Shared};
+use driver::{Cmd, Shared, Socket};
 use http::{Request, StatusCode};
+use meow_common::ProxyPacketConn;
+use meow_transport::datagram::SocketIo;
 use quiche::h3;
 use std::{
     io,
-    net::SocketAddr,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     sync::{atomic::Ordering, Arc},
     time::Duration,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+use tracing::warn;
 
 /// Dials QUIC connections to one TrustTunnel endpoint.
 pub struct QuicConnector {
@@ -39,6 +45,9 @@ pub struct QuicConnector {
     /// which is verified against an `iPAddress` SAN instead (see
     /// [`tls::build`]) — the same split the HTTP/2 path's `TlsLayer` makes.
     server_name: Option<String>,
+    /// `dialer-proxy` front, when one is configured: the QUIC connection
+    /// rides its UDP association instead of a bound `UdpSocket`.
+    dialer: Option<Arc<dyn TcpDialer>>,
     /// Built once, as the H2 path builds its `TlsLayer` once at config load:
     /// seeding the verify store parses the whole webpki root bundle (~120 DER
     /// certificates) into a fresh `X509Store`, which is not work a dial
@@ -78,20 +87,155 @@ impl QuicConnector {
             host: host.to_owned(),
             port,
             server_name: ip.is_none().then(|| name.to_owned()),
+            dialer: None,
             config: std::sync::Mutex::new(config),
         })
     }
 
+    /// The `dialer-proxy` variant: every QUIC connection this connector
+    /// dials rides a fresh front UDP association — the WireGuard/hysteria2
+    /// `with_dialer` contract (issue #899 follow-up).
+    pub fn with_dialer(
+        host: &str,
+        port: u16,
+        tls: &meow_transport::tls::TlsConfig,
+        timeout: Duration,
+        dialer: Arc<dyn TcpDialer>,
+    ) -> io::Result<Self> {
+        let mut connector = Self::new(host, port, tls, timeout)?;
+        connector.dialer = Some(dialer);
+        Ok(connector)
+    }
+
+    /// Bind the endpoint's front UDP association — the WireGuard
+    /// `bind_via_dialer` contract. `UdpTarget::named` collapses an
+    /// IP-literal `host` to `Addr` and delegates a domain to the front
+    /// hop's own resolver view (issue #657); a front that cannot carry a
+    /// domain refuses `Unsupported` and the documented fallback applies:
+    /// resolve locally, redial each literal.
+    ///
+    /// The returned `SocketAddr` is what quiche records as this path's
+    /// peer: a real address, never `write_dst`'s `0.0.0.0:port`
+    /// placeholder — for a `Name` target it comes from a local resolution,
+    /// strictly cosmetic (a bound conn ignores the write arg), so a failed
+    /// lookup warns and keeps the inert placeholder rather than unbinding
+    /// a dial that succeeded.
+    async fn bind_association(&self) -> io::Result<(Arc<dyn ProxyPacketConn>, SocketAddr)> {
+        let dialer = self
+            .dialer
+            .as_ref()
+            .expect("bind_association is only called with a dialer");
+        let target = UdpTarget::named(&self.host, self.port);
+        // `internal` stays false on every dial below: this association is
+        // the dial signal a lazy front hop sees for the pooled connection's
+        // whole lifetime — marking it internal would leave the front
+        // permanently "unused" while user traffic flows (issue #555
+        // boundary, the same rule hysteria2's association dial documents).
+        match dialer.dial_udp_conn(target.clone(), false).await {
+            Ok(conn) => {
+                let peer = match &target {
+                    UdpTarget::Addr(addr) => *addr,
+                    UdpTarget::Name { .. } => match self.resolve_peers().await {
+                        Ok(peers) => match peers.into_iter().next() {
+                            Some(addr) => addr,
+                            None => {
+                                warn!(
+                                    "trusttunnel-h3: front bound {target} but local \
+                                     resolution returned no address — peer addr stays \
+                                     unspecified (inert on the bound conn)"
+                                );
+                                target.write_dst()
+                            }
+                        },
+                        Err(e) => {
+                            warn!(
+                                "trusttunnel-h3: front bound {target} but local \
+                                 resolution failed ({e}) — peer addr stays unspecified \
+                                 (inert on the bound conn)"
+                            );
+                            target.write_dst()
+                        }
+                    },
+                };
+                Ok((conn, peer))
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::Unsupported
+                    && matches!(target, UdpTarget::Name { .. }) =>
+            {
+                let peers = self.resolve_peers().await?;
+                let mut last: Option<io::Error> = None;
+                let mut bound = None;
+                for peer in peers {
+                    match dialer.dial_udp_conn(UdpTarget::Addr(peer), false).await {
+                        Ok(conn) => {
+                            bound = Some((conn, peer));
+                            break;
+                        }
+                        Err(e) => last = meow_common::MeowError::prefer_errno_io(last, e),
+                    }
+                }
+                bound.ok_or_else(|| {
+                    last.unwrap_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "TrustTunnel endpoint resolved to no address",
+                        )
+                    })
+                })
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn resolve_peers(&self) -> io::Result<Vec<SocketAddr>> {
+        meow_common::resolve_host_all(&self.host, self.port).await
+    }
+
+    /// `dial` generalized: `Some(io)` runs the connection over an injected
+    /// connected endpoint (a `dialer-proxy` front association), `None`
+    /// binds a `UdpSocket` for `peer` exactly as the direct path always
+    /// has. For `Io`, `local` comes from the endpoint's
+    /// [`SocketIo::local_addr_hint`] — the association may report none, in
+    /// which case quiche gets an unspecified `to` of the peer's family
+    /// (cosmetic: a bound association owns no dialable local tuple).
     async fn dial(
         &self,
         peer: SocketAddr,
+        socket_io: Option<Box<dyn SocketIo>>,
         cancel: CancellationToken,
     ) -> io::Result<Box<dyn Connection>> {
         // The socket's family follows the canonical peer; a loopback peer is
         // left outside the TUN global-route interface binding.
         let peer = meow_common::canonical_socket_addr(peer);
-        let socket = meow_common::bind_udp_for_peer(peer.ip()).await?;
-        let local = socket.local_addr()?;
+        let (socket, local, mtu_hint) = match socket_io {
+            Some(io) => {
+                let local = io.local_addr_hint().unwrap_or_else(|| {
+                    SocketAddr::new(
+                        if peer.is_ipv6() {
+                            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+                        } else {
+                            IpAddr::V4(Ipv4Addr::UNSPECIFIED)
+                        },
+                        0,
+                    )
+                });
+                // The front's per-packet encapsulation makes the stock
+                // send cap unsafe — same [`SocketIo::mtu_hint`] contract
+                // the hysteria2 client applies.
+                let mtu_hint = io.mtu_hint();
+                (Socket::Io { io, peer }, local, mtu_hint)
+            }
+            None => {
+                let socket = meow_common::bind_udp_for_peer(peer.ip()).await?;
+                // Same receive-buffer headroom as the hysteria2 raw path:
+                // a full 208 KiB default drops datagrams quiche must then
+                // detect and resend.
+                meow_common::enlarge_udp_recv_buffer(&socket);
+                let local = socket.local_addr()?;
+                (Socket::Raw(socket), local, None)
+            }
+        };
         let mut scid = [0u8; quiche::MAX_CONN_ID_LEN];
         for byte in &mut scid {
             *byte = rand::random();
@@ -101,6 +245,9 @@ impl QuicConnector {
                 .config
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(mtu) = mtu_hint {
+                config.set_max_send_udp_payload_size(mtu);
+            }
             quiche::connect(
                 self.server_name.as_deref(),
                 &quiche::ConnectionId::from_ref(&scid),
@@ -110,7 +257,8 @@ impl QuicConnector {
             )
             .map_err(|e| io::Error::other(format!("TrustTunnel QUIC setup: {e}")))?
         };
-        let (cmd_tx, shared) = driver::spawn(socket, local, conn, cancel).await?;
+        let (cmd_tx, shared) =
+            driver::spawn(socket, local, conn, driver::AckCoalesce::default(), cancel).await?;
         Ok(Box::new(H3Connection { cmd_tx, shared }))
     }
 }
@@ -118,7 +266,29 @@ impl QuicConnector {
 #[async_trait]
 impl super::Connector for QuicConnector {
     async fn connect(&self, cancel: CancellationToken) -> io::Result<Box<dyn Connection>> {
-        let peers = meow_common::resolve_host_all(&self.host, self.port).await?;
+        if self.dialer.is_some() {
+            // One association per pooled connection attempt — like the
+            // WireGuard endpoint bind, a dead conn is never resurrected.
+            // A failed driver cancels only this attempt; the guard also
+            // stops the driver if the caller drops this await.
+            let attempt = cancel.child_token();
+            let guard = attempt.clone().drop_guard();
+            let result = match self.bind_association().await {
+                Ok((conn, peer)) => {
+                    let socket = PacketConnSocket::new(conn, peer);
+                    self.dial(peer, Some(Box::new(socket)), attempt).await
+                }
+                Err(e) => Err(e),
+            };
+            return match result {
+                Ok(connection) => {
+                    guard.disarm();
+                    Ok(connection)
+                }
+                Err(error) => Err(error),
+            };
+        }
+        let peers = self.resolve_peers().await?;
         let mut last = None;
         for peer in peers {
             if cancel.is_cancelled() {
@@ -132,7 +302,7 @@ impl super::Connector for QuicConnector {
             // guard also stops the driver if the caller drops this await.
             let attempt = cancel.child_token();
             let guard = attempt.clone().drop_guard();
-            match self.dial(peer, attempt).await {
+            match self.dial(peer, None, attempt).await {
                 Ok(connection) => {
                     guard.disarm();
                     return Ok(connection);

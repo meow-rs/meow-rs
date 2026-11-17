@@ -16,11 +16,13 @@ use super::proto::{self, UdpMessage};
 use super::tcp::{DuplexStream, WRITE_BUFFER_BYTES};
 use super::udp::note_drop;
 use super::{Config, Error, Result};
+use meow_transport::datagram::{try_poll_recv_once, SocketIo};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::io::ReadBuf;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::{mpsc, oneshot, Notify, OwnedSemaphorePermit, Semaphore};
@@ -86,8 +88,10 @@ const UDP_SESSION_QUEUE: usize = 64;
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// Datagrams fed to quiche per socket wakeup before the driver flushes. One
 /// flush then acknowledges the whole batch, where a flush per datagram sent
-/// an ACK (and a syscall) for every packet of a download.
-const RECV_BATCH: usize = 32;
+/// an ACK (and a syscall) for every packet of a download. 128 keeps a
+/// saturated download draining the socket inside one wakeup — at ~1400 B a
+/// pass is ~180 KB, the same order as the queues feeding it.
+const RECV_BATCH: usize = 128;
 /// Commands handled per wakeup, for the same reason on the upload side.
 const CMD_BATCH: usize = 64;
 /// An ACK-only flush is held back until this many datagrams have been
@@ -225,10 +229,81 @@ impl Drop for StreamState {
     }
 }
 
+/// The driver's datagram transport.
+///
+/// `Raw` is the direct path: an *unconnected* bound socket so port hopping
+/// can retarget each send and received datagrams report their real source.
+/// `Io` is an injected connected endpoint — a `dialer-proxy` front UDP
+/// association bridged by `PacketConnSocket` — whose peer is implicit:
+/// `send` ignores `dest`, `recv` reports the association's bound peer, and
+/// there is nothing for `HopState` to hop (the parser clears `ports` /
+/// `hop_interval` for an injected dialer; [`spawn`] also skips `HopState`
+/// construction on this arm).
+pub(crate) enum DriverSocket {
+    Raw(UdpSocket),
+    Io {
+        io: Box<dyn SocketIo>,
+        /// The address quiche sees as this path's peer — the association's
+        /// `UdpTarget` (or a locally-resolved cosmetic stand-in for a
+        /// `Name` target). Received datagrams report it as `from`.
+        peer: SocketAddr,
+    },
+}
+
+impl DriverSocket {
+    /// Await one datagram. `Raw` reports the real source; `Io` reports the
+    /// association's bound peer — its reads are connected-mode and carry
+    /// no source address.
+    async fn recv_from(&mut self, buf: &mut [u8]) -> std::io::Result<(usize, SocketAddr)> {
+        match self {
+            Self::Raw(socket) => socket.recv_from(buf).await,
+            Self::Io { io, peer } => {
+                let mut rb = ReadBuf::new(buf);
+                std::future::poll_fn(|cx| io.poll_recv(cx, &mut rb)).await?;
+                Ok((rb.filled().len(), *peer))
+            }
+        }
+    }
+
+    /// Non-blocking companion to [`Self::recv_from`], for the drain pass
+    /// after the select arm's awaited read. `Ok(None)` ends the batch.
+    fn try_recv_from(&mut self, buf: &mut [u8]) -> std::io::Result<Option<(usize, SocketAddr)>> {
+        match self {
+            Self::Raw(socket) => match socket.try_recv_from(buf) {
+                Ok(v) => Ok(Some(v)),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
+                Err(e) => Err(e),
+            },
+            Self::Io { io, peer } => {
+                // The noop-waker contract this relies on — the enclosing
+                // select re-polls `poll_recv` on its next wakeup — lives
+                // on `try_poll_recv_once`.
+                try_poll_recv_once(&mut **io, buf).map(|o| o.map(|n| (n, *peer)))
+            }
+        }
+    }
+
+    /// One datagram out. `Io` ignores `dest` — the endpoint is bound to the
+    /// association's peer, so `debug_assert` it matches what quiche asked
+    /// for rather than silently routing elsewhere.
+    async fn send_to(&mut self, buf: &[u8], dest: SocketAddr) -> std::io::Result<usize> {
+        match self {
+            Self::Raw(socket) => socket.send_to(buf, dest).await,
+            Self::Io { io, peer } => {
+                debug_assert_eq!(
+                    *peer, dest,
+                    "injected endpoint must only send to its bound peer"
+                );
+                std::future::poll_fn(|cx| io.poll_send(cx, buf)).await
+            }
+        }
+    }
+}
+
 /// Driver state that is NOT the `quiche::Connection`, so helpers can borrow it
 /// alongside `&mut conn`.
 struct State {
-    socket: UdpSocket,
+    socket: DriverSocket,
     local: SocketAddr,
     obfs: Option<Obfs>,
     hop: Option<HopState>,
@@ -258,7 +333,7 @@ struct AuthCtx {
 /// Resolves once authentication succeeds, returning a live handle.
 pub(crate) async fn spawn(
     cfg: &Config,
-    socket: UdpSocket,
+    socket: DriverSocket,
     local: SocketAddr,
     peer: SocketAddr,
     conn: quiche::Connection,
@@ -268,12 +343,19 @@ pub(crate) async fn spawn(
     let read_notify = Arc::new(Notify::new());
     let closed = Arc::new(AtomicBool::new(false));
     let obfs = cfg.obfs.as_ref().map(Obfs::new);
-    let hop = HopState::new(
-        peer,
-        &cfg.hop_ports,
-        cfg.hop_interval_min_secs,
-        cfg.hop_interval_max_secs,
-    )?;
+    let hop = match &socket {
+        // An injected connected endpoint is bound to one front association —
+        // there is no second port to hop to. The parser already clears
+        // `ports`/`hop_interval` when a proxy dialer is present; skipping
+        // `HopState` here keeps an unthreaded config harmless anyway.
+        DriverSocket::Io { .. } => None,
+        DriverSocket::Raw(_) => HopState::new(
+            peer,
+            &cfg.hop_ports,
+            cfg.hop_interval_min_secs,
+            cfg.hop_interval_max_secs,
+        )?,
+    };
 
     let state = State {
         socket,
@@ -377,9 +459,18 @@ async fn run(
         let mut woke_on_cmd = false;
         let mut woke_on_notify = false;
         tokio::select! {
-            r = st.socket.readable() => {
-                match r.and_then(|()| recv_batch(&mut st, &mut conn, &mut buf)) {
-                    Ok(n) => received = n,
+            r = st.socket.recv_from(&mut buf) => {
+                match r {
+                    Ok((n, from)) => {
+                        received = accept(&mut st, &mut conn, &mut buf[..n], from);
+                        match recv_batch(&mut st, &mut conn, &mut buf) {
+                            Ok(more) => received += more,
+                            Err(e) => {
+                                fail(&mut ready_tx, &mut st, Error::Io(e));
+                                break;
+                            }
+                        }
+                    }
                     Err(e) => {
                         fail(&mut ready_tx, &mut st, Error::Io(e));
                         break;
@@ -959,10 +1050,11 @@ async fn flush_send(
     }
 }
 
-/// Feed the datagrams queued on the socket to quiche, at most
-/// [`RECV_BATCH`] of them, undoing obfs and port-hopping. Returns how many
-/// datagrams quiche accepted — obfs rejects and packets `conn.recv` refuses
-/// owe no ACK, so they don't count toward coalescing.
+/// Drain the datagrams still queued on the socket after the select arm's
+/// awaited read — at most [`RECV_BATCH`] per wakeup, undoing obfs and
+/// port-hopping. Returns how many datagrams quiche accepted — obfs rejects
+/// and packets `conn.recv` refuses owe no ACK, so they don't count toward
+/// coalescing.
 fn recv_batch(
     st: &mut State,
     conn: &mut quiche::Connection,
@@ -970,26 +1062,34 @@ fn recv_batch(
 ) -> std::io::Result<u32> {
     let mut received = 0;
     for _ in 0..RECV_BATCH {
-        let (n, from) = match st.socket.try_recv_from(buf) {
-            Ok(v) => v,
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(received),
-            Err(e) => return Err(e),
+        let Some((n, from)) = st.socket.try_recv_from(buf)? else {
+            return Ok(received);
         };
-        let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
-        let info = quiche::RecvInfo { from, to: st.local };
-        let accepted = match st.obfs.as_mut() {
-            Some(obfs) => match obfs.decode(&buf[..n], from) {
-                Some(mut dgram) => conn.recv(&mut dgram, info),
-                None => continue,
-            },
-            None => conn.recv(&mut buf[..n], info),
-        };
-        match accepted {
-            Ok(_) => received += 1,
-            Err(e) => tracing::debug!("hysteria2 could not receive QUIC packet: {e}"),
-        }
+        received += accept(st, conn, &mut buf[..n], from);
     }
     Ok(received)
+}
+
+/// Feed one received datagram to quiche, undoing obfs and port-hopping.
+/// Returns 1 when quiche accepted it (counts toward ACK coalescing), 0 when
+/// the datagram was rejected.
+fn accept(st: &mut State, conn: &mut quiche::Connection, pkt: &mut [u8], from: SocketAddr) -> u32 {
+    let from = st.hop.as_ref().map_or(from, |h| h.normalize_source(from));
+    let info = quiche::RecvInfo { from, to: st.local };
+    let accepted = match st.obfs.as_mut() {
+        Some(obfs) => match obfs.decode(pkt, from) {
+            Some(mut dgram) => conn.recv(&mut dgram, info),
+            None => return 0,
+        },
+        None => conn.recv(pkt, info),
+    };
+    match accepted {
+        Ok(_) => 1,
+        Err(e) => {
+            tracing::debug!("hysteria2 could not receive QUIC packet: {e}");
+            0
+        }
+    }
 }
 
 fn fail(ready_tx: &mut Option<oneshot::Sender<Result<bool>>>, _st: &mut State, err: Error) {

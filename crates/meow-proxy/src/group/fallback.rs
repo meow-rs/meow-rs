@@ -273,6 +273,14 @@ impl Proxy for FallbackGroup {
         self.health.alive() && self.first_alive().is_some_and(|p| p.alive_for_url(url))
     }
 
+    /// Forward to the same member `support_udp` consults — the first
+    /// alive pick a UDP dial would take. `false` on no pick: the slide
+    /// is the safe failure side (issue #969).
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        self.first_alive()
+            .is_some_and(|p| p.is_dialer_proxy_non_transparent())
+    }
+
     fn last_delay(&self) -> u16 {
         self.first_alive().map_or(0, |p| p.last_delay())
     }
@@ -557,6 +565,42 @@ mod tests {
         assert!(!g.support_udp(), "a is alive and tcp-only");
         a_ref.set_alive(false);
         assert!(g.support_udp(), "fallback to udp-capable b");
+    }
+
+    /// Issue #969: when the first *alive* pick is a `dialer-proxy`-chained,
+    /// UDP-incapable member the group must answer the pair the match probe
+    /// reads — `support_udp() == false` and
+    /// `is_dialer_proxy_non_transparent() == true` — so the scan stops on
+    /// the matched rule instead of sliding to a later target. The verdict
+    /// tracks `first_alive` exactly like `support_udp` does.
+    #[test]
+    fn fallback_pick_chained_udp_incapable_fails_closed() {
+        let chained_inner = MockProxy::new_udp_unsupported("chained", AdapterType::Snell);
+        let chained_inner_ref = Arc::clone(&chained_inner);
+        let chained: Arc<dyn Proxy> = Arc::new(crate::DialerProxyAdapter::new(
+            chained_inner,
+            crate::dialer::DialerTarget::new(
+                "never-resolved",
+                &crate::dialer::ProxyRegistry::default(),
+            ),
+        ));
+        let g = FallbackGroup::new("fb", vec![chained, MockProxy::new_udp("udp-ok")]);
+
+        assert_eq!(g.first_alive().unwrap().name(), "chained");
+        assert!(
+            !g.support_udp(),
+            "the first-alive pick cannot carry UDP — the group advertises its pick"
+        );
+        assert!(
+            g.is_dialer_proxy_non_transparent(),
+            "the fail-closed verdict must follow the same pick support_udp consults"
+        );
+
+        // Dead-marking the chained member moves the pick — and both
+        // verdicts — to the UDP-capable spare.
+        chained_inner_ref.set_alive(false);
+        assert!(g.support_udp(), "fallback to udp-capable b");
+        assert!(!g.is_dialer_proxy_non_transparent());
     }
 
     #[tokio::test]

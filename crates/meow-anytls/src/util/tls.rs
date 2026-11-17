@@ -9,7 +9,7 @@
 //! **Server side** (feature `server`) keeps the rustls-based acceptor
 //! helpers the upstream fork ships.
 
-use crate::util::Result;
+use crate::util::{AnyTlsError, Result};
 use std::future::Future;
 use std::pin::Pin;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -19,7 +19,19 @@ use tokio::net::TcpStream;
 pub trait AsyncStream: AsyncRead + AsyncWrite + Send + Unpin {}
 impl<T: AsyncRead + AsyncWrite + Send + Unpin + ?Sized> AsyncStream for T {}
 
-/// Future returned by [`TlsConnect::connect`].
+/// An [`AsyncStream`] that is also `Sync` — the currency a
+/// [`TransportDialer`](crate::util::TransportDialer) returns.
+///
+/// `Sync` is part of the dialer's contract rather than the client's: a
+/// host TLS hook keeps the transport reachable through `&` references
+/// (BoringSSL's `SslStream<S>`, conn tables), so a stream that only
+/// satisfies `Send` cannot be handed to
+/// [`TlsConnect::connect_stream`].
+pub trait SyncStream: AsyncStream + Sync {}
+impl<T: AsyncStream + Sync + ?Sized> SyncStream for T {}
+
+/// Future returned by [`TlsConnect::connect`] and
+/// [`TlsConnect::connect_stream`].
 pub type TlsConnectFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Box<dyn AsyncStream>>> + Send + 'a>>;
 
@@ -30,6 +42,22 @@ pub type TlsConnectFuture<'a> =
 pub trait TlsConnect: Send + Sync {
     /// Perform the TLS handshake over `tcp`.
     fn connect(&self, tcp: TcpStream) -> TlsConnectFuture<'_>;
+
+    /// Perform the TLS handshake over an already-connected transport —
+    /// what the client asks for when a
+    /// [`TransportDialer`](crate::util::TransportDialer) supplied the
+    /// underlying stream (a connection tunnelled through another proxy,
+    /// not a `TcpStream` it can name). The default refuses: a hook that
+    /// only knows `TcpStream` cannot lift a chained connection, and
+    /// failing the dial loudly beats carrying AnyTLS plaintext.
+    fn connect_stream(&self, stream: Box<dyn SyncStream>) -> TlsConnectFuture<'_> {
+        let _ = stream;
+        Box::pin(async {
+            Err(AnyTlsError::Tls(
+                "the TLS hook cannot handshake over a chained transport".to_string(),
+            ))
+        })
+    }
 }
 
 // ─── Server side (rustls) ────────────────────────────────────────────────────

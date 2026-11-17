@@ -109,6 +109,10 @@ pub struct TrustTunnelAdapter {
     client: Client,
     udp: bool,
     health: ProxyHealth,
+    /// `H3`'s hop to the server is datagram-shaped: an injected
+    /// `dialer-proxy` front takes the UDP-association path for it, while
+    /// H2 keeps the trait-default TCP hop.
+    hop_udp: bool,
 }
 impl TrustTunnelAdapter {
     #[allow(
@@ -125,15 +129,32 @@ impl TrustTunnelAdapter {
         transport: Transport,
         dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Result<Self> {
+        let mut hop_udp = false;
         let connector = match transport {
             Transport::H2 => Self::h2_connector(server, port, tls, dialer)?,
             #[cfg(feature = "trusttunnel-h3")]
-            Transport::H3 => Arc::new(protocol::QuicConnector::new(
-                server,
-                port,
-                &tls,
-                options.timeout,
-            )?) as Arc<dyn protocol::Connector>,
+            Transport::H3 => {
+                hop_udp = true;
+                // A real `dialer-proxy` chain carries the QUIC endpoint's
+                // UDP transport through the front hop's UDP association —
+                // the WireGuard/hysteria2 `with_dialer` contract (issue
+                // #899 follow-up). Like those adapters there is no
+                // `supports_udp` gate here: the flag answers `false` for
+                // an unresolved group target, and a UDP-less front simply
+                // fails `dial_udp_conn` at dial, closed.
+                let connector = if dialer.is_proxy() {
+                    protocol::QuicConnector::with_dialer(
+                        server,
+                        port,
+                        &tls,
+                        options.timeout,
+                        dialer,
+                    )?
+                } else {
+                    protocol::QuicConnector::new(server, port, &tls, options.timeout)?
+                };
+                Arc::new(connector) as Arc<dyn protocol::Connector>
+            }
         };
         let client = Client::new(connector, options)?;
         Ok(Self {
@@ -146,6 +167,7 @@ impl TrustTunnelAdapter {
             client,
             udp,
             health: ProxyHealth::new(),
+            hop_udp,
         })
     }
 
@@ -190,6 +212,17 @@ impl ProxyAdapter for TrustTunnelAdapter {
     }
     fn support_udp(&self) -> bool {
         self.udp
+    }
+    /// H3 carries every flow's hop to the server as a QUIC datagram — TCP
+    /// CONNECTs included — so an injected `dialer-proxy` front takes the
+    /// UDP association path for it (same whole-transport shape as
+    /// hysteria2). H2 keeps the trait default.
+    fn dialer_hop_network(&self, _flow: meow_common::Network) -> meow_common::Network {
+        if self.hop_udp {
+            meow_common::Network::Udp
+        } else {
+            meow_common::Network::Tcp
+        }
     }
     fn health(&self) -> &ProxyHealth {
         &self.health

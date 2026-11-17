@@ -409,11 +409,32 @@ impl SessionCrypto {
     /// here; the `WrongIndex`/counter-check/open/mark ordering is
     /// identical. Returns the plaintext length
     /// (`ct_and_tag.len() - AEAD_SIZE`) on success.
-    /// PATCH(18): callable through a `SessionHandle` — the shared
-    /// replay-window mutex makes concurrent opens on the same session
-    /// replay-safe (the mark side of the check rejects a duplicate the
-    /// quick check raced past).
     pub(crate) fn receive_packet_data_in_place(
+        &self,
+        receiver_idx: u32,
+        counter: u64,
+        ct_and_tag: &mut [u8],
+    ) -> Result<usize, WireGuardError> {
+        let pt_len = self.open_packet_data_in_place(receiver_idx, counter, ct_and_tag)?;
+        // After decryption is done, check counter again, and mark as received
+        self.receiving_counter_mark(counter)?;
+        Ok(pt_len)
+    }
+
+    /// PATCH(18): `receive_packet_data_in_place`'s worker half —
+    /// everything through the AEAD open but *without* the replay mark.
+    /// The crypto pool runs this on its workers, where completion order
+    /// is a scheduling artifact: a worker parked behind another pass's
+    /// chunk (the pool shares RX opens and TX seals) would otherwise
+    /// mark a contiguous counter span thousands of positions behind the
+    /// watermark the racing siblings advanced, and `mark_did_receive`
+    /// would reject every one of those still-legitimate packets as
+    /// replays. The ordered post-pass calls [`mark_rx`](Self::mark_rx)
+    /// in wire order instead, so the replay window advances exactly as
+    /// the serial path's fused decapsulate advances it — duplicates and
+    /// genuinely reordered-past-window datagrams still fail there, but
+    /// worker-completion jitter can no longer counterfeit them.
+    pub(crate) fn open_packet_data_in_place(
         &self,
         receiver_idx: u32,
         counter: u64,
@@ -445,9 +466,15 @@ impl SessionCrypto {
             opened.map_err(|_| WireGuardError::InvalidAeadTag)?
         };
 
-        // After decryption is done, check counter again, and mark as received
-        self.receiving_counter_mark(counter)?;
         Ok(pt_len)
+    }
+
+    /// PATCH(18): the replay mark [`open_packet_data_in_place`] omits —
+    /// invoked by the caller's ordered post-pass in wire order, never
+    /// on a worker. Same verdict source as the fused path's inline
+    /// mark: `mark_did_receive`.
+    pub(crate) fn mark_rx(&self, counter: u64) -> Result<(), WireGuardError> {
+        self.receiving_counter_mark(counter)
     }
 
     /// Returns the estimated downstream packet loss for this session

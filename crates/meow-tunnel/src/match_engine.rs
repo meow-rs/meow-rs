@@ -176,6 +176,14 @@ pub fn match_rules<'rules>(
                         rule_payload: rule.payload(),
                     });
                 }
+                TargetCheck::Unusable => {
+                    warn_unusable_target(adapter_name, rule.as_ref());
+                    return Some(MatchResult {
+                        adapter_name,
+                        rule_type: rule.rule_type(),
+                        rule_payload: rule.payload(),
+                    });
+                }
                 TargetCheck::Pass => tracing::debug!("{adapter_name} match Pass rule"),
                 TargetCheck::Missing => warn_missing_target(adapter_name, rule.as_ref()),
             }
@@ -190,6 +198,14 @@ pub fn match_rules<'rules>(
         let adapter_name = rule.adapter();
         match probe.check(adapter_name) {
             TargetCheck::Usable => {
+                return Some(MatchResult {
+                    adapter_name,
+                    rule_type: rule.rule_type(),
+                    rule_payload: rule.payload(),
+                });
+            }
+            TargetCheck::Unusable => {
+                warn_unusable_target(adapter_name, rule.as_ref());
                 return Some(MatchResult {
                     adapter_name,
                     rule_type: rule.rule_type(),
@@ -213,6 +229,14 @@ pub fn match_rules<'rules>(
                         rule_payload: rule.payload(),
                     });
                 }
+                TargetCheck::Unusable => {
+                    warn_unusable_target(adapter_name, rule.as_ref());
+                    return Some(MatchResult {
+                        adapter_name,
+                        rule_type: rule.rule_type(),
+                        rule_payload: rule.payload(),
+                    });
+                }
                 TargetCheck::Pass => tracing::debug!("{adapter_name} match Pass rule"),
                 TargetCheck::Missing => warn_missing_target(adapter_name, rule.as_ref()),
             }
@@ -222,16 +246,28 @@ pub fn match_rules<'rules>(
     None
 }
 
-/// Log a skipped match: the rule matched but its target is absent from the
-/// registry or unusable for this traffic (issue #513; mihomo's match loop
-/// also `continue`s a target without UDP support on UDP flows).
+/// Log a skipped match: the rule matched but its target is absent from
+/// the registry (issue #513; mihomo's `continue` in the match loop).
 /// Keep the wording in sync with the IR engine's copy in
 /// `rule_ir::warn_missing_target`.
 fn warn_missing_target(adapter_name: &str, rule: &dyn Rule) {
     tracing::warn!(
-        "rule {} matched target '{adapter_name}' which is unavailable for \
-         this connection (absent from the registry, or no UDP support); \
-         skipping it",
+        "rule {} matched target '{adapter_name}' which is absent from the \
+         registry; skipping it",
+        rule.rule_type().as_str(),
+    );
+}
+
+/// Log a [`TargetCheck::Unusable`] verdict: the rule matched and the target
+/// exists, but it cannot carry this connection class — the match is still
+/// returned (the dial then fails loudly) instead of sliding to a later
+/// rule (issue #969). Keep the wording in sync with
+/// `rule_ir::warn_unusable_target`.
+fn warn_unusable_target(adapter_name: &str, rule: &dyn Rule) {
+    tracing::warn!(
+        "rule {} matched target '{adapter_name}' which cannot carry this \
+         connection class (e.g. no UDP support on a UDP flow); failing \
+         closed instead of sliding to a later rule",
         rule.rule_type().as_str(),
     );
 }

@@ -301,17 +301,32 @@ fn process_missing(metadata: &Metadata) -> bool {
     metadata.process.is_empty() && metadata.src_ip.is_some() && metadata.src_port != 0
 }
 
-/// Log a skipped match: the rule matched but its target is absent from the
-/// registry or unusable for this traffic (issue #513; mihomo's match loop
-/// also `continue`s a target without UDP support on UDP flows).
+/// Log a skipped match: the rule matched but its target is absent from
+/// the registry (issue #513; mihomo's `continue` in the match loop).
 /// Interpolated into the message itself because the /logs broadcast
 /// forwards only the `message` field. Keep the wording in sync with the
 /// legacy engine's copy in `match_engine::warn_missing_target`.
 fn warn_missing_target(m: &CompiledMatchResult<'_>) {
     warn!(
-        "rule {} matched target '{}' which is unavailable for this \
-         connection (absent from the registry, or no UDP support); \
+        "rule {} matched target '{}' which is absent from the registry; \
          skipping it",
+        m.rule_type.as_str(),
+        m.adapter_name,
+    );
+}
+
+/// Log a [`TargetCheck::Unusable`] verdict: the rule matched and the
+/// target exists, but it cannot carry this connection class — unlike a
+/// missing target the scan does not slide past it. The match is still
+/// returned (the dial then fails loudly); this warn records *why* the
+/// connection is about to fail rather than falling through to a later
+/// rule (issue #969). Keep the wording in sync with
+/// `match_engine::warn_unusable_target`.
+fn warn_unusable_target(m: &CompiledMatchResult<'_>) {
+    warn!(
+        "rule {} matched target '{}' which cannot carry this connection \
+         class (e.g. no UDP support on a UDP flow); failing closed \
+         instead of sliding to a later rule",
         m.rule_type.as_str(),
         m.adapter_name,
     );
@@ -686,6 +701,10 @@ impl CompiledRuleSet {
             let m = self.static_match(slot, rules);
             match check_target(probe, &m) {
                 TargetCheck::Usable => return Some(m),
+                TargetCheck::Unusable => {
+                    warn_unusable_target(&m);
+                    return Some(m);
+                }
                 TargetCheck::Pass => note_pass_skip(probe, &m),
                 TargetCheck::Missing => on_missing(m),
             }
@@ -797,6 +816,10 @@ impl CompiledRuleSet {
                     let m = self.static_match(slot, rules);
                     match check_target(probe, &m) {
                         TargetCheck::Usable => {
+                            break 'scan LazyMatchOutcome::Matched(m);
+                        }
+                        TargetCheck::Unusable => {
+                            warn_unusable_target(&m);
                             break 'scan LazyMatchOutcome::Matched(m);
                         }
                         TargetCheck::Pass => note_pass_skip(probe, &m),
@@ -972,6 +995,14 @@ impl CompiledRuleSet {
             if let Some(m) = matched {
                 match check_target(probe, &m) {
                     TargetCheck::Usable => return ScanOutcome::Matched(m),
+                    // An existing-but-unusable target terminates the scan
+                    // *on* this match — the dial fails loudly where a
+                    // `Missing` verdict would slide to a later rule
+                    // (issue #969).
+                    TargetCheck::Unusable => {
+                        warn_unusable_target(&m);
+                        return ScanOutcome::Matched(m);
+                    }
                     // A PASS-typed target silently skips the rule — the
                     // match loop's `continue GetRules` upstream. Distinct
                     // from `Missing`: never warned, never buffered.
@@ -3366,7 +3397,7 @@ mod tests {
             Some("CidrProxy"),
             "the dead-target rule is skipped and the CIDR rule wins"
         );
-        let warns = logs.matches("unavailable").count();
+        let warns = logs.matches("'DEAD'").count();
         assert_eq!(
             warns, 1,
             "expected exactly one dead-target warn, got: {logs}"
@@ -3390,7 +3421,7 @@ mod tests {
         };
         let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
         assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
-        let warns = logs.matches("unavailable").count();
+        let warns = logs.matches("'DEAD'").count();
         assert_eq!(
             warns, 1,
             "final outcome must emit the warn once, got: {logs}"
@@ -3513,7 +3544,7 @@ mod tests {
         };
         let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
         assert!(matches!(outcome, LazyMatchOutcome::NoMatch));
-        let warns = logs.matches("unavailable").count();
+        let warns = logs.matches("'DEAD'").count();
         assert_eq!(
             warns, 1,
             "NoMatch must drain the buffered warn, got: {logs}"
@@ -3559,7 +3590,9 @@ mod tests {
     }
 
     /// Issue #533 probe stub: `PASS` classifies as `Pass`, `DEAD` as
-    /// `Missing`, everything else `Usable`; `PASS-RULE` and `SEL` answer
+    /// `Missing`, `CHAINED` as `Unusable` — a `dialer-proxy` chain over a
+    /// non-transparent inner, the only producer of that verdict on the
+    /// route probe (issue #969); `PASS-RULE` and `SEL` answer
     /// `is_pass_rule`. `SEL` stands in for a group whose member is a
     /// PASS-RULE adapter — usable at top level (a PassRule-typed hop is not
     /// a top-level skip), skipped only inside SUB-RULE scans.
@@ -3569,6 +3602,7 @@ mod tests {
             match name {
                 "PASS" => TargetCheck::Pass,
                 "DEAD" => TargetCheck::Missing,
+                "CHAINED" => TargetCheck::Unusable,
                 _ => TargetCheck::Usable,
             }
         }
@@ -3598,6 +3632,41 @@ mod tests {
             !logs.contains("PASS"),
             "PASS skip must never warn, got: {logs}"
         );
+    }
+
+    /// Issue #969: a matched rule whose target is a `dialer-proxy` chain
+    /// that cannot carry this connection class (`Unusable`) terminates the
+    /// scan on the match — the dial fails loudly — where a `Missing`
+    /// verdict warns and slides to a later rule (`DEAD` above proves that
+    /// arm still slides).
+    #[test]
+    fn unusable_target_stops_the_scan_on_the_match() {
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(DomainSuffixRule::new("example.com", "CHAINED")),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        let meta = Metadata {
+            host: "x.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        for strict in [true, false] {
+            let result = if strict {
+                set.match_rules(&meta, &rules, &BuiltinProbe)
+                    .map(|m| m.adapter_name)
+            } else {
+                match set.match_rules_lazy(&meta, &rules, &BuiltinProbe) {
+                    LazyMatchOutcome::Matched(m) => Some(m.adapter_name),
+                    _ => panic!("lazy scan must not defer or miss"),
+                }
+            };
+            assert_eq!(
+                result,
+                Some("CHAINED"),
+                "strict={strict}: Unusable must return the match, never slide to DIRECT"
+            );
+        }
     }
 
     /// `PATCH /rules/disable`: a disabled rule is skipped like a PASS

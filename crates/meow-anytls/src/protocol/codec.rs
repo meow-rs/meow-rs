@@ -42,7 +42,7 @@ impl Decoder for FrameCodec {
             "[FrameCodec] decode: Parsing header (buffer had {} bytes)",
             before_header,
         );
-        tracing::debug!(
+        tracing::trace!(
             "[FrameCodec] decode: Parsed header cmd={:?} (byte={}), stream_id={}, data_len={}",
             cmd,
             cmd_byte,
@@ -53,7 +53,7 @@ impl Decoder for FrameCodec {
         // Check if we have enough data (header + payload)
         let total_needed = HEADER_OVERHEAD_SIZE + data_len;
         if src.len() < total_needed {
-            tracing::debug!(
+            tracing::trace!(
                 "[FrameCodec] decode: Not enough data for complete frame (have {}, need {})",
                 src.len(),
                 total_needed
@@ -73,7 +73,7 @@ impl Decoder for FrameCodec {
             Bytes::new()
         };
 
-        tracing::debug!(
+        tracing::trace!(
             "[FrameCodec] decode: Successfully decoded frame cmd={:?}, stream_id={}, data_len={}",
             cmd,
             stream_id,

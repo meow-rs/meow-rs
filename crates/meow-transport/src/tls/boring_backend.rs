@@ -4,8 +4,8 @@
 //! fingerprint shaping, ECH (with server `retry_configs` self-healing),
 //! mTLS and ALPN.
 
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -337,29 +337,71 @@ struct ConnectorKey {
     skip_cert_verify: bool,
 }
 
+/// FIFO store of `(server_name, session)` pairs shared between an
+/// `SSL_CTX`'s new-session callback (producer — fires once per received
+/// ticket, post-handshake for TLS 1.3) and the connect path (consumer).
+type SessionCache = Arc<Mutex<VecDeque<(String, boring::ssl::SslSession)>>>;
+
+/// Total tickets held per `SSL_CTX` across all server names; the FIFO
+/// drops the oldest entry beyond this.  A BoringSSL server sends two
+/// tickets per TLS 1.3 handshake (`num_tickets = 2`), so 64 covers
+/// sustained churn to a handful of upstreams without unbounded growth.
+const SESSION_CACHE_CAP: usize = 64;
+
+/// An `SslConnector` bundled with the client-session ticket store bound
+/// to its `SSL_CTX`.
+///
+/// The two are inseparable: `SSL_set_session` ([`SslRef::set_session`])
+/// is `unsafe` precisely because the offered session must have been
+/// minted by the *same* `SSL_CTX` that will resume it — a global store
+/// keyed by SNI alone would hand tickets across contexts whenever two
+/// connectors (different fingerprint/verify shaping) share a
+/// `server_name`.  [`BoringInner::build_connector`] installs the ctx's
+/// new-session callback feeding `sessions`, and [`shared_connector`]
+/// caches the pair, so every `BoringInner` on one ctx also shares its
+/// tickets.
+struct SharedConnector {
+    connector: boring::ssl::SslConnector,
+    /// TLS 1.3 tickets are single-use — the server rotates them on every
+    /// resume — so [`BoringInner::take_session`] *pops* the newest match
+    /// rather than peeking; the next handshake's callback deposits fresh
+    /// ones.  Keyed by SNI: one `SSL_CTX` serves several `server_name`s
+    /// (SNI is per-connection, not in [`ConnectorKey`]).
+    sessions: SessionCache,
+}
+
 /// Process-wide cache of BoringSSL `SslConnector`s.
 ///
+/// `Ssl` ex_data flag marking a connection whose certificate check runs
+/// under an override policy (`cert_pin`/`verify_name`).  The shared
+/// `SSL_CTX`'s new-session callback skips depositing their tickets:
+/// they were minted under a different policy, and a resumed handshake
+/// carries no Certificate — a later override-free connection on this
+/// ctx offering one would complete with the cert never inspected.
+static VERIFY_OVERRIDE: LazyLock<boring::ex_data::Index<boring::ssl::Ssl, bool>> =
+    LazyLock::new(|| boring::ssl::Ssl::new_ex_index().expect("Ssl ex_data index allocation"));
+
 /// An `SSL_CTX` with its verify store and session cache is ~160 KB; with
 /// e.g. 100 TLS proxies from a subscription that would be ~16 MB of
 /// identical contexts.  `SslConnector::clone()` is an `SSL_CTX_up_ref`, so
 /// every layer with the same key shares one C-level context.
-static CONNECTOR_CACHE: OnceLock<Mutex<HashMap<ConnectorKey, boring::ssl::SslConnector>>> =
+static CONNECTOR_CACHE: OnceLock<Mutex<HashMap<ConnectorKey, Arc<SharedConnector>>>> =
     OnceLock::new();
 
-/// Return a shared `SslConnector` for `config`, building (and caching) it on
-/// first use.
+/// Return a shared [`SharedConnector`] for `config`, building (and caching)
+/// it on first use.
 ///
 /// Only configs without `additional_roots` / `client_cert` are cached —
 /// those are rare (tests, mTLS) and would force hashing certificate blobs
 /// into the key.  `fingerprint = "random"` is also uncached because the
 /// profile is drawn at construction time and each layer should get its own
 /// draw.  Such configs get a private, uncached build.
-fn shared_connector(config: &TlsConfig) -> Result<boring::ssl::SslConnector> {
+fn shared_connector(config: &TlsConfig) -> Result<Arc<SharedConnector>> {
     let cacheable = config.additional_roots.is_empty()
         && config.client_cert.is_none()
         && config.fingerprint.as_deref() != Some("random");
     if !cacheable {
-        return BoringInner::build_connector(config);
+        return BoringInner::build_connector(config).map(Arc::new);
     }
 
     let key = ConnectorKey {
@@ -372,15 +414,15 @@ fn shared_connector(config: &TlsConfig) -> Result<boring::ssl::SslConnector> {
     {
         let map = cache.lock().expect("boring connector cache poisoned");
         if let Some(shared) = map.get(&key) {
-            return Ok(shared.clone());
+            return Ok(Arc::clone(shared));
         }
     }
     // Build outside the lock (SSL_CTX setup parses cipher/curve lists and
     // seeds the verify store); a racing builder for the same key just wins
     // or loses harmlessly.
-    let built = BoringInner::build_connector(config)?;
+    let built = Arc::new(BoringInner::build_connector(config)?);
     let mut map = cache.lock().expect("boring connector cache poisoned");
-    Ok(map.entry(key).or_insert(built).clone())
+    Ok(Arc::clone(map.entry(key).or_insert(built)))
 }
 
 /// Fold a bracketed IP literal (`[::1]` — e.g. a `server:` display form
@@ -397,7 +439,10 @@ pub(super) fn unbracket_ip_literal(name: &str) -> &str {
 }
 
 pub(super) struct BoringInner {
-    connector: boring::ssl::SslConnector,
+    /// The shared `SSL_CTX` plus its client-session ticket store —
+    /// `Arc` so the connector cache can hand the pair to every
+    /// `BoringInner` built on the same [`ConnectorKey`].
+    ctx: Arc<SharedConnector>,
     server_name: String,
     /// Certificate-verification hostname when it differs from
     /// `server_name` (gost-plugin `name-cert-verify`). Per-connection
@@ -496,9 +541,9 @@ impl BoringInner {
                 "TlsLayer requires sni to be Some; None is reserved for non-TLS paths.".into(),
             )
         })?;
-        let connector = shared_connector(config)?;
+        let ctx = shared_connector(config)?;
         Ok(Self {
-            connector,
+            ctx,
             server_name: unbracket_ip_literal(&server_name).to_owned(),
             verify_name: config
                 .verify_name
@@ -511,11 +556,12 @@ impl BoringInner {
         })
     }
 
-    /// Build a fresh `SslConnector` (one `SSL_CTX`) for `config`.
+    /// Build a fresh [`SharedConnector`] (one `SSL_CTX` plus its session
+    /// ticket store) for `config`.
     ///
     /// Callers should go through [`shared_connector`] so identical shaping
     /// keys share a single context; this is the uncached primitive.
-    fn build_connector(config: &TlsConfig) -> Result<boring::ssl::SslConnector> {
+    fn build_connector(config: &TlsConfig) -> Result<SharedConnector> {
         let mut b = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())
             .map_err(|e| TransportError::Config(format!("boring TLS init: {e}")))?;
 
@@ -609,16 +655,55 @@ impl BoringInner {
                 .map_err(|e| TransportError::Tls(format!("boring: set_private_key: {e}")))?;
         }
 
-        // BoringSSL defaults to SSL_SESS_CACHE_BOTH with unbounded size
-        // (0 = unlimited) — every completed handshake stores an
-        // SSL_SESSION that is never evicted, leaking memory proportional
-        // to connection count.  Cap at 64 entries: enough for TLS 1.3
-        // session-ticket resumption to the same upstream proxy server
-        // (saves one round-trip per resumed connection), small enough
-        // that memory is bounded even under sustained load.
-        b.set_session_cache_size(64);
+        // ── Client session resumption ────────────────────────────────────
+        // ssl_update_cache short-circuits a client SSL unless the ctx mode
+        // carries SSL_SESS_CACHE_CLIENT (the default is SERVER-only), so
+        // this is what makes the new-session callback below fire at all —
+        // the previous `set_session_cache_size(64)` only capped the
+        // internal cache, which `ssl_update_cache` never populates on a
+        // client ("Clients never use the internal session cache"), making
+        // it dead code.  Our store is the callback-fed `sessions` deque;
+        // CLIENT mode adds nothing else on this side.
+        b.set_session_cache_mode(boring::ssl::SslSessionCacheMode::CLIENT);
+        let sessions: SessionCache = Arc::new(Mutex::new(VecDeque::new()));
+        let cb_sessions = Arc::clone(&sessions);
+        b.set_new_session_callback(move |ssl, session| {
+            // INVARIANT: every verify-override connection MUST set
+            // VERIFY_OVERRIDE (the `connect_typed` override arm does) —
+            // this gate depends on it; a missed flag lets
+            // override-minted tickets into the store, where they get
+            // offered to stock connections.  The deposit half of the
+            // override invariant: a ticket minted under a
+            // `cert_pin`/`verify_name` connection must never enter the
+            // store — `offer_cached_session` withholds tickets FROM
+            // override connections, and this withholds override
+            // connections' tickets from the store.  A resumed handshake
+            // carries no Certificate, so a stock connection offering
+            // such a ticket would finish without the override policy's
+            // check ever running.
+            if ssl.ex_data(*VERIFY_OVERRIDE).copied().unwrap_or(false) {
+                return;
+            }
+            // Keyed by the SNI this connection sent — an IP-literal
+            // target sends none (RFC 6066 §3) and gets no resumption.
+            // Poison can only come from a panic while held; nothing here
+            // panics, so recover rather than propagate across FFI.
+            let Some(name) = ssl.servername(boring::ssl::NameType::HOST_NAME) else {
+                return;
+            };
+            let mut q = cb_sessions
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if q.len() >= SESSION_CACHE_CAP {
+                q.pop_front();
+            }
+            q.push_back((name.to_owned(), session));
+        });
 
-        Ok(b.build())
+        Ok(SharedConnector {
+            connector: b.build(),
+            sessions,
+        })
     }
 
     async fn connect(&self, inner: Box<dyn Stream>) -> Result<Box<dyn Stream>> {
@@ -640,6 +725,63 @@ impl BoringInner {
             .map_err(ConnectTypedError::into_transport)
     }
 
+    /// Pop the newest queued ticket for `self.server_name`, if any.
+    ///
+    /// TLS 1.3 tickets are single-use — the server rotates them on every
+    /// resume — so the offered ticket leaves the store whether the server
+    /// accepts it or not; every full *and* resumed handshake deposits
+    /// fresh ones via the new-session callback.  Newest-first (`rposition`)
+    /// because a later ticket carries the later expiry window.
+    fn take_session(&self) -> Option<boring::ssl::SslSession> {
+        let mut q = self
+            .ctx
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let idx = q.iter().rposition(|(name, _)| name == &self.server_name)?;
+        q.remove(idx).map(|(_, session)| session)
+    }
+
+    /// Offer a cached ticket to `ssl` before the handshake (best-effort —
+    /// a rejected `set_session` just falls through to a full handshake,
+    /// the ticket already spent).  Returns whether a ticket was actually
+    /// installed: `connect_typed` narrows [`invalidate_sessions`] to
+    /// handshake failures that could implicate one.
+    ///
+    /// [`invalidate_sessions`]: Self::invalidate_sessions
+    fn offer_cached_session(&self, ssl: &mut boring::ssl::Ssl) -> bool {
+        // Per-connection verify overrides (`cert_pin`, `verify_name`)
+        // inspect the peer's Certificate — a resumed handshake carries
+        // none, so offering a ticket minted under the stock policy
+        // would silently skip their check.  These configs are rare;
+        // lose the resumption, keep the guarantee.  (Their own deposits
+        // are withheld in the new-session callback — see VERIFY_OVERRIDE.)
+        if self.cert_pin.is_some() || self.verify_name.is_some() {
+            return false;
+        }
+        let Some(session) = self.take_session() else {
+            return false;
+        };
+        // SAFETY: `self.ctx.sessions` only ever receives tickets minted by
+        // `self.ctx.connector`'s `SSL_CTX` — the new-session callback bound
+        // at build is the sole producer — and `ssl` was built from the same
+        // ctx, so `set_session`'s same-`SslContext` requirement holds.
+        unsafe { ssl.set_session(&session) }.is_ok()
+    }
+
+    /// Drop every queued ticket for `self.server_name`.  Called after a
+    /// failed handshake *that offered one*: a restart or ticket-key
+    /// rotation on the peer would make all outstanding tickets stale.
+    /// A failure offering nothing (a full handshake — TCP reset, cert
+    /// rejection) implicates no ticket, so `connect_typed` skips this.
+    fn invalidate_sessions(&self) {
+        self.ctx
+            .sessions
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(name, _)| name != &self.server_name);
+    }
+
     /// [`connect`](Self::connect) over a caller-provided stream type,
     /// returning the concrete `SslStream<S>` so the inner stream can be
     /// recovered after the handshake.  shadow-tls needs this: the cover
@@ -657,6 +799,7 @@ impl BoringInner {
         S: AsyncRead + AsyncWrite + Unpin,
     {
         let mut cfg = self
+            .ctx
             .connector
             .configure()
             .map_err(|e| TransportError::Tls(format!("boring: configure: {e}")))
@@ -712,7 +855,8 @@ impl BoringInner {
         // `InsecureSkipVerify` and replaces verification with a SHA-256
         // pin check, so it installs `SSL_set_custom_verify` instead —
         // the callback then owns the accept/reject decision entirely.
-        let handshake = if self.verify_name.is_some() || self.cert_pin.is_some() {
+        let (handshake, session_offered) = if self.verify_name.is_some() || self.cert_pin.is_some()
+        {
             // `verify_name`-only (no pin): `into_ssl` would seed the verify
             // param with `server_name` (hosts for DNS names, ip for IP
             // literals), and `check_id` enforces hosts and ip
@@ -730,6 +874,14 @@ impl BoringInner {
                 .into_ssl(&self.server_name)
                 .map_err(|e| TransportError::Tls(format!("boring: into_ssl: {e}")))
                 .map_err(ConnectTypedError::Transport)?;
+            let session_offered = self.offer_cached_session(&mut ssl);
+            // INVARIANT: every verify-override connection MUST set
+            // VERIFY_OVERRIDE — the new-session gate in
+            // `build_connector` depends on it; a missed flag lets
+            // override-minted tickets into the store and get offered
+            // to stock connections.  Kept textually adjacent to the
+            // verify installs below so the pairing survives edits.
+            ssl.set_ex_data(*VERIFY_OVERRIDE, true);
             if let Some(pin) = self.cert_pin {
                 // Upstream: `serverName = state.ServerName`, overridden by
                 // `NameCertVerify` — the pin's chain-verify DNS name.
@@ -754,11 +906,29 @@ impl BoringInner {
                 .map_err(|e| TransportError::Tls(format!("boring: set verify name: {e}")))
                 .map_err(ConnectTypedError::Transport)?;
             }
-            tokio_boring::SslStreamBuilder::new(ssl, inner)
-                .connect()
-                .await
+            (
+                tokio_boring::SslStreamBuilder::new(ssl, inner)
+                    .connect()
+                    .await,
+                session_offered,
+            )
         } else {
-            tokio_boring::connect(cfg, &self.server_name, inner).await
+            // Same path `tokio_boring::connect` takes — `into_ssl` then
+            // `SslStreamBuilder::connect` — split so a cached ticket can
+            // be offered between them.  An `into_ssl` failure surfaces as
+            // `Transport` rather than `Handshake(SetupFailure)`: equally
+            // streamless either way (setup failures carry no `S`).
+            let mut ssl = cfg
+                .into_ssl(&self.server_name)
+                .map_err(|e| TransportError::Tls(format!("boring: into_ssl: {e}")))
+                .map_err(ConnectTypedError::Transport)?;
+            let session_offered = self.offer_cached_session(&mut ssl);
+            (
+                tokio_boring::SslStreamBuilder::new(ssl, inner)
+                    .connect()
+                    .await,
+                session_offered,
+            )
         };
 
         match handshake {
@@ -770,11 +940,24 @@ impl BoringInner {
                     ech_requested = ech_requested,
                     ech_accepted = ech_accepted,
                     tls_version = %version,
+                    session_reused = tls_stream.ssl().session_reused(),
                     "boring TLS handshake complete"
                 );
                 Ok(tls_stream)
             }
             Err(e) => {
+                // Only a handshake that offered a cached ticket can fail
+                // *because* of one — the peer restarted or rotated its
+                // ticket key, so the rest of the SNI's queue is equally
+                // stale and gets dropped.  A fresh full handshake
+                // failing (TCP reset, cert rejection) implicates no
+                // ticket: the queued ones stay.  (The offered ticket
+                // already left the store via `take_session`; this clears
+                // its siblings.  The ECH self-heal path below shares the
+                // same reset.)
+                if session_offered {
+                    self.invalidate_sessions();
+                }
                 // If ECH was active and the server rejected with `ech_required`,
                 // BoringSSL surfaces the new `retry_configs` blob the server
                 // signed. Self-heal: store the new bytes so the *next*
@@ -1026,8 +1209,8 @@ fn verify_leaf_under_pinned_cert(
 mod tests {
     use super::*;
 
-    fn same_ctx(a: &boring::ssl::SslConnector, b: &boring::ssl::SslConnector) -> bool {
-        std::ptr::eq(a.context(), b.context())
+    fn same_ctx(a: &SharedConnector, b: &SharedConnector) -> bool {
+        std::ptr::eq(a.connector.context(), b.connector.context())
     }
 
     /// Same (fingerprint, curves, alpn, skip_cert_verify) → same shared
@@ -1609,5 +1792,446 @@ mod tests {
                  raise the workspace floor"
             );
         }
+    }
+
+    // ── Client session resumption ────────────────────────────────────
+
+    /// Loopback TLS server for the resumption tests: accept on an
+    /// ephemeral port with a self-signed `cn` cert, then echo bytes until
+    /// EOF.  The echo is load-bearing — BoringSSL delivers TLS 1.3
+    /// NewSessionTickets as post-handshake messages, so only an actual
+    /// `SSL_read` on the client pumps them into the new-session callback.
+    async fn spawn_tls_echo_server(cn: &str) -> std::net::SocketAddr {
+        spawn_tls_echo_server_with_leaf(cn).await.0
+    }
+
+    /// [`spawn_tls_echo_server`] plus the leaf certificate — tests that
+    /// pin the server's cert need it to compute the expected SHA-256.
+    async fn spawn_tls_echo_server_with_leaf(
+        cn: &str,
+    ) -> (std::net::SocketAddr, boring::x509::X509) {
+        let (leaf, leaf_key) = make_cert(cn, &CertOpts::DEFAULT, None);
+        let mut builder =
+            boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
+                .expect("acceptor");
+        builder.set_certificate(&leaf).unwrap();
+        builder.set_private_key(&leaf_key).unwrap();
+        let acceptor = builder.build();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+                    let Ok(mut tls) = tokio_boring::accept(&acceptor, tcp).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 256];
+                    loop {
+                        match tls.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => {
+                                if tls.write_all(&buf[..n]).await.is_err() {
+                                    return;
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        (addr, leaf)
+    }
+
+    /// `connect_typed` plus one echoed byte — the round trip ingests the
+    /// server's NewSessionTickets on the client side.
+    async fn connect_pumped(
+        inner: &BoringInner,
+        addr: std::net::SocketAddr,
+    ) -> tokio_boring::SslStream<tokio::net::TcpStream> {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut stream = inner
+            .connect_typed(tcp)
+            .await
+            .map_err(ConnectTypedError::into_transport)
+            .expect("connect_typed");
+        stream.write_all(b"x").await.unwrap();
+        stream.read_exact(&mut [0u8; 1]).await.unwrap();
+        stream
+    }
+
+    /// A skip-verify `BoringInner` on a private SNI partition — the
+    /// session store is shared process-wide by every same-key ctx, and
+    /// parallel tests on one SNI would hand each other tickets minted
+    /// on different servers (each reject-decrypts the other's into a
+    /// spurious full handshake).
+    fn skip_verify_inner(sni: &str) -> BoringInner {
+        BoringInner::new(&TlsConfig {
+            skip_cert_verify: true,
+            ..TlsConfig::new(sni)
+        })
+        .unwrap()
+    }
+
+    /// Tickets queued under `inner`'s own SNI — the store is shared
+    /// across every same-key ctx in this test binary, so tests pick
+    /// distinct SNIs to keep their partitions private.
+    fn queued_tickets(inner: &BoringInner) -> usize {
+        inner
+            .ctx
+            .sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| name == &inner.server_name)
+            .count()
+    }
+
+    /// A second connect to the same SNI must offer the cached ticket and
+    /// come back `session_reused()` — proving both halves: the ctx's
+    /// new-session callback deposited it, and `set_session` offered it.
+    #[tokio::test]
+    async fn boring_client_session_resumption_reuses_ticket() {
+        let addr = spawn_tls_echo_server("localhost").await;
+        let inner = skip_verify_inner("reuse-ticket.test");
+
+        let s1 = connect_pumped(&inner, addr).await;
+        assert!(
+            !s1.ssl().session_reused(),
+            "first connect must run a full handshake"
+        );
+        drop(s1);
+
+        let s2 = connect_pumped(&inner, addr).await;
+        assert!(
+            s2.ssl().session_reused(),
+            "second connect to the same SNI must resume via the cached ticket"
+        );
+    }
+
+    /// A failed handshake invalidates every queued ticket for that SNI:
+    /// the live server would happily resume the leftover ticket, so a
+    /// full handshake on the next connect proves the store was emptied.
+    /// A resumed connect after that proves resumption recovered.
+    #[tokio::test]
+    async fn boring_client_sessions_dropped_on_handshake_failure() {
+        let addr = spawn_tls_echo_server("localhost").await;
+        let inner = skip_verify_inner("dropped-on-fail.test");
+
+        // Two successful connects: the first fills the store (BoringSSL
+        // sends num_tickets = 2 per handshake), the second pops one and
+        // resumes, re-filling it on its own post-handshake tickets.
+        drop(connect_pumped(&inner, addr).await);
+        let s2 = connect_pumped(&inner, addr).await;
+        assert!(s2.ssl().session_reused(), "warm store must resume");
+        drop(s2);
+        let queued = queued_tickets(&inner);
+        assert!(queued >= 2, "fixture must queue ≥2 tickets, got {queued}");
+
+        // Black-hole peer: accepts TCP then drops — handshake fails.
+        let black_hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bh_addr = black_hole.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = black_hole.accept().await {
+                drop(tcp);
+            }
+        });
+        let tcp = tokio::net::TcpStream::connect(bh_addr).await.unwrap();
+        assert!(
+            inner.connect_typed(tcp).await.is_err(),
+            "handshake against a dropped connection must fail"
+        );
+        assert_eq!(
+            queued_tickets(&inner),
+            0,
+            "the failed handshake must invalidate the queued tickets"
+        );
+
+        // The live server still holds the old tickets' key — if one had
+        // survived, this connect would resume.  A full handshake it is.
+        let s3 = connect_pumped(&inner, addr).await;
+        assert!(
+            !s3.ssl().session_reused(),
+            "no ticket may survive invalidation"
+        );
+        let s4 = connect_pumped(&inner, addr).await;
+        assert!(
+            s4.ssl().session_reused(),
+            "the next connect must resume on the freshly issued ticket"
+        );
+    }
+
+    /// "Server restart": a different acceptor (new ticket key + cert) on
+    /// a different port, same SNI.  The stale ticket is offered and
+    /// silently ignored — TLS falls back to a full handshake, whose own
+    /// tickets then resume the following connect.
+    #[tokio::test]
+    async fn boring_client_session_cache_recovers_server_restart() {
+        let addr_a = spawn_tls_echo_server("localhost").await;
+        let inner = skip_verify_inner("server-restart.test");
+
+        let s1 = connect_pumped(&inner, addr_a).await;
+        assert!(!s1.ssl().session_reused());
+        drop(s1);
+
+        let addr_b = spawn_tls_echo_server("localhost").await;
+        let s2 = connect_pumped(&inner, addr_b).await;
+        assert!(
+            !s2.ssl().session_reused(),
+            "server B cannot decrypt server A's ticket — full handshake expected"
+        );
+        drop(s2);
+
+        let s3 = connect_pumped(&inner, addr_b).await;
+        assert!(
+            s3.ssl().session_reused(),
+            "the ticket B issued during connect 2 must resume connect 3"
+        );
+    }
+
+    /// `cert_pin` / `verify_name` are per-connection policy kept out of
+    /// [`ConnectorKey`], so an override `BoringInner` shares its stock
+    /// sibling's ctx and ticket store — but must never *offer* from it:
+    /// a resumed handshake carries no Certificate for the pin/name
+    /// check to inspect, silently weakening the override.  The offer
+    /// step must leave the shared queue exactly as found.
+    #[tokio::test]
+    async fn boring_verify_overrides_never_offer_sessions() {
+        // A private SNI partition — the store is keyed by sent SNI, so
+        // a unique name isolates the test from the other resumption
+        // tests running in parallel on the same cached ctx.
+        const SNI: &str = "override-offer.test";
+        let addr = spawn_tls_echo_server("localhost").await;
+        let plain = BoringInner::new(&TlsConfig {
+            skip_cert_verify: true,
+            ..TlsConfig::new(SNI)
+        })
+        .expect("build plain inner");
+        drop(connect_pumped(&plain, addr).await);
+        let queued = queued_tickets(&plain);
+        assert!(queued >= 2, "fixture must queue ≥2 tickets, got {queued}");
+
+        for (label, cfg) in [
+            (
+                "cert_pin",
+                TlsConfig {
+                    skip_cert_verify: true,
+                    cert_pin: Some([0xAB; 32]),
+                    ..TlsConfig::new(SNI)
+                },
+            ),
+            (
+                "verify_name",
+                TlsConfig {
+                    skip_cert_verify: true,
+                    verify_name: Some("localhost".into()),
+                    ..TlsConfig::new(SNI)
+                },
+            ),
+        ] {
+            let inner = BoringInner::new(&cfg).expect("build override inner");
+            assert!(
+                same_ctx(&inner.ctx, &plain.ctx),
+                "{label} stays out of the ConnectorKey, so it must share \
+                 the plain ctx — otherwise an empty private store would \
+                 make this check vacuous"
+            );
+            let mut ssl = inner
+                .ctx
+                .connector
+                .configure()
+                .expect("configure")
+                .into_ssl(SNI)
+                .expect("into_ssl");
+            assert!(
+                !inner.offer_cached_session(&mut ssl),
+                "{label} must not offer a cached ticket"
+            );
+            assert_eq!(
+                queued_tickets(&plain),
+                queued,
+                "{label} offer must leave the queue untouched"
+            );
+        }
+
+        // Control: the stock sibling still offers — and spends — one.
+        let mut ssl = plain
+            .ctx
+            .connector
+            .configure()
+            .expect("configure")
+            .into_ssl(SNI)
+            .expect("into_ssl");
+        assert!(plain.offer_cached_session(&mut ssl));
+        assert_eq!(queued_tickets(&plain), queued - 1);
+    }
+
+    /// The deposit mirror of [`boring_verify_overrides_never_offer_sessions`]:
+    /// a ticket minted under an override-policy handshake must never enter
+    /// the shared store — a stock sibling would offer it and complete a
+    /// resumed handshake with no Certificate presented, silently skipping
+    /// the override's check.  Drives real handshakes so the peer's
+    /// NewSessionTickets actually arrive.
+    #[tokio::test]
+    async fn boring_verify_overrides_never_deposit_sessions() {
+        const SNI: &str = "override-deposit.test";
+        let (addr, leaf) = spawn_tls_echo_server_with_leaf("localhost").await;
+        let pin: [u8; 32] = leaf
+            .digest(boring::hash::MessageDigest::sha256())
+            .expect("leaf digest")
+            .as_ref()
+            .try_into()
+            .expect("sha256 is 32 bytes");
+
+        for (label, cfg) in [
+            (
+                "cert_pin",
+                TlsConfig {
+                    skip_cert_verify: true,
+                    cert_pin: Some(pin),
+                    ..TlsConfig::new(SNI)
+                },
+            ),
+            (
+                "verify_name",
+                TlsConfig {
+                    skip_cert_verify: true,
+                    verify_name: Some("localhost".into()),
+                    ..TlsConfig::new(SNI)
+                },
+            ),
+        ] {
+            let inner = BoringInner::new(&cfg).expect("build override inner");
+            assert!(
+                same_ctx(&inner.ctx, &skip_verify_inner(SNI).ctx),
+                "{label} must share the stock ctx for the check to be real"
+            );
+            drop(connect_pumped(&inner, addr).await);
+            assert_eq!(
+                queued_tickets(&inner),
+                0,
+                "{label} handshake must not deposit tickets"
+            );
+        }
+
+        // Control: the stock sibling deposits on the same ctx partition.
+        let plain = skip_verify_inner(SNI);
+        drop(connect_pumped(&plain, addr).await);
+        assert!(
+            queued_tickets(&plain) >= 2,
+            "stock control must deposit — otherwise the override checks were vacuous"
+        );
+    }
+
+    /// A handshake that offered no ticket cannot fail *because* of one:
+    /// a pinned connect (which never offers) dying against a black-hole
+    /// peer must leave the shared store's queued tickets alone — the
+    /// TCP reset implicates no ticket.  The stock sibling then still
+    /// resumes on them.
+    #[tokio::test]
+    async fn boring_ticket_free_failure_keeps_sessions() {
+        // A private SNI partition — the store is keyed by sent SNI, so
+        // a unique name isolates the test from the other resumption
+        // tests running in parallel on the same cached ctx.
+        const SNI: &str = "ticket-free-fail.test";
+        let addr = spawn_tls_echo_server("localhost").await;
+        let plain = BoringInner::new(&TlsConfig {
+            skip_cert_verify: true,
+            ..TlsConfig::new(SNI)
+        })
+        .expect("build plain inner");
+        drop(connect_pumped(&plain, addr).await);
+        let queued = queued_tickets(&plain);
+        assert!(queued >= 2, "fixture must queue ≥2 tickets, got {queued}");
+
+        // Same ConnectorKey as `plain` — the shared store it deposited
+        // into — but the pin config never offers.
+        let pinned = BoringInner::new(&TlsConfig {
+            skip_cert_verify: true,
+            cert_pin: Some([0xAB; 32]),
+            ..TlsConfig::new(SNI)
+        })
+        .expect("build pinned inner");
+
+        // Black-hole peer: accepts TCP then drops — the handshake fails
+        // having offered no ticket, so the sibling's tickets were never
+        // implicated and must survive.
+        let black_hole = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bh_addr = black_hole.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = black_hole.accept().await {
+                drop(tcp);
+            }
+        });
+        let tcp = tokio::net::TcpStream::connect(bh_addr).await.unwrap();
+        assert!(
+            pinned.connect_typed(tcp).await.is_err(),
+            "handshake against a dropped connection must fail"
+        );
+        assert_eq!(
+            queued_tickets(&plain),
+            queued,
+            "a failure that offered no ticket must not invalidate the queue"
+        );
+
+        // The survivors are live: the stock sibling still resumes.
+        let s = connect_pumped(&plain, addr).await;
+        assert!(
+            s.ssl().session_reused(),
+            "the untouched tickets must still resume"
+        );
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn bench_bare_handshake() {
+        let (leaf, leaf_key) = make_cert("localhost", &CertOpts::DEFAULT, None);
+        let mut builder =
+            boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
+                .expect("acceptor");
+        builder.set_certificate(&leaf).unwrap();
+        builder.set_private_key(&leaf_key).unwrap();
+        let acceptor = builder.build();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = tokio_boring::accept(&acceptor, tcp).await;
+                });
+            }
+        });
+
+        let cfg = TlsConfig {
+            skip_cert_verify: true,
+            ..TlsConfig::new("localhost")
+        };
+        let inner = BoringInner::new(&cfg).unwrap();
+        const N: usize = 200;
+        let mut ts = Vec::with_capacity(N);
+        for _ in 0..N {
+            let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let t0 = std::time::Instant::now();
+            let r = inner.connect_typed(tcp).await;
+            assert!(r.is_ok());
+            ts.push(t0.elapsed());
+        }
+        ts.sort();
+        let us = |d: std::time::Duration| d.as_micros();
+        eprintln!(
+            "bare boring handshake: p50={}us p99={}us avg={}us",
+            us(ts[N / 2]),
+            us(ts[N * 99 / 100]),
+            us(ts.iter().sum::<std::time::Duration>()) / N as u128
+        );
     }
 }

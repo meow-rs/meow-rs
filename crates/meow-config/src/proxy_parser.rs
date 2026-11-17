@@ -66,6 +66,18 @@ impl WrappedProxy {
         let port = config
             .get("port")
             .and_then(serde_json::Value::as_u64)
+            .filter(|&port| port > 0)
+            .or_else(|| {
+                // A `ports`-only node (hysteria2's hopping range, which may
+                // carry `port: 0` or none at all) still dials one concrete
+                // endpoint: the range's first port, same as the adapter.
+                config
+                    .get("ports")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(|ports| ports.split([',', '-']).next())
+                    .and_then(|first| first.trim().parse::<u64>().ok())
+                    .filter(|&port| port > 0)
+            })
             .and_then(|port| u16::try_from(port).ok());
         if let (true, Some(host), Some(port)) = (dialer.is_proxy(), host, port) {
             self.hop = Some(DialerHop {
@@ -164,6 +176,178 @@ impl Proxy for WrappedProxy {
     }
     fn delay_history(&self) -> Vec<DelayHistory> {
         self.adapter.health().delay_history()
+    }
+}
+
+/// Marks a `proxies:` leaf whose `dialer-proxy` was applied by *injection* —
+/// its adapter threads every dial through the chained front hop itself, so
+/// no `DialerProxyAdapter` wrapper exists to carry the chain signal the UDP
+/// probe reads (issue #969).
+///
+/// Every `Proxy` / `ProxyAdapter` method delegates to `inner` verbatim — the
+/// marker is observational only: `support_udp` still propagates the inner
+/// advertisement (an `http` node reports `false`; a `ss`/`socks5` node folds
+/// the front's live capability), `as_any` still resolves the inner concrete
+/// type so existing downcasts land exactly as they did on the bare entry,
+/// and the health/delay/member views are untouched.
+///
+/// The one override is `is_dialer_proxy_non_transparent` →
+/// `!inner.support_udp()`: the #969 fail-closed verdict is exactly the
+/// `support_udp` condition, matching `DialerProxyAdapter`'s
+/// `!transparent`. An injected leaf whose chained transport carries UDP
+/// — hysteria2 over the front's UDP association, WireGuard, or anytls
+/// `udp: true` (UoT rides the chained TCP session) — is *not*
+/// non-transparent: its UDP flow rides the declared chain, so there is
+/// nothing to fail closed on. `type: direct` rejects the injected dialer
+/// inside [`parse_proxy_with_dialer`] (`reject_unthreaded_dialer`), and
+/// `ss` with an external SIP003 plugin bails on its own inline check —
+/// either way the leaf lands in the relay-based
+/// `DialerProxyAdapter` fallback instead, which computes its own
+/// transparency — so reaching this wrapper already proves the inner owns a
+/// server transport. A UDP flow matched to a rule targeting a
+/// UDP-incapable chained node then fails closed on the match instead of
+/// sliding to a later rule the way a plain `udp: false` node does.
+pub struct ChainedProxy {
+    inner: Arc<dyn Proxy>,
+}
+
+impl ChainedProxy {
+    pub fn new(inner: Arc<dyn Proxy>) -> Self {
+        Self { inner }
+    }
+}
+
+#[async_trait]
+impl ProxyAdapter for ChainedProxy {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+    fn adapter_type(&self) -> AdapterType {
+        self.inner.adapter_type()
+    }
+    fn addr(&self) -> &str {
+        self.inner.addr()
+    }
+    fn support_udp(&self) -> bool {
+        self.inner.support_udp()
+    }
+    async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
+        self.inner.dial_tcp(metadata).await
+    }
+    async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+        self.inner.dial_udp(metadata).await
+    }
+    async fn connect_over(
+        &self,
+        stream: Box<dyn ProxyConn>,
+        metadata: &Metadata,
+    ) -> Result<Box<dyn ProxyConn>> {
+        self.inner.connect_over(stream, metadata).await
+    }
+
+    /// Forward the peek/commit walk like `WrappedProxy` — a chained entry
+    /// whose inner resolved (theoretical today: injected entries are leaves)
+    /// must not hide PASS/PASS-RULE members from the match-time probe.
+    fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
+        self.inner.unwrap_proxy(metadata, touch)
+    }
+
+    /// The injected leaf answers the front hop itself; forward so the
+    /// answer keeps reaching the probe through this wrapper.
+    fn dialer_hop(&self, metadata: &Metadata) -> Option<Arc<dyn Proxy>> {
+        self.inner.dialer_hop(metadata)
+    }
+
+    /// The injected leaf already reports the configured chain; forward.
+    fn has_configured_dialer(&self) -> bool {
+        self.inner.has_configured_dialer()
+    }
+
+    fn dialer_hop_network(&self, flow: meow_common::Network) -> meow_common::Network {
+        self.inner.dialer_hop_network(flow)
+    }
+
+    /// Forward the session flush (issue #695) — a marker that hid it would
+    /// strand the inner adapter's pooled transport sessions.
+    fn reset_sessions(&self) {
+        self.inner.reset_sessions();
+    }
+
+    fn health(&self) -> &ProxyHealth {
+        self.inner.health()
+    }
+}
+
+impl Proxy for ChainedProxy {
+    fn alive(&self) -> bool {
+        self.inner.alive()
+    }
+    fn alive_for_url(&self, url: &str) -> bool {
+        self.inner.alive_for_url(url)
+    }
+    fn last_delay(&self) -> u16 {
+        self.inner.last_delay()
+    }
+    fn last_delay_for_url(&self, url: &str) -> u16 {
+        self.inner.last_delay_for_url(url)
+    }
+    fn delay_history(&self) -> Vec<DelayHistory> {
+        self.inner.delay_history()
+    }
+
+    /// Transparent to concrete-type downcasts: callers still reach the
+    /// injected leaf (`WrappedProxy`, the group types) — the registry entry
+    /// answers `as_any` exactly as the bare inner did before marking.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.as_any()
+    }
+
+    /// The marker's single verdict (issue #969): an injected leaf is the
+    /// non-transparent chain shape only when the chain cannot carry UDP
+    /// — `!inner.support_udp()`, the same condition
+    /// `DialerProxyAdapter` answers with `!transparent` and the only case
+    /// the route probe consults this marker for. A leaf whose chained
+    /// transport does carry UDP (injected hysteria2/WireGuard, anytls
+    /// `udp: true`) answers `false` so a group pick forwarding this
+    /// verdict stays truthful.
+    fn is_dialer_proxy_non_transparent(&self) -> bool {
+        !self.inner.support_udp()
+    }
+
+    fn members(&self) -> Option<Vec<String>> {
+        self.inner.members()
+    }
+
+    fn member_proxies(&self) -> Option<Vec<Arc<dyn Proxy>>> {
+        self.inner.member_proxies()
+    }
+
+    fn current(&self) -> Option<String> {
+        self.inner.current()
+    }
+
+    fn selection(&self) -> Option<&dyn meow_common::ProxySelection> {
+        self.inner.selection()
+    }
+
+    fn test_url(&self) -> Option<&str> {
+        self.inner.test_url()
+    }
+
+    fn expected_status(&self) -> Option<&str> {
+        self.inner.expected_status()
+    }
+
+    fn group_display(&self) -> Option<&GroupDisplay> {
+        self.inner.group_display()
+    }
+
+    fn usage_generation(&self) -> u64 {
+        self.inner.usage_generation()
+    }
+
+    fn chain_health(&self) -> Option<&Arc<meow_common::chain_health::ChainHealth>> {
+        self.inner.chain_health()
     }
 }
 
@@ -506,15 +690,36 @@ pub fn parse_proxy_with_dialer(
         }
         #[cfg(feature = "anytls")]
         "anytls" => {
-            reject_unthreaded_dialer(name, "anytls", dialer)?;
             let adapter = parse_anytls(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            // WireGuard-shaped injection: a proxy dialer becomes the
+            // client's per-session transport dialer — the raw chained
+            // stream the client layers its own TLS + session pool on — so
+            // injected sessions pool like direct ones and `udp: true` UoT
+            // rides the chain. The no-op `DirectDialer` keeps the built-in
+            // connect path.
+            let adapter = if dialer.is_proxy() {
+                adapter.with_dialer(Arc::clone(dialer))
+            } else {
+                adapter
+            };
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "hysteria2")]
         "hysteria2" => {
-            reject_unthreaded_dialer(name, "hysteria2", dialer)?;
-            let adapter = parse_hysteria2(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            // A `dialer-proxy` chain carries the QUIC endpoint's UDP
+            // transport through the front hop's UDP association (issue
+            // #899 follow-up, the WireGuard precedent). Any proxy dialer
+            // is accepted here — no `supports_udp` gate: that flag
+            // answers `false` for an unresolved group target, which would
+            // kill legal group fronts at parse time. A UDP-less front
+            // fails `dial_udp_conn` at runtime, closed like any other
+            // endpoint bind error.
+            let adapter = parse_hysteria2(name, config, dialer)?;
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+            ))
         }
         #[cfg(feature = "vmess")]
         "vmess" => {
@@ -602,14 +807,13 @@ fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
 
 /// Reject a `ProxyDialer` for adapter types that do not thread it through.
 ///
-/// `anytls` dials via `meow_common::connect_tcp_host` internally and
-/// `hysteria2` owns its QUIC socket; `direct` is a raw egress by definition.
-/// None of them can honour an injected dialer, so accepting one here would
-/// silently drop the user's `dialer-proxy` and egress from the real source
-/// path — a Class A silent divergence (ADR-0002).  Returning `Err` instead
-/// lets the `dialer-proxy` leaf parse fall back to the relay-based
-/// `DialerProxyAdapter` wrapper, which fails loudly at dial time rather
-/// than pretending the chain was applied or dialing direct.
+/// `direct` is a raw egress by definition — a resolver-threaded dial
+/// belongs on the real source path — so accepting an injected dialer here
+/// would silently drop the user's `dialer-proxy` and egress from the real
+/// source path — a Class A silent divergence (ADR-0002).  Returning `Err`
+/// instead lets the `dialer-proxy` leaf parse fall back to the
+/// relay-based `DialerProxyAdapter` wrapper, which fails loudly at dial
+/// time rather than pretending the chain was applied or dialing direct.
 ///
 /// A `DirectDialer` is always accepted: it is the no-op default, so nothing
 /// is lost by ignoring it.
@@ -873,7 +1077,7 @@ fn parse_http(
         (Some(u), Some(p)) => Some((u.to_string(), p.to_string())),
         (None, None) => None,
         _ => {
-            return Err("http: both 'username' and 'password' must be set, or neither".to_string())
+            return Err("http: both 'username' and 'password' must be set, or neither".to_string());
         }
     };
 
@@ -946,7 +1150,7 @@ fn parse_socks5(
         _ => {
             return Err(
                 "socks5: both 'username' and 'password' must be set, or neither".to_string(),
-            )
+            );
         }
     };
 
@@ -1095,11 +1299,13 @@ fn parse_trusttunnel(
     if quic {
         return Err("trusttunnel: `quic: true` selects the HTTP/3 transport, which is not compiled into this build; rebuild with `--features trusttunnel-h3`".into());
     }
-    if quic {
-        // QUIC carries its own UDP socket, so there is no TCP connection for
-        // a `dialer-proxy` chain to carry (same reason hysteria2 refuses it).
-        reject_unthreaded_dialer(name, "trusttunnel", dialer)?;
-    }
+    // A `quic: true` node's `dialer-proxy` chain carries the QUIC
+    // endpoint's UDP transport through the front hop's UDP association
+    // (issue #899 follow-up — `TrustTunnelAdapter` hands the dialer to
+    // `QuicConnector::with_dialer`); H2 keeps its TCP dialer path. No
+    // `supports_udp` gate: that flag answers `false` for an unresolved
+    // group target, and a UDP-less front fails `dial_udp_conn` at dial,
+    // closed.
     let nonempty = |field: &str| {
         config.get(field).is_some_and(|value| match value {
             serde_json::Value::Null => false,
@@ -1262,7 +1468,10 @@ fn parse_trusttunnel(
             .map_err(|e| format!("trusttunnel: {e}"))?;
     options.health_check = boolean("health-check", false)?;
     if options.health_check {
-        tracing::warn!(name, "trusttunnel: mihomo performs idle health checks; this client currently checks only new sessions");
+        tracing::warn!(
+            name,
+            "trusttunnel: mihomo performs idle health checks; this client currently checks only new sessions"
+        );
     }
     #[cfg(feature = "trusttunnel-h3")]
     let transport = if quic {
@@ -1420,8 +1629,9 @@ fn reject_unsupported_anytls_options(
 /// backend: `up`, `down`, `obfs: salamander | gecko`, `obfs-password`,
 /// `obfs-min-packet-size` / `obfs-max-packet-size` (gecko only), `ports`,
 /// `hop-interval`, `sni`, `skip-cert-verify`, `fingerprint`, `udp`,
-/// `fast-open`, and the four `*-receive-window` keys (bytes; `0`/absent
-/// is unset — a present non-integer value is a hard error).
+/// `fast-open`, the four `*-receive-window` keys (bytes; `0`/absent
+/// is unset — a present non-integer value is a hard error), and
+/// `quic-connections` — a meow-rs extension with no mihomo equivalent.
 ///
 /// # Hard errors (Class A per ADR-0002)
 ///
@@ -1437,6 +1647,7 @@ fn reject_unsupported_anytls_options(
 fn parse_hysteria2(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
+    dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<meow_proxy::Hy2Adapter, String> {
     use meow_proxy::{Hy2HopInterval, Hy2Options};
 
@@ -1471,7 +1682,20 @@ fn parse_hysteria2(
         return Err(format!("hysteria2[{name}]: missing obfs-password"));
     }
 
-    let hop_interval = parse_hy2_hop_interval(name, config.get("hop-interval"))?;
+    let mut hop_interval = parse_hy2_hop_interval(name, config.get("hop-interval"))?;
+    let mut ports = ports;
+    // A `dialer-proxy` chain binds the QUIC connection to one front UDP
+    // association — a connected endpoint has no second port to hop to.
+    // Hopping config is legal beside it, so warn and drop it rather than
+    // reject: the driver also skips `HopState` on an injected endpoint.
+    if dialer.is_proxy() && (ports.is_some() || hop_interval.is_some()) {
+        tracing::warn!(
+            "hysteria2[{name}]: `ports`/`hop-interval` are ignored with `dialer-proxy` \
+             — a front association is bound to a single peer port and cannot hop"
+        );
+        ports = None;
+        hop_interval = None;
+    }
     let fingerprint = parse_hy2_fingerprint(name, config.get("fingerprint"))?;
     let fast_open = config
         .get("fast-open")
@@ -1496,26 +1720,68 @@ fn parse_hysteria2(
         initial_conn: window("initial-connection-receive-window")?,
         max_conn: window("max-connection-receive-window")?,
     };
+    let quic_connections = parse_hy2_quic_connections(name, config.get("quic-connections"))?;
 
-    meow_proxy::Hy2Adapter::new(Hy2Options {
-        name: name.to_string(),
-        server: server.to_string(),
-        port,
-        password: password.to_string(),
-        sni: sni.map(str::to_string),
-        skip_cert_verify,
-        udp,
-        up_bps,
-        down_bps,
-        obfs,
-        obfs_password,
-        ports,
-        hop_interval: hop_interval
-            .map(|(min_secs, max_secs)| Hy2HopInterval { min_secs, max_secs }),
-        fingerprint,
-        fast_open,
-        windows,
-    })
+    meow_proxy::Hy2Adapter::new(
+        Hy2Options {
+            name: name.to_string(),
+            server: server.to_string(),
+            port,
+            password: password.to_string(),
+            sni: sni.map(str::to_string),
+            skip_cert_verify,
+            udp,
+            up_bps,
+            down_bps,
+            obfs,
+            obfs_password,
+            ports,
+            hop_interval: hop_interval
+                .map(|(min_secs, max_secs)| Hy2HopInterval { min_secs, max_secs }),
+            fingerprint,
+            fast_open,
+            windows,
+            quic_connections,
+        },
+        Some(Arc::clone(dialer)),
+    )
+}
+
+/// `quic-connections` (performance spec ITEM A): the K-way QUIC
+/// connection-pool width — `K` independent connections, each with its own
+/// quiche driver task, round-robin new streams and UDP sessions. Absent
+/// resolves to [`meow_proxy::DEFAULT_QUIC_CONNECTIONS`]; a present
+/// non-integer is a hard error. The value clamps to
+/// `1..=`[`meow_proxy::MAX_QUIC_CONNECTIONS`], warning when the clamp
+/// bites or above 4 — extra driver tasks rarely pay off past that.
+///
+/// Constraint worth repeating at the config surface: a single flow still
+/// rides one connection — this widens *aggregate* throughput only.
+#[cfg(feature = "hysteria2")]
+fn parse_hy2_quic_connections(
+    name: &str,
+    value: Option<&serde_json::Value>,
+) -> std::result::Result<Option<usize>, String> {
+    let Some(value) = value.filter(|v| !v.is_null()) else {
+        return Ok(None);
+    };
+    let n = value.as_u64().ok_or_else(|| {
+        format!("hysteria2[{name}]: 'quic-connections' must be an unsigned integer")
+    })?;
+    let n = usize::try_from(n).unwrap_or(usize::MAX);
+    let clamped = n.clamp(1, meow_proxy::MAX_QUIC_CONNECTIONS);
+    if clamped != n {
+        tracing::warn!(
+            "hysteria2[{name}]: 'quic-connections' {n} out of range, clamped to {clamped}"
+        );
+    }
+    if clamped > 4 {
+        tracing::warn!(
+            "hysteria2[{name}]: 'quic-connections' {clamped} exceeds 4 — each connection \
+             costs a driver task; larger pools rarely add aggregate throughput"
+        );
+    }
+    Ok(Some(clamped))
 }
 
 #[cfg(feature = "hysteria2")]
@@ -2040,14 +2306,14 @@ fn parse_wireguard(
         None => None,
         Some(std::net::IpAddr::V4(a)) => Some(a),
         Some(std::net::IpAddr::V6(_)) => {
-            return Err(format!("wireguard[{name}]: 'ip' must be IPv4"))
+            return Err(format!("wireguard[{name}]: 'ip' must be IPv4"));
         }
     };
     let ipv6: Option<Ipv6Addr> = match parse_tunnel_addr("ipv6")? {
         None => None,
         Some(std::net::IpAddr::V6(a)) => Some(a),
         Some(std::net::IpAddr::V4(_)) => {
-            return Err(format!("wireguard[{name}]: 'ipv6' must be IPv6"))
+            return Err(format!("wireguard[{name}]: 'ipv6' must be IPv6"));
         }
     };
 
@@ -2084,7 +2350,7 @@ fn parse_wireguard(
         Some(_) => {
             return Err(format!(
                 "wireguard[{name}]: 'dns' must be a nameserver string or list"
-            ))
+            ));
         }
     };
     if dns_present {
@@ -2113,13 +2379,13 @@ fn parse_wireguard(
                     "wireguard[{name}]: 'ip-stack' \"{other}\" is not supported — \
                      this build runs the smoltcp userspace stack \
                      (accepted: \"gvisor\", \"system\")"
-                ))
+                ));
             }
         },
         Some(_) => {
             return Err(format!(
                 "wireguard[{name}]: 'ip-stack' must be \"gvisor\" or \"system\""
-            ))
+            ));
         }
     }
 
@@ -2307,7 +2573,9 @@ fn ws_max_early_data(ws_opts: Option<&serde_json::Value>) -> usize {
 ///
 /// - `tls: false` with plain VLESS — plaintext, but correct destination
 /// - `mux: { enabled: true }` — sing-mux multiplexing (server must be sing-box/mihomo)
-/// - `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only; UDP uses plain VLESS
+/// - `flow: xtls-rprx-vision` + `udp: true` — Vision is TCP-only; UDP rides
+///   a Mux.Cool substream with the flow addon (or reports unsupported
+///   without the `mux` feature)
 /// - `reality-opts.short-id` given as a bare YAML number (e.g. `0x1f`) —
 ///   coerced to its decimal digits before hex-decoding (matching mihomo),
 ///   which can silently reinterpret the value; quote it to preserve the
@@ -2495,8 +2763,10 @@ fn parse_vless(
         tracing::warn!(
             proxy = %name,
             "flow: xtls-rprx-vision applies to TCP only; UDP relays on \
-             this proxy will use plain VLESS (Vision's inner-TLS splice \
-             is not defined for UDP datagrams). (Class B divergence)"
+             this proxy ride a per-association Mux.Cool substream carrying \
+             the flow addon (as upstream clients do — strict servers reject \
+             a bare Cmd::Udp on vision accounts). Without the `mux` feature \
+             this node reports `udp: false`. (Class B divergence)"
         );
     }
 
@@ -2787,7 +3057,7 @@ fn parse_mux_options(
         Some(other) => {
             return Err(format!(
                 "{name}: mux option 'protocol' must be a string, got {other:?}"
-            ))
+            ));
         }
     };
     let Some(protocol) = meow_proxy::mux::Protocol::parse(protocol_str) else {
@@ -4830,6 +5100,41 @@ tls: true
         assert!(parse_proxy(&on).unwrap().support_udp());
     }
 
+    /// `dialer-proxy` injects into anytls (Batch 2): the vendored client
+    /// threads every session's transport through the chained dialer, so
+    /// the parse accepts it and `dialing_through` records the hop. A
+    /// `NamedProxyDialer` reports `is_proxy()` without resolving — target
+    /// lookup only happens at dial time.
+    #[cfg(feature = "anytls")]
+    #[tokio::test]
+    async fn parse_anytls_accepts_dialer_proxy_injection() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+
+        let cfg = anytls_config(&format!("{ANYTLS_BASE}dialer-proxy: front\n"));
+        let chained = super::parse_proxy_with_dialer(&cfg, &dialer, false)
+            .expect("anytls must accept an injected dialer");
+        assert!(chained.has_configured_dialer());
+
+        // `udp: true` still advertises UDP over the chain — UoT rides the
+        // same chained session, so it only needs the front to carry TCP.
+        let cfg_udp = anytls_config(&format!("{ANYTLS_BASE}udp: true\ndialer-proxy: front\n"));
+        let chained_udp = super::parse_proxy_with_dialer(&cfg_udp, &dialer, false)
+            .expect("anytls + udp must accept an injected dialer");
+        assert!(chained_udp.support_udp());
+        assert!(chained_udp.has_configured_dialer());
+
+        // The no-op `DirectDialer` leaves the plain parse untouched: no
+        // chain is reported for an unchained node.
+        let direct: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(meow_proxy::dialer::DirectDialer);
+        let plain = super::parse_proxy_with_dialer(&cfg, &direct, false).expect("unchained parse");
+        assert!(!plain.has_configured_dialer());
+    }
+
     #[cfg(feature = "anytls")]
     const ANYTLS_BASE: &str =
         "name: jp\ntype: anytls\nserver: 1.2.3.4\nport: 443\npassword: secret\n";
@@ -4961,6 +5266,49 @@ tls: true
             "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: secret\n",
         );
         assert!(parse_proxy(&cfg).is_ok());
+    }
+
+    /// `quic-connections` — the K-way pool knob (spec ITEM A): absent is
+    /// `None` (adapter default), a present integer clamps to 1..=8, a
+    /// non-integer is a hard error like the window fields.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn parse_hysteria2_quic_connections() {
+        use serde_json::json;
+
+        let parse = |value: serde_json::Value| parse_hy2_quic_connections("t", Some(&value));
+        assert_eq!(parse(json!(1)).unwrap(), Some(1));
+        assert_eq!(parse(json!(4)).unwrap(), Some(4));
+        assert_eq!(parse(json!(8)).unwrap(), Some(8));
+        assert_eq!(
+            parse(json!(0)).unwrap(),
+            Some(1),
+            "0 clamps up to the pool floor"
+        );
+        assert_eq!(
+            parse(json!(42)).unwrap(),
+            Some(meow_proxy::MAX_QUIC_CONNECTIONS),
+            "past the ceiling clamps down"
+        );
+        assert!(parse(json!("two")).is_err(), "non-integer is a hard error");
+        assert_eq!(
+            parse_hy2_quic_connections("t", None).unwrap(),
+            None,
+            "absent stays unset for the adapter default"
+        );
+
+        // End to end through the proxy block.
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: secret\nquic-connections: 3\n",
+        );
+        assert!(parse_proxy(&cfg).is_ok());
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 443\npassword: secret\nquic-connections: two\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("a non-integer quic-connections must not be ignored");
+        };
+        assert!(err.contains("quic-connections"), "msg: {err}");
     }
 
     #[cfg(feature = "hysteria2")]
@@ -5119,6 +5467,96 @@ tls: true
         assert!(parse_proxy(&cfg).is_ok());
     }
 
+    /// A `dialer-proxy` chain binds the QUIC endpoint to one front UDP
+    /// association, so `ports`/`hop-interval` can never take effect: the
+    /// parser warns once and drops them instead of rejecting a config the
+    /// operator may share with an unchained build.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn hysteria2_dialer_proxy_warns_and_drops_hopping_fields() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '443,8443'\nhop-interval: 10-30\npassword: secret\n",
+        );
+        let (parsed, logs) = capture_warns(|| super::parse_proxy_with_dialer(&cfg, &dialer, true));
+        parsed.expect("hopping fields under dialer-proxy warn, not error");
+        assert!(
+            logs.contains("ports`/`hop-interval` are ignored"),
+            "expected the hopping warning, got: {logs}"
+        );
+        // Without the chain the same fields stay: direct builds keep the
+        // hop behaviour the config asked for.
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '443,8443'\nhop-interval: 10-30\npassword: secret\n",
+        );
+        let (_, logs) = capture_warns(|| parse_proxy(&cfg).unwrap());
+        assert!(
+            !logs.contains("ports`/`hop-interval"),
+            "an unchained node must not warn, got: {logs}"
+        );
+    }
+
+    /// A `ports`-only hysteria2 node (and the `port: 0` spelling of one)
+    /// has no `port` field for the hop record — but the chain still dials
+    /// one endpoint, the range's first port. `dialing_through` must fall
+    /// back to it or `dialer_hop`/`has_configured_dialer` lose the chain.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn hysteria2_ports_only_chain_records_the_hop() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+        for yaml in [
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nports: '443,8443-8446'\npassword: secret\n",
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 0\nports: '443,8443'\npassword: secret\n",
+        ] {
+            let cfg = hy2_config(yaml);
+            let parsed = super::parse_proxy_with_dialer(&cfg, &dialer, true)
+                .unwrap_or_else(|e| panic!("ports-only chain must parse: {e}"));
+            assert!(
+                parsed.has_configured_dialer(),
+                "the declared chain must survive a `ports`-only config"
+            );
+            let wrapped = parsed
+                .as_any()
+                .and_then(|any| any.downcast_ref::<WrappedProxy>())
+                .expect("a parsed leaf sits behind WrappedProxy");
+            assert_eq!(
+                wrapped.hop.as_ref().map(|hop| hop.port),
+                Some(443),
+                "the hop endpoint is the range's first port"
+            );
+        }
+    }
+
+    /// An explicit `port:` always wins over the `ports:` range — the hop
+    /// must record the address the QUIC socket actually dials.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn hysteria2_explicit_port_beats_ports_range_for_the_hop() {
+        use meow_proxy::dialer::{DialerTarget, NamedProxyDialer, ProxyRegistry};
+
+        let registry = ProxyRegistry::default();
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(NamedProxyDialer::new(DialerTarget::new("front", &registry)));
+        let cfg = hy2_config(
+            "name: jp-hy2\ntype: hysteria2\nserver: 1.2.3.4\nport: 9443\nports: '443,8443'\npassword: secret\n",
+        );
+        let parsed = super::parse_proxy_with_dialer(&cfg, &dialer, true)
+            .unwrap_or_else(|e| panic!("explicit-port chain must parse: {e}"));
+        let wrapped = parsed
+            .as_any()
+            .and_then(|any| any.downcast_ref::<WrappedProxy>())
+            .expect("a parsed leaf sits behind WrappedProxy");
+        assert_eq!(wrapped.hop.as_ref().map(|hop| hop.port), Some(9443));
+    }
+
     #[cfg(feature = "hysteria2")]
     #[test]
     fn parse_hysteria2_accepts_zero_and_positive_windows() {
@@ -5259,6 +5697,65 @@ tls: true
             };
             assert!(err.contains(needle), "{yaml:?} → {err}");
         }
+    }
+
+    /// The `ChainedProxy` marker forwards every `Proxy` view to the
+    /// injected leaf — only `is_dialer_proxy_non_transparent` differs
+    /// (issue #969). Exercised over a `SelectorGroup` inner so the member
+    /// views have observable values; a leaf inner answers `None` for those
+    /// either way and would prove nothing about the delegation.
+    #[test]
+    fn chained_proxy_delegates_alive_and_member_proxies() {
+        let member: Arc<dyn Proxy> = Arc::new(WrappedProxy::new(Box::new(DirectAdapter::new())));
+        let group = SelectorGroup::new("front", vec![Arc::clone(&member)]);
+        let chained = ChainedProxy::new(Arc::new(group));
+
+        assert!(chained.alive(), "delegated liveness starts alive");
+        member.health().set_alive(false);
+        assert!(
+            !chained.alive(),
+            "a dead inner must read dead through the marker"
+        );
+        assert!(!chained.alive_for_url("http://x"));
+        member.health().record_delay(321);
+        assert_eq!(chained.last_delay(), 321, "delay delegates");
+        assert_eq!(chained.delay_history().len(), 1, "history delegates");
+
+        assert_eq!(
+            chained.members().expect("members delegate"),
+            vec!["DIRECT".to_string()]
+        );
+        let members = chained.member_proxies().expect("member_proxies delegate");
+        assert_eq!(members.len(), 1);
+        assert!(
+            Arc::ptr_eq(&members[0], &member),
+            "the marker must hand back the inner's own member list"
+        );
+        assert_eq!(chained.current().as_deref(), Some("DIRECT"));
+
+        // Verbatim delegation, not invention: the inner's capability,
+        // group-only views and `as_any` target all survive the wrap —
+        // `as_any` still resolves the *inner* concrete type.
+        assert!(
+            chained.support_udp(),
+            "support_udp propagates the inner advertisement"
+        );
+        assert!(!chained.has_configured_dialer());
+        assert!(chained.selection().is_some(), "selection delegates");
+        assert!(
+            chained
+                .as_any()
+                .and_then(|any| any.downcast_ref::<SelectorGroup>())
+                .is_some(),
+            "as_any must reach the inner SelectorGroup, not the marker"
+        );
+
+        // The marker's single verdict (issue #969): the chained entry
+        // reports `!inner.support_udp()` — this inner advertises UDP, so
+        // the marker is `false` (a UDP flow rides the chain; there is
+        // nothing to fail closed on). A UDP-incapable inner marks `true`
+        // — see the leaf-level tests for that half.
+        assert!(!chained.is_dialer_proxy_non_transparent());
     }
 
     // ─── Load-balance strategy parser (F1-F7) ────────────────────────────────

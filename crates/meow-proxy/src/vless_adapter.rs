@@ -24,11 +24,15 @@ use smol_str::SmolStr;
 use tracing::debug;
 
 #[cfg(feature = "mux")]
-use crate::mux::{MuxClient, MuxOptions};
+use crate::mux::{DialFn, MuxClient, MuxOptions, Protocol};
 use crate::stream_conn::StreamConn;
 use crate::transport_chain::TransportChain;
 use crate::vless::{addr_from_metadata, Cmd, VlessConn, VlessPacketConn};
 use std::sync::Arc;
+use std::time::Instant;
+
+#[cfg(all(feature = "mux", feature = "vless-vision"))]
+use std::sync::atomic::{AtomicBool, Ordering};
 
 #[cfg(feature = "vless-vision")]
 use crate::vless::VisionConn;
@@ -48,6 +52,24 @@ pub enum VlessFlow {
 
 // ─── Adapter ─────────────────────────────────────────────────────────────────
 
+/// Per-call connect-phase timings of [`VlessAdapter::dial_stream`], in
+/// milliseconds as `f64` (the measured phases are mostly sub-millisecond on
+/// loopback rigs).  `dial_tcp` / `connect_over` report them as the
+/// `vless connect breakdown` debug line.
+#[derive(Debug, Default, Clone, Copy)]
+struct DialPhases {
+    /// `dialer.dial` — the direct TCP connect, or the front hop's whole
+    /// dial on a `dialer-proxy` chain (its own transport handshake folds
+    /// in here).
+    tcp_ms: f64,
+    /// `transport.connect(_shared)` plus the VLESS Encryption handshake —
+    /// the BoringSSL handshake for a `tls: true` node.
+    transport_ms: f64,
+    /// The stream came off a multiplexed transport's shared conn: no dial
+    /// or transport handshake ran, so the phases above read 0.
+    reused: bool,
+}
+
 /// VLESS outbound proxy adapter.
 pub struct VlessAdapter {
     name: SmolStr,
@@ -62,6 +84,12 @@ pub struct VlessAdapter {
     /// sing-mux compatible connection multiplexing (optional).
     #[cfg(feature = "mux")]
     mux: Option<Arc<MuxClient>>,
+    /// Warn-once latch: a vision node falling back to a bare `Cmd::Udp`
+    /// request (a domain UDP target Mux.Cool cannot express, or
+    /// `only-tcp`) is rejected by strict servers as a flow mismatch —
+    /// surface that once per adapter, not per association.
+    #[cfg(all(feature = "mux", feature = "vless-vision"))]
+    vision_udp_bare_warned: AtomicBool,
     /// VLESS post-quantum Encryption (`mlkem768x25519plus`), applied below the
     /// VLESS header exchange once per dial. `None` for plain VLESS.
     #[cfg(feature = "vless-encryption")]
@@ -101,6 +129,8 @@ impl VlessAdapter {
             dialer,
             #[cfg(feature = "mux")]
             mux: None,
+            #[cfg(all(feature = "mux", feature = "vless-vision"))]
+            vision_udp_bare_warned: AtomicBool::new(false),
             #[cfg(feature = "vless-encryption")]
             encryption: None,
             health: ProxyHealth::new(),
@@ -117,7 +147,20 @@ impl VlessAdapter {
     ///   (CommandMux 0x03, no address); server must be Xray / sing-box.
     #[cfg(feature = "mux")]
     pub fn with_mux(mut self, options: MuxOptions) -> Self {
-        use crate::mux::{MuxClient, Protocol, MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
+        self.mux = Some(MuxClient::new(self.mux_dial_fn(options.protocol), options));
+        self
+    }
+
+    /// The session dial shared by the configured mux pool and by the
+    /// per-association Mux.Cool session `dial_udp` builds for a vision
+    /// node: `self.dialer` (so `dialer-proxy` chains still apply) →
+    /// transport chain → Encryption handshake → VLESS request for
+    /// `protocol` (smux/yamux/h2mux target `sp.mux.sing-box.arpa:444`
+    /// with `Cmd::Tcp`; muxcool is the `Cmd::Mux` CommandMux request,
+    /// Vision-wrapped first when a flow is set).
+    #[cfg(feature = "mux")]
+    fn mux_dial_fn(&self, protocol: Protocol) -> DialFn {
+        use crate::mux::{MUX_DESTINATION_FQDN, MUX_DESTINATION_PORT};
         use crate::vless::header::VlessAddr;
         use std::sync::Arc as StdArc;
 
@@ -127,11 +170,10 @@ impl VlessAdapter {
         let transport = StdArc::clone(&self.transport);
         let flow = self.flow;
         let dialer = Arc::clone(&self.dialer);
-        let protocol = options.protocol;
         #[cfg(feature = "vless-encryption")]
         let encryption = self.encryption.clone();
 
-        let dial: crate::mux::DialFn = StdArc::new(move || {
+        let dial: DialFn = StdArc::new(move || {
             let server = server.clone();
             let transport = StdArc::clone(&transport);
             let dialer = Arc::clone(&dialer);
@@ -209,8 +251,45 @@ impl VlessAdapter {
                 }
             })
         });
-        self.mux = Some(MuxClient::new(dial, options));
-        self
+        dial
+    }
+
+    /// Vision UDP: one Mux.Cool session per association — the physical
+    /// VLESS request is CommandMux (0x03) carrying the
+    /// xtls-rprx-vision addon inside the first Vision record
+    /// (`VlessConn::new_mux_deferred` + `VisionConn` in `mux_dial_fn`),
+    /// and `MuxClient::open_packet_stream_for` opens the `network=UDP`
+    /// substream on it.
+    ///
+    /// `self.mux` is deliberately not reused: the association gets a
+    /// session of its own, mirroring the per-association
+    /// `VlessPacketConn` the bare path hands out and keeping UDP off
+    /// the TCP stream pool.  `Ok(None)` means the mux path declined —
+    /// a `domain_udp_target` (Mux.Cool frames carry an `IpAddr`, not a
+    /// name, per datagram); the caller warns once and falls back to the
+    /// bare `Cmd::Udp` request.
+    ///
+    /// The caller does not drop the session early: `muxcool::PacketConn`
+    /// pins the session for the association's life, and the transient
+    /// `MuxClient` owns nothing else once this returns.
+    #[cfg(all(feature = "mux", feature = "vless-vision"))]
+    async fn dial_udp_vision(
+        &self,
+        metadata: &Metadata,
+    ) -> Result<Option<Box<dyn ProxyPacketConn>>> {
+        debug!(
+            "VLESS vision UDP (Mux.Cool) connecting to {} via {}",
+            metadata.remote_address(),
+            self.addr_str
+        );
+        let mux = MuxClient::new(
+            self.mux_dial_fn(Protocol::MuxCool),
+            MuxOptions {
+                protocol: Protocol::MuxCool,
+                ..MuxOptions::default()
+            },
+        );
+        mux.open_packet_stream_for(metadata, "vless").await
     }
 
     /// Attach a VLESS Encryption client (`encryption: mlkem768x25519plus…`).
@@ -222,27 +301,43 @@ impl VlessAdapter {
     }
 
     /// Dial a raw TCP + transport-chain stream to the VLESS server, then run the
-    /// VLESS Encryption handshake if one is configured.
-    async fn dial_stream(&self, internal: bool) -> Result<Box<dyn meow_transport::Stream>> {
+    /// VLESS Encryption handshake if one is configured.  Returns the stream
+    /// plus the per-phase timings [`dial_tcp`](ProxyAdapter::dial_tcp) reports
+    /// as the `vless connect breakdown` debug line.
+    async fn dial_stream(
+        &self,
+        internal: bool,
+    ) -> Result<(Box<dyn meow_transport::Stream>, DialPhases)> {
+        let mut phases = DialPhases::default();
         // A user dial straight to the server shares a multiplexed
         // (gRPC/xhttp) connection; probes and `dialer-proxy` chains keep
         // their own.
         let shared = !internal && !self.dialer.is_proxy();
         if shared {
             if let Some(stream) = self.transport.reuse().await {
-                return self.encrypt(stream).await;
+                phases.reused = true;
+                let t = Instant::now();
+                let stream = self.encrypt(stream).await?;
+                phases.transport_ms = t.elapsed().as_secs_f64() * 1000.0;
+                return Ok((stream, phases));
             }
         }
+        let t = Instant::now();
         let stream = self
             .dialer
             .dial(&self.server, self.port, internal)
             .await
             .map_err(MeowError::Io)?;
-        if shared {
+        phases.tcp_ms = t.elapsed().as_secs_f64() * 1000.0;
+        let t = Instant::now();
+        let stream = if shared {
             let stream = self.transport.connect_shared(stream).await?;
-            return self.encrypt(stream).await;
-        }
-        self.wrap_stream(stream).await
+            self.encrypt(stream).await?
+        } else {
+            self.wrap_stream(stream).await?
+        };
+        phases.transport_ms = t.elapsed().as_secs_f64() * 1000.0;
+        Ok((stream, phases))
     }
 
     /// The VLESS Encryption handshake, when one is configured.
@@ -346,10 +441,32 @@ impl ProxyAdapter for VlessAdapter {
     }
 
     fn support_udp(&self) -> bool {
+        // With the `mux` + `vless-vision` pair compiled in, a vision
+        // node's UDP rides a per-association Mux.Cool session — `self.udp`
+        // covers it.  Without them there is no wire shape a strict server
+        // accepts: a bare `Cmd::Udp` request carries no flow addon and
+        // xray / sing-box ≥1.12 (vendored sing-vmess `vless.Service`
+        // checks `request.Flow == account.Flow` on every command) reject
+        // the mismatch, so the capability stays off rather than promising
+        // a conn that blackholes.
+        #[cfg(all(feature = "mux", feature = "vless-vision"))]
+        let plain_udp = self.udp
+            // A vision node whose configured mux pool is `only-tcp` has
+            // no accepted wire shape: the pool declines UDP, the
+            // transient session is skipped (a configured pool wins),
+            // and strict servers reject the bare fallback — advertise
+            // honestly instead of promising a conn that blackholes.
+            && !(matches!(self.flow, Some(VlessFlow::XtlsRprxVision))
+                && self
+                    .mux
+                    .as_ref()
+                    .is_some_and(|m| !m.supports_udp()));
+        #[cfg(not(all(feature = "mux", feature = "vless-vision")))]
+        let plain_udp = self.udp && self.flow.is_none();
         // With mux enabled, UDP rides the mux TCP session (unless
         // `only-tcp` forces the plain path) — mirrors mihomo's
         // SingMux.SupportUDP.
-        self.udp || {
+        plain_udp || {
             #[cfg(feature = "mux")]
             {
                 self.mux.as_ref().is_some_and(|mux| mux.supports_udp())
@@ -375,8 +492,27 @@ impl ProxyAdapter for VlessAdapter {
             return Ok(Box::new(conn));
         }
 
-        let stream = self.dial_stream(metadata.is_internal()).await?;
-        self.handshake_tcp(stream, metadata).await
+        let t0 = Instant::now();
+        let (stream, phases) = self.dial_stream(metadata.is_internal()).await?;
+        let t1 = Instant::now();
+        let conn = self.handshake_tcp(stream, metadata).await?;
+        // Establish breakdown: `tcp_ms` is the raw/front-hop dial
+        // (`dialer-proxy` chains fold their front hop into it), `tls_ms`
+        // the transport chain (BoringSSL handshake for `tls: true`),
+        // `vless_ms` the VLESS request exchange — ~0 under Vision, whose
+        // header is deferred into the first padded write (timed there as
+        // `vision first payload write` / `vision first server data`).
+        debug!(
+            proxy = %self.name,
+            dst = %metadata.remote_address(),
+            tcp_ms = phases.tcp_ms,
+            tls_ms = phases.transport_ms,
+            vless_ms = t1.elapsed().as_secs_f64() * 1000.0,
+            total_ms = t0.elapsed().as_secs_f64() * 1000.0,
+            reused = phases.reused,
+            "vless connect breakdown"
+        );
+        Ok(conn)
     }
 
     /// Run the VLESS handshake over an existing stream (relay chain).
@@ -394,8 +530,21 @@ impl ProxyAdapter for VlessAdapter {
         if self.mux.is_some() {
             debug!("VLESS mux bypassed on relay-supplied stream (single-use)");
         }
+        let t0 = Instant::now();
         let stream = self.wrap_stream(Box::new(stream)).await?;
-        self.handshake_tcp(stream, metadata).await
+        let t1 = Instant::now();
+        let conn = self.handshake_tcp(stream, metadata).await?;
+        debug!(
+            proxy = %self.name,
+            dst = %metadata.remote_address(),
+            tcp_ms = 0.0,
+            tls_ms = (t1 - t0).as_secs_f64() * 1000.0,
+            vless_ms = t1.elapsed().as_secs_f64() * 1000.0,
+            total_ms = t0.elapsed().as_secs_f64() * 1000.0,
+            relay = true,
+            "vless connect breakdown"
+        );
+        Ok(conn)
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
@@ -413,7 +562,58 @@ impl ProxyAdapter for VlessAdapter {
             }
         }
 
-        // Vision is TCP-only; UDP always uses plain VlessConn regardless of flow.
+        // A vision node with no configured mux pool still cannot emit a
+        // bare `Cmd::Udp` request — strict servers reject its missing
+        // flow addon.  Route the association through its own Mux.Cool
+        // session instead (CommandMux request + xtls-rprx-vision addon +
+        // `network=UDP` substream), the wire shape xray / mihomo /
+        // sing-box clients use.
+        #[cfg(all(feature = "mux", feature = "vless-vision"))]
+        if self.mux.is_none() && matches!(self.flow, Some(VlessFlow::XtlsRprxVision)) {
+            if let Some(conn) = self.dial_udp_vision(metadata).await? {
+                return Ok(conn);
+            }
+        }
+
+        // Reaching the bare `Cmd::Udp` request for a flow user means the
+        // Mux.Cool route declined — a domain UDP target it cannot express
+        // (or `only-tcp` on the configured pool).  Strict servers reject
+        // the flow mismatch; warn once, then attempt the request anyway
+        // for tolerant listeners rather than silently blackholing.
+        #[cfg(all(feature = "mux", feature = "vless-vision"))]
+        if matches!(self.flow, Some(VlessFlow::XtlsRprxVision))
+            && !self.vision_udp_bare_warned.swap(true, Ordering::Relaxed)
+        {
+            let reason = if self.mux.as_ref().is_some_and(|m| !m.supports_udp()) {
+                "the configured mux pool is only-tcp"
+            } else {
+                "Mux.Cool cannot express a domain UDP target"
+            };
+            tracing::warn!(
+                proxy = %self.name,
+                "vless: UDP for flow xtls-rprx-vision fell back to a bare Cmd::Udp request \
+                 ({reason}): strict servers \
+                 (xray, sing-box >=1.12) reject it as a flow mismatch"
+            );
+        }
+
+        // Without the `mux` + `vless-vision` pair compiled in there is no
+        // wire shape a strict server accepts for vision UDP — refuse as a
+        // capability error (matching `support_udp`) rather than return a
+        // conn that blackholes.
+        #[cfg(not(all(feature = "mux", feature = "vless-vision")))]
+        if matches!(self.flow, Some(VlessFlow::XtlsRprxVision)) {
+            return Err(MeowError::NotSupported(format!(
+                "vless '{}': xtls-rprx-vision UDP needs a Mux.Cool session — \
+                 rebuild with the `mux` and `vless-vision` features (a bare \
+                 Cmd::Udp request carries no flow addon and strict servers \
+                 reject it)",
+                self.name
+            )));
+        }
+
+        // Non-vision UDP is the plain VLESS `Cmd::Udp` request — no flow
+        // addon, matching every upstream client.
         debug!(
             "VLESS UDP connecting to {} via {}",
             metadata.remote_address(),
@@ -426,7 +626,7 @@ impl ProxyAdapter for VlessAdapter {
         // frame (issue #657).  Checked before dialing so the refusal costs
         // no handshake.
         let addr = addr_from_metadata(metadata).map_err(MeowError::NotSupported)?;
-        let stream = self.dial_stream(metadata.is_internal()).await?;
+        let (stream, _phases) = self.dial_stream(metadata.is_internal()).await?;
 
         let conn = VlessPacketConn::new(stream, &self.uuid_bytes, metadata.dst_port, &addr).await?;
 
@@ -564,15 +764,49 @@ mod tests {
         let _a = make_adapter(Some(VlessFlow::XtlsRprxVision), false);
     }
 
-    // ─── E6: dial_udp ignores Vision flow (guard-rail) ───────────────────────
+    // ─── E6: vision UDP capability tracks the Mux.Cool route ─────────────────
 
-    // This is tested at runtime in the integration tests.
-    // The compile-time check: dial_udp should always compile regardless of flow.
+    // Runtime behavior is covered by the `vision_udp_mux` integration
+    // tests.  With the `mux` + `vless-vision` pair compiled in, a
+    // per-association Mux.Cool session carries vision UDP, so `udp: true`
+    // advertises the capability.
+    #[cfg(all(feature = "mux", feature = "vless-vision"))]
     #[test]
-    fn vless_udp_ignores_vision_flow_compiles() {
-        // Just verify the adapter compiles with XtlsRprxVision + udp: true.
-        #[cfg(feature = "vless-vision")]
-        let _ = make_adapter(Some(VlessFlow::XtlsRprxVision), true);
-        let _ = make_adapter(None, true);
+    fn vless_vision_udp_supported_via_muxcool() {
+        assert!(make_adapter(Some(VlessFlow::XtlsRprxVision), true).support_udp());
+        assert!(!make_adapter(Some(VlessFlow::XtlsRprxVision), false).support_udp());
+        assert!(make_adapter(None, true).support_udp());
+    }
+
+    // A vision node whose configured mux pool is `only-tcp` has no
+    // accepted wire shape — the pool declines UDP, the transient
+    // session is skipped (a configured pool wins), and strict servers
+    // reject the bare fallback — so it advertises no UDP capability.
+    // A non-vision node on the same pool still carries `Cmd::Udp`.
+    #[cfg(all(feature = "mux", feature = "vless-vision"))]
+    #[test]
+    fn vless_vision_udp_unsupported_with_only_tcp_pool() {
+        let vision = make_adapter(Some(VlessFlow::XtlsRprxVision), true).with_mux(MuxOptions {
+            protocol: Protocol::MuxCool,
+            only_tcp: true,
+            ..MuxOptions::default()
+        });
+        assert!(!vision.support_udp());
+        let plain = make_adapter(None, true).with_mux(MuxOptions {
+            protocol: Protocol::MuxCool,
+            only_tcp: true,
+            ..MuxOptions::default()
+        });
+        assert!(plain.support_udp());
+    }
+
+    // Without the mux pair there is no wire shape a strict server accepts
+    // for a flow user's UDP — `support_udp` stays off so a group does not
+    // pick the member for UDP; non-vision UDP is unchanged.
+    #[cfg(not(all(feature = "mux", feature = "vless-vision")))]
+    #[test]
+    fn vless_vision_udp_unsupported_without_muxcool() {
+        assert!(!make_adapter(Some(VlessFlow::XtlsRprxVision), true).support_udp());
+        assert!(make_adapter(None, true).support_udp());
     }
 }

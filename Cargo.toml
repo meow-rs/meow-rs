@@ -33,6 +33,16 @@ opt-level = "z"
 [profile.release.package.smoltcp]
 opt-level = 3
 
+# quiche's packet/STREAM frame processing is the hysteria2 data-plane hot
+# path; shadowsocks' AEAD is on every SS packet (and every front-hopped
+# QUIC datagram under `dialer-proxy`). Same `opt-level = "z"` penalty,
+# same single-crate exemption as smoltcp above.
+[profile.release.package.quiche]
+opt-level = 3
+
+[profile.release.package.shadowsocks]
+opt-level = 3
+
 # Profile for dhat heap profiling — keeps debug symbols, no strip, no LTO.
 [profile.dhat]
 inherits = "release"

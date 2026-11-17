@@ -798,6 +798,10 @@ impl ProxyAdapter for Socks5Adapter {
             .await
             .map_err(MeowError::Io)?;
         socket.connect(relay_addr).await.map_err(MeowError::Io)?;
+        // A chained QUIC transport can ride this association — same
+        // receive-buffer headroom as the QUIC raw path (see
+        // `enlarge_udp_recv_buffer`).
+        meow_common::enlarge_udp_recv_buffer(&socket);
 
         Ok(Box::new(Socks5UdpConn {
             transport: Socks5UdpTransport::Raw(socket),

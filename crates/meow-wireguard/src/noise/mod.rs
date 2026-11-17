@@ -158,9 +158,15 @@ pub enum Packet<'a> {
 pub struct SessionHandle(pub(crate) Arc<session::SessionCrypto>);
 
 impl SessionHandle {
-    /// The in-place open the crypto pool runs — identical to the call
-    /// `handle_data_in_place` makes on the ring slot's `Session`,
-    /// exposed on the shared crypto so `&mut Tunn` is not required.
+    /// The in-place open the crypto pool runs — the same index check,
+    /// counter quick-check and AEAD open `handle_data_in_place` makes
+    /// on the ring slot's `Session`, but **without the replay mark**:
+    /// worker completion order is a scheduling artifact, not wire
+    /// order, so a chunk delayed behind another pass's work would mark
+    /// its counters thousands of positions behind the racing
+    /// watermark and `mark_did_receive` would drop every still-valid
+    /// packet in the span. The ordered post-pass calls
+    /// [`mark_received`](Self::mark_received) in wire order instead.
     pub(crate) fn open_in_place(
         &self,
         receiver_idx: u32,
@@ -168,7 +174,16 @@ impl SessionHandle {
         ct_and_tag: &mut [u8],
     ) -> Result<usize, WireGuardError> {
         self.0
-            .receive_packet_data_in_place(receiver_idx, counter, ct_and_tag)
+            .open_packet_data_in_place(receiver_idx, counter, ct_and_tag)
+    }
+
+    /// PATCH(18): the replay mark `open_in_place` deliberately omits.
+    /// The caller's post-pass replays job results in wire order and
+    /// marks here — on the session that actually performed the open —
+    /// so the window advances in arrival order exactly as the fused
+    /// serial decapsulate advances it.
+    pub(crate) fn mark_received(&self, counter: u64) -> Result<(), WireGuardError> {
+        self.0.mark_rx(counter)
     }
 
     /// PATCH(19): block-reserve `n` sending counters on this session,
@@ -357,8 +372,21 @@ impl Tunn {
 
         // If there is no session, queue the packet for future retry
         self.queue_packet(src);
-        // Initiate a new handshake if none is in progress
-        self.format_handshake_initiation(dst, false)
+        // PATCH(20): mint a new initiation when none is in flight — and
+        // re-arm one whose last send is already REKEY_TIMEOUT old, the
+        // way the kernel's `wg_packet_send_queued_handshake_initiation`
+        // resends a stale initiation on packet pressure instead of
+        // dedup'ing on the in-flight state. Upstream's unconditional
+        // `false` meant an unanswered initiation held the dedup for its
+        // whole flight: post-expiry re-handshakes sit InitSent for up to
+        // a REKEY_ATTEMPT_TIME generation while fresh data only queued —
+        // and each generation's `clear_all` wiped that queue — with only
+        // `update_timers`' retransmit ever renewing the wire. The forced
+        // resend is the same call `update_timers` makes on its own
+        // rekey timeout, so the attempt-generation accounting is
+        // unchanged; a fresh in-flight initiation still dedups to
+        // `Done`.
+        self.format_handshake_initiation(dst, self.handshake.is_init_stale())
     }
 
     /// PATCH(18): `decapsulate*`'s verify/dispatch half, split out so a
@@ -1119,6 +1147,81 @@ mod tests {
         assert!(matches!(res, TunnResult::Done), "got {res:?}");
     }
 
+    /// PATCH(20), the dedup side — clock-free on every feature set: a
+    /// freshly minted in-flight initiation is not yet stale, so packet
+    /// pressure inside REKEY_TIMEOUT still reports `Done` exactly as
+    /// upstream did. The stale arm is the mock-instant test below.
+    #[test]
+    fn encapsulate_dedups_fresh_in_flight_initiation() {
+        // Under mock-instant a sibling's `MockClock::advance` could age
+        // the fresh initiation past REKEY_TIMEOUT between the mint and
+        // the assert and flip the verdict — the lock rules that out (a
+        // no-op cost on the real clock).
+        let _clock = TIMER_CLOCK_LOCK.lock();
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let _init = create_handshake_init(&mut my_tun);
+        let mut dst = vec![0u8; 2048];
+        let udp = create_ipv4_udp_packet();
+        assert!(
+            matches!(my_tun.encapsulate(&udp, &mut dst), TunnResult::Done),
+            "a fresh in-flight initiation must dedup, not re-arm"
+        );
+    }
+
+    /// PATCH(20): kernel `wg_packet_send_queued_handshake_initiation`
+    /// parity — once an in-flight initiation is REKEY_TIMEOUT old, the
+    /// next data packet must mint a *new* initiation, not `Done`.
+    /// Pre-fix this arm dedup'd on the in-flight state for the whole
+    /// flight, which is the "UDP never recovers past session expiry"
+    /// mechanism: the datagram queued behind a stale initiation while
+    /// only `update_timers`' retransmit could renew the wire.
+    #[test]
+    #[cfg(feature = "mock-instant")]
+    fn encapsulate_rearms_stale_in_flight_initiation() {
+        // `advance` moves the process-global clock — hold the lock like
+        // every clock-moving test so no sibling assert can observe the
+        // shifted timeline.
+        let _clock = TIMER_CLOCK_LOCK.lock();
+        let (mut my_tun, _their_tun) = create_two_tuns();
+        let mut dst = vec![0u8; 2048];
+        let udp = create_ipv4_udp_packet();
+
+        // One initiation in flight, no session behind it — the state
+        // every post-expiry re-handshake generation sits in.
+        let init = create_handshake_init(&mut my_tun);
+
+        // Inside REKEY_TIMEOUT the packet only queues — the initiation
+        // is fresh, so the in-flight dedup still holds.
+        assert!(matches!(
+            my_tun.encapsulate(&udp, &mut dst),
+            TunnResult::Done
+        ));
+
+        // Past REKEY_TIMEOUT the same call must produce a new
+        // initiation — a different sender index, not a byte replay.
+        crate::mock_instant::MockClock::advance(REKEY_TIMEOUT);
+        let res = my_tun.encapsulate(&udp, &mut dst);
+        let TunnResult::WriteToNetwork(packet_data) = res else {
+            panic!("a stale in-flight initiation must re-arm on packet pressure, got {res:?}");
+        };
+        let resent_idx = match Tunn::parse_incoming_packet(packet_data).unwrap() {
+            Packet::HandshakeInit(p) => p.sender_idx,
+            other => panic!("expected a fresh HandshakeInit, got {other:?}"),
+        };
+        let init_idx = u32::from_le_bytes(init[4..8].try_into().unwrap());
+        assert_ne!(
+            resent_idx, init_idx,
+            "the re-armed initiation is freshly minted, not replayed"
+        );
+
+        // The re-arm is per-REKEY_TIMEOUT, not per-packet — the
+        // just-resent initiation is fresh and dedups again.
+        assert!(
+            matches!(my_tun.encapsulate(&udp, &mut dst), TunnResult::Done),
+            "a just-resent initiation must dedup again"
+        );
+    }
+
     #[test]
     fn one_ip_packet() {
         let (mut my_tun, mut their_tun) = create_two_tuns_and_handshake();
@@ -1202,8 +1305,17 @@ mod tests {
                 "job {pos} (packet {i}) plaintext"
             );
         }
-        // Every counter is now marked on the shared session — a replay
-        // of the first packet must fail through the same handle.
+        // The post-pass marks every counter on the shared session in
+        // wire order — the caller-side half of the D4 contract, where
+        // the worker pass itself now only opens.
+        for job in &jobs {
+            assert!(
+                matches!(job.mark_received(), Ok(())),
+                "wire-order mark must admit every job"
+            );
+        }
+        // A replay of the first packet must now fail through the same
+        // handle — the quick check still sees the landed marks.
         let wire = wires[0].clone();
         let r_idx = u32::from_le_bytes(wire[4..8].try_into().unwrap());
         let counter = u64::from_le_bytes(wire[8..16].try_into().unwrap());
@@ -1222,10 +1334,14 @@ mod tests {
         ));
     }
 
-    /// PATCH(18): the replay-window mutex under real contention — the
-    /// same wire datagram four times in one batch must open exactly
-    /// once: every worker passes the quick check before the winner's
-    /// mark lands, so the losers die on the authoritative mark.
+    /// PATCH(18): the replay window under real contention — the same
+    /// wire datagram four times in one batch. Under the D4 split the
+    /// opens all succeed (nothing is marked yet — a worker's quick
+    /// check cannot see an unmarked sibling), and the *post-pass*
+    /// marks decide in wire order: the first lands, the rest die on
+    /// the authoritative mark — the same verdict the fused path's
+    /// post-open mark produced, now impossible for worker-completion
+    /// jitter to reach ahead of.
     #[test]
     fn parallel_rx_replay_rejection() {
         use crate::crypto_pool::{CryptoJob, CryptoPool};
@@ -1256,19 +1372,57 @@ mod tests {
             .iter()
             .filter(|j| matches!(j.result, Some(Ok(_))))
             .count();
-        let dup = jobs
+        assert_eq!(ok, 4, "unmarked opens all succeed — the mark dedups");
+        let marks: Vec<_> = jobs.iter().map(CryptoJob::mark_received).collect();
+        let landed = marks.iter().filter(|r| r.is_ok()).count();
+        let replayed = marks
             .iter()
-            .filter(|j| {
-                matches!(
-                    j.result,
-                    Some(Err(
-                        WireGuardError::DuplicateCounter | WireGuardError::InvalidCounter
-                    ))
-                )
-            })
+            .filter(|r| matches!(r, Err(WireGuardError::InvalidCounter)))
             .count();
-        assert_eq!(ok, 1, "exactly one duplicate may open");
-        assert_eq!(dup, 3, "the other three must be replay-rejected");
+        assert_eq!(landed, 1, "exactly one copy may mark");
+        assert_eq!(replayed, 3, "the other three die on the mark");
+    }
+
+    /// PATCH(D4): the replay mark must advance in *wire* order, never
+    /// in worker-completion order. Pin it with the failure it fixes:
+    /// open the highest-counter datagram first — a fused open+mark
+    /// would push the watermark past N_BITS and convict every earlier
+    /// datagram as a replay the moment its own open ran the mark. With
+    /// the split, opens never mark, so the tail stays admissible; the
+    /// post-pass then marks in wire order and every counter lands.
+    #[test]
+    fn rx_marks_follow_wire_order_not_completion_order() {
+        let (mut my_tun, their_tun) = create_two_tuns_and_handshake();
+        let mut enc_dst = [0u8; 2048];
+        const N: usize = 2100; // > the 2048-bit replay window
+        let inner = create_ipv4_udp_packet();
+        let wires: Vec<Vec<u8>> = (0..N)
+            .map(|_| {
+                let TunnResult::WriteToNetwork(w) = my_tun.encapsulate(&inner, &mut enc_dst) else {
+                    unreachable!();
+                };
+                w.to_vec()
+            })
+            .collect();
+        let open = |wire: &Vec<u8>| {
+            let r_idx = u32::from_le_bytes(wire[4..8].try_into().unwrap());
+            let counter = u64::from_le_bytes(wire[8..16].try_into().unwrap());
+            let handle = their_tun
+                .session_handle_for(r_idx)
+                .expect("session established");
+            let mut w = wire.clone();
+            let len = wire.len();
+            handle
+                .open_in_place(r_idx, counter, &mut w[DATA_PAYLOAD_OFF..len])
+                .map(|_| (handle, counter))
+        };
+        // The worker-finished-first order: the tail datagram opens
+        // before the head — the exact inversion a stalled chunk made.
+        let (hi_handle, hi_ctr) = open(&wires[N - 1]).expect("tail opens first");
+        let (lo_handle, lo_ctr) = open(&wires[0]).expect("head still opens: unmarked");
+        // Wire order marks: head first, then the tail — both land.
+        assert!(matches!(lo_handle.mark_received(lo_ctr), Ok(())));
+        assert!(matches!(hi_handle.mark_received(hi_ctr), Ok(())));
     }
 
     /// PATCH(18): a session handle outlives its ring slot — the

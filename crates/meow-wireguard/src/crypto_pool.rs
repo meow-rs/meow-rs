@@ -105,11 +105,31 @@ impl CryptoJob {
         }
     }
 
+    /// The replay mark for this job's counter — **post-pass only, in
+    /// wire order**. Workers only `open_in_place` (quick-check + AEAD
+    /// open); marking on a worker would stamp counters in
+    /// chunk-completion order, and a worker parked behind another
+    /// pass's chunk (the pool shares RX opens and TX seals) could push
+    /// a contiguous span thousands of positions behind the watermark
+    /// its siblings advanced, getting every still-valid packet in it
+    /// dropped as a replay. Marked on the session the job captured —
+    /// the one that actually opened — so a mid-batch session rotation
+    /// still marks the window the decrypt used. `NoCurrentSession`
+    /// when the job carried no crypto (its `result` is already that
+    /// same error, so callers never reach this on that path).
+    pub fn mark_received(&self) -> Result<(), WireGuardError> {
+        match &self.crypto {
+            Some(handle) => handle.mark_received(self.counter),
+            None => Err(WireGuardError::NoCurrentSession),
+        }
+    }
+
     /// The AEAD open itself — the only work that travels to a worker
-    /// thread. Index/mutex discipline lives in
-    /// `SessionCrypto::receive_packet_data_in_place`: concurrent opens
-    /// on one session are replay-safe because the counter mark, not the
-    /// quick check, is authoritative under the shared mutex.
+    /// thread. The replay mark deliberately does *not* happen here:
+    /// completion order is a scheduling artifact, so the ordered
+    /// post-pass calls [`mark_received`](Self::mark_received) in wire
+    /// order (see its doc). The quick check inside `open_in_place`
+    /// still pre-screens replays before paying the decrypt.
     fn decrypt(&mut self) {
         self.result = Some(match self.crypto.as_ref() {
             Some(handle) => {

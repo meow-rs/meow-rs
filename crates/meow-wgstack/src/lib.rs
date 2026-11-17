@@ -13,11 +13,12 @@
 use std::collections::VecDeque;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut};
 use meow_common::{ProxyConn, WriteBytes};
 use smoltcp::iface::{Interface, PollResult, SocketSet};
 use smoltcp::phy::{Checksum, Device, DeviceCapabilities, Medium, RxToken, TxToken};
@@ -26,36 +27,74 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::mpsc::{self, error::SendError, OwnedPermit};
 
 mod endpoint;
-pub use endpoint::{BatchEndpoint, Endpoint, ProxyEndpoint};
+pub use endpoint::{BatchEndpoint, BridgedEndpoint, Endpoint, ProxyEndpoint};
 
-/// actor→conn stream events per TCP flow (≈32 × 64 KiB ≈ 2 MiB of read
-/// backpressure per flow — deeper than the 1 MiB smoltcp socket window
-/// so the relay read side, not the channel, is the stall point; the two
-/// layers together bound a saturated flow at ~3 MiB).
-pub const TCP_READ_QUEUE: usize = 32;
+/// actor→conn stream events per TCP flow (≈64 × 64 KiB = 4 MiB of read
+/// backpressure per flow — covers the 4 MiB smoltcp socket window so the
+/// relay read side, not the channel, is the stall point; the two layers
+/// together bound a saturated flow at ~8 MiB).
+pub const TCP_READ_QUEUE: usize = 64;
 /// conn→actor write items per TCP flow.
 pub const TCP_WRITE_QUEUE: usize = 64;
 
 /// Per-socket smoltcp buffers (rx and tx). The rx half doubles as the
 /// advertised TCP window — smoltcp negotiates RFC 7323 window scaling in
-/// SYN (`remote_win_shift = bit_width(capacity) - 16` = 21 - 16 = 5, so
-/// the wire window can grow past the 16-bit field up to the full 1 MiB
-/// buffer), and per-flow throughput caps at `TCP_SOCKET_BUF / RTT`:
-/// 64 KiB held a 140 ms-RTT path to ~0.5 MB/s and 256 KiB to ~1.8 MB/s
-/// (measured on a real KR↔US peer); 1 MiB lifts the cap to ~7.5 MB/s.
-/// Peers that don't answer with `window_scale` fall back to the 16-bit
-/// wire window (~64 KiB cap) silently. Cost: 2 × 1 MiB eagerly
-/// allocated per WG TCP connection — a high-conn-count deployment
-/// should weigh that against its configured connection bound.
+/// SYN (`remote_win_shift = bit_width(capacity) - 16` = 23 - 16 = 7, so
+/// the wire window can grow past the 16-bit field up to the full 4 MiB
+/// buffer), and per-flow *inbound* throughput caps at
+/// `TCP_SOCKET_BUF / RTT`: 64 KiB held a 140 ms-RTT path to ~0.5 MB/s
+/// and 256 KiB to ~1.8 MB/s (measured on a real KR↔US peer); 1 MiB
+/// lifted the cap to ~7.5 MB/s, 4 MiB lifts it to ~30 MB/s. Peers that
+/// don't answer with `window_scale` fall back to the 16-bit wire window
+/// (~64 KiB cap) silently. Cost: 2 × 4 MiB eagerly allocated per WG TCP
+/// connection — a high-conn-count deployment should weigh that against
+/// its configured connection bound.
+///
+/// Note the window only bounds the *download* direction — the C1-gate
+/// measurement (instrumented `dropped_*`/`txq` counters on a sub-ms LAN
+/// rig) showed zero drops anywhere and `txq` saturated by the *peer's*
+/// advertised window: the far end's own receive window ÷ effective RTT
+/// is the upload bound (sing-box's userspace stack ~8 MB/s vs a kernel
+/// TCP peer ~44 MB/s on the same smoltcp path), which this constant
+/// cannot move.
 ///
 /// `pub`: the endpoint socket's kernel receive buffer is sized from this
 /// — a full-window burst arrives as ~this many WG datagrams (see
 /// [`enlarge_recv_buffer`]).
-pub const TCP_SOCKET_BUF: usize = 1024 * 1024;
+pub const TCP_SOCKET_BUF: usize = 4 * 1024 * 1024;
 
 /// Endpoint→Tunn drain bound per loop iteration; excess waits for the next
-/// wake-up rather than starving the rest of the service pass.
-pub const WIRE_DRAIN_BUDGET: usize = 64;
+/// wake-up rather than starving the rest of the service pass. Raised
+/// 64 → 256 (wg-perf): 64 × ~1.4 KB wire datagrams capped a saturated
+/// flow at ~86 KB/pass (~42 MB/s at the measured ~490 pass/s cadence);
+/// 256 lifts the per-pass ceiling to ~345 KB. The macOS `sendmsg_x`/
+/// `recvmsg_x` per-call chunk stays under XNU's 100-datagram clip via
+/// `endpoint`'s `MSGX_CHUNK`, not this constant.
+pub const WIRE_DRAIN_BUDGET: usize = 256;
+
+/// Inner-TX admission bound per service pass — how many `tx_queue`
+/// packets `drain_device_tx` may seal into wire datagrams before the
+/// rest of the pass runs. The unbounded drain it replaces let one pass
+/// stage every saturated socket's full window (≈2 800 datagrams each at
+/// [`POLL_TX_BYTES_BUDGET`]) straight into the outbox and on to the
+/// kernel: a burst that large cannot be absorbed by *any* downstream
+/// UDP receive buffer (macOS caps `SO_RCVBUF` at 8 MiB ≈ 5 800
+/// datagrams), so the peer's kernel silently dropped the tail and the
+/// inner TCP paid a ≥1 s RTO per lost segment — under 16 concurrent
+/// flows the aggregate burst turned ~30 % of the wire into
+/// retransmissions (measured: +124k kernel-buffer drops per 16×4 MiB
+/// run vs +2k for a same-path mihomo run).
+///
+/// Leaving the excess in `tx_queue` is not just the cheap option, it is
+/// the correct one: the queue is FIFO so no per-conn starvation is
+/// possible, its worst-case depth is bounded by the sum of the sockets'
+/// send windows — the same data has to live *somewhere* before the wire
+/// carries it — and the back-pressure then reaches the inner TCP
+/// through the socket's own send-buffer/window machinery instead of a
+/// packet drop. 1 024 datagrams ≈ 1.4 MB per pass stays far below any
+/// conforming `SO_RCVBUF` while keeping emission at `pass_rate × 1024`,
+/// far above the inner flows' ACK-clocked demand.
+pub const TX_DRAIN_BUDGET: usize = 4 * WIRE_DRAIN_BUDGET;
 
 /// Bound on [`Interface::poll`] iterations per service pass — see
 /// [`poll_burst`]. A permanently-progressing pass (a saturated bulk flow
@@ -95,13 +134,44 @@ pub const POLL_BURST: usize = 256;
 /// Under normal WG flow the budget rarely trips at all — `PollResult::
 /// None` exits the burst first (the quiet poll after the stack drains).
 /// The budget is the degenerate-load bound, not the everyday exit.
-pub const POLL_TX_BYTES_BUDGET: usize = 2 * 1024 * 1024;
+///
+/// 4 MiB covers one [`TCP_SOCKET_BUF`]-sized full-window drain in a
+/// single pass so a saturated flow's egress isn't sliced across passes.
+pub const POLL_TX_BYTES_BUDGET: usize = 4 * 1024 * 1024;
+// One pass must stage a whole full-window drain — see the doc above.
+const _: () = assert!(POLL_TX_BYTES_BUDGET >= TCP_SOCKET_BUF);
 
 /// boringtun's own device loop ticks its timers at 250 ms (rekey timeout is
 /// 5 s, jitter ≤ 333 ms — this is well inside slack). Spec §3.4 sketched
 /// 100 ms without naming a constant; the upstream cadence is the better
 /// choice for idle CPU.
 pub const WG_TIMER_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Per-poll ingress bound on `ChannelDevice::rx_queue` (D3): admitted
+/// packets past it stage in `rx_hold` and [`ChannelDevice::fill_rx_queue`]
+/// promotes them between `Interface::poll` iterations. One poll's
+/// socket-service cost is proportional to the ingress it drains —
+/// smoltcp 0.13's `poll` consumes the device queue *completely* — so the
+/// cap is what bounds the pass's largest atomic unit (~1 ms) to keep the
+/// wire-RX heartbeat inside the interval kernel buffering tolerates.
+pub const RX_INGRESS_CAP: usize = 2 * WIRE_DRAIN_BUDGET;
+
+/// Depth cap on `ChannelDevice::tx_queue` (D3): `transmit` reports the
+/// device exhausted past it — smoltcp's `EgressError::Exhausted`, a clean
+/// break out of `socket_egress` — bounding one poll's egress burst the
+/// way [`RX_INGRESS_CAP`] bounds its ingress. Without it a fresh
+/// full-window burst (N flows × [`TCP_SOCKET_BUF`]) can stage ~64 MiB of
+/// segments into one `Interface::poll` call, an atomic stall far past
+/// the ~5 ms kernel-buffer slack. Deferred segments stay in the socket's
+/// tx window losslessly and re-dispatch next poll.
+///
+/// The earlier rejection of a transmit cap (see [`POLL_TX_BYTES_BUDGET`])
+/// argued insertion-order starvation: sockets before the break eat the
+/// whole budget every pass. That was a *per-pass allowance* — here the
+/// cap is queue *depth*, and the unfairness self-limits: a hogging
+/// socket's send window closes after ~[`TCP_SOCKET_BUF`] emitted, it goes
+/// quiet, and the tail sockets dispatch within milliseconds.
+pub const TX_QUEUE_CAP: usize = 2 * TX_DRAIN_BUDGET;
 
 /// Upper bound on `ChannelDevice::tx_pool` residency; buffers returned
 /// past the cap free instead of pooling.
@@ -117,12 +187,44 @@ const TX_POOL_CAP: usize = 128;
 /// reuses the allocation rather than paying a `vec![]` per packet.
 pub struct ChannelDevice {
     pub rx_queue: VecDeque<Bytes>,
+    /// Inner packets admitted past [`RX_INGRESS_CAP`]: the per-poll
+    /// staging area `fill_rx_queue` drains into `rx_queue` between
+    /// `Interface::poll` iterations. FIFO-global with `rx_queue` —
+    /// `push_rx` is the only writer, so ordering is one logical queue.
+    pub rx_hold: VecDeque<Bytes>,
     pub tx_queue: VecDeque<Vec<u8>>,
     pub tx_pool: VecDeque<Vec<u8>>,
     caps: DeviceCapabilities,
 }
 
 impl ChannelDevice {
+    /// Admit one inner packet to the ingress path (D3): straight into
+    /// `rx_queue` while it stays under [`RX_INGRESS_CAP`], else `rx_hold`
+    /// — so a flood's `rx_queue` depth at poll entry, and with it one
+    /// `Interface::poll`'s atomic socket-service cost, is always bounded.
+    /// Once `rx_hold` is nonempty every admit goes there: FIFO order is
+    /// `rx_queue` then `rx_hold`, never interleaved.
+    pub fn push_rx(&mut self, pkt: Bytes) {
+        if self.rx_hold.is_empty() && self.rx_queue.len() < RX_INGRESS_CAP {
+            self.rx_queue.push_back(pkt);
+        } else {
+            self.rx_hold.push_back(pkt);
+        }
+    }
+
+    /// Promote held packets into `rx_queue` up to [`RX_INGRESS_CAP`].
+    /// `Interface::poll` drains the queue completely each call, so the
+    /// caller invokes this *between* polls of one burst — each poll's
+    /// ingress stays bounded while the burst's total stays unlimited.
+    pub fn fill_rx_queue(&mut self) {
+        while self.rx_queue.len() < RX_INGRESS_CAP {
+            match self.rx_hold.pop_front() {
+                Some(p) => self.rx_queue.push_back(p),
+                None => break,
+            }
+        }
+    }
+
     /// Return a drained `tx_queue` buffer to `tx_pool`. The pool is a
     /// peak-water recycler, so cap it — a one-off burst must not pin
     /// MTU-sized allocations for the process lifetime.
@@ -153,6 +255,7 @@ impl ChannelDevice {
         caps.checksum.icmpv6 = Checksum::Tx;
         Self {
             rx_queue: VecDeque::new(),
+            rx_hold: VecDeque::new(),
             tx_queue: VecDeque::new(),
             tx_pool: VecDeque::new(),
             caps,
@@ -214,6 +317,15 @@ impl Device for ChannelDevice {
     }
 
     fn transmit(&mut self, _timestamp: SmolInstant) -> Option<Self::TxToken<'_>> {
+        // [`TX_QUEUE_CAP`]: report the device exhausted rather than stage
+        // an unbounded egress burst — smoltcp maps `None` to
+        // `EgressError::Exhausted` and cleanly defers the socket's
+        // remaining dispatch to the next poll. The paired-token path in
+        // `receive` bypasses the cap: ACK replies to admitted ingress
+        // must not be throttled.
+        if self.tx_queue.len() >= TX_QUEUE_CAP {
+            return None;
+        }
         Some(SmolTxToken {
             queue: &mut self.tx_queue,
             pool: &mut self.tx_pool,
@@ -283,6 +395,142 @@ fn poll_burst_budgeted(
         }
     }
     POLL_BURST
+}
+
+// ── ITEM C1 measurement-gate instrumentation ────────────────────
+//
+// Drop/saturation counters for the inner-UDP-socket hypothesis (WG
+// over a chained UDP hop): observability only — no behavior changes.
+// The two headline counters are [`AtomicU64`]s (the only hot-path
+// atomics added); everything finer is an actor-local `u64` the
+// owning actor folds into its periodic DEBUG snapshot.
+
+/// The first-hit / power-of-two log gate behind [`note_drop`] and
+/// [`note_count`]: the first event always reports; thereafter a bump
+/// reports iff `new` set a bit higher than `prev`'s top bit — i.e.
+/// the total crossed 2, 4, 8, 16, … One bump crossing several powers
+/// reports once, never floods.
+fn log_crossed(prev: u64, new: u64) -> bool {
+    prev == 0 || new.leading_zeros() < prev.leading_zeros()
+}
+
+/// Bump `counter` by `n` and log at the first hit and every
+/// power-of-two crossing — the `note_drop` convention from
+/// meow-proxy's `dialer.rs`/`hysteria2`: a saturated flow stays
+/// observable without flooding the log. Returns the new total.
+pub fn note_drop(counter: &AtomicU64, n: u64, msg: impl std::fmt::Display) -> u64 {
+    let prev = counter.fetch_add(n, Ordering::Relaxed);
+    let new = prev + n;
+    if log_crossed(prev, new) {
+        tracing::debug!(dropped = new, "{msg}");
+    }
+    new
+}
+
+/// [`note_drop`] for an actor-local `u64` — same first-hit /
+/// powers-of-two cadence, no atomic needed off the wire.
+pub fn note_count(counter: &mut u64, n: u64, msg: impl std::fmt::Display) -> u64 {
+    let prev = *counter;
+    *counter += n;
+    let new = *counter;
+    if log_crossed(prev, new) {
+        tracing::debug!(total = new, "{msg}");
+    }
+    new
+}
+
+/// Drop/saturation counters for a WG actor's smoltcp UDP path —
+/// ITEM C1's measurement gate. `dropped_rx`/`dropped_tx` are the two
+/// hot-path atomics; the detail fields are plain `u64`s bumped by
+/// the single-threaded actor and read out via its snapshot/logs.
+///
+/// Directions are the UDP association's, not the wire's:
+/// * **inner→outer (`rx`)** — wire datagrams decrypted into
+///   `ChannelDevice::rx_queue` → `Interface::poll` → smoltcp UDP rx
+///   buffer → conn channel. Loss points: the rx `PacketBuffer` full
+///   inside `udp::Socket::process` (counted by the owning actor's
+///   offered-vs-dequeued diff — smoltcp exposes no drop counter) and
+///   a full conn channel at drain time.
+/// * **outer→inner (`tx`)** — conn datagrams → `send_slice` → smoltcp
+///   UDP tx buffer → `tx_queue`. No-socket-space surfaces as
+///   `BufferFull`/`!can_send` refusals (backpressure, not loss — the
+///   datagram waits in `out`) and rare terminal `Err` drops.
+#[derive(Debug, Default)]
+pub struct DropStats {
+    /// Inner→outer datagrams dropped: `rx_sockbuf_dropped` +
+    /// `rx_chan_dropped` (the two subsets are bumped at their own
+    /// points, then summed here).
+    pub dropped_rx: AtomicU64,
+    /// Outer→inner no-socket-space *events*: `tx_buf_full` +
+    /// `tx_err_dropped`. Stall refusals dominate — they are not lost
+    /// datagrams but are the saturation signal this gate measures.
+    pub dropped_tx: AtomicU64,
+
+    /// Datagrams dropped on a full conn read channel at drain time —
+    /// subset of `dropped_rx`.
+    pub rx_chan_dropped: u64,
+    /// Datagrams `udp::Socket::process` dropped on a full rx buffer —
+    /// the hypothesis-B drop point; subset of `dropped_rx`.
+    pub rx_sockbuf_dropped: u64,
+    /// Times a drain observed the socket rx buffer within ~2 KiB (one
+    /// max-size datagram) of capacity — the always-on saturation
+    /// corroboration for `rx_sockbuf_dropped`.
+    pub rx_buf_full_obs: u64,
+    /// Peak socket rx payload occupancy in bytes (`recv_queue()`)
+    /// sampled at a drain; per-snapshot window, reset by
+    /// `log_socket_stats`.
+    pub rx_occ_max: usize,
+    /// Peak `ChannelDevice::rx_queue` depth in datagrams at the offer
+    /// scan; per-snapshot window, reset by `log_socket_stats`.
+    pub rx_queue_max: usize,
+    /// Send-side refusal events — `send_slice` `BufferFull`, or
+    /// `!can_send()` with queued datagrams (same condition); backpressure,
+    /// not lost datagrams. Subset of `dropped_tx`.
+    pub tx_buf_full: u64,
+    /// Datagrams dropped on `send_slice` terminal errors — subset of
+    /// `dropped_tx`.
+    pub tx_err_dropped: u64,
+    /// `rx_queue` UDP datagrams offered to no bound socket — sanity
+    /// check on the offer scan's port attribution.
+    pub rx_udp_unclaimed: u64,
+    /// Times a service pass found a TCP socket holding queued `Data`
+    /// while `!can_send()` — the send-side stall signature
+    /// (tx-buffer-full or remote-window-0).
+    pub tcp_tx_stall: u64,
+    /// Wire datagrams dropped at endpoint egress — `flush_outbox`'s
+    /// non-`WouldBlock` errno arm (one each) plus the dead-conn
+    /// `outbox.clear()` (the whole queue + the current datagram).
+    pub outbox_dropped: u64,
+}
+
+/// The destination port an inner packet's UDP header carries — `pkt`
+/// is a bare IPv4/IPv6 datagram (the `ChannelDevice` queue shape).
+/// `None` for non-UDP, truncated, non-first-fragment, or v6
+/// extension-header packets (ext-header traversal is deliberately not
+/// done — tunnel UDP flows never carry them, and a miss only
+/// under-counts the scan, never miscounts it).
+pub fn udp_dst_port(pkt: &[u8]) -> Option<u16> {
+    match *pkt.first()? >> 4 {
+        4 => {
+            let ihl = usize::from(pkt[0] & 0x0f) * 4;
+            if ihl < 20 || pkt.len() < ihl + 4 || pkt[9] != 17 {
+                return None;
+            }
+            // Non-first fragments carry no port fields.
+            if u16::from_be_bytes([pkt[6], pkt[7]]) & 0x1fff != 0 {
+                return None;
+            }
+            Some(u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]))
+        }
+        6 => {
+            // Fixed 40-byte header; `next_header` at [6], no ext walk.
+            if pkt.len() < 44 || pkt[6] != 17 {
+                return None;
+            }
+            Some(u16::from_be_bytes([pkt[42], pkt[43]]))
+        }
+        _ => None,
+    }
 }
 
 /// conn→actor TCP items.
@@ -560,16 +808,25 @@ impl AsyncWrite for WgStream {
 }
 
 /// perf-7 P7-1: the conn→actor channel carries `TcpIo::Data(Bytes)`, so
-/// the caller's owned `Bytes` moves straight into a channel slot — the
-/// `poll_write` slice copy (`Bytes::copy_from_slice`) is gone on this
-/// path. The `Option` slot stays the *caller's*: on full channel the
-/// bytes are handed back into it (the relay re-presents them next poll,
-/// its `pos` having never advanced), on success `take()` leaves `None`.
+/// the caller's owned buffer — frozen on the way in — moves straight
+/// into a channel slot: the `poll_write` slice copy
+/// (`Bytes::copy_from_slice`) is gone on this path. The `Option` slot
+/// stays the *caller's*: on full channel the bytes are handed back into
+/// it (the relay re-presents them next poll, its `pos` having never
+/// advanced), on success `take()` leaves `None`.
+///
+/// `want_write_headroom` stays `0` — the WG framing happens in the
+/// peer's `Tunn`, not here; a reserved prefix would only ride the
+/// channel as dead bytes.
 impl WriteBytes for WgStream {
+    fn want_write_headroom(&self) -> usize {
+        0
+    }
+
     fn poll_write_bytes(
         mut self: Pin<&mut Self>,
         cx: &mut Context<'_>,
-        bytes: &mut Option<Bytes>,
+        bytes: &mut Option<BytesMut>,
     ) -> Poll<std::io::Result<()>> {
         if self.write_done {
             return Poll::Ready(Err(stream_broken()));
@@ -604,10 +861,31 @@ impl WriteBytes for WgStream {
             // The caller's slot is the in-flight marker: `None` means an
             // earlier poll already handed the bytes to the channel (or
             // the caller had nothing) — the write is done either way.
-            let Some(b) = bytes.take() else {
+            if bytes.is_none() {
                 return Poll::Ready(Ok(()));
+            }
+            // Claim a send slot BEFORE taking the buffer: the channel
+            // item is `Bytes`-typed, so a `Full` bounce would have to
+            // reconstitute the caller's `BytesMut` — a whole-buffer copy
+            // under every backpressure bounce. With a reserved permit
+            // (or visible capacity) the send below cannot fail `Full`.
+            if self.write_permit.is_none() && self.tx.capacity() == 0 {
+                match self.poll_write_wait(cx) {
+                    Poll::Ready(true) => continue,
+                    Poll::Ready(false) => {
+                        self.write_done = true;
+                        return Poll::Ready(Err(stream_broken()));
+                    }
+                    Poll::Pending => return Poll::Pending,
+                }
+            }
+            let Some(b) = bytes.take() else {
+                unreachable!("checked is_some above");
             };
-            match self.send_item(TcpIo::Data(b)) {
+            // `TcpIo::Data` is `Bytes`-typed; freezing the caller's
+            // `BytesMut` region is a refcount bump on the same
+            // allocation, not a copy.
+            match self.send_item(TcpIo::Data(b.freeze())) {
                 Ok(()) => {
                     self.nudge();
                     return Poll::Ready(Ok(()));
@@ -617,13 +895,18 @@ impl WriteBytes for WgStream {
                     // `pending_write` (which the stream retries itself),
                     // the item stays reachable through this poll entry —
                     // the relay only re-enters the write arm while its
-                    // `pos` is unconsumed, so the parked `Bytes` would
+                    // `pos` is unconsumed, so the parked bytes would
                     // never drain if they moved into `pending_write`
                     // with `pos` already at `cap`.
                     let TcpIo::Data(b) = item else {
                         unreachable!("the item was built from Data above");
                     };
-                    *bytes = Some(b);
+                    // The channel item round-trips as `Bytes`; re-typing
+                    // it back into the caller's `BytesMut` slot is the
+                    // one copy on this path — kept for completeness:
+                    // the capacity pre-check above makes `Full` here
+                    // unreachable absent a second competing sender.
+                    *bytes = Some(BytesMut::from(&b[..]));
                     match self.poll_write_wait(cx) {
                         Poll::Ready(true) => continue,
                         Poll::Ready(false) => {
@@ -653,7 +936,7 @@ impl ProxyConn for WgStream {
 }
 
 /// One full-window inner-TCP burst lands on this socket as ~`TCP_SOCKET_BUF`
-/// bytes of back-to-back WG datagrams (~1.1 MB on the wire at the current
+/// bytes of back-to-back WG datagrams (~4.4 MB on the wire at the current
 /// window — far over the 208 KiB Linux default, which would drop the tail
 /// of every saturated burst and cost an inner-TCP retransmit round). 4×
 /// absorbs bursts from a few saturated flows at once; the kernel commits
@@ -682,8 +965,8 @@ pub fn enlarge_recv_buffer(socket: &tokio::net::UdpSocket) {
 }
 
 /// The send side needs the same headroom as the receive side: one
-/// [`poll_burst`] pass can stage up to `POLL_TX_BYTES_BUDGET` (~2 MiB,
-/// ≈1 400 datagrams at ~1.5 KB) of wire-bound inner segments before its
+/// [`poll_burst`] pass can stage up to `POLL_TX_BYTES_BUDGET` (~4 MiB,
+/// ≈2 800 datagrams at ~1.5 KB) of wire-bound inner segments before its
 /// soft budget trips, handed to the kernel as [`WIRE_DRAIN_BUDGET`]-sized
 /// `send_batch` batches back to back — and the default send buffer is
 /// far smaller than one batch on some platforms: macOS grants only
@@ -848,16 +1131,16 @@ mod tests {
         );
     }
 
-    /// P4-1: `TCP_SOCKET_BUF` is 1 MiB — the rx half's window-scale
-    /// negotiation needs `bit_width(capacity) - 16` ≥ 5 to advertise past
+    /// C1a: `TCP_SOCKET_BUF` is 4 MiB — the rx half's window-scale
+    /// negotiation needs `bit_width(capacity) - 16` = 7 to advertise past
     /// the 16-bit field up to the full buffer, and `ENDPOINT_RECV_BUFFER`
     /// tracks it at 4× automatically. Both halves of the socket buffer
-    /// pair are this size, so a WG TCP connection allocates 2 × 1 MiB —
+    /// pair are this size, so a WG TCP connection allocates 2 × 4 MiB —
     /// pinned here in lieu of heap profiling.
     #[test]
-    fn tcp_socket_buf_is_one_mib() {
-        assert_eq!(TCP_SOCKET_BUF, 1024 * 1024);
-        assert_eq!(ENDPOINT_RECV_BUFFER, 4 * 1024 * 1024);
+    fn tcp_socket_buf_is_four_mib() {
+        assert_eq!(TCP_SOCKET_BUF, 4 * 1024 * 1024);
+        assert_eq!(ENDPOINT_RECV_BUFFER, 16 * 1024 * 1024);
         // The allocation shape every WG TCP socket pays (pump `dial_tcp`
         // and the listener's accept path share this constructor).
         use smoltcp::socket::tcp;
@@ -865,14 +1148,14 @@ mod tests {
         let tx = tcp::SocketBuffer::new(vec![0; TCP_SOCKET_BUF]);
         assert_eq!(
             rx.capacity() + tx.capacity(),
-            2 * 1024 * 1024,
-            "one WG TCP connection holds 2 × 1 MiB of socket buffers"
+            8 * 1024 * 1024,
+            "one WG TCP connection holds 2 × 4 MiB of socket buffers"
         );
         // smoltcp's `remote_win_shift = bit_width(capacity) - 16`; at
-        // 1 MiB that is 21 - 16 = 5 — enough shift to advertise the
+        // 4 MiB that is 23 - 16 = 7 — enough shift to advertise the
         // whole buffer on the wire.
         let shift = usize::BITS as usize - TCP_SOCKET_BUF.leading_zeros() as usize - 16;
-        assert_eq!(shift, 5);
+        assert_eq!(shift, 7);
     }
 
     /// `reset_scratch` contract: a pooled-capacity Vec comes back at
@@ -1048,6 +1331,101 @@ mod tests {
         assert_eq!(POLL_BURST, 256);
     }
 
+    // ── D3: bounded atomic units (RX_INGRESS_CAP / TX_QUEUE_CAP) ───
+
+    /// `push_rx` is the only ingress writer and owns one logical FIFO:
+    /// the first `RX_INGRESS_CAP` packets land in `rx_queue`, the rest
+    /// stage in `rx_hold`, and `fill_rx_queue` promotes them in order —
+    /// the per-poll bound the burst loop relies on.
+    #[test]
+    fn push_rx_caps_poll_ingress_in_fifo_order() {
+        let mut device = ChannelDevice::new(1400);
+        let total = RX_INGRESS_CAP + 10;
+        for i in 0..total {
+            device.push_rx(Bytes::from(vec![(i % 251) as u8; 60]));
+        }
+        assert_eq!(device.rx_queue.len(), RX_INGRESS_CAP);
+        assert_eq!(device.rx_hold.len(), 10);
+
+        // Drain the queue the way `Interface::poll` would, then fill:
+        // the held tail promotes in FIFO order up to the same cap.
+        device.rx_queue.clear();
+        device.fill_rx_queue();
+        assert_eq!(device.rx_queue.len(), 10);
+        assert!(device.rx_hold.is_empty());
+        for (i, pkt) in device.rx_queue.iter().enumerate() {
+            assert_eq!(
+                pkt[0],
+                ((RX_INGRESS_CAP + i) % 251) as u8,
+                "hold must promote in admit order"
+            );
+        }
+    }
+
+    /// Once `rx_hold` is nonempty, fresh admits go to the hold even
+    /// while `rx_queue` is shallow — FIFO order must never interleave
+    /// a newer packet ahead of a held one.
+    #[test]
+    fn push_rx_never_reorders_ahead_of_hold() {
+        let mut device = ChannelDevice::new(1400);
+        for _ in 0..RX_INGRESS_CAP {
+            device.push_rx(Bytes::from(vec![0xAA; 60]));
+        }
+        // Queue full: next admit stages.
+        device.push_rx(Bytes::from(vec![0xBB; 60]));
+        assert_eq!(device.rx_hold.len(), 1);
+        // Pop one from the queue — a new admit must still join the
+        // hold, not jump ahead of the staged packet.
+        device.rx_queue.pop_front();
+        device.push_rx(Bytes::from(vec![0xCC; 60]));
+        assert_eq!(device.rx_hold.len(), 2);
+        assert_eq!(device.rx_hold[1][0], 0xCC);
+    }
+
+    /// `transmit` reports the device exhausted at `TX_QUEUE_CAP` — the
+    /// `EgressError::Exhausted` smoltcp maps to a clean egress break —
+    /// and serves again below it. This is what bounds one poll's
+    /// egress burst the way `RX_INGRESS_CAP` bounds its ingress.
+    #[test]
+    fn transmit_reports_exhausted_at_tx_queue_cap() {
+        let mut device = ChannelDevice::new(1400);
+        for _ in 0..TX_QUEUE_CAP {
+            device.tx_queue.push_back(vec![0u8; 60]);
+        }
+        assert!(
+            device.transmit(SmolInstant::ZERO).is_none(),
+            "a full tx_queue must report exhaustion"
+        );
+        device.tx_queue.pop_front();
+        assert!(
+            device.transmit(SmolInstant::ZERO).is_some(),
+            "one slot below the cap must serve again"
+        );
+    }
+
+    /// The paired-token path (`receive`'s bundled TxToken) bypasses
+    /// the cap — ACK replies to admitted ingress must not be
+    /// throttled — and consumes into `tx_queue` as usual.
+    #[test]
+    fn receive_pair_token_bypasses_tx_cap() {
+        let mut device = ChannelDevice::new(1400);
+        for _ in 0..TX_QUEUE_CAP {
+            device.tx_queue.push_back(vec![0u8; 60]);
+        }
+        device.push_rx(Bytes::from(vec![0x11; 60]));
+        let (rx, tx) = device
+            .receive(SmolInstant::ZERO)
+            .expect("an admitted packet must yield a token pair");
+        let sent = tx.consume(60, |buf| {
+            buf[..60].fill(0x22);
+            60
+        });
+        assert_eq!(sent, 60);
+        assert_eq!(device.tx_queue.len(), TX_QUEUE_CAP + 1);
+        assert_eq!(device.tx_queue.back().unwrap()[0], 0x22);
+        drop(rx);
+    }
+
     // ── perf-7 P7-1: owned-Bytes writes ──────────────────────────
 
     fn test_stream(tx: mpsc::Sender<TcpIo>) -> WgStream {
@@ -1066,15 +1444,15 @@ mod tests {
         }
     }
 
-    /// P7-1: `poll_write_bytes` moves the caller's `Bytes` into the
-    /// channel slot untouched — the `TcpIo::Data` the actor receives is
-    /// the SAME allocation, no `copy_from_slice`.
+    /// P7-1/B3: `poll_write_bytes` moves the caller's `BytesMut` into the
+    /// channel slot as one `freeze` — the `TcpIo::Data` the actor
+    /// receives is the SAME allocation, no `copy_from_slice`.
     #[tokio::test]
     async fn wg_stream_write_bytes_zero_copy() {
         let (tx, mut rx) = mpsc::channel::<TcpIo>(1);
         let mut stream = test_stream(tx);
 
-        let bytes = Bytes::from(vec![7u8; 4096]);
+        let bytes = BytesMut::from(&vec![7u8; 4096][..]);
         let original_ptr = bytes.as_ptr();
         let mut slot = Some(bytes);
         std::future::poll_fn(|cx| Pin::new(&mut stream).poll_write_bytes(cx, &mut slot))
@@ -1101,7 +1479,7 @@ mod tests {
     async fn write_bytes_pending_preserves_ordering() {
         let (tx, mut rx) = mpsc::channel::<TcpIo>(2);
         let mut stream = test_stream(tx);
-        let msgs: Vec<Bytes> = (0..4u8).map(|i| Bytes::from(vec![i; 16])).collect();
+        let msgs: Vec<BytesMut> = (0..4u8).map(|i| BytesMut::from(&vec![i; 16][..])).collect();
 
         // Fill the channel to capacity.
         for m in &msgs[..2] {
@@ -1152,5 +1530,74 @@ mod tests {
                 other => panic!("expected TcpIo::Data, got {other:?}"),
             }
         }
+    }
+
+    // ── ITEM C1 instrumentation ─────────────────────────────────
+
+    /// `udp_dst_port` reads the port out of the same datagram shape
+    /// the offer scan sees on `rx_queue`: IPv4 with arbitrary IHL and
+    /// payload, IPv6 with a direct UDP next-header; everything else —
+    /// TCP, fragments, extension headers — parses as `None` (the
+    /// scan's "not for us" bucket, never a miscount).
+    #[test]
+    fn udp_dst_port_reads_v4_and_v6() {
+        // v4, IHL 5 — the `udp_datagram_v4` shape (dport 9).
+        assert_eq!(udp_dst_port(&udp_datagram_v4(40, 7)), Some(9));
+
+        // v4 with options (IHL 6) and a different port.
+        let mut p = vec![0u8; 24 + 8 + 4];
+        p[0] = 0x46; // IPv4, IHL 6
+        p[2..4].copy_from_slice(&(36u16).to_be_bytes());
+        p[9] = 17;
+        p[24..26].copy_from_slice(&1111u16.to_be_bytes());
+        p[26..28].copy_from_slice(&2222u16.to_be_bytes());
+        assert_eq!(udp_dst_port(&p), Some(2222));
+
+        // v4 non-UDP → None.
+        let mut tcp = udp_datagram_v4(40, 1).to_vec();
+        tcp[9] = 6;
+        assert_eq!(udp_dst_port(&tcp), None);
+
+        // v4 non-first fragment → None (ports live in fragment 0 only).
+        let mut frag = udp_datagram_v4(40, 1).to_vec();
+        frag[7] = 8; // fragment offset 64
+        assert_eq!(udp_dst_port(&frag), None);
+
+        // v6 direct UDP → port at the fixed offset.
+        let mut v6 = vec![0u8; 40 + 8 + 4];
+        v6[0] = 0x60;
+        v6[6] = 17;
+        v6[40..42].copy_from_slice(&53u16.to_be_bytes());
+        v6[42..44].copy_from_slice(&5353u16.to_be_bytes());
+        assert_eq!(udp_dst_port(&v6), Some(5353));
+
+        // v6 with an extension header → None (no ext traversal).
+        v6[6] = 0; // hop-by-hop
+        assert_eq!(udp_dst_port(&v6), None);
+
+        // Truncated/garbage → None.
+        assert_eq!(udp_dst_port(&[]), None);
+        assert_eq!(udp_dst_port(&[0x45, 0x00]), None);
+    }
+
+    /// The powers-of-two cadence itself: first hit always reports,
+    /// then only doublings — a counter crossing several powers in one
+    /// bump reports once, never skips.
+    #[test]
+    fn log_crossed_gates_first_hit_and_doublings() {
+        // First hit.
+        assert!(log_crossed(0, 1));
+        assert!(log_crossed(0, 5));
+        // Doublings.
+        assert!(log_crossed(1, 2));
+        assert!(log_crossed(3, 4));
+        assert!(log_crossed(7, 8));
+        // Non-crossings stay quiet.
+        assert!(!log_crossed(2, 3));
+        assert!(!log_crossed(8, 9));
+        assert!(!log_crossed(9, 15));
+        // One bump across several powers reports once.
+        assert!(log_crossed(15, 17));
+        assert!(log_crossed(1, 100));
     }
 }

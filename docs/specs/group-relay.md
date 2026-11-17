@@ -51,10 +51,16 @@ In scope:
    established; the final hop receives the actual target.
 3. UDP through a relay chain, sent from the chain's exit and never from
    an earlier hop. DIRECT/COMPATIBLE hops are dropped (as upstream
-   does). With no proxy hops left a DIRECT hop sends the UDP; with one,
-   that hop's own `dial_udp` does. With two or more, `dial_udp` returns
-   `UdpNotSupported`: chaining UDP through relay hops is a follow-up
-   (issue #495 item 6).
+   does) — except a `dialer-proxy` leaf at the *entry* position, which
+   counts as a proxy hop even when its inner outbound is DIRECT-class:
+   the flattened chain keeps the wrapper at hop 0 so TCP dials its
+   configured front, and counting it keeps `relay: [dialer-proxy, exit]`
+   from sending UDP past the front TCP traverses — the split-path
+   bypass closed in issue #971. With no proxy hops left a DIRECT hop
+   sends the UDP; with one, that hop's own `dial_udp` does. With two or
+   more, `dial_udp` returns `UdpNotSupported`: chaining UDP through
+   relay hops — upstream's `ListenPacketWithDialer` composition — is a
+   follow-up (issue #495 item 6).
 4. Minimum chain length: 2 proxies. Single-proxy `relay` is a
    configuration error — hard-error at parse time.
 5. `AdapterType::Relay` added to `meow-common/src/adapter_type.rs`.
@@ -103,11 +109,11 @@ Out of scope:
   chain that must keep mux pooling, prefer a `dialer-proxy` front on the
   last hop — for adapters that accept an injected `TcpDialer`
   (vless/vmess/trojan/ss) the mux layer pools sessions above the
-  injected dialer, matching mihomo's model. This does not extend to
-  `anytls` or `hysteria2`: they cannot carry an injected dialer, so
-  `dialer-proxy` falls back to the same relay wrapper — anytls sessions
-  stay unpooled per connection and hysteria2 fails loudly at dial time.
-  `type: relay` is for ad hoc multi-hop.
+  injected dialer, matching mihomo's model. `anytls` likewise accepts an
+  injected transport dialer and keeps its session pooling on the chained
+  transport; `hysteria2` rides the front's UDP association instead (its
+  sessions pool on the QUIC connection, not per dial). `type: relay` is
+  for ad hoc multi-hop.
 
 ## User-facing config
 

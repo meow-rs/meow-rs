@@ -184,8 +184,64 @@ the canonical, in-repo source a release is cut from.
   dials and forwards them upstream first. TCP flows on the same
   listeners keep the existing TLS/HTTP sniff; non-TUN inbounds carry
   no sniffed UDP.
+- **`dialer-proxy` on `hysteria2` and `trusttunnel` (`quic: true`)
+  nodes** — the QUIC endpoint's whole transport rides the front hop's
+  UDP association, the WireGuard `with_dialer` contract (issue #899
+  follow-up); TrustTunnel `quic: false` keeps its existing TCP path. A
+  hysteria2 node's `ports`/`hop-interval` hopping is ignored with a
+  warning beside a chain — a bound front association has no second port
+  to hop to. `direct` and `ss` with an external SIP003 plugin still
+  cannot take an injected dialer (relay-based wrapper fallback).
+
+- **`dialer-proxy` on `anytls` nodes** — the vendored client accepts a
+  per-instance transport dialer, so the session's TCP transport rides the
+  injected front hop while TLS, auth, and stream framing stay on the
+  client's own `TlsConnect` path (identical SNI/ALPN/verify profile to
+  direct dials). Chained sessions pool, reuse, and reset exactly like
+  direct ones; `udp: true` UoT rides the same chained session, and a
+  front that cannot dial fails closed rather than falling back to a
+  direct connection. `connect_over` relay sessions remain unpooled.
 
 ### Changed
+
+- **WireGuard received packets are now serviced in the same pump pass
+  that polls them**, removing a half-poll scheduling gap that left an
+  inbound packet waiting for the next timer wakeup — this was the ~12.7 ms
+  floor under every chained-WireGuard RTT. A pass that did work reschedules
+  at once instead of the idle 10 ms sleep, smoltcp's TCP ACK delay drops
+  from 10 ms to 1 ms, UDP socket queues grow 64→256 packets, the wire
+  drain budget grows 64→256, and macOS `sendmsg_x`/`recvmsg_x` calls are
+  chunked at 100 (XNU clips larger counts). On a LAN rig the chained
+  WireGuard UDP echo RTT went from a 12.7 ms p50 to 0.35 ms and new-TCP
+  churn from ~24 to ~850 connections/s.
+
+- **Chained Hysteria2/TrustTunnel-H3 datagrams drop instead of stalling
+  the whole QUIC engine when the front hop is congested.** The
+  `ProxyPacketConn → SocketIo` bridge used `PollSender::poll_reserve`, so
+  one full mpsc queue suspended the connection driver's entire poll —
+  every stream on the association stalled behind a single slow front
+  hop. `poll_send` now uses `try_send` (quic-go's semantics: QUIC's own
+  loss recovery absorbs a dropped datagram, a stalled driver cannot be
+  recovered), with a `dropped_tx` counter for observability. The
+  outbound queue stays shallow at 512 (a deeper tail-drop FIFO would
+  delay the loss signal and inflate quiche's RTT/BDP estimate) while
+  the inbound queue grows 256→4096, UDP receive buffers grow to 7 MiB,
+  the front hop gets a 1280 MTU hint, and the receive batch grows
+  32→128. `quiche` and `shadowsocks` are now compiled at `opt-level=3`.
+
+- **BoringTLS client connections resume sessions from a per-`SSL_CTX`
+  ticket store.** Each connector keeps a 64-entry FIFO of
+  `SslSession`s keyed by SNI, offers the newest via `SSL_set_session`
+  only within the same context, and drops an SNI's whole queue when a
+  handshake that offered a ticket fails (peer restart or ticket-key
+  rotation makes stale tickets actively harmful). A node configured
+  with `cert-pin` or `verify-name` never offers a cached ticket — a
+  resumed handshake carries no Certificate for the override check to
+  inspect. Verified live: `session_reused=true` on the
+  `boring TLS handshake complete` debug line against sing-box. A
+  `vless connect breakdown` debug line now reports per-phase connect
+  timings (`tcp_ms`/`tls_ms`/`vless_ms`) for VLESS dials, plus first
+  payload-write/first-server-data markers on Vision streams.
 
 - **gRPC and XHTTP (stream-one) tunnels share one HTTP/2 connection per
   proxy**, as mihomo and Xray clients do, instead of a TCP + TLS/REALITY
@@ -248,10 +304,10 @@ the canonical, in-repo source a release is cut from.
   field as the target — matching upstream comma protection.
 - `dns.proxy-server-nameserver-policy` now also rejects a proxy tagged while
   it carries a `dialer-proxy:` chain through the relay-based fallback
-  wrapper (hysteria2 and anytls nodes cannot take an injected dialer): the
-  declared dependency is read through a `ProxyAdapter` query instead of a
-  concrete-type downcast, so a front group parked on REJECT can no longer
-  make the chain invisible.
+  wrapper (anytls and `direct` nodes — and `ss` with an external SIP003
+  plugin — cannot take an injected dialer): the declared dependency is
+  read through a `ProxyAdapter` query instead of a concrete-type downcast,
+  so a front group parked on REJECT can no longer make the chain invisible.
 - hysteria2 `max-stream-receive-window` values configured above
   `max-connection-receive-window` are clamped to the connection ceiling —
   a stream can never outrun connection credit — keeping the advertised
@@ -447,6 +503,55 @@ the canonical, in-repo source a release is cut from.
   Windows (Linux bound loopback TCP too), everything else — LAN,
   link-local and multicast included — keeps it. IPv4-mapped destinations
   get an IPv4 socket; native IPv6 keeps its scope id.
+- **A UDP flow matched to a `dialer-proxy`-chained target whose inner is
+  non-transparent now fails loudly at the named rule** instead of sliding
+  to a later rule that may resolve to `DIRECT` (issue #969): the chain
+  the operator pinned cannot be silently replaced, and the dial refuses
+  with `UdpNotSupported`. A chain over a transparent inner
+  (`type: direct`) is unchanged — UDP routes through the front hop's
+  association — and a plain `udp: false` node keeps mihomo's `continue`
+  semantics, the scan sliding to the next rule as before.
+- fix(tunnel): UDP flows to an injected `dialer-proxy` node whose inner
+  cannot carry UDP (e.g. `type: http`, or `type: ss`/`type: socks5` via a
+  UDP-incapable front) now fail closed at the matched rule instead of
+  silently sliding to `DIRECT` — the injected-path counterpart of the
+  #969 fix above, since an injected leaf carries no `DialerProxyAdapter`
+  to report the configured chain; a new `ChainedProxy` registry marker
+  reports it instead (#969). The same verdict now reaches the scan
+  through a *group* target too: every group type forwards
+  `is_dialer_proxy_non_transparent` to the member its `support_udp`
+  picks (the selector's selection, the url-test/fallback pick, the
+  relay's UDP exit hop, the load-balance live member set), so a matched
+  rule targeting a group whose pick is a chained UDP-incapable member
+  stops the same way instead of rerouting the flow past the pinned
+  chain. Provider-sourced nodes whose `dialer-proxy` was injected are
+  marked `ChainedProxy` exactly like static `proxies:` entries, closing
+  the last spot a chained leaf could answer `false` (#969).
+
+- **`vless` `flow: xtls-rprx-vision` UDP no longer sends a bare
+  `Cmd::Udp` request** — strict servers (sing-box ≥1.12's vendored
+  sing-vmess `vless.Service`) validate `request.Flow == account.Flow` on
+  every command, so the empty-addon datagram request was rejected with
+  `flow mismatch` and UDP timed out while TCP worked. Vision UDP now
+  rides a per-association Mux.Cool session — a `CommandMux` request
+  carrying the `xtls-rprx-vision` addon with the datagrams as a
+  `network=0x02` substream — the shape xray, mihomo and sing-box
+  clients use. A domain `UdpTarget::Name` warns once and falls back to
+  the bare request; without the `mux` feature a vision node reports
+  `support_udp() = false`. Non-vision UDP is unchanged.
+
+- **WireGuard UDP flows now recover after session expiry without waiting
+  for TCP traffic.** `encapsulate`'s no-session arm deduped on
+  `is_in_progress()`, so for the whole post-expiry retry generation —
+  up to a `REKEY_ATTEMPT_TIME` window — a fresh datagram could only
+  queue behind the in-flight `InitSent` and was silently dropped when
+  the generation gave up; only smoltcp's retransmitted TCP SYNs stayed
+  queue-resident long enough to flush on completion. Matching the
+  kernel's `wg_packet_send_queued_handshake_initiation`, an in-flight
+  initiation whose birthdate is older than `REKEY_TIMEOUT` is now
+  re-armed by packet pressure — the same forced-resend call
+  `update_timers` makes on a rekey timeout, throttled at the same 5 s
+  floor.
 
 ## [0.29.0] - 2026-11-05
 

@@ -77,7 +77,9 @@ Implemented scope:
 Out of scope:
 
 - VLESS inbound / server mode.
-- Vision UDP splice. UDP still uses plain VLESS and logs a config warning.
+- Vision UDP splice details. UDP rides a per-association Mux.Cool
+  substream carrying the flow addon (upstream clients' XUDP shape) and
+  logs a config warning at load; see proxy-vless.md §Vision UDP.
 - Mux.Cool.
 - Committing the test sample or subscription nodes as repository fixtures.
 

@@ -34,7 +34,9 @@ divergence. ADR-0002 Class cite (A or B) per `feedback_adr_0002_class_cite.md`.
 - Reality transport (`reality-opts`) — hard-error tested in §D; no
   implementation to test.
 - VLESS inbound / server mode.
-- Mux.Cool runtime behavior — warn-ignore; only the config warn is tested.
+- Configured `mux:` sing-mux session pooling internals — warn-tested at
+  load; the Mux.Cool wire path itself *is* exercised by the vision-UDP
+  cases below (per-association CommandMux session).
 - XTLS-RPRX-Direct / Splice runtime behavior — hard-error tested; no
   implementation to exercise at runtime.
 - Performance / throughput benchmarks — M2.
@@ -51,7 +53,7 @@ divergence. ADR-0002 Class cite (A or B) per `feedback_adr_0002_class_cite.md`.
 | 4 | Unknown `flow` value — upstream ignores | A | Unknown flow may skip expected security processing. Hard-error. |
 | 5 | `encryption: <non-none>` — upstream hard-errors too | — | Match (both hard-error). Not a divergence. |
 | 6 | `mux: { enabled: true }` — sing-mux multiplexing | B | Implemented (default h2mux; smux/yamux also supported) for sing-box/mihomo servers; Xray Mux.Cool (`protocol: muxcool`) for Xray servers. |
-| 7 | `flow: xtls-rprx-vision` + `udp: true` — upstream UDP uses plain VLESS silently | B | Warn-once at load; UDP still routes same destination with outer-TLS. Not Class A (crypto unchanged). |
+| 7 | `flow: xtls-rprx-vision` + `udp: true` — UDP rides a per-association Mux.Cool CommandMux substream with the flow addon (upstream clients' XUDP shape), not the configured `Cmd::Udp` | B | Warn-once at load; UDP still routes same destination with outer-TLS. Not Class A (crypto unchanged). Domain `UdpTarget::Name` warns once and falls back to the bare request; without `mux` the node reports `udp: false`. |
 
 ---
 
@@ -112,7 +114,7 @@ must be bounced back to engineer.
 | C7 | `vision_reads_full_clienthello_before_sending` | Stage a ClientHello arriving in two `poll_read` chunks (first 5 bytes, then remainder). Assert `VisionConn` does not emit any bytes to the underlying writer until the full record (`5 + body_length` bytes) is buffered. <br/> Upstream: `transport/vless/vision/vision.go::ReadClientHelloRecord`. <br/> NOT partial-send on the first chunk — sending a truncated ClientHello to the server breaks the inner TLS handshake with no diagnostic. |
 | C8 | `vision_clienthello_body_length_from_bytes_3_4` **[guard-rail]** | Feed a ClientHello where `uint16_BE(bytes[3..5]) = 512`. Assert `VisionConn` issues a second `read_exact(512)` to buffer the body. Guards against an off-by-one that reads `bytes[4..6]` or miscounts the header-vs-body boundary. |
 | C9 | `vision_sends_padding_then_clienthello_in_order` | Assert that after Vision mode is entered, the bytes written to the underlying stream are in order: padding header bytes, then ClientHello bytes. Not interleaved, not reversed. |
-| C10 | `vision_udp_path_uses_plain_conn` **[guard-rail]** | Confirm that `VlessAdapter::dial_udp` when `flow = Some(XtlsRprxVision)` returns a plain `VlessConn` (not `VisionConn`). Assert no padding header is ever written on the UDP path. Guards against accidentally wrapping UDP in Vision. |
+| C10 | `vision_udp_rides_muxcool_session` **[guard-rail]** | Against a strict mock that rejects `Cmd::Udp` without the account's flow addon (sing-box semantics), assert vision `dial_udp` emits `cmd=0x03` (CommandMux) + the `xtls-rprx-vision` addon + a `network=0x02` New frame, and that a datagram echoes through the mux substream. Guards against regressing to the bare `Cmd::Udp` shape strict servers drop; see `vision_udp_domain_target_falls_back_and_warns_once` for the deliberate bare fallback on domain targets. |
 | C11 | `vision_no_inner_tls_no_log_noise` **[guard-rail]** | Feed non-TLS data in pass-through mode. Assert no `warn!` or `error!` is emitted — only a `trace!` at most. Vision's pass-through is the expected path for HTTP-over-VLESS; it must not spam logs. |
 
 ### D. Config parser unit tests (`crates/meow-config/src/proxy_parser.rs`)
@@ -158,7 +160,7 @@ the resulting `TransportChain` shape; no network required.
 | E3 | `vless_ws_with_tls_chain_ordered` | `network: ws`, `tls: true`. Chain = `[TlsLayer, WsLayer]` in that order. TLS wraps TCP; WS wraps TLS. |
 | E4 | `vless_grpc_transport_chain` **[guard-rail]** | `network: grpc` (implies TLS). Chain includes `GrpcLayer`. Only when `grpc` feature enabled. |
 | E5 | `vless_vision_wrapped_around_vless_conn` | `flow: "xtls-rprx-vision"`, `tls: true`, `network: tcp`. `dial_tcp` returns a `VisionConn` wrapper, not a bare `VlessConn`. The Vision wrapping is inside the ProxyConn, orthogonal to the `TransportChain`. |
-| E6 | `vless_udp_ignores_vision_flow` **[guard-rail]** | `flow: "xtls-rprx-vision"`, `udp: true`, `tls: true`. `dial_udp` returns a plain `VlessConn` (no `VisionConn` wrapper). Acceptance criterion §Scope: "Vision is TCP-only". |
+| E6 | `vless_vision_udp_supported_via_muxcool` / `vless_vision_udp_unsupported_without_muxcool` **[guard-rail]** | `flow: "xtls-rprx-vision"`, `udp: true`, `tls: true`. With `mux`+`vless-vision` features `support_udp()` is true and `dial_udp` opens a per-association Mux.Cool session (CommandMux + vision addon — the datagrams never ride a bare `VlessConn`); without the pair the node reports `support_udp() == false`. Acceptance criterion §Scope: "Vision is TCP-only" — the Vision *splice* never wraps UDP, but the UDP request still carries the flow addon strict servers require. |
 
 ### F. Connection wire tests (`crates/meow-proxy/src/vless/conn.rs`)
 
@@ -228,7 +230,8 @@ absent; when `=0` or unset, skip gracefully.
 - **XTLS-RPRX-Direct / Splice runtime** — hard-errors at parse time (D7,
   D8); no implementation to exercise.
 - **VLESS inbound** — not in scope.
-- **Mux.Cool runtime** — warn-ignore; D16 tests the config warn.
+- **Configured `mux:` sing-mux runtime** — warn-ignore; D16 tests the
+  config warn. (The vision-UDP Mux.Cool path is covered by C10/§H.)
 - **uTLS fingerprint** (`client-fingerprint` field) — accepted and
   forwarded to transport layer; no VLESS-specific behavior to test
   beyond what the transport-layer test plan §A11–A13 covers.

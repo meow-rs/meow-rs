@@ -38,24 +38,28 @@ impl Drop for ClearHook {
 async fn pooled_endpoint_resolution_can_reenter_before_connect_lock() {
     let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let proxy = Arc::new(
-        Hy2Adapter::new(Hy2Options {
-            name: "bootstrap-fixture".into(),
-            server: "bootstrap.invalid".into(),
-            port: socket.local_addr().unwrap().port(),
-            password: "fixture".into(),
-            sni: Some("localhost".into()),
-            skip_cert_verify: true,
-            udp: true,
-            up_bps: 0,
-            down_bps: 0,
-            obfs: None,
-            obfs_password: None,
-            ports: None,
-            hop_interval: None,
-            fingerprint: None,
-            fast_open: false,
-            windows: Default::default(),
-        })
+        Hy2Adapter::new(
+            Hy2Options {
+                name: "bootstrap-fixture".into(),
+                server: "bootstrap.invalid".into(),
+                port: socket.local_addr().unwrap().port(),
+                password: "fixture".into(),
+                sni: Some("localhost".into()),
+                skip_cert_verify: true,
+                udp: true,
+                up_bps: 0,
+                down_bps: 0,
+                obfs: None,
+                obfs_password: None,
+                ports: None,
+                hop_interval: None,
+                fingerprint: None,
+                fast_open: false,
+                windows: Default::default(),
+                quic_connections: None,
+            },
+            None,
+        )
         .unwrap(),
     );
     meow_common::socket_protect::set_host_resolver(Arc::new(ReentrantHook(Arc::downgrade(&proxy))));
