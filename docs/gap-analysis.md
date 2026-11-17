@@ -259,6 +259,30 @@ Upstream config keys documented at https://wiki.metacubex.one/. Checking `crates
 
 `port`, `socks-port`, `mixed-port`, `allow-lan`, `bind-address`, `mode`, `log-level`, `ipv6`, `external-controller`, `secret`, `external-ui` / `external-ui-name` (serves a static third-party dashboard at `/ui`; `external-ui-url` is parsed but auto-download is not performed), `dns`, `proxies`, `proxy-groups`, `rules`, `rule-providers`, `tproxy-port`, `tproxy-sni`, `routing-mark`, `interface-name`, and the custom `subscriptions`. Per-node dialer options (`routing-mark`, `interface-name`, `ip-version`, `tfo`, `mptcp`) are honoured on every `proxies:` leaf — resolved node-over-global at dial time, with `routing-mark: 0` meaning unset and the loopback exemption `binds_peer` already gives the TUN binding; `ip-version` filters/reorders hostname resolution (`ipv4`/`ipv6` fail when no candidate of that family remains, `*-prefer` stable-sort their family first) while IP literals bypass it. Per-outbound `dialer-proxy` (chained dialing via any proxy/group, TCP) is supported on the stream-based outbound types — `ss`, `trojan`, `vless`, `vmess`, `snell`, `http`, `socks5` — where an injected `TcpDialer` carries the adapter's own handshake. `wireguard` honours it through a different shape: the endpoint's UDP transport rides the front's UDP association, so the front must be UDP-capable (`direct` with routing-mark, `ss`, `socks5`, a group whose live member carries UDP) — a TCP-only front fails the endpoint bind at dial time, never a silent direct egress (`amnezia-wg-option` on the node stays rejected — deferred to Phase-3). `hysteria2` owns its transport (QUIC) and honours it through a different shape: the QUIC endpoint rides the front's UDP association (a TCP-only front fails loudly; `ports`/`hop-interval` hopping is disabled with a warning). `anytls` takes a per-instance transport dialer — sessions pool and `udp: true` UoT rides the chained session. `direct` and `ss` with an external SIP003 plugin still cannot take an injected dialer. Those fall back to the relay-based wrapper, which fails loudly rather than dialing direct. `dialer-proxy` is honoured on provider-sourced nodes as well (per-node field, provider-level `dialer-proxy`, and `override.dialer-proxy` — mihomo's unconditional-write precedence applies: `override` > provider > node); the target must be a top-level `proxies:`/`proxy-groups:` entry — provider node names are not resolvable targets, same as mihomo. UDP rides the front's own datagram association (Shadowsocks plain relay, SOCKS5 UDP ASSOCIATE), failing closed when the front cannot carry UDP; mux-carried UDP traverses the chain. See [the migration guide](migration-from-go-mihomo.md) for details.
 
+Per-node dialer options reach every socket meow itself opens, with three
+deliberate carve-outs, all matching how the fields behave in mihomo:
+
+- **External SIP003 plugin sockets.** An `obfs`/`v2ray-plugin` node spawns
+  the plugin as a subprocess that owns its own outbound sockets — the
+  node's `routing-mark`/`interface-name`/`tfo`/`mptcp` cannot reach them
+  (the only socket meow opens is the loopback hop to the plugin's local
+  endpoint, which is loopback-exempt anyway). Same boundary as
+  `dialer-proxy`: plugins cannot take an injected dialer either.
+- **Managed-tproxy firewall exemptions match only the global mark.** The
+  nftables/pf rules meow installs exempt the top-level `routing-mark`
+  from redirection; a per-node `routing-mark` is *not* exempted and its
+  traffic is caught by the tproxy rules like any other unmarked flow —
+  extend the firewall yourself if a node mark must bypass redirection.
+  This asymmetry is also why only the global mark is pin-refused while
+  the managed firewall is live.
+- **Resolver/DoH sockets run under the global options only.** A node's
+  fields never steer DNS plumbing: upstream exchange sockets — including
+  a DoH provider's pooled HTTP/2 connection — carry the global
+  `routing-mark`/`interface-name` and ignore the node's `tfo`/`mptcp`,
+  keeping a node-specific mark/interface out of shared resolver state.
+  The node's `ip-version` still filters the *results* before the dial,
+  exactly like the global filter would.
+
 ### Missing top-level keys (gaps)
 
 | Key | Purpose |

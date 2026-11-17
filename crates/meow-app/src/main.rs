@@ -629,13 +629,7 @@ fn run_application_inner(
         // provider fetch already takes it. A node's own `interface-name`
         // and the loopback exemption outrank it inside the dial scope;
         // `None`/empty clears.
-        meow_common::set_global_interface_name(
-            raw.interface_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(std::sync::Arc::from),
-        );
+        meow_common::set_global_interface_name(raw.interface_name.as_deref());
 
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);

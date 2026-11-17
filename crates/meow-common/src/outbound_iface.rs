@@ -492,6 +492,24 @@ pub(crate) fn bind_socket_to_name(
     domain: socket2::Domain,
     name: &str,
 ) -> io::Result<()> {
+    // The parse layer normalizes first, but this is the last line before
+    // the syscall — keep it defensive: Linux `bind_device` takes a C
+    // string, so a NUL would silently truncate the name and bind the
+    // *wrong* interface (spec §1.2; the same check
+    // `install_outbound_interface` runs).
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "interface name is empty",
+        ));
+    }
+    if name.contains('\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("interface name '{name}' contains a NUL byte"),
+        ));
+    }
     #[cfg(target_os = "linux")]
     {
         let _ = domain;
@@ -831,6 +849,14 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            // `bind_udp_with_opts` resolves `GLOBAL_INTERFACE_NAME` into
+            // the scope at bind time — serialise against
+            // `socket_protect`'s tests mutating it, and clear it for the
+            // duration so a leaked name cannot steer these binds onto
+            // the wrong interface (issue #974 review).
+            let _state = crate::socket_protect::TEST_DIAL_STATE_LOCK.lock().await;
+            let saved_global_iface = crate::socket_protect::global_interface_name();
+            crate::socket_protect::set_global_interface_name(None);
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let stream = connect_tcp_iface_bound(addr).await.expect("loopback dial");
@@ -895,6 +921,7 @@ mod tests {
                 let err = socket.send_to(b"x", outside).await.expect_err("scoped UDP");
                 assert_eq!(err.raw_os_error(), Some(libc::ENETUNREACH), "{err}");
             }
+            crate::socket_protect::set_global_interface_name(saved_global_iface.as_deref());
         });
     }
 

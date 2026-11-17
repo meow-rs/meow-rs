@@ -1170,12 +1170,11 @@ async fn update_configs(
         info!("routing-mark changed to {mark}");
     }
     if let Some(name) = body.interface_name {
-        // The same normalization the startup path applies (issue #974):
-        // trimmed, empty meaning unset — so `interface-name: ""` clears.
-        let trimmed = name.trim().to_string();
-        meow_common::set_global_interface_name(
-            (!trimmed.is_empty()).then(|| std::sync::Arc::from(trimmed.as_str())),
-        );
+        // The setter normalizes the same way as the node parser (issue
+        // #974): trimmed, empty meaning unset — so `interface-name: ""`
+        // clears.
+        let trimmed = name.trim();
+        meow_common::set_global_interface_name(Some(trimmed));
         info!("interface-name changed to {trimmed}");
         raw.interface_name = Some(name);
     }
@@ -3587,15 +3586,9 @@ async fn swap_config_and_reconcile_tun(
         // change under pinned managed rules was refused before this.
         meow_common::set_routing_mark(candidate.routing_mark);
         // `interface-name` re-applies on every load the same way
-        // (issue #974): trimmed, empty meaning unset.
-        meow_common::set_global_interface_name(
-            candidate
-                .interface_name
-                .as_deref()
-                .map(str::trim)
-                .filter(|name| !name.is_empty())
-                .map(std::sync::Arc::from),
-        );
+        // (issue #974); the setter normalizes — trimmed, empty meaning
+        // unset.
+        meow_common::set_global_interface_name(candidate.interface_name.as_deref());
         let ledger = candidate.traffic_ledger.as_ref();
         let ledger = (
             meow_config::raw::RawTrafficLedger::enabled(ledger),

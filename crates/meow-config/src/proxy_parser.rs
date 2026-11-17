@@ -431,6 +431,14 @@ fn parse_node_dialer_opts(
                 .as_str()
                 .ok_or_else(|| format!("{name}: `interface-name` must be a string"))?;
             let trimmed = raw.trim();
+            // A NUL is a hard error, not normalization: Linux
+            // `SO_BINDTODEVICE` would silently truncate the name at it
+            // and bind the wrong interface (spec §1.2).
+            if trimmed.contains('\0') {
+                return Err(format!(
+                    "{name}: `interface-name` must not contain NUL bytes"
+                ));
+            }
             (!trimmed.is_empty()).then(|| std::sync::Arc::from(trimmed))
         }
     };
@@ -7354,12 +7362,30 @@ tls: true
         for yaml in [
             "routing-mark: -1\n",
             "routing-mark: 'abc'\n",
+            "routing-mark: 4294967296\n",
             "interface-name: 7\n",
             "tfo: 'yes'\n",
             "mptcp: 1\n",
         ] {
             let cfg = proxy_config(&format!("name: d\ntype: direct\n{yaml}"));
             assert!(parse_proxy(&cfg).is_err(), "{yaml}");
+        }
+    }
+
+    /// A NUL-bearing `interface-name` is a hard parse error, not the
+    /// empty-means-unset normalization: Linux `SO_BINDTODEVICE` would
+    /// silently truncate the name at the NUL and bind the *wrong*
+    /// interface — the one misconfiguration worse than a missing one.
+    #[test]
+    fn node_dialer_opts_rejects_nul_interface_name() {
+        let mut cfg = proxy_config("name: d\ntype: direct\n");
+        cfg.insert(
+            "interface-name".to_string(),
+            serde_json::Value::String("en0\0x".to_string()),
+        );
+        match parse_proxy(&cfg) {
+            Err(err) => assert!(err.contains("NUL"), "{err}"),
+            Ok(_) => panic!("a NUL interface-name must error"),
         }
     }
 
@@ -7399,66 +7425,83 @@ tls: true
         assert!(group.is_ok(), "group blocks ignore dialer fields");
     }
 
-    /// The wrapper installs its resolved opts as the task-local scope
-    /// around the adapter's dial — the mechanism every socket helper
-    /// reads (issue #974). A stub adapter captures `dialer_opts()`
-    /// mid-dial to prove the scope landed and did not leak past it.
-    #[tokio::test]
-    async fn wrapped_dial_installs_the_scope() {
-        type Seen = std::sync::Arc<parking_lot::Mutex<Option<meow_common::DialerOpts>>>;
-        struct Capture {
-            health: ProxyHealth,
-            seen: Seen,
+    /// Records the [`meow_common::dialer_opts`] a dial ran under — the
+    /// scope probe every `WrappedProxy`/`ChainedProxy` coverage test
+    /// shares (issue #974).
+    type Seen = std::sync::Arc<parking_lot::Mutex<Option<meow_common::DialerOpts>>>;
+
+    struct Capture {
+        health: ProxyHealth,
+        seen: Seen,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyAdapter for Capture {
+        fn name(&self) -> &str {
+            "capture"
         }
-        #[async_trait::async_trait]
-        impl ProxyAdapter for Capture {
-            fn name(&self) -> &str {
-                "capture"
-            }
-            fn adapter_type(&self) -> AdapterType {
-                AdapterType::Direct
-            }
-            fn addr(&self) -> &str {
-                ""
-            }
-            fn support_udp(&self) -> bool {
-                false
-            }
-            async fn dial_tcp(
-                &self,
-                _metadata: &Metadata,
-            ) -> Result<Box<dyn meow_common::ProxyConn>> {
-                *self.seen.lock() = Some(meow_common::dialer_opts());
-                Err(meow_common::MeowError::Proxy("captured".into()))
-            }
-            async fn dial_udp(
-                &self,
-                _metadata: &Metadata,
-            ) -> Result<Box<dyn meow_common::ProxyPacketConn>> {
-                *self.seen.lock() = Some(meow_common::dialer_opts());
-                Err(meow_common::MeowError::Proxy("captured".into()))
-            }
-            fn health(&self) -> &ProxyHealth {
-                &self.health
-            }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
         }
-        let seen: Seen = Default::default();
-        let adapter = Capture {
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn meow_common::ProxyConn>> {
+            *self.seen.lock() = Some(meow_common::dialer_opts());
+            Err(meow_common::MeowError::Proxy("captured".into()))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> Result<Box<dyn meow_common::ProxyPacketConn>> {
+            *self.seen.lock() = Some(meow_common::dialer_opts());
+            Err(meow_common::MeowError::Proxy("captured".into()))
+        }
+        async fn connect_over(
+            &self,
+            _stream: Box<dyn meow_common::ProxyConn>,
+            _metadata: &Metadata,
+        ) -> Result<Box<dyn meow_common::ProxyConn>> {
+            *self.seen.lock() = Some(meow_common::dialer_opts());
+            Err(meow_common::MeowError::Proxy("captured".into()))
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    fn scoped_leaf(seen: &Seen) -> WrappedProxy {
+        WrappedProxy::new(Box::new(Capture {
             health: ProxyHealth::new(),
-            seen: std::sync::Arc::clone(&seen),
-        };
-        let proxy = WrappedProxy::new(Box::new(adapter)).with_node_dialer_opts(
-            meow_common::NodeDialerOpts {
-                ip_version: meow_common::IpVersion::Ipv6,
-                routing_mark: Some(4242),
-                ..Default::default()
-            },
-        );
-        let metadata = Metadata {
+            seen: std::sync::Arc::clone(seen),
+        }))
+        .with_node_dialer_opts(meow_common::NodeDialerOpts {
+            ip_version: meow_common::IpVersion::Ipv6,
+            routing_mark: Some(4242),
+            ..Default::default()
+        })
+    }
+
+    fn test_metadata() -> Metadata {
+        Metadata {
             host: "h.test".into(),
             dst_port: 443,
             ..Default::default()
-        };
+        }
+    }
+
+    /// The wrapper installs its resolved opts as the task-local scope
+    /// around the adapter's dial — the mechanism every socket helper
+    /// reads (issue #974). The stub captures `dialer_opts()` mid-dial to
+    /// prove the scope landed and did not leak past it.
+    #[tokio::test]
+    async fn wrapped_dial_installs_the_scope() {
+        let seen: Seen = Default::default();
+        let proxy = scoped_leaf(&seen);
+        let metadata = test_metadata();
         // Both dial paths install the node's resolved opts.
         assert!(proxy.dial_tcp(&metadata).await.is_err());
         {
@@ -7477,6 +7520,54 @@ tls: true
         assert_eq!(
             meow_common::dialer_opts().ip_version,
             meow_common::IpVersion::Dual
+        );
+    }
+
+    /// `connect_over` — the relay-chain dial path — installs the same
+    /// scope (issue #974): an injected leaf's transport handshake and any
+    /// socket it opens run under the node's fields too.
+    #[tokio::test]
+    async fn wrapped_connect_over_installs_the_scope() {
+        let seen: Seen = Default::default();
+        let proxy = scoped_leaf(&seen);
+        let metadata = test_metadata();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let stream: Box<dyn meow_common::ProxyConn> = Box::new(stream);
+        assert!(proxy.connect_over(stream, &metadata).await.is_err());
+        let captured = seen.lock();
+        let opts = captured.as_ref().expect("connect_over ran under the scope");
+        assert_eq!(opts.ip_version, meow_common::IpVersion::Ipv6);
+        assert_eq!(opts.routing_mark, Some(4242));
+    }
+
+    /// `ChainedProxy` is observational only: it must not install a
+    /// (default) scope of its own over the inner `WrappedProxy`'s —
+    /// every method delegates verbatim, so a chained dial still sees the
+    /// leaf's resolved opts, never the empty defaults a re-scope would
+    /// leave (issue #974 review).
+    #[tokio::test]
+    async fn chained_proxy_delegates_without_rescoping() {
+        let seen: Seen = Default::default();
+        let inner: Arc<dyn Proxy> = Arc::new(scoped_leaf(&seen));
+        let chained = ChainedProxy::new(inner);
+        let metadata = test_metadata();
+        assert!(chained.dial_tcp(&metadata).await.is_err());
+        {
+            let captured = seen.lock();
+            let opts = captured
+                .as_ref()
+                .expect("the chained dial reached the leaf's scope");
+            assert_eq!(opts.ip_version, meow_common::IpVersion::Ipv6);
+            assert_eq!(opts.routing_mark, Some(4242));
+        }
+        *seen.lock() = None;
+        assert!(chained.dial_udp(&metadata).await.is_err());
+        assert_eq!(
+            seen.lock().as_ref().map(|o| o.ip_version),
+            Some(meow_common::IpVersion::Ipv6)
         );
     }
 }
