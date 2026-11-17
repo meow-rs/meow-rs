@@ -670,8 +670,8 @@ enum Transport {
         addr: SocketAddr,
         sni: Arc<str>,
     },
-    /// DNS over HTTPS over HTTP/3 — mihomo `prefer-h3`, with the HTTP/1.1
-    /// DoH path as the fallback (`self.doh_h1`).
+    /// DNS over HTTPS over HTTP/3 — mihomo `prefer-h3`, with the HTTP/2 /
+    /// HTTP/1.1 DoH path as the fallback (`self.doh_h1`).
     #[cfg(feature = "quic-dns")]
     Doh3 {
         addr: SocketAddr,
@@ -809,7 +809,9 @@ impl DnsClient {
         }
     }
 
-    /// DNS over HTTPS (RFC 8484) — HTTP/1.1 POST application/dns-message.
+    /// DNS over HTTPS (RFC 8484) — `POST application/dns-message` over the
+    /// ALPN-negotiated version: HTTP/2 when the server picks it, HTTP/1.1
+    /// otherwise.
     #[cfg(feature = "encrypted")]
     pub fn doh(addr: SocketAddr, sni: &str, path: &str) -> Self {
         Self {
@@ -862,12 +864,12 @@ impl DnsClient {
     /// DNS over HTTPS over HTTP/3 — the `prefer-h3` form of a `https://`
     /// entry.
     ///
-    /// The HTTP/1.1 DoH client built here is the fallback: when the QUIC
-    /// exchange fails (no h3 support, UDP blocked, connection loss) the
-    /// exchange is retried over HTTP/1.1, and a failed handshake parks h3 for
-    /// this upstream so the next query does not pay a second timeout. The
-    /// fallback shares this client's timeout, proxy tag, certificate roots and
-    /// TLS session pool.
+    /// The DoH client built here is the fallback: when the QUIC exchange
+    /// fails (no h3 support, UDP blocked, connection loss) the exchange is
+    /// retried over it — HTTP/2 or HTTP/1.1 as its own ALPN negotiates — and
+    /// a failed handshake parks h3 for this upstream so the next query does
+    /// not pay a second timeout. The fallback shares this client's timeout,
+    /// proxy tag, certificate roots and TLS session pool.
     #[cfg(feature = "quic-dns")]
     pub fn doh3(addr: SocketAddr, sni: &str, path: &str) -> Self {
         let h1 = DnsClient::doh(addr, sni, path);
@@ -887,7 +889,7 @@ impl DnsClient {
     }
 
     /// DoH3 in mihomo's per-entry form (`?h3=true`): HTTP/3 only, with no
-    /// HTTP/1.1 fallback. A failure is reported as-is.
+    /// DoH fallback. A failure is reported as-is.
     #[cfg(feature = "quic-dns")]
     pub fn doh3_force(addr: SocketAddr, sni: &str, path: &str) -> Self {
         Self::with_quic(
@@ -1094,20 +1096,25 @@ impl DnsClient {
         let quic_fallback_reset = self.doh_h1.as_ref().map_or(0, |h1| h1.reset_connections());
         #[cfg(feature = "encrypted")]
         {
-            // The pool reset bumps the generation the shared h2 conn was
-            // stamped with; dropping it here closes it now instead of at
-            // the next query. Its in-flight streams finish first.
+            // The pool resets run *before* the shared h2 conn is taken:
+            // `doh_h2_install` reads the generation under the slot lock,
+            // so an install ordered before the bumps has its conn taken
+            // here, and one ordered after sees the new generation and
+            // refuses — a conn retired while it was installing is never
+            // installed. Dropping it closes it now instead of at the next
+            // query; its in-flight streams finish first.
+            let pool_reset = self.tcp_pool.reset() + self.tls_pool.reset();
             #[cfg(feature = "doh-h2")]
             let h2_reset = usize::from(self.doh_h2.lock().take().is_some());
             #[cfg(not(feature = "doh-h2"))]
             let h2_reset = 0;
             #[cfg(feature = "quic-dns")]
             {
-                self.tcp_pool.reset() + self.tls_pool.reset() + h2_reset + quic_fallback_reset
+                pool_reset + h2_reset + quic_fallback_reset
             }
             #[cfg(not(feature = "quic-dns"))]
             {
-                self.tcp_pool.reset() + self.tls_pool.reset() + h2_reset
+                pool_reset + h2_reset
             }
         }
         #[cfg(not(feature = "encrypted"))]
@@ -1159,7 +1166,7 @@ impl DnsClient {
                         format!("quic://{sni}:{}", addr.port())
                     }
                 }
-                // A DoH3 entry is the same URL as its HTTP/1.1 fallback, so
+                // A DoH3 entry is the same URL as its DoH fallback, so
                 // the label stays `https://…` — the transport is an
                 // implementation detail of one upstream, not its identity.
                 #[cfg(feature = "quic-dns")]
@@ -1667,7 +1674,8 @@ impl DnsClient {
         // deadline, a retry on `Io`/deadline only, and the retried query
         // gets the fresh path.
         #[cfg(feature = "doh-h2")]
-        if let Some(conn) = (!self.tls_pool_disabled)
+        if let Some(conn) = (matches!(self.transport, Transport::Doh { .. })
+            && !self.tls_pool_disabled)
             .then(|| self.doh_h2_current())
             .flatten()
         {
@@ -1854,8 +1862,10 @@ impl DnsClient {
     /// Make `conn` the shared h2 conn unless a reusable one is already
     /// there: concurrent first queries each dial, and the surplus conns
     /// close once their own stream ends. The generation is read under the
-    /// lock, as `Pool::push` checks it under the pool's — so a conn from a
-    /// generation retired while it was dialing is never installed.
+    /// lock — as `Pool::push` checks it under the pool's — so a conn
+    /// retired while it was being installed is never installed:
+    /// `reset_connections` bumps the generations before taking the slot,
+    /// and every checkout revalidates anyway.
     #[cfg(feature = "doh-h2")]
     fn doh_h2_install(&self, conn: Arc<DohH2Conn>) {
         let mut slot = self.doh_h2.lock();
@@ -1927,6 +1937,7 @@ impl DnsClient {
         };
         let request = http::Request::builder()
             .method(http::Method::POST)
+            .version(http::Version::HTTP_2)
             .uri(doh_h2_uri(sni, path))
             .header(http::header::USER_AGENT, "meow-rs")
             .header(http::header::ACCEPT, "application/dns-message")
@@ -2038,7 +2049,7 @@ impl DnsClient {
         decode_validated_response(&response, expected)
     }
 
-    /// One DoH3 exchange, falling back to the HTTP/1.1 DoH path — the
+    /// One DoH3 exchange, falling back to the plain DoH path — the
     /// semantics `prefer-h3` names: h3 is preferred, not required.
     #[cfg(feature = "quic-dns")]
     async fn doh3_exchange(
@@ -2050,7 +2061,7 @@ impl DnsClient {
             "prefer-h3 transport without an upstream driver",
         ))?;
         if upstream.h3_available() {
-            // Half the budget. A hung QUIC handshake must leave the HTTP/1.1
+            // Half the budget. A hung QUIC handshake must leave the DoH
             // fallback enough time to answer, or `prefer-h3` would turn a
             // dead UDP path into a dead resolver.
             let budget = self.timeout / 2;
@@ -2074,13 +2085,13 @@ impl DnsClient {
             tracing::debug!(
                 upstream = %self.upstream_label(),
                 error = %failure,
-                "DoH3 exchange failed; retrying over HTTP/1.1"
+                "DoH3 exchange failed; retrying over the DoH fallback"
             );
             // Park only for connectivity/handshake verdicts. A per-query
             // protocol answer on a healthy HTTP/3 connection (non-200 status,
             // empty body, peer reset) is not evidence that the server lacks
             // HTTP/3, and parking would send the next ten minutes of queries
-            // over HTTP/1.1 for no reason.
+            // over the DoH fallback for no reason.
             if matches!(failure, ClientError::Io(_) | ClientError::Timeout(_)) {
                 upstream.park_h3(true);
             }
