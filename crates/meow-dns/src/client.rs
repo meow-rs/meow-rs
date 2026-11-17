@@ -1674,10 +1674,19 @@ impl DnsClient {
             match tls_reuse_budget(self.timeout, conn.est_rtt()) {
                 Some(budget) => {
                     let started = Instant::now();
-                    match tokio::time::timeout(budget, self.doh_h2_request(&conn, wire)).await {
-                        Ok(Ok(body)) => {
+                    // Decode inside the timed future, as the HTTP/1.1 reuse
+                    // path runs `tls_message_exchange` — exchange plus
+                    // decode — under its budget; it also keeps `est_rtt`
+                    // measuring what the fresh dial below measures.
+                    match tokio::time::timeout(budget, async {
+                        let body = self.doh_h2_request(&conn, wire).await?;
+                        decode_validated_response(&body, expected)
+                    })
+                    .await
+                    {
+                        Ok(Ok(response)) => {
                             conn.record_exchange(started.elapsed());
-                            return decode_validated_response(&body, expected);
+                            return Ok(response);
                         }
                         Ok(Err(ClientError::Io(err))) => {
                             tracing::debug!(
@@ -1844,15 +1853,16 @@ impl DnsClient {
 
     /// Make `conn` the shared h2 conn unless a reusable one is already
     /// there: concurrent first queries each dial, and the surplus conns
-    /// close once their own stream ends. A conn from a generation retired
-    /// while it was dialing is never installed.
+    /// close once their own stream ends. The generation is read under the
+    /// lock, as `Pool::push` checks it under the pool's — so a conn from a
+    /// generation retired while it was dialing is never installed.
     #[cfg(feature = "doh-h2")]
     fn doh_h2_install(&self, conn: Arc<DohH2Conn>) {
+        let mut slot = self.doh_h2.lock();
         let generation = self.tls_pool.generation();
         if !conn.reusable(generation, Instant::now()) {
             return;
         }
-        let mut slot = self.doh_h2.lock();
         if slot
             .as_ref()
             .is_none_or(|current| !current.reusable(generation, Instant::now()))
