@@ -2591,16 +2591,19 @@ mod tests {
             mptcp: true,
             ..Default::default()
         };
-        let stream = match dialer_opts_scope(scoped, connect_tcp(addr)).await {
-            Ok(stream) => stream,
-            // Linux lands the options on the socket — the outcome
-            // depends on the running kernel (MPTCP needs ≥5.6), so
-            // nothing to assert there.
-            #[cfg(target_os = "linux")]
-            Err(_) => return,
-            #[cfg(not(target_os = "linux"))]
-            Err(e) => panic!("tfo/mptcp warn-and-skip must not fail the dial: {e}"),
+        // Linux lands the options on the socket — the outcome depends
+        // on the running kernel (MPTCP needs ≥5.6), so an `Err` just
+        // ends the test early; off-Linux the warn-and-skip path must
+        // never fail the dial.
+        #[cfg(target_os = "linux")]
+        let Ok(stream) = dialer_opts_scope(scoped, connect_tcp(addr)).await
+        else {
+            return;
         };
+        #[cfg(not(target_os = "linux"))]
+        let stream = dialer_opts_scope(scoped, connect_tcp(addr))
+            .await
+            .expect("tfo/mptcp warn-and-skip must not fail the dial");
         let _ = accept.await.unwrap();
         drop(stream);
     }
