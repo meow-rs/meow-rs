@@ -718,6 +718,7 @@ const TX_COALESCE: Duration = Duration::from_millis(1);
 /// `recv_batch` the socket is nearly dry, so re-poll briefly for more
 /// arrivals instead of spending a fresh `poll`+`recvmsg_x` round on
 /// every straggler.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
 const RX_COALESCE_USEC: libc::useconds_t = 200;
 
 /// Accumulation sleep after a short drain: parks the bridge thread for
