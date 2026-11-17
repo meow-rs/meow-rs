@@ -699,6 +699,37 @@ impl BatchEndpoint {
 /// staged (wg-perf, paired with the `WIRE_DRAIN_BUDGET` raise).
 const PROXY_ENDPOINT_QUEUE: usize = 4 * WIRE_DRAIN_BUDGET;
 
+/// Coalescing bound of the TX bridge's staged flush queue: below this
+/// depth the task waits up to `TX_COALESCE` for the producer to deepen
+/// the batch, so a wire datagram rides one `sendmsg_x` with its
+/// neighbours instead of spending a syscall alone. 32 covers a typical
+/// inner-TCP burst without paying more than the window in latency.
+const TX_COALESCE_MIN: usize = 32;
+
+/// How long the TX bridge waits for the producer to deepen a shallow
+/// staged batch. Tokio's timer granularity makes sub-millisecond
+/// windows ineffective, so 1 ms is the finest meaningful bound —
+/// long enough to fold a producer burst into one `sendmsg_x`, short
+/// enough that a sparse first datagram is delayed less than a pump
+/// pass.
+const TX_COALESCE: Duration = Duration::from_millis(1);
+
+/// The symmetric bound on the RX thread's side: after a short
+/// `recv_batch` the socket is nearly dry, so re-poll briefly for more
+/// arrivals instead of spending a fresh `poll`+`recvmsg_x` round on
+/// every straggler.
+const RX_COALESCE_USEC: libc::useconds_t = 200;
+
+/// Accumulation sleep after a short drain: parks the bridge thread for
+/// `RX_COALESCE_USEC` so the next `recv_batch` sees a deeper socket
+/// queue. Readiness is not re-checked — under a continuous stream the
+/// window itself is the coalescer, and a dry follow-up batch exits the
+/// drain loop back onto the parked `poll`.
+#[cfg(any(target_os = "linux", target_os = "android", target_os = "macos"))]
+fn rx_coalesce() {
+    unsafe { libc::usleep(RX_COALESCE_USEC) };
+}
+
 /// Staging buffer of the [`ProxyEndpoint`] RX bridge — one full UDP
 /// payload. WG wire datagrams stay far below this (outer MTU +
 /// overhead); the bound only keeps a pathological conn read inside the
@@ -1358,6 +1389,23 @@ impl BridgedEndpoint {
                     while let Ok(p) = pump_rx.try_recv() {
                         sendq.push_back(p);
                     }
+                    // Coalesce: under a trickle the channel feeds
+                    // `sendq` a datagram at a time and an immediate
+                    // flush would spend a `sendmsg_x` syscall on each
+                    // wire datagram. Park briefly so the producer can
+                    // deepen the batch — the flood path never comes
+                    // here, and sparse bursts pay at most `TX_COALESCE`
+                    // on their first datagram.
+                    if sendq.len() < TX_COALESCE_MIN {
+                        tokio::select! {
+                            biased;
+                            _ = shutdown.notified() => break 'outer,
+                            _ = tokio::time::sleep(TX_COALESCE) => {},
+                        }
+                        while let Ok(p) = pump_rx.try_recv() {
+                            sendq.push_back(p);
+                        }
+                    }
                     while !sendq.is_empty() {
                         let sent = {
                             let refs: Vec<(SocketAddr, &[u8])> =
@@ -1462,7 +1510,6 @@ impl BridgedEndpoint {
                             SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
                             WIRE_DRAIN_BUDGET
                         ];
-                    let mut single = vec![0u8; BRIDGE_BUF];
                     'outer: loop {
                         // Wait on the fd itself *and* the wake edge;
                         // the timeout only bounds how often the
@@ -1515,19 +1562,11 @@ impl BridgedEndpoint {
                                         break 'outer;
                                     }
                                 }
+                                if n == 0 {
+                                    break;
+                                }
                                 if n < staged.len() {
-                                    match ep.try_recv(&mut single) {
-                                        Ok(m) => {
-                                            spent += 1;
-                                            let pkt = Bytes::copy_from_slice(&single[..m]);
-                                            if wire_tx.blocking_send((peer, pkt)).is_err() {
-                                                break 'outer;
-                                            }
-                                            continue;
-                                        }
-                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                        Err(_) => break 'outer,
-                                    }
+                                    rx_coalesce();
                                 }
                             } else {
                                 let n = ep.recv_batch_from(
@@ -1542,19 +1581,11 @@ impl BridgedEndpoint {
                                         break 'outer;
                                     }
                                 }
+                                if n == 0 {
+                                    break;
+                                }
                                 if n < staged.len() {
-                                    match ep.try_recv_from(&mut single) {
-                                        Ok((m, src)) => {
-                                            spent += 1;
-                                            let pkt = Bytes::copy_from_slice(&single[..m]);
-                                            if wire_tx.blocking_send((src, pkt)).is_err() {
-                                                break 'outer;
-                                            }
-                                            continue;
-                                        }
-                                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                                        Err(_) => break 'outer,
-                                    }
+                                    rx_coalesce();
                                 }
                             }
                         }
