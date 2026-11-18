@@ -512,6 +512,10 @@ the canonical, in-repo source a release is cut from.
   warning vs strict refusal), not what the entry matches.
   `DOMAIN-REGEX` stays unchecked: whether an arbitrary pattern can match
   a normalized host is not decidable by label inspection.
+- **Controller secret changes require a restart.** `PUT /configs` rejects
+  adding, changing, or removing the YAML secret, even with `?force=true`.
+  Reloads that preserve the YAML secret work with a startup override.
+
 - **UDP to a loopback destination works under TUN global route scope.**
   With `tun.auto-route: true` (or `global`) meow binds its own sockets to
   the physical interface against routing loops, and decided that for UDP

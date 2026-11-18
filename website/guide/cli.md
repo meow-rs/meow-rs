@@ -100,8 +100,8 @@ decode fine) are skipped and reported as a warning with the count.
 
 ## Hot reload
 
-You don't have to restart to apply config changes. The REST API can reload the whole file
-in place:
+The REST API can reload the configuration in place. Applying a change to the controller
+secret requires a restart.
 
 ```bash
 curl -X PUT 'http://127.0.0.1:9090/configs' \

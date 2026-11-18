@@ -3876,6 +3876,19 @@ async fn put_configs(
     // add/refresh — keep resolving before the lane: they never change
     // `tun:`, so the running listener's binding already covers them.)
     let _mutation = CONFIG_MUTATION.lock().await;
+    // Compare YAML fields to preserve reloads with a startup secret override.
+    let secret_changed = {
+        let live = state.raw_config.read();
+        raw_config.secret.as_deref().unwrap_or_default()
+            != live.secret.as_deref().unwrap_or_default()
+    };
+    if secret_changed {
+        return reload_rejected(
+            StatusCode::BAD_REQUEST,
+            "changing the controller secret requires a restart",
+        );
+    }
+
     // Dropped on every rejection below, restoring the running listener's
     // binding; a TUN (re)spawn in the reconcile adopts it instead.
     if let Some(msg) = routing_mark_change_refused(&raw_config) {

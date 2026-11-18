@@ -48,7 +48,7 @@ struct Meow {
 
 impl Meow {
     async fn start() -> Self {
-        Self::start_with(CONFIG).await
+        Self::start_with(&format!("secret: {SECRET}\n{CONFIG}")).await
     }
 
     async fn start_with(config: &str) -> Self {

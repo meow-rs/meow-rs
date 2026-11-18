@@ -5707,6 +5707,57 @@ async fn put_configs_swaps_running_dns_resolver() {
     );
 }
 
+#[tokio::test]
+async fn put_configs_requires_restart_to_change_the_controller_secret() {
+    use base64::Engine as _;
+
+    let state = test_state_with_secret("startup-override");
+    state.raw_config.write().secret = Some("original-yaml-value".into());
+    let app = create_router(Arc::clone(&state));
+
+    for (uri, candidate, status) in [
+        (
+            "/configs?force=true",
+            "mode: global\nsecret: new-yaml-value\n",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/configs", "mode: global\n", StatusCode::BAD_REQUEST),
+        (
+            "/configs",
+            "mode: direct\nsecret: original-yaml-value\n",
+            StatusCode::NO_CONTENT,
+        ),
+    ] {
+        let payload = base64::engine::general_purpose::STANDARD.encode(candidate);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put(uri)
+                    .header("authorization", "Bearer startup-override")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        if status == StatusCode::BAD_REQUEST {
+            assert_eq!(
+                body_json(response).await["message"],
+                "changing the controller secret requires a restart"
+            );
+            assert_eq!(state.raw_config.read().mode.as_deref(), Some("rule"));
+        }
+        assert_eq!(
+            state.raw_config.read().secret.as_deref(),
+            Some("original-yaml-value")
+        );
+    }
+    assert_eq!(state.raw_config.read().mode.as_deref(), Some("direct"));
+}
+
 /// A `PUT /configs` parse failure surfaces the tree error through the 400
 /// body: `{"message": "config parse error: line N column M: port: invalid
 /// u16"}`. The `line`/`column` prefix plus the dotted field path are the

@@ -66,6 +66,7 @@ ipv6: false
 # REST API
 external-controller: 127.0.0.1:9090
 secret: ""
+# Applying a change to the controller secret requires a restart.
 # Mount a third-party dashboard (metacubexd, yacd, …) at /ui instead of the
 # built-in panel. Point external-ui at a directory of static files; if the UI
 # lives in a sub-directory, set external-ui-name. Auto-download via
