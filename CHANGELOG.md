@@ -202,6 +202,18 @@ the canonical, in-repo source a release is cut from.
   front that cannot dial fails closed rather than falling back to a
   direct connection. `connect_over` relay sessions remain unpooled.
 
+- **Unknown config keys warn at load** — every config section that used
+  to drop keys its schema doesn't model (the top level, `dns:`, `tun:`,
+  `sniffer:`, `geodata:`/`geox-url:`, `logbook:`, `traffic-ledger:`,
+  `listeners:`, `proxy-groups:`, provider definitions and
+  `subscriptions:`, plus per-`type` `proxies:` node inventories) now
+  emits a sorted warn per rebuild: unrecognized keys aggregate with
+  spelling hints, mihomo keys this build doesn't implement name the
+  feature, and misplaced keys name the surface that honors them.
+  Warn-only — a verbatim mihomo config keeps loading, `strict: true`
+  does not promote them, and unknown keys round-trip through the config
+  save path. (ADR-0002 Class B, issue #974)
+
 ### Changed
 
 - **WireGuard received packets are now serviced in the same pump pass

@@ -32,6 +32,7 @@ pub mod subscription;
 pub mod subscription_userinfo;
 #[cfg(test)]
 mod test_support;
+pub(crate) mod validation;
 mod yaml_tree;
 
 pub use dropped_providers::DroppedProviders;
@@ -3175,6 +3176,10 @@ fn rebuild_from_raw_impl(
     fetch_geodata: bool,
 ) -> Result<RebuildResult, anyhow::Error> {
     dns_parser::validate_node_policy_sources(raw)?;
+    // Warn-only unknown-key reporting (issue #974): classify-and-warn every
+    // key the typed schema dropped. Runs on every rebuild pass — startup's
+    // `-t`/load passes and `PUT`/`PATCH /configs` rebuilds all re-emit.
+    validation::validate_and_warn(raw);
     // Top-level `strict: true` (issue #533): warn-skipped defects in
     // *operator-authored* content become hard errors — proxies,
     // proxy-groups and rules are covered inside
@@ -4099,20 +4104,26 @@ fn ensure_geodata_blocking(
     {
         return;
     }
+    // Carry the scoped dispatcher onto the download thread so its warns
+    // reach the caller's subscriber (same propagation
+    // `spawn_blocking_with_current_dispatcher` applies).
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let joined = std::thread::scope(|scope| {
         scope
             .spawn(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                rt.block_on(ensure_geodata(
-                    raw,
-                    geo,
-                    scan_lines,
-                    Some(map),
-                    chained_providers,
-                ));
-                Ok::<(), std::io::Error>(())
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    rt.block_on(ensure_geodata(
+                        raw,
+                        geo,
+                        scan_lines,
+                        Some(map),
+                        chained_providers,
+                    ));
+                    Ok::<(), std::io::Error>(())
+                })
             })
             .join()
     });
@@ -5362,6 +5373,18 @@ fn build_named_listeners(
         // the listen-default and warn-dedupe branches below still need it.
         let is_redir = raw_l.listener_type.eq_ignore_ascii_case("redir");
         let spec = parse_listener_spec(raw_l, global_tproxy_sni, sniffer_declared)?;
+        // `type: wireguard` entries already warned their extra keys inside
+        // `build_wg_listener_spec` (peer extras too); on every other type the
+        // extras would drop silently — classify-and-warn here (issue #974).
+        if !matches!(spec, ListenerSpec::WireGuard(_)) {
+            validation::warn_extra(&format!("listener '{}'", raw_l.name), &raw_l.extra);
+            if let Some(obfs) = &raw_l.simple_obfs {
+                validation::warn_extra(
+                    &format!("listener '{}' simple-obfs", raw_l.name),
+                    &obfs.extra,
+                );
+            }
+        }
         if raw_l.firewall.is_some() && !matches!(spec, ListenerSpec::TProxy { .. }) {
             warn!(
                 "listeners[{}].firewall: only meaningful on `type: tproxy`, ignored; \
@@ -7869,6 +7892,7 @@ mod geoip_context_tests {
                 proxy: None,
                 header: None,
                 payload: Some(vec!["GEOIP,KR".to_string(), "GEOSITE,youtube".to_string()]),
+                extra: Default::default(),
             },
         );
         let raw = raw::RawConfig {
@@ -7897,6 +7921,7 @@ mod geoip_context_tests {
             proxy: None,
             header: None,
             payload: None,
+            extra: Default::default(),
         };
         let raw = raw::RawConfig {
             rule_providers: Some(HashMap::from([

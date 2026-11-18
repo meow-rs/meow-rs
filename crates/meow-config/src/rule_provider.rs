@@ -1799,12 +1799,18 @@ fn fetch_http_blocking(
     let thread_url = url.clone();
     let proxy = proxy.cloned();
     let headers = headers.to_vec();
+    // The spawn sees no caller context — carry the scoped dispatcher so
+    // warns inside the fetch reach the subscriber in effect here (same
+    // propagation `spawn_blocking_with_current_dispatcher` applies).
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("building temporary tokio runtime for rule-provider fetch")?;
-        rt.block_on(fetch_http_async(&thread_url, proxy.as_ref(), &headers))
+        tracing::dispatcher::with_default(&dispatch, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building temporary tokio runtime for rule-provider fetch")?;
+            rt.block_on(fetch_http_async(&thread_url, proxy.as_ref(), &headers))
+        })
     })
     .join()
     .map_err(|payload| {
@@ -1921,6 +1927,7 @@ mod tests {
             proxy: proxy.map(str::to_string),
             header: None,
             payload: None,
+            extra: Default::default(),
         }
     }
 
@@ -2018,6 +2025,7 @@ mod tests {
                 proxy: Some("NoSuch".to_string()),
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2043,6 +2051,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2068,6 +2077,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: Some(vec!["example.com".to_string(), "+.foo.com".to_string()]),
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
@@ -2089,6 +2099,7 @@ mod tests {
             proxy: None,
             header: None,
             payload: Some(vec!["example.com".to_string()]),
+            extra: Default::default(),
         };
         let err = load_inline("p", &cfg, RuleSetBehavior::Domain, &ctx(), false)
             .map(|_| ())
@@ -2118,6 +2129,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2138,6 +2150,7 @@ mod tests {
             proxy: None,
             header: None,
             payload: None,
+            extra: Default::default(),
         }
     }
 
@@ -2260,6 +2273,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2282,6 +2296,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
@@ -2306,6 +2321,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2363,6 +2379,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
 
@@ -2475,6 +2492,7 @@ header:
                 proxy: None,
                 header: Some(header),
                 payload: None,
+                extra: Default::default(),
             },
         );
 
@@ -2553,6 +2571,7 @@ header:
                 proxy: None,
                 header: Some(header),
                 payload: None,
+                extra: Default::default(),
             },
         );
 
@@ -2589,6 +2608,7 @@ header:
                 proxy: None,
                 header: None,
                 payload: Some(vec!["example.com".to_string()]),
+                extra: Default::default(),
             },
         );
         providers.insert(
@@ -2603,6 +2623,7 @@ header:
                 proxy: None,
                 header: None,
                 payload: Some(vec!["10.0.0.0/8".to_string()]),
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
@@ -2835,6 +2856,7 @@ header:
             proxy: None,
             header: None,
             payload: Some(vec!["example.com".to_string()]),
+            extra: Default::default(),
         };
 
         // No cache dir (the `PUT /configs` rebuild context): previously a
@@ -2982,6 +3004,7 @@ header:
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, Some(dir.path()), &parse_ctx, None, false)

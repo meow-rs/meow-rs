@@ -3551,3 +3551,594 @@ rules:
     assert!(rule.match_metadata(&metadata("api123.example"), &meow_common::RuleMatchHelper));
     assert!(!rule.match_metadata(&metadata("api1234.example"), &meow_common::RuleMatchHelper));
 }
+
+// ── Unknown-key warnings (issue #974) ───────────────────────────────────
+//
+// Class B per ADR-0002: keys no schema models warn by name — never an
+// error, so a verbatim mihomo config keeps loading. `TU-4` (top-level
+// `firewall`) is covered by `test_top_level_firewall_warns_and_is_ignored`
+// above: that key is typed on `RawConfig` and keeps its bespoke warn.
+mod unknown_key_warns {
+    use meow_config::{load_config_from_str, parse_raw_yaml, rebuild_from_raw};
+    use std::sync::{Arc, Mutex};
+
+    /// WARN-sink + scoped-subscriber harness: the config build runs inside
+    /// `with_default` on a current-thread runtime so the thread-local
+    /// dispatch is in effect when warns fire (same pattern as the listener
+    /// misuse tests above).
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+
+    fn capture_warns<T>(f: impl FnOnce() -> T) -> (T, String) {
+        let sink = Sink(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+        (out, logs)
+    }
+
+    fn load_and_capture_warns(yaml: &str) -> (meow_config::Config, String) {
+        capture_warns(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(load_config_from_str(yaml))
+                .unwrap()
+        })
+    }
+
+    /// TU-1/TU-2/TU-3: unsupported keys name the feature and cite the
+    /// tracking issue where one exists; a bare typo aggregates under
+    /// "unknown keys".
+    #[test]
+    fn unknown_top_level_keys_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+brutal-delay: 1
+ntp:
+  enable: true
+tcp-idl-timeout: 5
+"#,
+        );
+        assert!(
+            logs.contains("unsupported key in top-level config: brutal-delay"),
+            "got: {logs}"
+        );
+        assert!(
+            logs.contains("unsupported key in top-level config: ntp (issue #974)"),
+            "got: {logs}"
+        );
+        assert!(
+            logs.contains("unknown keys in top-level config: tcp-idl-timeout"),
+            "got: {logs}"
+        );
+    }
+
+    /// Misplaced keys name the surface that honors them — `firewall` under
+    /// `dns:` is not a typed field there, so the extra-capture classify
+    /// fires (the top-level `firewall` key is typed and warned by its own
+    /// bespoke check instead).
+    #[test]
+    fn misplaced_keys_name_their_surface() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+dns:
+  firewall: true
+proxy-groups:
+  - name: g
+    type: select
+    proxies: [DIRECT]
+    tfo: true
+"#,
+        );
+        assert!(
+            logs.contains("misplaced key in dns: firewall (belongs on a listeners:"),
+            "got: {logs}"
+        );
+        assert!(
+            logs.contains("misplaced key in proxy-group 'g': tfo"),
+            "got: {logs}"
+        );
+        assert!(logs.contains("proxies: entry"), "got: {logs}");
+    }
+
+    /// TP-1/TP-2: per-node keys outside the ss inventory warn — registered
+    /// unsupported keys with their reason, open-ended `brutal-*` too.
+    #[test]
+    fn unknown_ss_node_keys_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxies:
+  - name: s
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+    udp-over-tcp-version: 3
+    brutal-opts: {}
+"#,
+        );
+        assert!(
+            logs.contains("unsupported key in proxy 's': udp-over-tcp-version"),
+            "got: {logs}"
+        );
+        assert!(
+            logs.contains("unsupported key in proxy 's': brutal-opts"),
+            "got: {logs}"
+        );
+    }
+
+    /// TP-3: a misspelling of a real key gets the spelling hint.
+    #[test]
+    fn trojan_near_miss_hint() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxies:
+  - name: t
+    type: trojan
+    server: example.com
+    port: 443
+    password: pw
+    skip-cert-verfiy: true
+"#,
+        );
+        assert!(
+            logs.contains(
+                "unknown keys in proxy 't': skip-cert-verfiy (not recognized; mihomo uses 'skip-cert-verify')"
+            ),
+            "got: {logs}"
+        );
+    }
+
+    /// TP-4: `smux`/`mux` are both accepted — neither warns.
+    #[test]
+    fn mux_smux_aliases_do_not_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxies:
+  - name: a
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+    smux:
+      enabled: true
+  - name: b
+    type: trojan
+    server: example.com
+    port: 443
+    password: pw
+    mux:
+      enabled: true
+"#,
+        );
+        assert!(
+            !logs.contains("unknown keys in proxy 'a': smux"),
+            "smux alias must not warn: {logs}"
+        );
+        assert!(
+            !logs.contains("unknown keys in proxy 'b': mux"),
+            "mux alias must not warn: {logs}"
+        );
+        assert!(!logs.contains("unknown keys"), "got: {logs}");
+    }
+
+    /// TPG-1/TPG-2: group-level keys outside the group schema — a near-miss
+    /// spelling plus a plain unknown.
+    #[test]
+    fn proxy_group_unknown_keys_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxy-groups:
+  - name: auto
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    proxies: [DIRECT]
+    test-timeout: 5
+  - name: relay-g
+    type: select
+    proxies: [DIRECT]
+    max-alive: 3
+"#,
+        );
+        assert!(
+            logs.contains(
+                "unknown keys in proxy-group 'auto': test-timeout (not recognized; mihomo uses 'timeout' (not modeled here))"
+            ),
+            "got: {logs}"
+        );
+        assert!(
+            logs.contains("unknown keys in proxy-group 'relay-g': max-alive"),
+            "got: {logs}"
+        );
+    }
+
+    /// TL-1: a key no listener schema models warns on `type: mixed`.
+    #[test]
+    fn listener_unknown_key_warns() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+listeners:
+  - name: mixed-l
+    type: mixed
+    listen: 127.0.0.1:0
+    unknown-listener-opt: 1
+"#,
+        );
+        assert!(
+            logs.contains("unknown keys in listener 'mixed-l': unknown-listener-opt"),
+            "got: {logs}"
+        );
+    }
+
+    /// TL-2: WG peer extras keep their bespoke per-peer warn.
+    #[test]
+    fn wg_peer_unknown_key_warns() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+listeners:
+  - name: wg-in
+    type: wireguard
+    listen: 127.0.0.1:0
+    private-key: "eCtXsJZ27+4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU="
+    peers:
+      - public-key: "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo="
+        allowed-ips: [10.0.0.2/32]
+        persistant-keepalive: 25
+"#,
+        );
+        assert!(
+            logs.contains("persistant-keepalive")
+                && logs.contains("not a known wireguard peer field"),
+            "got: {logs}"
+        );
+    }
+
+    /// TD-1/TT-1/TS-1/TG-1/TGX-1: one unknown key per section.
+    #[test]
+    fn section_unknown_keys_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+dns:
+  bogus-dns-key: 1
+tun:
+  bogus-tun-key: 1
+sniffer:
+  bogus-sniffer-key: 1
+geodata:
+  bogus-geodata-key: 1
+geox-url:
+  bogus-geox-key: 1
+"#,
+        );
+        for want in [
+            "unknown keys in dns: bogus-dns-key",
+            "unknown keys in tun: bogus-tun-key",
+            "unknown keys in sniffer: bogus-sniffer-key",
+            "unknown keys in geodata: bogus-geodata-key",
+            "unknown keys in geox-url: bogus-geox-key",
+        ] {
+            assert!(logs.contains(want), "missing '{want}' in: {logs}");
+        }
+    }
+
+    /// `nameserver-policy` keys are domain patterns, not config keys —
+    /// they must never warn.
+    #[test]
+    fn nameserver_policy_patterns_do_not_warn() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+dns:
+  enable: true
+  nameserver-policy:
+    "+.example.com": 1.1.1.1
+    "geosite:cn": [8.8.8.8]
+"#,
+        );
+        assert!(
+            !logs.contains("unknown keys in dns"),
+            "policy patterns warned: {logs}"
+        );
+    }
+
+    /// TR-1: provider-definition keys outside the schema warn with the
+    /// provider named; the provider need not load for the def-level warn.
+    #[test]
+    fn proxy_provider_unknown_key_warns() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxy-providers:
+  p:
+    type: file
+    path: /nonexistent/nodes.yaml
+    bogus-provider-key: 1
+"#,
+        );
+        assert!(
+            logs.contains("unknown keys in proxy-provider 'p': bogus-provider-key"),
+            "got: {logs}"
+        );
+    }
+
+    /// TR-2 + TV-3: a loaded `file:` provider — override keys other than
+    /// `dialer-proxy` warn (pre-existing bespoke warn), and provider
+    /// payload nodes warn with provider context. `path:` providers resolve
+    /// inside the provider cache dir, so this goes through `build_config`
+    /// with a tempdir rather than the `None`-cache `load_config_from_str`.
+    #[test]
+    fn provider_override_and_node_unknown_keys_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - name: n\n    type: ss\n    server: 1.2.3.4\n    port: 8388\n    cipher: aes-256-gcm\n    password: pw\n    bogus-node-key: 1\n",
+        )
+        .unwrap();
+        let yaml = "proxy-providers:\n  p:\n    type: file\n    path: nodes.yaml\n    override:\n      dialer-proxy: DIRECT\n      bogus-override-key: 1\n";
+        let (_config, logs) = capture_warns(|| {
+            let raw = parse_raw_yaml(yaml).unwrap();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(meow_config::build_config(raw, Some(dir.path())))
+                .unwrap()
+        });
+        assert!(
+            logs.contains("proxy-provider override key 'bogus-override-key' is not supported"),
+            "got: {logs}"
+        );
+        assert!(
+            !logs.contains("'dialer-proxy' is not supported"),
+            "dialer-proxy must stay honored: {logs}"
+        );
+        assert!(
+            logs.contains("unknown keys in proxy 'n' (from provider 'p'): bogus-node-key"),
+            "got: {logs}"
+        );
+    }
+
+    /// TV-2: a rebuild (the `PUT`/`PATCH /configs` path) re-emits — warns
+    /// are not one-shot startup noise.
+    #[test]
+    fn unknown_keys_reemit_on_rebuild() {
+        let raw = parse_raw_yaml("rebuild-bogus-key: 1\n").unwrap();
+        let (_out, logs) = capture_warns(|| {
+            rebuild_from_raw(&raw).unwrap();
+            rebuild_from_raw(&raw).unwrap();
+        });
+        assert_eq!(
+            logs.matches("unknown keys in top-level config: rebuild-bogus-key")
+                .count(),
+            2,
+            "each rebuild pass must re-emit: {logs}"
+        );
+    }
+
+    /// TC-1: unrecognized keys aggregate sorted into one line per context.
+    #[test]
+    fn unknown_keys_aggregate_sorted_into_one_line() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+zebra-key: 1
+alpha-key: 2
+mid-key: 3
+beta-key: 4
+kappa: 5
+"#,
+        );
+        assert!(
+            logs.contains(
+                "unknown keys in top-level config: alpha-key, beta-key, kappa, mid-key, zebra-key"
+            ),
+            "got: {logs}"
+        );
+    }
+
+    /// TC-2: the same unknown key on three nodes warns three times, each
+    /// carrying its node's name.
+    #[test]
+    fn same_unknown_key_warns_per_proxy() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+proxies:
+  - name: a
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+    bogus-key: 1
+  - name: b
+    type: ss
+    server: 1.2.3.5
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+    bogus-key: 1
+  - name: c
+    type: trojan
+    server: example.com
+    port: 443
+    password: pw
+    bogus-key: 1
+"#,
+        );
+        for name in ["a", "b", "c"] {
+            assert!(
+                logs.contains(&format!("unknown keys in proxy '{name}': bogus-key")),
+                "missing proxy '{name}' warn in: {logs}"
+            );
+        }
+    }
+
+    /// `strict: true` promotes *defects* to errors — unknown keys are not
+    /// defects; the warns stay warns and the config still loads.
+    #[test]
+    fn strict_mode_keeps_unknown_keys_warn_only() {
+        let (config, logs) = load_and_capture_warns(
+            r#"
+strict: true
+strict-bogus-key: 1
+"#,
+        );
+        assert!(
+            logs.contains("unknown keys in top-level config: strict-bogus-key"),
+            "got: {logs}"
+        );
+        drop(config);
+    }
+
+    /// TI-1: serialized `RawConfig::default()` exposes exactly the typed
+    /// fields (the `extra` flatten contributes nothing when empty). The
+    /// exact list, not a count — a `skip_serializing_if`-gated addition
+    /// would evade a bare `len()` check, as would one name for another.
+    /// (Still not airtight: a field that never serializes leaves no mark.)
+    #[test]
+    fn raw_config_field_inventory_is_pinned() {
+        let v = serde_json::to_value(meow_config::raw::RawConfig::default()).unwrap();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let expected = [
+            "allow-lan",
+            "authentication",
+            "bind-address",
+            "connection-notes",
+            "disable-keep-alive",
+            "dns",
+            "external-controller",
+            "external-ui",
+            "external-ui-name",
+            "external-ui-url",
+            "firewall",
+            "geodata",
+            "geox-url",
+            "hosts",
+            "interface-name",
+            "ipv6",
+            "keep-alive-idle",
+            "keep-alive-interval",
+            "listeners",
+            "log-level",
+            "logbook",
+            "max-connections",
+            "mixed-port",
+            "mode",
+            "port",
+            "proxies",
+            "proxy-groups",
+            "proxy-providers",
+            "redir-port",
+            "routing-mark",
+            "rule-providers",
+            "rules",
+            "secret",
+            "skip-auth-prefixes",
+            "sniffer",
+            "socks-port",
+            "strict",
+            "sub-rules",
+            "subscriptions",
+            "tcp-connect-timeout",
+            "tcp-idle-timeout",
+            "tcp-keepalive",
+            "tcp-keepalive-idle",
+            "tcp-keepalive-interval",
+            "tcp-keepalive-probes",
+            "tproxy-port",
+            "tproxy-sni",
+            "traffic-ledger",
+            "tun",
+            "udp",
+            "udp-timeout",
+            "unified-delay",
+        ];
+        assert_eq!(
+            keys, expected,
+            "RawConfig serialized fields changed — confirm a new typed field \
+             is deliberate; unknown keys must keep flowing into `extra`"
+        );
+    }
+
+    /// Unknown keys never block a load — a config carrying several of them
+    /// still builds its proxies.
+    #[test]
+    fn config_with_unknown_keys_still_loads() {
+        let (config, _logs) = load_and_capture_warns(
+            r#"
+bogus-key: 1
+proxies:
+  - name: s
+    type: ss
+    server: 1.2.3.4
+    port: 8388
+    cipher: aes-256-gcm
+    password: pw
+    another-bogus: 2
+"#,
+        );
+        assert!(
+            config.proxies.contains_key("s"),
+            "node must load despite the unknown key"
+        );
+    }
+
+    /// Review F1 regression: an unknown key whose *value* nests a map with
+    /// non-string scalar keys must still load — serde's flatten buffer
+    /// hands typed keys (`123` as `u64`) to the extra map, which used to
+    /// fail the whole parse. The nested keys stringify for the
+    /// warn + save round-trip; the outer key warns as before.
+    #[test]
+    fn unknown_key_with_nonstring_nested_keys_loads() {
+        let (config, logs) = load_and_capture_warns(
+            "mode: rule\nx-tpl: &h {123: 1.1.1.1, true: x, 1.5: y}\nrules: [MATCH,DIRECT]\n",
+        );
+        assert!(
+            logs.contains("unknown keys in top-level config: x-tpl"),
+            "got: {logs}"
+        );
+        assert_eq!(
+            config.raw.extra["x-tpl"].0,
+            serde_json::json!({"123": "1.1.1.1", "1.5": "y", "true": "x"}),
+            "nested scalar keys must stringify, not fail the parse"
+        );
+    }
+
+    /// Same F1 regression through the production ingest path —
+    /// `parse_raw_yaml`'s `yaml_tree` deserializer types nested keys the
+    /// same way, so the boundary must hold there too. A null key keeps
+    /// erroring (the `String` map key rejected it before).
+    #[test]
+    fn parse_raw_yaml_unknown_key_nonstring_nested_keys() {
+        let raw = meow_config::parse_raw_yaml("mode: rule\nx-tpl: &h {123: 1.1.1.1, true: x}\n")
+            .expect("non-string scalar keys inside an unknown key must load");
+        assert_eq!(
+            raw.extra["x-tpl"].0,
+            serde_json::json!({"123": "1.1.1.1", "true": "x"})
+        );
+
+        let err = meow_config::parse_raw_yaml("x-tpl: {~: v}\n")
+            .expect_err("a null mapping key must still fail");
+        assert!(err.to_string().contains("null"), "got: {err}");
+    }
+}

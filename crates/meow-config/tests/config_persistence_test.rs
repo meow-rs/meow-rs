@@ -98,6 +98,7 @@ fn save_roundtrip_with_subscriptions() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
 
     save_raw_config(path_str, &raw).unwrap();
@@ -475,6 +476,51 @@ fn raw_config_serialize_deserialize_roundtrip() {
     assert_eq!(loaded.rules, raw.rules);
 }
 
+/// The `#[serde(flatten)]` `extra` maps serialize back: unknown keys the
+/// loader warned on must survive a save round-trip verbatim — and in
+/// sorted order (`BTreeMap`, no diff noise across saves).
+#[test]
+fn raw_config_extra_keys_roundtrip_sorted() {
+    let raw: RawConfig = serde_saphyr::from_str(
+        "mixed-port: 7890\nzebra-key: 1\nalpha-key: {nested: true}\ndns:\n  bogus-dns: x\n",
+    )
+    .unwrap();
+    assert!(raw.extra.contains_key("zebra-key"));
+
+    let yaml = to_yaml(&raw);
+    assert!(yaml.contains("alpha-key"), "{yaml}");
+    assert!(yaml.contains("zebra-key"), "{yaml}");
+    assert!(yaml.contains("bogus-dns"), "{yaml}");
+    assert!(
+        yaml.find("alpha-key") < yaml.find("zebra-key"),
+        "extra keys must save in sorted order: {yaml}"
+    );
+
+    let loaded: RawConfig = serde_saphyr::from_str(&yaml).unwrap();
+    assert_eq!(loaded.extra, raw.extra);
+    assert_eq!(
+        loaded.dns.as_ref().unwrap().extra,
+        raw.dns.as_ref().unwrap().extra
+    );
+}
+
+/// Non-string scalar keys inside an unknown-key subtree must not fail the
+/// parse — serde's flatten buffer hands typed keys to the extra map, which
+/// `serde_json::Value`'s own visitor rejects (review F1). They stringify
+/// (`123` → `"123"`) and write back as ordinary string keys.
+#[test]
+fn raw_config_extra_nested_scalar_keys_roundtrip() {
+    let raw: RawConfig = serde_saphyr::from_str("x-tpl: {123: 1.1.1.1, true: x}\n").unwrap();
+    assert_eq!(
+        raw.extra["x-tpl"].0,
+        serde_json::json!({"123": "1.1.1.1", "true": "x"})
+    );
+
+    let yaml = to_yaml(&raw);
+    let loaded: RawConfig = serde_saphyr::from_str(&yaml).unwrap();
+    assert_eq!(loaded.extra, raw.extra);
+}
+
 #[test]
 fn raw_subscription_serde() {
     let sub = RawSubscription {
@@ -486,6 +532,7 @@ fn raw_subscription_serde() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     };
     let yaml = to_yaml(&sub);
     assert!(
@@ -519,6 +566,7 @@ fn raw_subscription_serde_applied_fields() {
         applied_proxies: vec!["node-1".into(), "node-2".into()],
         applied_groups: vec!["g".into()],
         applied_rules: vec!["MATCH,DIRECT".into()],
+        extra: Default::default(),
     };
     let yaml = to_yaml(&sub);
     assert!(yaml.contains("applied-proxies:"), "{yaml}");
@@ -548,6 +596,7 @@ fn raw_subscription_serde_proxy() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     };
     let yaml = to_yaml(&sub);
     assert!(yaml.contains("proxy: front"), "{yaml}");
@@ -567,6 +616,7 @@ fn raw_config_clone() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
     let cloned = raw.clone();
     assert_eq!(cloned.mixed_port, raw.mixed_port);

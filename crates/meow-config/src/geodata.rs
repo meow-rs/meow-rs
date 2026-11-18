@@ -343,6 +343,7 @@ mod tests {
                 mmdb: Some("https://example.com/country.mmdb".to_string()),
                 asn: None,
                 geosite: Some("https://example.com/geosite.mrs".to_string()),
+                extra: Default::default(),
             }),
             ..raw_defaults()
         };
@@ -410,6 +411,7 @@ mod tests {
             asn: Some("https://cdn.test/ASN.mmdb".to_string()),
             geosite: None,
             geoip: None,
+            extra: Default::default(),
         };
         let cfg = parse_geodata(None, Some(&geox)).unwrap();
         assert_eq!(cfg.mmdb_url, "https://cdn.test/Country.mmdb");
@@ -429,6 +431,7 @@ mod tests {
                 mmdb: Some("https://explicit.test/Country.mmdb".to_string()),
                 asn: None,
                 geosite: None,
+                extra: Default::default(),
             }),
             ..raw_defaults()
         };
@@ -437,6 +440,7 @@ mod tests {
             asn: Some("https://alias.test/ASN.mmdb".to_string()),
             geosite: Some("https://alias.test/geosite.dat".to_string()),
             geoip: None,
+            extra: Default::default(),
         };
         let cfg = parse_geodata(Some(&raw), Some(&geox)).unwrap();
         assert_eq!(

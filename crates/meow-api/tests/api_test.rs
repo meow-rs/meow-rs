@@ -1756,6 +1756,7 @@ async fn get_subscriptions_with_data() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
     let state = test_state(raw);
     let app = create_router(state);
@@ -1792,6 +1793,7 @@ async fn get_subscriptions_reports_counts() {
         applied_proxies: vec!["S1".into()],
         applied_groups: vec!["G".into()],
         applied_rules: vec!["MATCH,G".into()],
+        extra: Default::default(),
     }]);
     let mut proxy1 = std::collections::HashMap::new();
     proxy1.insert("name".to_string(), serde_json::Value::String("S1".into()));
@@ -1859,6 +1861,7 @@ async fn delete_subscription_clears_data() {
         applied_proxies: vec!["S1".into()],
         applied_groups: vec!["G".into()],
         applied_rules: vec!["MATCH,G".into()],
+        extra: Default::default(),
     }]);
     let mut proxy1 = std::collections::HashMap::new();
     proxy1.insert("name".to_string(), serde_json::Value::String("S1".into()));
@@ -1975,6 +1978,7 @@ async fn refresh_subscription_deleted_mid_fetch_returns_404() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
     let state = test_state(raw);
     let app = create_router(Arc::clone(&state));
@@ -2497,6 +2501,7 @@ async fn delete_subscription_without_backing_file_skips_persist() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
     let state = test_state_ephemeral(raw);
     let app = create_router(Arc::clone(&state));
@@ -2610,6 +2615,7 @@ async fn refresh_subscription_without_backing_file_reports_not_persisted() {
         applied_proxies: vec![],
         applied_groups: vec![],
         applied_rules: vec![],
+        extra: Default::default(),
     }]);
     let state = test_state_ephemeral(raw);
     let app = create_router(Arc::clone(&state));
@@ -5394,6 +5400,7 @@ async fn rule_provider_format_uses_mihomo_names() {
         proxy: None,
         header: None,
         payload: None,
+        extra: Default::default(),
     };
     let cases = [
         ("yaml", file(&yaml, Some("yaml")), "YamlRule"),
@@ -6057,6 +6064,7 @@ async fn put_configs_carries_subscription_tracking_forward() {
             applied_proxies: vec!["node-1".into()],
             applied_groups: Vec::new(),
             applied_rules: Vec::new(),
+            extra: Default::default(),
         },
         RawSubscription {
             name: "t".into(),
@@ -6067,6 +6075,7 @@ async fn put_configs_carries_subscription_tracking_forward() {
             applied_proxies: vec!["t-node".into()],
             applied_groups: Vec::new(),
             applied_rules: Vec::new(),
+            extra: Default::default(),
         },
     ]);
     let state = test_state(raw);
@@ -9228,6 +9237,7 @@ async fn rule_provider_refresh_failure_is_readable_and_preserves_last_good() {
             proxy: None,
             header: None,
             payload: None,
+            extra: Default::default(),
         },
     )]);
     let state = test_state_default();
@@ -9624,5 +9634,69 @@ dns:
     assert_eq!(
         put("rules: ['MATCH,DIRECT']\n").await.unwrap().status(),
         StatusCode::NO_CONTENT
+    );
+}
+
+/// Issue #974 (TV-2): a `PUT /configs` rebuild re-emits unknown-key
+/// warnings — they are not one-shot startup noise. The rebuild runs inside
+/// the request handler on this test's runtime, so a scoped subscriber sees
+/// the warns.
+#[test]
+fn put_configs_warns_on_unknown_keys() {
+    use base64::Engine as _;
+
+    #[derive(Clone)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+    let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let status = tracing::subscriber::with_default(subscriber, || {
+        let state = test_state_default();
+        let payload = base64::engine::general_purpose::STANDARD
+            .encode("api-bogus-key: 1\nrules:\n  - MATCH,DIRECT\n");
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                create_router(Arc::clone(&state))
+                    .oneshot(
+                        Request::builder()
+                            .method("PUT")
+                            .uri("/configs")
+                            .header("content-type", "application/json")
+                            .body(axum::body::Body::from(
+                                serde_json::json!({"payload": payload}).to_string(),
+                            ))
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                    .status()
+            })
+    });
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+    assert!(
+        logs.contains("unknown keys in top-level config: api-bogus-key"),
+        "PUT rebuild must re-emit the unknown-key warn: {logs}"
     );
 }

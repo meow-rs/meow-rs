@@ -376,6 +376,7 @@ async fn delete_during_in_flight_refresh_discards_payload() {
             applied_proxies: Vec::new(),
             applied_groups: Vec::new(),
             applied_rules: Vec::new(),
+            extra: Default::default(),
         });
     spawn_loop(&fx);
 
@@ -643,6 +644,7 @@ async fn refresh_fetches_through_subscription_proxy() {
                 applied_proxies: Vec::new(),
                 applied_groups: Vec::new(),
                 applied_rules: Vec::new(),
+                extra: Default::default(),
             },
         );
     }

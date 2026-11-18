@@ -3132,6 +3132,7 @@ mod tests {
                     proxy: None,
                     header: None,
                     payload: Some(payload.clone()),
+                    extra: Default::default(),
                 },
             );
         }
@@ -3553,6 +3554,7 @@ mod tests {
             geoip_code: None,
             ipcidr: Some(vec!["240.0.0.0/4".to_string()]),
             domain: None,
+            extra: Default::default(),
         };
         let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
         let bogon: IpAddr = "240.1.2.3".parse().unwrap();
@@ -3571,6 +3573,7 @@ mod tests {
             geoip_code: None,
             ipcidr: None,
             domain: Some(vec!["+.google.cn".to_string()]),
+            extra: Default::default(),
         };
         let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
         assert!(ff.domain_gated("www.google.cn"));
@@ -3589,6 +3592,7 @@ mod tests {
             geoip_code: None,
             ipcidr: None,
             domain: Some(vec!["*.fb.test".to_string()]),
+            extra: Default::default(),
         };
         let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
         assert!(
@@ -3613,6 +3617,7 @@ mod tests {
             geoip_code: None,
             ipcidr: None,
             domain: Some(vec!["a..b".to_string(), "fine.example".to_string()]),
+            extra: Default::default(),
         };
         let cap = WarnCapture::start();
         let ff = build_fallback_filter(Some(&raw), None, false).unwrap();
@@ -3645,6 +3650,7 @@ mod tests {
                 geoip_code: None,
                 ipcidr: None,
                 domain: Some(vec![dead.to_string()]),
+                extra: Default::default(),
             };
             let cap = WarnCapture::start();
             build_fallback_filter(Some(&raw), None, false)

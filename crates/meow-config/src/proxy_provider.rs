@@ -967,14 +967,21 @@ impl ProxyProvider {
              would run a real network fetch on the caller's lane"
         );
         let name = self.name.clone();
+        // The scoped thread sees no caller context — carry the scoped
+        // dispatcher so warns inside the load reach the subscriber in
+        // effect here (same propagation
+        // `spawn_blocking_with_current_dispatcher` applies).
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
         std::thread::scope(|s| {
             s.spawn(|| {
-                use anyhow::Context as _;
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .context("building temporary tokio runtime for proxy-provider load")?;
-                rt.block_on(self.initial_load_unrecorded(strict))
+                tracing::dispatcher::with_default(&dispatch, || {
+                    use anyhow::Context as _;
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("building temporary tokio runtime for proxy-provider load")?;
+                    rt.block_on(self.initial_load_unrecorded(strict))
+                })
             })
             .join()
             .map_err(|payload| {
@@ -1236,6 +1243,9 @@ impl ProxyProvider {
         raw_name: &str,
         declared: &mut Vec<String>,
     ) -> Result<Arc<dyn Proxy>, String> {
+        // Unknown-node-key warn (issue #974) — once per node load, before
+        // any early return, with the provider named for context.
+        crate::validation::warn_unknown_node_keys(raw_map, Some(&self.name));
         let direct: Arc<dyn meow_proxy::dialer::TcpDialer> =
             Arc::new(meow_proxy::dialer::DirectDialer);
         let node_dialer = match raw_map.get("dialer-proxy") {
@@ -1880,6 +1890,7 @@ mod tests {
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         }
     }
 
@@ -1947,6 +1958,7 @@ mod tests {
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         };
         let Err(err) = ProxyProvider::new(
             "test",
@@ -1998,6 +2010,7 @@ mod tests {
                 override_: None,
                 proxy: None,
                 dialer_proxy: None,
+                extra: Default::default(),
             },
         );
         validate_paths(&map, Some(dir.path())).expect("contained paths must validate");
@@ -2026,6 +2039,7 @@ mod tests {
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         };
         let p = ProxyProvider::new("airport", &raw, None, true, false, Default::default()).unwrap();
         assert_eq!(p.vehicle_type, "HTTP");
@@ -2063,6 +2077,7 @@ mod tests {
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         };
         let p = ProxyProvider::new("airport", &raw, None, true, false, Default::default()).unwrap();
         // Multi-value entries repeat the name (one field line per value),
@@ -2094,6 +2109,7 @@ mod tests {
             timeout,
             expected_status: expected_status.map(str::to_string),
             lazy,
+            extra: Default::default(),
         }
     }
 
@@ -3471,6 +3487,7 @@ header:
             override_: None,
             proxy: proxy.map(str::to_string),
             dialer_proxy: None,
+            extra: Default::default(),
         }
     }
 
