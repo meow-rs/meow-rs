@@ -1032,8 +1032,22 @@ async fn patch_configs_global_ua_lifecycle() {
         }
     };
 
-    // Unset: the mihomo-compatible empty string, both keys exposed.
-    assert_eq!(get_ua(&state).await, ("".into(), "".into()));
+    // Unset: the mihomo-compatible empty string, both keys exposed. A
+    // racing writer may have left a UA installed, so clear it ourselves
+    // first and read under the lane — a commit between the clear and the
+    // read would swap the live global mid-assertion.
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"global-ua":""}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua().is_none() {
+            assert_eq!(get_ua(&state).await, ("".into(), "".into()));
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept re-installing a global UA");
+    }
 
     // Set → the live global, the raw, and GET all carry it (retry loop:
     // a parallel writer's commit can reset the shared global).
@@ -1069,13 +1083,21 @@ async fn patch_configs_global_ua_lifecycle() {
         "a rejected PATCH must never install its value"
     );
 
-    // `""` clears the live override — race-free to observe since every
-    // other writer commits `None`.
-    let resp = patch(r#"{"global-ua":""}"#).await;
-    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
-    assert!(meow_common::global_ua().is_none());
-    assert_eq!(get_ua(&state).await, ("".into(), "".into()));
+    // `""` clears the live override — same retry shape as the set side:
+    // a racing PUT commits `Some(..)`, so the cleared state is only safe
+    // to observe while the lane is held.
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"global-ua":""}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua().is_none() {
+            assert_eq!(get_ua(&state).await, ("".into(), "".into()));
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept re-installing a global UA");
+    }
 }
 
 /// Issue #974: `PUT /configs` commits `global-ua` and
@@ -1087,6 +1109,15 @@ async fn patch_configs_global_ua_lifecycle() {
 async fn put_configs_commits_global_ua_and_client_fingerprint() {
     use base64::Engine as _;
     let state = test_state_default();
+    // This test leaves `Some("mihomo/v1.18.0")` installed on the happy
+    // path — reset it on every exit so later tests never inherit it.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            meow_common::set_global_ua(None);
+        }
+    }
+    let _reset = Reset;
     let put = |document: &str| {
         let app = create_router(Arc::clone(&state));
         let payload = base64::engine::general_purpose::STANDARD.encode(document);
@@ -1149,6 +1180,147 @@ async fn put_configs_commits_global_ua_and_client_fingerprint() {
         attempts += 1;
         assert!(attempts < 20, "writers kept resetting the global UA");
     }
+
+    // Ordered cleanup under the lane: a racing reader between here and
+    // the `Reset` guard's drop never observes this test's stale value.
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    meow_common::set_global_ua(None);
+}
+
+/// `?force` degrades the `global-ua` admission gate to warn + rewrite:
+/// an invalid value must never persist, because the verbatim-commit arm
+/// (strict and lenient rebuilds both fail) lands `raw_config` untouched
+/// and every later warm mutation re-validates the field through its
+/// rebuild — a persisted injection string would 400 them all and
+/// hard-error the next boot. The gate rewrites it to the live override.
+#[tokio::test]
+async fn put_configs_force_invalid_global_ua_commits_live_value() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    // This test installs a live UA — reset it on every exit so later
+    // tests never inherit it.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            meow_common::set_global_ua(None);
+        }
+    }
+    let _reset = Reset;
+    let put = |uri: &'static str, document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // The committed `global-ua`, checked under the mutation lane: never
+    // the injected value, always boot-valid. Returns whether it is the
+    // live override this test installed (a racing writer's commit can
+    // swap the process-global the gate copies — equally valid, but not
+    // ours, so the caller retries).
+    let check_committed_ua = |state: &Arc<AppState>| {
+        let state = Arc::clone(state);
+        async move {
+            let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+            let committed = state.raw_config.read().global_ua.clone();
+            assert!(
+                meow_config::validate_global_ua(committed.as_deref()).is_ok(),
+                "a forced commit must persist a boot-valid global-ua, got {committed:?}"
+            );
+            committed.as_deref() == Some("mihomo/v1.18.0")
+        }
+    };
+
+    let mut attempts = 0;
+    loop {
+        // The live override the gate should copy on the forced PUTs.
+        let resp = put("/configs", "global-ua: mihomo/v1.18.0\n").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // Arm 1 — the verbatim-commit early return: duplicate group names
+        // are rejected unconditionally, so the rebuild fails under strict
+        // AND lenient and `raw_config` is persisted as written.
+        let resp = put(
+            "/configs?force=true",
+            concat!(
+                "global-ua: \"bad\\r\\nua\"\n",
+                "proxy-groups:\n",
+                "  - {name: dup, type: select, proxies: [DIRECT]}\n",
+                "  - {name: dup, type: select, proxies: [REJECT]}\n",
+            ),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        {
+            let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+            let raw = state.raw_config.read();
+            assert!(
+                raw.proxy_groups.as_deref().is_some_and(|groups| groups
+                    .iter()
+                    .filter(|g| g.name == "dup")
+                    .count()
+                    == 2),
+                "the unbuildable document must commit verbatim"
+            );
+        }
+        assert!(
+            state.tunnel.proxy("dup").is_none(),
+            "nothing built — the previous route table is kept"
+        );
+        if !check_committed_ua(&state).await {
+            attempts += 1;
+            assert!(attempts < 20, "writers kept resetting the global UA");
+            continue;
+        }
+
+        // Arm 2 — a buildable document: the gate normalizes `global-ua`
+        // before the rebuild ever sees it.
+        let resp = put(
+            "/configs?force=true",
+            "global-ua: \"bad\\r\\nua\"\nmode: rule\nrules:\n  - MATCH,DIRECT\n",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        if check_committed_ua(&state).await {
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting the global UA");
+    }
+
+    // The poison check: a warm-path mutation on the committed document
+    // re-validates `global-ua` through its rebuild — it must succeed.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/rules")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(r#"{"rules":["MATCH,DIRECT"]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a forced commit must not poison later warm-path mutations"
+    );
+
+    // Ordered cleanup under the lane, same as the PUT test above.
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    meow_common::set_global_ua(None);
 }
 
 #[tokio::test]

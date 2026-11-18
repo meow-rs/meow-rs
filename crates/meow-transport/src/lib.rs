@@ -231,6 +231,13 @@ pub trait Transport: Send + Sync {
 
     /// Forget the connection kept for [`Self::reuse`].
     fn reset(&self) {}
+
+    /// Concrete-type downcast for observational reads (e.g. the baked
+    /// uTLS fingerprint a `TlsLayer` carries, issue #974). Layers that do
+    /// not expose anything keep the default.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
 }
 
 /// Crate-level `Result` alias.  Errors are always [`TransportError`].

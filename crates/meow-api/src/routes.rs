@@ -1027,7 +1027,12 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             .as_deref()
             .unwrap_or("")
             .to_string(),
-        global_client_fingerprint: raw.global_client_fingerprint.clone().unwrap_or_default(),
+        // Echo the committed value normalized, as the parsers resolve it:
+        // `"none"`/`""`/whitespace report unset, case/space folds away.
+        global_client_fingerprint: meow_config::proxy_parser::normalize_client_fingerprint(
+            raw.global_client_fingerprint.as_deref(),
+        )
+        .unwrap_or_default(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
@@ -4145,6 +4150,25 @@ async fn put_configs(
         if force {
             tracing::error!("config reload forced despite {e}");
             forced.push(e.to_string());
+        } else {
+            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+    }
+
+    // Same admission contract for `global-ua`: it is validated inside
+    // `rebuild_from_raw_impl`, but under `force` a candidate whose strict
+    // and lenient rebuilds both fail commits `raw_config` verbatim — and
+    // the value is re-validated on every warm mutation
+    // (`commit_raw_candidate` → `apply_raw_to_tunnel`) and on the next
+    // boot's `build_config`, so persisting an invalid UA would latch every
+    // later mutation to a 400 and fail the reload. Under `force`, rewrite
+    // it to the live override — boot-valid by construction (None clears,
+    // matching `set_global_ua`'s own normalization).
+    if let Err(e) = meow_config::validate_global_ua(raw_config.global_ua.as_deref()) {
+        if force {
+            tracing::error!("config reload forced despite {e}");
+            forced.push(e.to_string());
+            raw_config.global_ua = meow_common::global_ua().map(|ua| ua.to_string());
         } else {
             return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
         }

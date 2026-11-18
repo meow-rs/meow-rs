@@ -243,7 +243,7 @@ The most feature-rich protocol: TLS, REALITY, XTLS-Vision flow, and five transpo
 | `skip-cert-verify` | bool | | `false` | |
 | `alpn` | list | | `[]` | e.g. `[h2, http/1.1]` |
 | `network` | string | | `tcp` | `tcp` · `ws` · `grpc` · `h2` · `httpupgrade` |
-| `client-fingerprint` | string | | — | uTLS profile (required for REALITY, where it shapes the ClientHello — see below) |
+| `client-fingerprint` | string | | — | uTLS profile (required for REALITY, where it shapes the ClientHello — see below). Omitted = inherit `global-client-fingerprint` |
 | `flow` | string | | — | `xtls-rprx-vision` (needs `network: tcp` + TLS or REALITY, and the `vless-vision` feature) |
 | `encryption` | string | | `none` | Must be `none`/empty |
 | `reality-opts` | map | | — | REALITY config (see below) |

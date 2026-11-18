@@ -3668,11 +3668,23 @@ global-ua: my-client/1.0
     /// `global-ua` with header-injection bytes is a Class A rejection —
     /// the build fails rather than emit a second request line. NUL and
     /// other control bytes cannot be spelled inside a YAML scalar, so
-    /// they drive the rebuild's validation gate directly.
+    /// they drive the rebuild's validation gate directly. Edge-position
+    /// bytes (`"evil\r\n"`) are the smuggling case: trimming first would
+    /// strip them before the check, so the validator must inspect the
+    /// untrimmed string.
     #[test]
     fn global_ua_rejects_crlf_and_control_bytes() {
         for bad in [
-            "a\nb", "a\rb", "a\u{0}b", "a\u{1f}b", "a\u{7f}b", "a\u{0b}b",
+            "a\nb",
+            "a\rb",
+            "a\u{0}b",
+            "a\u{1f}b",
+            "a\u{7f}b",
+            "a\u{0b}b",
+            "\r\n",
+            "evil\r\n",
+            "\r\nevil",
+            "evil\u{0b}",
         ] {
             let raw = meow_config::raw::RawConfig {
                 global_ua: Some(bad.to_string()),

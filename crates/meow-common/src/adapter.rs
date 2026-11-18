@@ -265,6 +265,15 @@ pub trait ProxyAdapter: Send + Sync {
     /// writes must stay observable — each group's `alive()` reads this bit
     /// alongside its delegated member check (issue #681).
     fn health(&self) -> &ProxyHealth;
+    /// The uTLS `client-fingerprint` profile baked at parse (issue #974)
+    /// — node value or the `global-client-fingerprint` it inherited —
+    /// `None` for outbounds whose handshake is unshaped or not
+    /// uTLS-driven (H3 QUIC, restls/jls, hysteria2's pinned-hello QUIC).
+    /// Observational: parsers and wrappers forward the leaf's answer.
+    #[doc(hidden)]
+    fn client_fingerprint(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// The `hidden:` and `icon:` keys of a proxy-group. Only GUIs read them —

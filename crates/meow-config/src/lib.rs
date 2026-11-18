@@ -32,6 +32,19 @@ pub mod subscription;
 pub mod subscription_userinfo;
 #[cfg(test)]
 mod test_support;
+
+/// Serializes tests that write `meow_common::set_global_ua` — a
+/// process-global the internal-HTTP/health emitters read per request, so
+/// a parallel test's setter would race a wire check. Callers must restore
+/// the cleared state before returning. `#[doc(hidden)]`: reached from the
+/// `global_ua_internal_http_test` integration binary, which `#[cfg(test)]`
+/// helpers cannot serve — not public API.
+#[doc(hidden)]
+pub fn global_ua_serial() -> &'static tokio::sync::Mutex<()> {
+    static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 pub(crate) mod validation;
 mod yaml_tree;
 
@@ -535,21 +548,24 @@ fn validate_connection_limit(value: usize) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// Validate the raw `global-ua` value (issue #974): trim; `None`/empty
-/// resolves to the default UA. A value with CR/LF/NUL/control bytes is a
-/// Class A rejection — the emitters format it into a raw request head,
-/// so an unchecked newline is header injection. Returns the trimmed
-/// value on success.
+/// Validate the raw `global-ua` value (issue #974): `None`/empty resolves
+/// to the default UA. A value with CR/LF/NUL/control bytes is a Class A
+/// rejection — the emitters format it into a raw request head, so an
+/// unchecked newline is header injection. The byte check runs on the
+/// UNTRIMMED string: `str::trim` strips `\r`/`\n`/`\x0b`/`\x0c` at the
+/// edges, which would smuggle `"evil\r\n"` past the check while callers
+/// keep the untrimmed value. Only `' '`/`'\t'` — HTTP OWS — are trimmed
+/// for the returned value; a bare `"\r\n"` is an error, not `None`.
 pub fn validate_global_ua(raw_ua: Option<&str>) -> Result<Option<&str>, anyhow::Error> {
-    let trimmed = raw_ua.map(str::trim).filter(|s| !s.is_empty());
-    if let Some(ua) = trimmed {
-        anyhow::ensure!(
-            meow_common::is_valid_http_header_value(ua),
-            "global-ua contains bytes that are not legal in an HTTP header \
-             value (newline/NUL/control characters are rejected)"
-        );
-    }
-    Ok(trimmed)
+    let Some(raw) = raw_ua else {
+        return Ok(None);
+    };
+    anyhow::ensure!(
+        meow_common::is_valid_http_header_value(raw),
+        "global-ua contains bytes that are not legal in an HTTP header \
+         value (newline/NUL/control characters are rejected)"
+    );
+    Ok(Some(raw.trim_matches([' ', '\t'])).filter(|s| !s.is_empty()))
 }
 
 /// Parse and validate the raw `tun:` block. Returns `TunConfig::default()`
@@ -5578,8 +5594,11 @@ pub async fn build_config(
     dns_parser::validate_node_policy_sources(&raw)?;
     // `global-ua` (issue #974): validate, then install the process-global
     // *before* any provider/subscription/geodata/ECH fetch below emits a
-    // `User-Agent`. A `PUT`/`PATCH` candidate does not reach this lane —
-    // the API's commit point re-asserts it there.
+    // `User-Agent`. Unlike `routing-mark`/`interface-name` (application
+    // and API commit points install those), the install lives here so
+    // library callers — `load_config`/`load_config_from_str` — also send
+    // the UA on startup fetches. A `PUT`/`PATCH` candidate does not reach
+    // this lane; the API's commit point re-asserts it there.
     meow_common::set_global_ua(validate_global_ua(raw.global_ua.as_deref())?);
     // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
     // sync `parse_proxy` path that follows can stay sync. Failures warn

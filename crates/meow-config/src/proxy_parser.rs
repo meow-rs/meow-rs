@@ -201,6 +201,11 @@ impl ProxyAdapter for WrappedProxy {
     fn health(&self) -> &ProxyHealth {
         self.adapter.health()
     }
+
+    /// Transparent wrapper — the baked fingerprint is the leaf's.
+    fn client_fingerprint(&self) -> Option<&str> {
+        self.adapter.client_fingerprint()
+    }
 }
 
 impl Proxy for WrappedProxy {
@@ -321,6 +326,11 @@ impl ProxyAdapter for ChainedProxy {
 
     fn health(&self) -> &ProxyHealth {
         self.inner.health()
+    }
+
+    /// Transparent marker — the baked fingerprint is the leaf's.
+    fn client_fingerprint(&self) -> Option<&str> {
+        self.inner.client_fingerprint()
     }
 }
 
@@ -2941,11 +2951,6 @@ fn parse_vless(
     #[cfg(not(feature = "vless-encryption"))]
     parse_vless_encryption(encryption)?;
 
-    // ── client-fingerprint ──────────────────────────────────────────────
-    // Passed through to TlsConfig.fingerprint; the TLS layer selects the
-    // BoringSSL backend when the `boring-tls` feature is compiled in,
-    // otherwise falls back to rustls with a stub warning.
-
     // ── Flow parsing ──────────────────────────────────────────────────────
     let flow_str = config.get("flow").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -4769,6 +4774,90 @@ mod tests {
             proxy_config("name: h\ntype: hysteria2\nserver: h.test\nport: 443\npassword: p\n");
         parse_proxy_with_dialer_and_fp(&cfg, &direct, false, Some("chrome"))
             .expect("hysteria2 must ignore the uTLS global entirely");
+    }
+
+    /// The per-site wiring (issue #974): the normalized global must reach
+    /// each protocol's own TLS config — `client_fingerprint()` reads what
+    /// the adapter actually baked, so a call site that dropped the global
+    /// argument cannot fake it. shadow-tls v1 keeps its upstream TLS 1.2
+    /// cap: even an inherited fingerprint is dropped there.
+    #[cfg(any(
+        feature = "vmess",
+        feature = "anytls",
+        feature = "shadow-tls",
+        feature = "trusttunnel"
+    ))]
+    #[tokio::test]
+    async fn protocol_sites_inherit_global_client_fingerprint() {
+        let direct: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+            std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+        let baked = |yaml: &str, global: Option<&str>| {
+            parse_proxy_with_dialer_and_fp(&proxy_config(yaml), &direct, false, global)
+                .map(|proxy| proxy.client_fingerprint().map(str::to_string))
+        };
+
+        #[cfg(feature = "vmess")]
+        {
+            // `tls: true` — the fingerprint lands on the TLS layer.
+            assert_eq!(
+                baked(
+                    "name: v\ntype: vmess\nserver: v.test\nport: 443\nuuid: b831381d-6324-4d53-ad4f-8cda48b30811\ntls: true\n",
+                    Some(" Chrome "),
+                ),
+                Ok(Some("chrome".to_string())),
+                "vmess: the normalized global must reach the TLS config"
+            );
+            // The node's own value still wins over the global.
+            assert_eq!(
+                baked(
+                    "name: v\ntype: vmess\nserver: v.test\nport: 443\nuuid: b831381d-6324-4d53-ad4f-8cda48b30811\ntls: true\nclient-fingerprint: firefox\n",
+                    Some("chrome"),
+                ),
+                Ok(Some("firefox".to_string()))
+            );
+        }
+        #[cfg(feature = "anytls")]
+        assert_eq!(
+            baked(
+                "name: a\ntype: anytls\nserver: a.test\nport: 443\npassword: p\n",
+                Some("chrome"),
+            ),
+            Ok(Some("chrome".to_string())),
+            "anytls: the global must reach the TLS config"
+        );
+        #[cfg(feature = "shadow-tls")]
+        {
+            const SS: &str = "name: s\ntype: ss\nserver: s.test\nport: 8388\ncipher: aes-256-gcm\npassword: pw\nplugin: shadow-tls\n";
+            assert_eq!(
+                baked(
+                    &format!(
+                        "{SS}plugin-opts:\n  host: cover.test\n  version: 3\n  password: psk\n"
+                    ),
+                    Some("chrome"),
+                ),
+                Ok(Some("chrome".to_string())),
+                "shadow-tls: the global must reach the cover handshake"
+            );
+            // v1's TLS 1.2 cap drops even an inherited fingerprint.
+            assert_eq!(
+                baked(
+                    &format!(
+                        "{SS}plugin-opts:\n  host: cover.test\n  version: 1\n  password: psk\n"
+                    ),
+                    Some("chrome"),
+                ),
+                Ok(None),
+            );
+        }
+        #[cfg(feature = "trusttunnel")]
+        assert_eq!(
+            baked(
+                "name: t\ntype: trusttunnel\nserver: t.test\nport: 443\nusername: u\npassword: p\n",
+                Some("chrome"),
+            ),
+            Ok(Some("chrome".to_string())),
+            "trusttunnel h2: the global must reach the TLS config"
+        );
     }
 
     /// `support-x25519mlkem768` reaches `RealityConfig` verbatim; absent

@@ -311,6 +311,11 @@ impl ShadowsocksAdapter {
                     cfg.path,
                     cfg.ech_config.len()
                 );
+                // `client-fingerprint` selects a uTLS profile upstream; our
+                // record-level client crafts a fixed-shape ClientHello.
+                if client_fingerprint.is_some() {
+                    warn!("SS '{name}': client-fingerprint has no effect on ech-tls-tunnel");
+                }
                 let tls = ech_tls_tunnel::build_tls_layer(&cfg)?;
                 PluginKind::EchTlsTunnel(cfg, tls)
             }
@@ -2021,6 +2026,17 @@ impl ProxyAdapter for ShadowsocksAdapter {
 
     fn health(&self) -> &ProxyHealth {
         &self.health
+    }
+
+    /// Only shadow-tls's cover handshake consumes the node's
+    /// `client-fingerprint` (issue #974); the other plugins shape or skip
+    /// the ClientHello their own way.
+    fn client_fingerprint(&self) -> Option<&str> {
+        match &self.core.plugin {
+            #[cfg(feature = "shadow-tls")]
+            PluginKind::ShadowTls(_, tls) => tls.fingerprint(),
+            _ => None,
+        }
     }
 }
 
