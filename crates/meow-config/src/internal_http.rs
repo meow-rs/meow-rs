@@ -24,7 +24,7 @@ use meow_transport::Transport as _;
 use smol_str::SmolStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
 use url::Url;
 
@@ -38,8 +38,8 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
 const USER_AGENT: &str = concat!("clash.meta/", env!("CARGO_PKG_VERSION"));
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB hard ceiling
-/// Headroom on top of the body cap for the status line + headers.
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
 
 /// Header names this client writes itself or that frame the request, so a
 /// user-supplied entry with one of these names is dropped instead of emitted
@@ -440,45 +440,52 @@ fn host_header(host: &str, port: u16, is_https: bool) -> String {
 
 async fn read_response<S>(stream: &mut S, limit: usize) -> Result<Outcome>
 where
-    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    S: AsyncRead + Unpin,
 {
-    // Read until EOF with a wall-clock timeout. Connection: close means
-    // the server signals end-of-body by closing the socket. The read cap is
-    // the body cap plus header headroom; the exact body-size checks happen
-    // in `parse_response` once the framing is known.
-    let read_cap = limit.saturating_add(MAX_HEADER_BYTES);
-    let mut buf = Vec::with_capacity(64 * 1024);
-    let read = async {
-        let mut tmp = [0u8; 16 * 1024];
-        loop {
-            let n = stream.read(&mut tmp).await?;
-            if n == 0 {
-                break;
-            }
-            if buf.len() + n > read_cap {
-                bail!("response exceeds max body size ({limit} bytes)");
-            }
-            buf.extend_from_slice(&tmp[..n]);
-        }
-        Result::<()>::Ok(())
-    };
-    tokio::time::timeout(READ_TIMEOUT, read)
+    let mut reader = BufReader::new(stream);
+    tokio::time::timeout(READ_TIMEOUT, read_response_inner(&mut reader, limit))
         .await
-        .map_err(|_| anyhow!("response read timed out after {READ_TIMEOUT:?}"))??;
-
-    parse_response(&buf, limit)
+        .map_err(|_| anyhow!("response read timed out after {READ_TIMEOUT:?}"))?
 }
 
-fn parse_response(buf: &[u8], limit: usize) -> Result<Outcome> {
+async fn read_response_inner(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    limit: usize,
+) -> Result<Outcome> {
+    let mut head = Vec::new();
+    let mut saw_status_line = false;
+    loop {
+        let remaining = MAX_HEADER_BYTES - head.len();
+        if remaining == 0 {
+            bail!("HTTP response headers exceed {MAX_HEADER_BYTES} bytes");
+        }
+        let start = head.len();
+        (&mut *reader)
+            .take(remaining as u64)
+            .read_until(b'\n', &mut head)
+            .await?;
+        let line = &head[start..];
+        if !line.ends_with(b"\n") {
+            if head.len() == MAX_HEADER_BYTES {
+                bail!("HTTP response headers exceed {MAX_HEADER_BYTES} bytes");
+            }
+            bail!("incomplete HTTP response (no header terminator)");
+        }
+        if !matches!(line, b"\r\n" | b"\n") {
+            saw_status_line = true;
+        } else if saw_status_line {
+            break;
+        }
+    }
+
     let mut headers = [httparse::EMPTY_HEADER; 64];
     let mut resp = httparse::Response::new(&mut headers);
     let parsed = resp
-        .parse(buf)
+        .parse(&head)
         .map_err(|e| anyhow!("response parse error: {e}"))?;
-    let body_start = match parsed {
-        httparse::Status::Complete(n) => n,
-        httparse::Status::Partial => bail!("incomplete HTTP response (no header terminator)"),
-    };
+    if parsed.is_partial() {
+        bail!("incomplete HTTP response (no header terminator)");
+    }
     let status = resp
         .code
         .ok_or_else(|| anyhow!("response missing status code"))?;
@@ -510,6 +517,7 @@ fn parse_response(buf: &[u8], limit: usize) -> Result<Outcome> {
             if declared > limit as u64 {
                 bail!("response exceeds max body size ({limit} bytes)");
             }
+            let declared = declared as usize;
             if content_length.is_some_and(|previous| previous != declared) {
                 bail!("conflicting Content-Length headers");
             }
@@ -524,18 +532,6 @@ fn parse_response(buf: &[u8], limit: usize) -> Result<Outcome> {
                     .any(|v| v.trim().eq_ignore_ascii_case("chunked"))
             })
     });
-    let body = if chunked {
-        decode_chunked(&buf[body_start..], limit)?
-    } else {
-        let body = &buf[body_start..];
-        if content_length.is_some_and(|declared| declared != body.len() as u64) {
-            bail!("response body length does not match Content-Length");
-        }
-        if body.len() > limit {
-            bail!("response exceeds max body size ({limit} bytes)");
-        }
-        body.to_vec()
-    };
     let headers = resp
         .headers
         .iter()
@@ -544,38 +540,102 @@ fn parse_response(buf: &[u8], limit: usize) -> Result<Outcome> {
             Some((header.name.to_owned(), value.trim().to_owned()))
         })
         .collect();
+    let body = if chunked {
+        // Keep the wire-size bound as well as the decoded-body bound.
+        let remaining = limit.saturating_add(MAX_HEADER_BYTES) - head.len();
+        read_chunked_body(&mut reader.take(remaining as u64), limit).await?
+    } else {
+        let size = content_length.unwrap_or(limit);
+        let mut body = Vec::new();
+        append_body(reader, &mut body, size, size).await?;
+        if let Some(declared) = content_length {
+            // We request Connection: close. An EOF check also rejects
+            // bytes sent beyond the declared length.
+            if body.len() != declared || !reader.fill_buf().await?.is_empty() {
+                bail!("response body length does not match Content-Length");
+            }
+        } else if body.len() == limit && !reader.fill_buf().await?.is_empty() {
+            bail!("response exceeds max body size ({limit} bytes)");
+        }
+        body
+    };
     Ok(Outcome::Body(Response { body, headers }))
 }
 
-fn decode_chunked(mut input: &[u8], limit: usize) -> Result<Vec<u8>> {
+async fn append_body(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    body: &mut Vec<u8>,
+    size: usize,
+    limit: usize,
+) -> std::io::Result<()> {
+    let end = body.len() + size;
+    while body.len() < end {
+        let available = reader.fill_buf().await?;
+        if available.is_empty() {
+            break;
+        }
+        let count = available.len().min(end - body.len());
+        let needed = body.len() + count;
+        if needed > body.capacity() {
+            // Grow as bytes arrive and clamp geometric growth to the cap.
+            let capacity = needed.max(body.capacity().saturating_mul(2).min(limit));
+            body.reserve_exact(capacity - body.len());
+        }
+        body.extend_from_slice(&available[..count]);
+        reader.consume(count);
+    }
+    Ok(())
+}
+
+async fn read_chunked_body(
+    reader: &mut (impl AsyncBufRead + Unpin),
+    limit: usize,
+) -> Result<Vec<u8>> {
     let mut body = Vec::new();
+    let mut line = Vec::new();
     loop {
-        let line_end = input
-            .windows(2)
-            .position(|w| w == b"\r\n")
+        line.clear();
+        (&mut *reader)
+            .take(MAX_CHUNK_LINE_BYTES as u64)
+            .read_until(b'\n', &mut line)
+            .await?;
+        let size_text = line
+            .strip_suffix(b"\r\n")
             .ok_or_else(|| anyhow!("incomplete chunk-size line"))?;
-        let size_text = std::str::from_utf8(&input[..line_end])
-            .map_err(|e| anyhow!("non-UTF-8 chunk size: {e}"))?;
+        let size_text =
+            std::str::from_utf8(size_text).map_err(|e| anyhow!("non-UTF-8 chunk size: {e}"))?;
         let size =
             usize::from_str_radix(size_text.split(';').next().unwrap_or_default().trim(), 16)
-                .map_err(|e| anyhow!("invalid chunk size '{size_text}': {e}"))?;
-        input = &input[line_end + 2..];
+                .map_err(|e| anyhow!("invalid chunk size: {e}"))?;
 
         if size == 0 {
-            // A zero chunk is followed by optional trailers and a final CRLF.
-            if input == b"\r\n" || input.windows(4).any(|w| w == b"\r\n\r\n") {
-                return Ok(body);
-            }
-            bail!("incomplete chunked response trailers");
+            break;
         }
-        if size > limit.saturating_sub(body.len()) {
+        if size > limit - body.len() {
             bail!("response exceeds max body size ({limit} bytes)");
         }
-        if input.len() < size + 2 || &input[size..size + 2] != b"\r\n" {
+        let end = body.len() + size;
+        append_body(reader, &mut body, size, limit).await?;
+        let mut crlf = [0; 2];
+        if body.len() != end {
             bail!("incomplete chunk data");
         }
-        body.extend_from_slice(&input[..size]);
-        input = &input[size + 2..];
+        reader.read_exact(&mut crlf).await?;
+        if crlf != *b"\r\n" {
+            bail!("incomplete chunk data");
+        }
+    }
+
+    // A zero chunk is followed by optional trailers and a final CRLF.
+    let mut trailers = reader.take(MAX_HEADER_BYTES as u64);
+    loop {
+        line.clear();
+        trailers.read_until(b'\n', &mut line).await?;
+        match line.as_slice() {
+            b"\r\n" => return Ok(body),
+            line if line.ends_with(b"\r\n") => {}
+            _ => bail!("incomplete chunked response trailers"),
+        }
     }
 }
 
@@ -599,19 +659,31 @@ mod tests {
     use super::*;
     use crate::test_support::{Dial, ScriptedProxy};
 
-    #[test]
-    fn parse_response_decodes_chunked_body_and_extensions() {
+    #[tokio::test]
+    async fn read_response_decodes_chunked_body_and_extensions() {
         let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4;foo=bar\r\nWiki\r\n5\r\npedia\r\n0\r\nX-Trailer: yes\r\n\r\n";
-        match parse_response(response, MAX_BODY_BYTES).unwrap() {
+        let (mut client, mut server) = tokio::io::duplex(response.len());
+        server.write_all(response).await.unwrap();
+        // The terminal chunk finishes the response even if the socket is
+        // still open.
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            read_response(&mut client, MAX_BODY_BYTES),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        match result {
             Outcome::Body(response) => assert_eq!(response.body, b"Wikipedia"),
             Outcome::Redirect(_) => panic!("unexpected redirect"),
         }
     }
 
-    #[test]
-    fn parse_response_keeps_header_fields_for_lookup() {
-        let response = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSubscription-Userinfo:  upload=1; total=2 \r\nX-Dup: first\r\nx-dup: second\r\nX-Bin: \xff\r\n\r\nok";
-        let Outcome::Body(response) = parse_response(response, MAX_BODY_BYTES).unwrap() else {
+    #[tokio::test]
+    async fn read_response_keeps_header_fields_for_lookup() {
+        let mut response = &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nSubscription-Userinfo:  upload=1; total=2 \r\nX-Dup: first\r\nx-dup: second\r\nX-Bin: \xff\r\n\r\nok"[..];
+        let Outcome::Body(response) = read_response(&mut response, MAX_BODY_BYTES).await.unwrap()
+        else {
             panic!("unexpected redirect");
         };
         assert_eq!(response.body, b"ok");
@@ -633,10 +705,31 @@ mod tests {
         assert_eq!(response.header("etag"), None);
     }
 
-    #[test]
-    fn parse_response_rejects_truncated_chunk() {
-        let response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabc";
-        assert!(parse_response(response, MAX_BODY_BYTES).is_err());
+    #[tokio::test]
+    async fn read_response_rejects_truncated_chunk() {
+        let mut response = &b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nabc"[..];
+        assert!(read_response(&mut response, MAX_BODY_BYTES).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn read_response_bounds_headers_chunk_lines_and_trailers() {
+        let oversized_headers = format!(
+            "HTTP/1.1 200 OK\r\nX-Header: {}\r\n\r\n",
+            "a".repeat(MAX_HEADER_BYTES)
+        );
+        let oversized_chunk_line = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0;ext={}\r\n\r\n",
+            "a".repeat(MAX_CHUNK_LINE_BYTES)
+        );
+        let oversized_trailers = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n0\r\nX-Trailer: {}\r\n\r\n",
+            "a".repeat(MAX_HEADER_BYTES)
+        );
+        for response in [oversized_headers, oversized_chunk_line, oversized_trailers] {
+            assert!(read_response(&mut response.as_bytes(), MAX_BODY_BYTES)
+                .await
+                .is_err());
+        }
     }
 
     #[tokio::test]
@@ -791,16 +884,17 @@ mod tests {
         assert!(error.to_string().contains("does not match Content-Length"));
     }
 
-    #[test]
-    fn content_length_framing_rejects_extra_bytes_and_conflicting_lengths() {
-        for response in [
+    #[tokio::test]
+    async fn content_length_framing_rejects_extra_bytes_and_conflicting_lengths() {
+        for mut response in [
             &b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nabc"[..],
             &b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\nContent-Length: 4\r\n\r\nabc"[..],
         ] {
-            assert!(parse_response(response, MAX_BODY_BYTES).is_err());
+            assert!(read_response(&mut response, MAX_BODY_BYTES).await.is_err());
         }
+        let mut response = &b"HTTP/1.1 200 OK\r\n\r\nabc"[..];
         assert!(
-            matches!(parse_response(b"HTTP/1.1 200 OK\r\n\r\nabc", MAX_BODY_BYTES).unwrap(), Outcome::Body(response) if response.body == b"abc")
+            matches!(read_response(&mut response, MAX_BODY_BYTES).await.unwrap(), Outcome::Body(response) if response.body == b"abc")
         );
     }
 
