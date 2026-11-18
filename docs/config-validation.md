@@ -37,7 +37,7 @@ Warnings are classified into three shapes:
 - **Unrecognized** — the key is not known anywhere:
   `unknown keys in top-level config: tcp-idl-timeout (not recognized; check spelling or see https://github.com/madeye/meow-rs/issues/974)`.
   A known misspelling names the correct key inline, e.g.
-  `test-timeout (not recognized; mihomo uses 'timeout')`.
+  `test-timeout (not recognized; mihomo uses 'timeout' (not modeled here))`.
 - **Unsupported** — mihomo supports the key but meow-rs does not:
   `unsupported key in top-level config: ntp (issue #974) — NTP time sync not implemented`.
   Every `brutal-*` key lands here (open-ended experimental surface).
@@ -68,3 +68,11 @@ Rules:
 - Warnings re-emit on every config rebuild — `meow -t`, startup load,
   and `PUT`/`PATCH /configs` — and on provider/subscription refreshes
   for the nodes they expand.
+
+## Save round-trip
+
+Unknown keys are captured in `#[serde(flatten)]` `extra` maps that
+serialize back, so `save_raw_config`, `POST /api/config/save`, and the
+`PUT /configs` persistence write them to disk verbatim (sorted by key) —
+a config saved through the API keeps the keys it warned on, ready for
+when a later build learns to honor them.

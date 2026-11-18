@@ -3765,7 +3765,7 @@ proxy-groups:
         );
         assert!(
             logs.contains(
-                "unknown keys in proxy-group 'auto': test-timeout (not recognized; mihomo uses 'timeout')"
+                "unknown keys in proxy-group 'auto': test-timeout (not recognized; mihomo uses 'timeout' (not modeled here))"
             ),
             "got: {logs}"
         );

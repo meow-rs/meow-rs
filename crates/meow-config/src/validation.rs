@@ -6,7 +6,7 @@
 //! those captures into one warning per category — never an error, so a
 //! verbatim mihomo config keeps loading.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tracing::warn;
 
 /// mihomo keys this build deliberately does not implement, mapped to
@@ -52,7 +52,7 @@ const UNSUPPORTED_KEYS: &[(&str, Option<u32>, &str)] = &[
     (
         "find-process-mode",
         Some(974),
-        "process-name sniffer not implemented",
+        "PROCESS-NAME/PROCESS-PATH rules work; the mode switch is unmodeled",
     ),
     ("lan-allowed-ips", None, "ACL not in proxy kernel scope"),
     ("lan-disallowed-ips", None, "ACL not in proxy kernel scope"),
@@ -69,6 +69,9 @@ const UNSUPPORTED_KEYS: &[(&str, Option<u32>, &str)] = &[
     ("tunnels", Some(974), "inbound tunnels not implemented"),
     ("udp-over-tcp", None, "UDP-over-TCP not implemented"),
     ("udp-over-tcp-version", None, "UDP-over-TCP not implemented"),
+    ("timeout", None, "group probe timeout not modeled"),
+    ("max-failed-times", None, "group probe tuning not modeled"),
+    ("disable-udp", None, "per-group UDP disable not modeled"),
 ];
 
 /// Keys an operator plausibly places on the wrong surface — mapped to the
@@ -79,7 +82,7 @@ const MISPLACED_KEYS: &[(&str, &str)] = &[
     ("firewall", "a listeners: entry (type: tproxy)"),
     (
         "udp",
-        "a listeners: (tproxy/shadowsocks/wireguard) or tun: entry, \
+        "a listeners: (tproxy/shadowsocks/wireguard) entry, \
          or a UDP-capable proxies: node",
     ),
     (
@@ -103,11 +106,11 @@ const MISPLACED_KEYS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Frequent misspellings of a real mihomo key — rendered inline in the
-/// unrecognized-keys line.
+/// Frequent misspellings of a real mihomo key — the hint renders inline
+/// in the unrecognized-keys line, verbatim after "not recognized; ".
 const NEAR_MISS_KEYS: &[(&str, &str)] = &[
-    ("test-timeout", "timeout"),
-    ("skip-cert-verfiy", "skip-cert-verify"),
+    ("test-timeout", "mihomo uses 'timeout' (not modeled here)"),
+    ("skip-cert-verfiy", "mihomo uses 'skip-cert-verify'"),
 ];
 
 enum KeyClass<'a> {
@@ -162,9 +165,7 @@ pub(crate) fn emit_unknown_keys_warn(context: &str, keys: &[String]) {
                     .find(|(m, _)| *m == key.as_str())
                     .map(|(_, h)| h)
                 {
-                    warn!(
-                        "unknown keys in {context}: {key} (not recognized; mihomo uses '{hint}')"
-                    );
+                    warn!("unknown keys in {context}: {key} (not recognized; {hint})");
                 } else {
                     unrecognized.push(key.as_str());
                 }
@@ -472,7 +473,7 @@ pub(crate) fn warn_unknown_node_keys(
 /// Emit the extra-map warnings for one section of a parsed config —
 /// shared by `validate_and_warn` and the `listeners:` build loop (which
 /// owns its own warn site for spec context).
-pub(crate) fn warn_extra(context: &str, extra: &HashMap<String, serde_json::Value>) {
+pub(crate) fn warn_extra(context: &str, extra: &BTreeMap<String, serde_json::Value>) {
     emit_unknown_keys_warn(context, &extra.keys().cloned().collect::<Vec<_>>());
 }
 

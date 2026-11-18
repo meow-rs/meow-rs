@@ -476,6 +476,34 @@ fn raw_config_serialize_deserialize_roundtrip() {
     assert_eq!(loaded.rules, raw.rules);
 }
 
+/// The `#[serde(flatten)]` `extra` maps serialize back: unknown keys the
+/// loader warned on must survive a save round-trip verbatim — and in
+/// sorted order (`BTreeMap`, no diff noise across saves).
+#[test]
+fn raw_config_extra_keys_roundtrip_sorted() {
+    let raw: RawConfig = serde_saphyr::from_str(
+        "mixed-port: 7890\nzebra-key: 1\nalpha-key: {nested: true}\ndns:\n  bogus-dns: x\n",
+    )
+    .unwrap();
+    assert!(raw.extra.contains_key("zebra-key"));
+
+    let yaml = to_yaml(&raw);
+    assert!(yaml.contains("alpha-key"), "{yaml}");
+    assert!(yaml.contains("zebra-key"), "{yaml}");
+    assert!(yaml.contains("bogus-dns"), "{yaml}");
+    assert!(
+        yaml.find("alpha-key") < yaml.find("zebra-key"),
+        "extra keys must save in sorted order: {yaml}"
+    );
+
+    let loaded: RawConfig = serde_saphyr::from_str(&yaml).unwrap();
+    assert_eq!(loaded.extra, raw.extra);
+    assert_eq!(
+        loaded.dns.as_ref().unwrap().extra,
+        raw.dns.as_ref().unwrap().extra
+    );
+}
+
 #[test]
 fn raw_subscription_serde() {
     let sub = RawSubscription {

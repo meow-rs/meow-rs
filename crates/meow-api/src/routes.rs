@@ -2045,7 +2045,8 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
 /// When a `dns:` section references
 /// proxies/rule-providers (`#name` nameserver tags, `rule-set:` policy
 /// keys), those sections join the comparison — the resolver snapshots
-/// them at build time.
+/// them at build time. Unmodelled `extra` keys ride the `==`s, so an
+/// unknown-key-only edit reads as a change — a safe over-trigger.
 fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
     // A pure key reorder of `nameserver-policy` must read as a change —
     // `a.dns == b.dns` alone is order-insensitive for this section.
