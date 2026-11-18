@@ -1235,6 +1235,9 @@ impl ProxyProvider {
         raw_name: &str,
         declared: &mut Vec<String>,
     ) -> Result<Arc<dyn Proxy>, String> {
+        // Unknown-node-key warn (issue #974) — once per node load, before
+        // any early return, with the provider named for context.
+        crate::validation::warn_unknown_node_keys(raw_map, Some(&self.name));
         let direct: Arc<dyn meow_proxy::dialer::TcpDialer> =
             Arc::new(meow_proxy::dialer::DirectDialer);
         let node_dialer = match raw_map.get("dialer-proxy") {
@@ -1909,6 +1912,7 @@ mod tests {
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         }
     }
 
@@ -1976,6 +1980,7 @@ mod tests {
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         };
         let Err(err) = ProxyProvider::new(
             "test",
@@ -2027,6 +2032,7 @@ mod tests {
                 override_: None,
                 proxy: None,
                 dialer_proxy: None,
+                extra: Default::default(),
             },
         );
         validate_paths(&map, Some(dir.path())).expect("contained paths must validate");
@@ -2055,6 +2061,7 @@ mod tests {
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         };
         let p = ProxyProvider::new("airport", &raw, None, true, false, Default::default()).unwrap();
         assert_eq!(p.vehicle_type, "HTTP");
@@ -2092,6 +2099,7 @@ mod tests {
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         };
         let p = ProxyProvider::new("airport", &raw, None, true, false, Default::default()).unwrap();
         // Multi-value entries repeat the name (one field line per value),
@@ -2123,6 +2131,7 @@ mod tests {
             timeout,
             expected_status: expected_status.map(str::to_string),
             lazy,
+            extra: Default::default(),
         }
     }
 
@@ -3500,6 +3509,7 @@ header:
             override_: None,
             proxy: proxy.map(str::to_string),
             dialer_proxy: None,
+            extra: Default::default(),
         }
     }
 

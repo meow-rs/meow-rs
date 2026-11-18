@@ -98,6 +98,7 @@ fn save_roundtrip_with_subscriptions() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
 
     save_raw_config(path_str, &raw).unwrap();
@@ -486,6 +487,7 @@ fn raw_subscription_serde() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     };
     let yaml = to_yaml(&sub);
     assert!(
@@ -519,6 +521,7 @@ fn raw_subscription_serde_applied_fields() {
         applied_proxies: vec!["node-1".into(), "node-2".into()],
         applied_groups: vec!["g".into()],
         applied_rules: vec!["MATCH,DIRECT".into()],
+        extra: Default::default(),
     };
     let yaml = to_yaml(&sub);
     assert!(yaml.contains("applied-proxies:"), "{yaml}");
@@ -548,6 +551,7 @@ fn raw_subscription_serde_proxy() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     };
     let yaml = to_yaml(&sub);
     assert!(yaml.contains("proxy: front"), "{yaml}");
@@ -567,6 +571,7 @@ fn raw_config_clone() {
         applied_proxies: Vec::new(),
         applied_groups: Vec::new(),
         applied_rules: Vec::new(),
+        extra: Default::default(),
     }]);
     let cloned = raw.clone();
     assert_eq!(cloned.mixed_port, raw.mixed_port);

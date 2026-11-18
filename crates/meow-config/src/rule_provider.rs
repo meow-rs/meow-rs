@@ -1908,6 +1908,7 @@ mod tests {
             proxy: proxy.map(str::to_string),
             header: None,
             payload: None,
+            extra: Default::default(),
         }
     }
 
@@ -2005,6 +2006,7 @@ mod tests {
                 proxy: Some("NoSuch".to_string()),
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2030,6 +2032,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2055,6 +2058,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: Some(vec!["example.com".to_string(), "+.foo.com".to_string()]),
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
@@ -2076,6 +2080,7 @@ mod tests {
             proxy: None,
             header: None,
             payload: Some(vec!["example.com".to_string()]),
+            extra: Default::default(),
         };
         let err = load_inline("p", &cfg, RuleSetBehavior::Domain, &ctx(), false)
             .map(|_| ())
@@ -2105,6 +2110,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2125,6 +2131,7 @@ mod tests {
             proxy: None,
             header: None,
             payload: None,
+            extra: Default::default(),
         }
     }
 
@@ -2247,6 +2254,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2269,6 +2277,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
@@ -2293,6 +2302,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out =
@@ -2350,6 +2360,7 @@ mod tests {
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
 
@@ -2462,6 +2473,7 @@ header:
                 proxy: None,
                 header: Some(header),
                 payload: None,
+                extra: Default::default(),
             },
         );
 
@@ -2540,6 +2552,7 @@ header:
                 proxy: None,
                 header: Some(header),
                 payload: None,
+                extra: Default::default(),
             },
         );
 
@@ -2576,6 +2589,7 @@ header:
                 proxy: None,
                 header: None,
                 payload: Some(vec!["example.com".to_string()]),
+                extra: Default::default(),
             },
         );
         providers.insert(
@@ -2590,6 +2604,7 @@ header:
                 proxy: None,
                 header: None,
                 payload: Some(vec!["10.0.0.0/8".to_string()]),
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, None, &ctx(), None, false).expect("load failed");
@@ -2822,6 +2837,7 @@ header:
             proxy: None,
             header: None,
             payload: Some(vec!["example.com".to_string()]),
+            extra: Default::default(),
         };
 
         // No cache dir (the `PUT /configs` rebuild context): previously a
@@ -2969,6 +2985,7 @@ header:
                 proxy: None,
                 header: None,
                 payload: None,
+                extra: Default::default(),
             },
         );
         let out = load_providers(&providers, Some(dir.path()), &parse_ctx, None, false)

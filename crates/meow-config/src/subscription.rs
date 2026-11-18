@@ -500,6 +500,7 @@ mod tests {
             applied_proxies: Vec::new(),
             applied_groups: Vec::new(),
             applied_rules: Vec::new(),
+            extra: Default::default(),
         }
     }
 

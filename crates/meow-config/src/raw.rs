@@ -149,6 +149,9 @@ pub struct RawGeoDataConfig {
     pub geodata_mode: Option<serde_json::Value>,
     pub geodata_loader: Option<serde_json::Value>,
     pub geoip_matcher: Option<serde_json::Value>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// `geodata.url.*` — download URL overrides.
@@ -158,6 +161,9 @@ pub struct RawGeoDataUrls {
     pub mmdb: Option<String>,
     pub asn: Option<String>,
     pub geosite: Option<String>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Top-level `geox-url:` block (mihomo's flat alias for `geodata.url.*`).
@@ -177,6 +183,9 @@ pub struct RawGeoXUrl {
     pub asn: Option<String>,
     pub geosite: Option<String>,
     pub geoip: Option<String>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -350,6 +359,11 @@ pub struct RawConfig {
     pub keep_alive_idle: Option<serde_json::Value>,
     pub keep_alive_interval: Option<serde_json::Value>,
     pub disable_keep_alive: Option<serde_json::Value>,
+    /// Keys no field above models land here — `validation::validate_and_warn`
+    /// warns on them by name (forward-compat, ADR-0002) instead of serde
+    /// dropping them silently (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl RawConfig {
@@ -461,6 +475,9 @@ pub struct RawTun {
     pub route_exclude_address: Option<serde_json::Value>,
     pub include_uid: Option<serde_json::Value>,
     pub exclude_uid: Option<serde_json::Value>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// `tun.auto-route` value: mihomo's boolean or a #375 mode string.
@@ -574,6 +591,9 @@ pub struct RawSimpleObfs {
     #[serde(default)]
     pub enable: bool,
     pub mode: Option<String>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// `dns.nftset`: `family#table#set` per address family and
@@ -584,6 +604,9 @@ pub struct RawNftset {
     pub ipv4: Option<String>,
     pub ipv6: Option<String>,
     pub timeout: Option<u64>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 impl RawNftset {
@@ -672,6 +695,9 @@ pub struct RawDns {
     /// that asks for HTTP/3 is a hard load error rather than a silent
     /// downgrade (ADR-0002 Class A).
     pub prefer_h3: Option<bool>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// A nameserver-policy value: either a single URL string or a list of URLs.
@@ -744,6 +770,9 @@ pub struct RawFallbackFilter {
     pub geoip_code: Option<String>,
     pub ipcidr: Option<Vec<String>>,
     pub domain: Option<Vec<String>>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
@@ -788,6 +817,10 @@ pub struct RawProxyGroup {
     /// it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
+    /// Keys no field above models land here — `validation` warns on them
+    /// (e.g. `test-timeout`, which mihomo spells `timeout`; issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -832,6 +865,9 @@ pub struct RawProxyProvider {
     /// (issue #489); other keys warn at load time.
     #[serde(rename = "override", skip_serializing_if = "Option::is_none")]
     pub override_: Option<HashMap<String, serde_json::Value>>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -848,6 +884,9 @@ pub struct RawHealthCheck {
     )]
     pub expected_status: Option<String>,
     pub lazy: Option<bool>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// A single entry in the top-level `rule-providers:` map.
@@ -877,10 +916,13 @@ pub struct RawRuleProvider {
     pub header: Option<HashMap<String, StringOrList>>,
     /// Inline payload: list of rule strings (only for type=inline).
     pub payload: Option<Vec<String>>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// `traffic-ledger:` section.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawTrafficLedger {
     /// Record traffic under `<home>/traffic/`. Default true.
@@ -891,7 +933,14 @@ pub struct RawTrafficLedger {
     /// the owning process of a flow from this host elsewhere, looked up
     /// for every such flow. Default true.
     pub apps: Option<bool>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
+
+// `serde_json::Value` cannot derive `Eq` but never holds NaN, so its
+// `PartialEq` is reflexive — the impl stays valid with `extra` present.
+impl Eq for RawTrafficLedger {}
 
 impl RawTrafficLedger {
     /// The effective `traffic-ledger.enable` of a config.
@@ -909,12 +958,18 @@ impl RawTrafficLedger {
 }
 
 /// `logbook:` section.
-#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawLogbook {
     /// Record events under `<home>/logbook/`. Default true.
     pub enable: Option<bool>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
+
+// Same `serde_json::Value`-in-`Eq` justification as `RawTrafficLedger`.
+impl Eq for RawLogbook {}
 
 impl RawLogbook {
     /// The effective `logbook.enable` of a config.
@@ -943,6 +998,9 @@ pub struct RawSniffer {
     pub sniff: Option<HashMap<String, RawSniffProtocol>>,
     pub force_domain: Option<Vec<String>>,
     pub skip_domain: Option<Vec<String>>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -950,6 +1008,9 @@ pub struct RawSniffer {
 pub struct RawSniffProtocol {
     #[serde(default, deserialize_with = "deserialize_port_list")]
     pub ports: Option<Vec<u16>>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// Cumulative cap on expanded sniff port entries: the u16 space holds at
@@ -1132,6 +1193,9 @@ pub struct RawSubscription {
     pub applied_groups: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applied_rules: Vec<String>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: HashMap<String, serde_json::Value>,
 }
 
 /// `subscriptions[].proxy`: absent/`""` → unset (fetches direct); a

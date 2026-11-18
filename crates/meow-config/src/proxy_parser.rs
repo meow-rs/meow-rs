@@ -6697,6 +6697,7 @@ tls: true
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         };
         let cache_dir = path.parent().expect("temp file has a parent dir");
         let provider = crate::proxy_provider::ProxyProvider::new(

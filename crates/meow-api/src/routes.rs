@@ -2352,14 +2352,21 @@ async fn rebuild_from_raw_runtime_async(
     cache_dir: Option<std::path::PathBuf>,
     provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
 ) -> Result<meow_config::RebuildResult, String> {
+    // Carry the caller's tracing dispatcher into the rebuild thread — the
+    // same propagation `spawn_blocking_with_current_dispatcher` applies
+    // inside meow-config — so warnings emitted there reach the subscriber
+    // in effect at the call site.
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     tokio::task::spawn_blocking(move || {
-        meow_config::rebuild_from_raw_runtime(
-            &raw,
-            Some(&resolver_slot),
-            &providers,
-            cache_dir.as_deref(),
-            &provider_dialer_registry,
-        )
+        tracing::dispatcher::with_default(&dispatch, || {
+            meow_config::rebuild_from_raw_runtime(
+                &raw,
+                Some(&resolver_slot),
+                &providers,
+                cache_dir.as_deref(),
+                &provider_dialer_registry,
+            )
+        })
     })
     .await
     .map_err(|e| format!("config rebuild task failed: {e}"))?
@@ -2479,6 +2486,7 @@ async fn add_subscription(
             applied_proxies: Vec::new(),
             applied_groups: Vec::new(),
             applied_rules: Vec::new(),
+            extra: Default::default(),
         };
         raw.subscriptions.get_or_insert_with(Vec::new).push(sub);
 
@@ -5527,6 +5535,7 @@ mod tests {
             override_: None,
             proxy: None,
             dialer_proxy: None,
+            extra: Default::default(),
         };
         let provider = Arc::new(
             ProxyProvider::new(
