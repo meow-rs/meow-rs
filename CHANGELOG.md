@@ -13,8 +13,9 @@ the canonical, in-repo source a release is cut from.
 - `global-client-fingerprint` and `global-ua` — mihomo's two top-level
   globals (issue #974). `global-client-fingerprint` is the default uTLS
   ClientHello profile for `proxies:`/`proxy-providers:` nodes omitting
-  `client-fingerprint`: the node value wins, an explicit `none`/`""` opts
-  out — under VLESS+REALITY the literal `none` passes through to the
+  `client-fingerprint`: the node value wins, an omitted or empty value
+  inherits the global, and an explicit `none` opts out — under
+  VLESS+REALITY the literal `none` passes through to the
   warn-and-Chrome fallback, matching upstream — and an unsupported name
   warns once per rebuild and degrades to the TLS backend's defaults. The
   value is config-threaded, not a process global: it is baked into the

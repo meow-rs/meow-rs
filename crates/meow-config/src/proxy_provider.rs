@@ -169,6 +169,16 @@ pub struct ProxyProvider {
     /// `strict`-flip still re-parses the same payload under the new
     /// strictness (issue #625 review).
     content_hash: Mutex<Option<(u64, bool)>>,
+    /// Bytes of the last committed payload — the content counterpart of
+    /// `content_hash`. A `PUT /configs` that changes only
+    /// `global-client-fingerprint` rebuilds this provider (the adapters
+    /// bake the profile at parse), and the rebuilt object re-parses these
+    /// bytes under the new fingerprint instead of serving an empty slot
+    /// until a fetch lands — with no usable on-disk cache (a
+    /// `--config-string` run, or a cache the payload deadline never
+    /// wrote) that gap would make provider-backed selectors answer "no
+    /// proxy selected" (issue #974 review).
+    last_payload: Mutex<Option<String>>,
     /// Plan usage reported with the payload this provider serves: the
     /// `subscription-userinfo` header of the last fetch it accepted (`None`
     /// when that fetch carried none), or, for a payload loaded from the
@@ -479,6 +489,7 @@ impl ProxyProvider {
             derived: RwLock::new(Vec::new()),
             def: Self::def_identity(raw),
             content_hash: Mutex::new(None), // see field docs
+            last_payload: Mutex::new(None), // see field docs
             subscription_userinfo: Mutex::new(None),
         })
     }
@@ -522,6 +533,24 @@ impl ProxyProvider {
                 == crate::proxy_parser::normalize_client_fingerprint(global_client_fingerprint)
                     .as_deref()
             && self.def == Self::def_identity(def)
+    }
+
+    /// [`matches_def`](Self::matches_def) minus the
+    /// `global-client-fingerprint` leg — `true` on a candidate whose
+    /// `matches_def` differs *only* in the fingerprint the adapters were
+    /// parsed under. That rebuild inherits the predecessor's last
+    /// committed payload ([`Self::retained_payload`]) instead of serving
+    /// an empty slot until the post-commit fetch lands (issue #974
+    /// review).
+    pub fn matches_def_modulo_fingerprint(&self, def: &RawProxyProvider, ipv6: bool) -> bool {
+        self.ipv6 == ipv6 && self.def == Self::def_identity(def)
+    }
+
+    /// Bytes of the last committed payload — `None` until one parses
+    /// ([`Self::last_payload`]). A fingerprint-only rebuild hands them to
+    /// [`ProxyProvider::adopt_transferred_payload`] on the fresh provider.
+    pub(crate) fn retained_payload(&self) -> Option<String> {
+        self.last_payload.lock().clone()
     }
 
     /// Create a live filtered view of this provider's proxies for one group
@@ -769,7 +798,7 @@ impl ProxyProvider {
         let (proxies, ech_resolved) = self.parse_proxies(&content, ech).await?;
         match source {
             Source::Fetched(userinfo) => {
-                self.write_cache(content).await;
+                self.write_cache(content.clone()).await;
                 // Rewritten with the cache whether it changed or not, so
                 // the two on disk always come from the same fetch.
                 self.set_userinfo(userinfo);
@@ -784,6 +813,9 @@ impl ProxyProvider {
         };
         self.commit(proxies);
         *self.content_hash.lock() = Some((hash, strict));
+        // Committed bytes are retained for a fingerprint-only rebuild to
+        // re-parse — the content counterpart of the hash above.
+        *self.last_payload.lock() = Some(content);
         self.ech_pending.store(!ech_resolved, Ordering::Relaxed);
         if from_remote {
             // Not "fetched" while the preresolve is still owed — the
@@ -1015,6 +1047,55 @@ impl ProxyProvider {
                         .build()
                         .context("building temporary tokio runtime for proxy-provider load")?;
                     rt.block_on(self.initial_load_unrecorded(strict))
+                })
+            })
+            .join()
+            .map_err(|payload| {
+                anyhow::anyhow!(
+                    "proxy-provider '{name}' load thread panicked: {}",
+                    crate::rule_provider::panic_message(payload.as_ref())
+                )
+            })?
+        })
+    }
+
+    /// [`initial_load_unrecorded`](Self::initial_load_unrecorded) minus the
+    /// acquisition: re-parse `content` — the payload a
+    /// fingerprint-only-rebuild predecessor last committed
+    /// ([`Self::retained_payload`]) — into this fresh provider under its
+    /// own `global-client-fingerprint`, so a `--config-string`/no-cache
+    /// rebuild serves the inherited nodes until the detached post-commit
+    /// fetch lands instead of an empty slot (issue #974 review).
+    ///
+    /// `Source::Cache` keeps `ingest` honest about the bytes' origin:
+    /// they were inherited, not fetched — nothing is written back, the
+    /// persisted plan usage stays whatever the predecessor committed, and
+    /// `fetched_remote` stays clear so the commit's `spawn_initial_fetch`
+    /// still revalidates against the live source (finishing the ECH
+    /// preresolve [`EchResolution::Defer`] owes, like the `file:` load).
+    ///
+    /// Returns `Err` on a parse defect — remote bytes degrade rather than
+    /// reject (the `initial_load` origin split), so the caller warns and
+    /// leaves the provider to the commit's detached fetch. Runs on a
+    /// scoped thread + `current_thread` runtime for the same reason
+    /// [`Self::initial_load_blocking`] does.
+    pub(crate) fn adopt_transferred_payload(&self, content: String) -> anyhow::Result<()> {
+        let name = self.name.clone();
+        let dispatch = tracing::dispatcher::get_default(Clone::clone);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                tracing::dispatcher::with_default(&dispatch, || {
+                    use anyhow::Context as _;
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .context("building temporary tokio runtime for proxy-provider load")?;
+                    rt.block_on(async {
+                        let _generation = self.refresh_lock.lock().await;
+                        self.ingest(content, Source::Cache, EchResolution::Defer, false)
+                            .await
+                            .map(|_| ())
+                    })
                 })
             })
             .join()

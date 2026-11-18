@@ -30,7 +30,7 @@ Use it as a pre-flight check.
 | `external-ui-url` | string | — | URL the UI archive can be fetched from (recorded only) |
 | `tproxy-sni` | bool | `true` | SNI sniffing on the TProxy listener (deprecated — use `sniffer`) |
 | `routing-mark` | u32 | — | Linux `SO_MARK` for transparent-proxy loop avoidance |
-| `global-client-fingerprint` | string | — | Default uTLS ClientHello profile for `proxies:`/`proxy-providers:` nodes omitting `client-fingerprint` (`chrome`, `firefox`, `safari`, `ios`, `android`, `edge`, `random`, …; node value wins, `none`/`""` opts out). Baked into adapters at parse — changes ride a full config load |
+| `global-client-fingerprint` | string | — | Default uTLS ClientHello profile for `proxies:`/`proxy-providers:` nodes omitting `client-fingerprint` (`chrome`, `firefox`, `safari`, `ios`, `android`, `edge`, `random`, …; node value wins, an omitted/empty node value inherits the global, `none` opts out). Baked into adapters at parse — changes ride a full config load |
 | `global-ua` | string | `clash.meta/<version>` | `User-Agent` on internal HTTP fetches (providers, subscriptions, geodata, external-ui) and latency probes; `""` clears, `PATCH /configs` applies live |
 | `max-connections` | usize | `256` | Global cap on concurrent inbound connections (`0` = unlimited); inherited by the TUN listener |
 | `tcp-keepalive` | bool | `true` | `SO_KEEPALIVE` on every accepted inbound socket (listener-startup snapshot) |

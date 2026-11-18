@@ -4752,8 +4752,13 @@ mod tests {
         let quic = proxy_config(
             "name: t\ntype: trusttunnel\nserver: t.test\nport: 443\nusername: u\npassword: p\nquic: true\n",
         );
-        parse_proxy_with_dialer_and_fp(&quic, &direct, false, Some("chrome"))
+        let adapter = parse_proxy_with_dialer_and_fp(&quic, &direct, false, Some("chrome"))
             .expect("the global fingerprint is TCP-only — H3 must not inherit it");
+        assert_eq!(
+            adapter.client_fingerprint(),
+            None,
+            "quiche has no uTLS to shape: the adapter must report no baked fingerprint"
+        );
         let with_node = proxy_config(
             "name: t\ntype: trusttunnel\nserver: t.test\nport: 443\nusername: u\npassword: p\nquic: true\nclient-fingerprint: chrome\n",
         );

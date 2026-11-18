@@ -2553,7 +2553,11 @@ fn insert_parsed_leaves(
 ///   into the rebuilt groups. A *changed* definition rebuilds the provider:
 ///   reusing the old object would keep fetching the old `url`/`path` with the
 ///   old filters forever while the committed config claims otherwise
-///   (issue #533 review).
+///   (issue #533 review). A rebuild whose *only* change is
+///   `global-client-fingerprint` — the adapters bake the profile at parse,
+///   so the object cannot be reused — adopts the predecessor's last
+///   committed payload into the fresh provider instead of serving an empty
+///   slot until the detached post-commit fetch lands (issue #974 review).
 /// - A newly declared def constructs an empty [`ProxyProvider`]. A `file:`
 ///   provider's payload is operator-authored local content, so it is read
 ///   and parsed right here — local I/O only, and the ECH DNS preresolve
@@ -2597,10 +2601,22 @@ fn materialize_proxy_providers(
     let global_fp = raw.global_client_fingerprint.as_deref();
     let mut out = HashMap::with_capacity(raw_map.len());
     for (name, def) in raw_map {
+        let mut inherited: Option<String> = None;
         if let Some(provider) = live.get(name) {
             if provider.matches_def(def, ipv6, global_fp) {
                 out.insert(name.clone(), Arc::clone(provider));
                 continue;
+            }
+            // A rebuild that fails `matches_def` on the fingerprint leg
+            // alone inherits the predecessor's last committed payload —
+            // re-parsed under the new `global-client-fingerprint` — so
+            // `use:` groups and provider-backed selectors never see the
+            // empty slot a `--config-string` run (no on-disk cache) would
+            // otherwise serve until the detached post-commit fetch lands
+            // (issue #974 review). `None` when nothing was ever committed:
+            // the provider starts empty and retries, same as today.
+            if provider.matches_def_modulo_fingerprint(def, ipv6) {
+                inherited = provider.retained_payload();
             }
         }
         match ProxyProvider::new_with_client_fingerprint(
@@ -2626,6 +2642,17 @@ fn materialize_proxy_providers(
                 // providers never load on this path.
                 if provider.is_file_vehicle() {
                     provider.initial_load_blocking(strict)?;
+                } else if let Some(content) = inherited {
+                    // Remote bytes degrade rather than reject — the same
+                    // payload parsed under the old fingerprint, so a
+                    // re-parse the new one rejects (e.g. a REALITY node
+                    // left without a profile) is a feed defect, not a
+                    // config defect: the commit's detached fetch retries.
+                    if let Err(e) = provider.adopt_transferred_payload(content) {
+                        warn!(provider = %name, error = %e,
+                            "inherited proxy-provider payload failed to re-parse under \
+                             the new client fingerprint; starting empty until a fetch succeeds");
+                    }
                 }
                 out.insert(name.clone(), Arc::new(provider));
             }
@@ -3236,8 +3263,14 @@ fn rebuild_from_raw_impl(
 ) -> Result<RebuildResult, anyhow::Error> {
     // `global-ua` gate first: an invalid UA is a Class A rejection for
     // every candidate — validate only; the live process-global is
-    // installed at the commit point (issue #974).
-    validate_global_ua(raw.global_ua.as_deref())?;
+    // installed at the commit point (issue #974). The validated value is
+    // also the UA this build's own HTTP emits send: `GLOBAL_UA` still
+    // holds the committed value on this lane, so the rule-provider
+    // prefetch below is handed the candidate's UA explicitly instead of
+    // reading the static (issue #974 review). `None` resolves to the
+    // default UA, the same effective value the static would give.
+    let candidate_ua =
+        validate_global_ua(raw.global_ua.as_deref())?.unwrap_or(meow_common::DEFAULT_USER_AGENT);
     dns_parser::validate_node_policy_sources(raw)?;
     // Warn-only unknown-key reporting (issue #974): classify-and-warn every
     // key the typed schema dropped. Runs on every rebuild pass — startup's
@@ -3366,6 +3399,7 @@ fn rebuild_from_raw_impl(
                 cache_dir,
                 download_proxy.as_ref(),
                 &proxy_lookup,
+                Some(candidate_ua),
             ),
             _ => rule_provider::PrefetchedPayloads::default(),
         }),
@@ -3494,6 +3528,15 @@ async fn prefetch_rule_provider_payloads_async(
     let raw_providers = raw_providers.clone();
     let raw_proxies: Vec<HashMap<String, serde_json::Value>> =
         raw.proxies.clone().unwrap_or_default();
+    // The startup `global-ua` (`build_config` already validated it, and
+    // installs it before this prefetch runs) — threaded explicitly so the
+    // downloads never depend on when the static was installed (issue #974
+    // review).
+    let user_agent = validate_global_ua(raw.global_ua.as_deref())
+        .ok()
+        .flatten()
+        .unwrap_or(meow_common::DEFAULT_USER_AGENT)
+        .to_string();
     spawn_blocking_with_current_dispatcher(move || {
         let default_proxy = prefetch
             .as_ref()
@@ -3504,6 +3547,7 @@ async fn prefetch_rule_provider_payloads_async(
             cache_dir.as_deref(),
             default_proxy.as_ref(),
             &lookup,
+            Some(&user_agent),
         )
     })
     .await
@@ -5588,7 +5632,7 @@ fn build_named_listeners(
 /// [`resource_cache_dir_for_config_path`] of the config file, or `None`
 /// for a document with no backing file (`--config-string`).
 pub async fn build_config(
-    mut raw: raw::RawConfig,
+    raw: raw::RawConfig,
     cache_dir: Option<&Path>,
 ) -> Result<Config, anyhow::Error> {
     dns_parser::validate_node_policy_sources(&raw)?;
@@ -5599,7 +5643,29 @@ pub async fn build_config(
     // library callers — `load_config`/`load_config_from_str` — also send
     // the UA on startup fetches. A `PUT`/`PATCH` candidate does not reach
     // this lane; the API's commit point re-asserts it there.
+    //
+    // The install is live process state, so a failed build must not keep
+    // it: snapshot the installed value first and restore it on every
+    // error path out of `build_config_inner` — a rejected config's UA
+    // would otherwise linger on the emitters of whatever config stays
+    // live (issue #974 review).
+    let previous_ua = meow_common::global_ua();
     meow_common::set_global_ua(validate_global_ua(raw.global_ua.as_deref())?);
+    let built = build_config_inner(raw, cache_dir).await;
+    if built.is_err() {
+        meow_common::set_global_ua(previous_ua.as_deref());
+    }
+    built
+}
+
+/// [`build_config`]'s build body, split out so the wrapper can restore the
+/// previous process-global `User-Agent` on every error path — the
+/// candidate's UA is installed before the fetches below, and a late `?`
+/// must not leave it live (issue #974 review).
+async fn build_config_inner(
+    mut raw: raw::RawConfig,
+    cache_dir: Option<&Path>,
+) -> Result<Config, anyhow::Error> {
     // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
     // sync `parse_proxy` path that follows can stay sync. Failures warn
     // and leave the map unchanged — except the `enable: true` with no
@@ -10354,6 +10420,96 @@ rules:
         assert!(
             Arc::ptr_eq(again.get("p").unwrap(), &provider),
             "interval is a schedule knob, not provider identity"
+        );
+    }
+
+    /// A `global-client-fingerprint` flip rebuilds the provider (its
+    /// adapters bake the profile), but the rebuild must not serve an
+    /// empty slot until a fetch lands: the predecessor's last committed
+    /// payload is re-parsed under the new fingerprint instead — with no
+    /// cache directory (the `--config-string` shape) there is nothing
+    /// else to serve from, and `origin.hits()` proves no request ran
+    /// (issue #974 review). A `vmess` `tls: true` node reports its baked
+    /// fingerprint, so `client_fingerprint()` reads which global the
+    /// parse ran under.
+    #[cfg(feature = "vmess")]
+    #[tokio::test]
+    async fn fingerprint_only_rebuild_inherits_last_good_payload() {
+        const PAYLOAD: &str = "proxies:\n  - {name: n1, type: vmess, server: 127.0.0.1, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, alterId: 0, cipher: auto, tls: true}\n";
+        let origin = crate::test_support::Origin::spawn(Some(PAYLOAD), true).await;
+        let yaml = |fp: &str| {
+            format!(
+                "global-client-fingerprint: {fp}\nproxy-providers:\n  p:\n    type: http\n    url: '{}'\n",
+                origin.url
+            )
+        };
+        let registry: meow_proxy::dialer::ProxyRegistry = Default::default();
+
+        // The live provider fetches once and commits the payload.
+        let raw = raw_config(&yaml("chrome"));
+        let live = materialize_proxy_providers(
+            &raw,
+            &HashMap::new(),
+            None,
+            false,
+            &registry,
+            &mut DroppedProviders::default(),
+        )
+        .expect("provider materializes");
+        live["p"]
+            .acquire_initial()
+            .await
+            .expect("the initial fetch lands");
+        assert_eq!(live["p"].proxies().len(), 1);
+        assert_eq!(origin.hits(), 1);
+
+        // Fingerprint-only candidate — identical def, new global: rebuilt,
+        // but populated from the predecessor's retained payload rather
+        // than serving empty until the detached post-commit fetch.
+        let next = materialize_proxy_providers(
+            &raw_config(&yaml("firefox")),
+            &live,
+            None,
+            false,
+            &registry,
+            &mut DroppedProviders::default(),
+        )
+        .expect("fingerprint-only rebuild materializes");
+        let rebuilt = &next["p"];
+        assert!(
+            !Arc::ptr_eq(rebuilt, &live["p"]),
+            "a changed global fingerprint must rebuild the provider"
+        );
+        assert_eq!(
+            rebuilt.proxies().len(),
+            1,
+            "the rebuild inherits the predecessor's payload instead of starting empty"
+        );
+        assert_eq!(
+            rebuilt.proxies()[0].client_fingerprint(),
+            Some("firefox"),
+            "the payload re-parsed under the candidate fingerprint, not the old adapters"
+        );
+        assert_eq!(
+            origin.hits(),
+            1,
+            "no request ran — the payload transferred without a fetch"
+        );
+
+        // A def change is not fingerprint-only: no transfer, the provider
+        // keeps the detached-fetch contract (empty until one lands).
+        let changed = materialize_proxy_providers(
+            &raw_config(&yaml("firefox").replace(&origin.url, "http://127.0.0.1:9/dead")),
+            &next,
+            None,
+            false,
+            &registry,
+            &mut DroppedProviders::default(),
+        )
+        .expect("def change materializes fresh");
+        assert!(
+            changed["p"].proxies().is_empty(),
+            "a changed def must not inherit the predecessor's payload"
         );
     }
 

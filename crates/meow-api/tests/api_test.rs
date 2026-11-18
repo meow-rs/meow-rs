@@ -1069,19 +1069,33 @@ async fn patch_configs_global_ua_lifecycle() {
     }
 
     // Header bytes are refused — `state.raw_config` is this test's own
-    // cell, so the unmutated check is race-free.
-    let resp = patch("{\"global-ua\":\"bad\\r\\nua\"}").await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_eq!(
-        state.raw_config.read().global_ua.as_deref(),
-        Some("mihomo/v1.18.0"),
-        "a rejected PATCH must not reach the committed raw"
-    );
-    assert_ne!(
-        meow_common::global_ua().as_deref(),
-        Some("bad\r\nua"),
-        "a rejected PATCH must never install its value"
-    );
+    // cell, so the unmutated check is race-free. The live UA must stay
+    // EXACTLY what it was — not merely "not the bad value" — so the
+    // snapshot/compare pair runs under the lane on both sides of the
+    // request, and retries when a sibling commit legitimately moved it.
+    let mut attempts = 0;
+    loop {
+        let before = {
+            let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+            meow_common::global_ua()
+        };
+        let resp = patch("{\"global-ua\":\"bad\\r\\nua\"}").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua() == before {
+            assert_eq!(
+                state.raw_config.read().global_ua.as_deref(),
+                Some("mihomo/v1.18.0"),
+                "a rejected PATCH must not reach the committed raw"
+            );
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 20,
+            "a rejected PATCH kept mutating the live global UA"
+        );
+    }
 
     // `""` clears the live override — same retry shape as the set side:
     // a racing PUT commits `Some(..)`, so the cleared state is only safe
@@ -1138,17 +1152,41 @@ async fn put_configs_commits_global_ua_and_client_fingerprint() {
     };
 
     // A document with header-injection bytes in `global-ua` fails at
-    // candidate validation — the live override is untouched (whatever a
-    // racing writer last committed — never this bad value).
-    let resp = put("global-ua: \"bad\\r\\nua\"\n").await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    assert_ne!(meow_common::global_ua().as_deref(), Some("bad\r\nua"));
-    assert!(state.raw_config.read().global_ua.is_none());
-
-    // The happy path: both keys commit together.
+    // candidate validation — and the live override must stay EXACTLY what
+    // it was, not merely "not the bad value": snapshot/compare under the
+    // lane on both sides, retrying when a sibling commit legitimately
+    // moved it between the two reads.
     let mut attempts = 0;
     loop {
-        let resp = put("global-ua: mihomo/v1.18.0\nglobal-client-fingerprint: chrome\n").await;
+        let before = {
+            let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+            meow_common::global_ua()
+        };
+        let resp = put("global-ua: \"bad\\r\\nua\"\n").await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua() == before {
+            assert!(state.raw_config.read().global_ua.is_none());
+            break;
+        }
+        attempts += 1;
+        assert!(
+            attempts < 20,
+            "a rejected PUT kept mutating the live global UA"
+        );
+    }
+
+    // The happy path: both keys commit together — and the VLESS REALITY
+    // node declares no `client-fingerprint` of its own, so its adapter can
+    // only satisfy the REALITY uTLS gate by inheriting the global the PUT
+    // committed (issue #974 review).
+    let mut attempts = 0;
+    loop {
+        let resp = put(
+            "global-ua: mihomo/v1.18.0\nglobal-client-fingerprint: chrome\n\
+             proxies:\n  - {name: rl, type: vless, server: rl.test, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, reality-opts: {public-key: hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo}}\n",
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
         assert_eq!(
             state.raw_config.read().global_client_fingerprint.as_deref(),
@@ -1157,6 +1195,15 @@ async fn put_configs_commits_global_ua_and_client_fingerprint() {
         assert_eq!(
             state.raw_config.read().global_ua.as_deref(),
             Some("mihomo/v1.18.0")
+        );
+        let rl = state
+            .tunnel
+            .proxy("rl")
+            .expect("the VLESS node registers in the tunnel");
+        assert_eq!(
+            rl.client_fingerprint(),
+            Some("chrome"),
+            "without the committed global the REALITY gate would have dropped it"
         );
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         if meow_common::global_ua().as_deref() == Some("mihomo/v1.18.0") {

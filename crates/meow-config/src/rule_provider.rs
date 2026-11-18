@@ -564,11 +564,27 @@ async fn initial_fetch_loop(provider: Weak<RuleProvider>, owed: InitialFetch) {
 #[derive(Default)]
 pub struct PrefetchedPayloads {
     entries: HashMap<String, Prefetched>,
+    /// The `User-Agent` [`prefetch_payloads`] sent on this set's downloads
+    /// — the *candidate's* `global-ua` on a config-build lane, where
+    /// `GLOBAL_UA` still holds the committed value until the commit point
+    /// installs the new one (issue #974 review). `None` means "use
+    /// [`meow_common::effective_user_agent`]", which is right on lanes
+    /// whose global is already installed. `load_http`'s blocking fallback
+    /// fetch sends the same override so every fetch on a lane speaks one
+    /// UA.
+    user_agent: Option<Arc<str>>,
 }
 
 impl PrefetchedPayloads {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The UA override this set's downloads ran under (`None` → the
+    /// process-global effective UA) — the load pass's own fetch sends
+    /// the same one.
+    fn user_agent(&self) -> Option<&str> {
+        self.user_agent.as_deref()
     }
 
     /// Record `bytes` as `name`'s payload; the load passes parse it as-is.
@@ -849,17 +865,29 @@ fn effective_download_proxy(
 /// prefetch layer can be absent when the caller had no need to build it)
 /// skips the provider quietly — the load pass acquires it against the full
 /// registry.
+///
+/// `user_agent` overrides the `User-Agent` the downloads send —
+/// `internal_http`'s request builder falls back to the process-global
+/// `effective_user_agent()`, which on a config-build lane still holds the
+/// *committed* value until the commit point installs the candidate's
+/// `global-ua` (issue #974 review). Build lanes therefore pass the
+/// candidate's validated UA explicitly; `None` keeps the static fallback.
+/// A provider's own `header:` User-Agent still wins. The override is
+/// recorded on the returned set so the load pass's fallback fetch sends
+/// the same one.
 pub fn prefetch_payloads(
     raw_providers: &HashMap<String, RawRuleProvider>,
     cache_dir: Option<&Path>,
     default_proxy: Option<&Arc<dyn Proxy>>,
     lookup: ProxyLookup<'_>,
+    user_agent: Option<&str>,
 ) -> PrefetchedPayloads {
     prefetch_payloads_within(
         raw_providers,
         cache_dir,
         default_proxy,
         lookup,
+        user_agent,
         crate::provider_fetch_deadline(),
     )
 }
@@ -871,9 +899,13 @@ pub fn prefetch_payloads_within(
     cache_dir: Option<&Path>,
     default_proxy: Option<&Arc<dyn Proxy>>,
     lookup: ProxyLookup<'_>,
+    user_agent: Option<&str>,
     deadline: Option<Duration>,
 ) -> PrefetchedPayloads {
-    let mut out = PrefetchedPayloads::default();
+    let mut out = PrefetchedPayloads {
+        user_agent: user_agent.map(Arc::from),
+        ..PrefetchedPayloads::default()
+    };
     let mut downloads = Vec::new();
     for (name, cfg) in raw_providers {
         let entry = match cfg.provider_type.as_str() {
@@ -902,7 +934,7 @@ pub fn prefetch_payloads_within(
                                 name: name.clone(),
                                 url: url.to_string(),
                                 proxy,
-                                headers: provider_headers(cfg),
+                                headers: with_user_agent(provider_headers(cfg), user_agent),
                             });
                             continue;
                         }
@@ -1069,6 +1101,7 @@ pub fn load_providers_prefetched(
             ctx,
             download_proxy.as_ref(),
             payload,
+            prefetched.user_agent(),
             dialer_registry,
             strict,
         ) {
@@ -1195,6 +1228,11 @@ fn load_one(
     ctx: &ParserContext,
     download_proxy: Option<&Arc<dyn Proxy>>,
     prefetched: Option<&Prefetched>,
+    // The UA the prefetch's downloads ran under — the candidate's
+    // `global-ua` on a build lane; `load_http` sends it on a fallback
+    // fetch of its own so the lane speaks one UA before `GLOBAL_UA` is
+    // installed (issue #974 review). `None` → the static effective UA.
+    fetch_user_agent: Option<&str>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
     strict: bool,
 ) -> Result<RuleProvider, LoadError> {
@@ -1221,6 +1259,7 @@ fn load_one(
             ctx,
             download_proxy,
             prefetched,
+            fetch_user_agent,
             dialer_registry,
             strict,
         ),
@@ -1378,6 +1417,7 @@ fn load_http(
     ctx: &ParserContext,
     download_proxy: Option<&Arc<dyn Proxy>>,
     prefetched: Option<&Prefetched>,
+    fetch_user_agent: Option<&str>,
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
     strict: bool,
 ) -> Result<RuleProvider, LoadError> {
@@ -1423,11 +1463,20 @@ fn load_http(
             let fetched = match read_cache(cache_path.as_deref()) {
                 Some(cached) => Ok(cached),
                 None if crate::is_offline_validate() => Err(anyhow!(offline_miss(url))),
-                None => fetch_http_blocking(url, download_proxy, &headers).map(|bytes| {
-                    Prefetched::Downloaded {
-                        bytes,
-                        persisted: AtomicBool::new(false),
-                    }
+                // Same UA the prefetch's downloads ran under — a
+                // candidate lane's `GLOBAL_UA` still holds the previous
+                // config's value (issue #974 review); the provider's own
+                // `header:` still wins. `fetch.headers` above stays clean:
+                // refresh fetches run post-commit, where the static is
+                // already the committed UA.
+                None => fetch_http_blocking(
+                    url,
+                    download_proxy,
+                    &with_user_agent(headers, fetch_user_agent),
+                )
+                .map(|bytes| Prefetched::Downloaded {
+                    bytes,
+                    persisted: AtomicBool::new(false),
                 }),
             };
             match fetched {
@@ -1613,6 +1662,27 @@ fn provider_headers(cfg: &RawRuleProvider) -> Vec<(String, String)> {
         .as_ref()
         .map(crate::raw::flatten_header_map)
         .unwrap_or_default()
+}
+
+/// `headers` plus `fetch_user_agent` as `User-Agent` — the explicit UA
+/// override for a config-build lane, whose `GLOBAL_UA` still holds the
+/// previous (or none) value until the commit point (issue #974 review).
+/// A provider's own `header:` User-Agent still wins, matching the
+/// custom-UA precedence `internal_http`'s request builder applies.
+fn with_user_agent(
+    headers: Vec<(String, String)>,
+    fetch_user_agent: Option<&str>,
+) -> Vec<(String, String)> {
+    let mut out = headers;
+    if let Some(ua) = fetch_user_agent {
+        if !out
+            .iter()
+            .any(|(n, _)| n.eq_ignore_ascii_case("user-agent"))
+        {
+            out.push(("User-Agent".to_string(), ua.to_string()));
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -3080,6 +3150,7 @@ header:
                 Some(&dir),
                 None,
                 &|_| None,
+                None,
                 deadline,
             ))
         })

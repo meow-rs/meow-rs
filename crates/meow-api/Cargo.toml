@@ -51,6 +51,9 @@ serde-saphyr = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
 # api_test opens a logbook.
 meow-common = { workspace = true, features = ["logbook", "traffic-ledger"] }
+# api_test PUTs a VLESS REALITY node to prove `global-client-fingerprint`
+# inheritance reaches the tunnel — the production dep stays feature-less.
+meow-config = { workspace = true, features = ["vless"] }
 meow-trie = { workspace = true }
 tower = { workspace = true }
 http-body-util = "0.1"
