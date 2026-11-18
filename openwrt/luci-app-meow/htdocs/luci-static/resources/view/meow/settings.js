@@ -71,6 +71,11 @@ return view.extend({
 			_('The API secret. Leave empty to allow the panel only from this router; ' +
 			  'set it to open the panel from other LAN devices.'));
 		o.password = true;
+		o.validate = function(sectionId, value) {
+			if (!value || (!/[^\x20-\x7e]/.test(value) && !value.endsWith(' ')))
+				return true;
+			return _('Use printable ASCII characters without trailing spaces.');
+		};
 
 		o = s.taboption('advanced', form.Value, 'config_file', _('Configuration file'),
 			_('Fixed path used by the managed service; edit it in the Configuration tab.'));

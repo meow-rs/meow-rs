@@ -16,9 +16,17 @@ path=$2
 port=$(uci -q get meow.main.panel_port || echo 9090)
 case "$port" in ''|*[!0-9]*) echo 'Invalid API port' >&2; exit 1 ;; esac
 [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || exit 1
-secret=$(uci -q get meow.main.secret || true)
+# The marker preserves trailing newlines until the UCI output terminator is removed.
+newline='
+'
+secret=$(uci -q get meow.main.secret && printf .) || secret=''
+secret=${secret%"$newline".}
+LC_ALL=C
+case "$secret" in *[![:print:]]|*' ') echo 'Invalid API secret' >&2; exit 1 ;; esac
 set -- --noproxy '*' --silent --show-error --fail --connect-timeout 2 --max-time 5 \
     --request "$method" "http://127.0.0.1:$port$path"
-[ -z "$secret" ] || set -- "$@" --header "Authorization: Bearer $secret"
 [ -z "$body" ] || set -- "$@" --header 'Content-Type: application/json' --data-binary "$body"
-exec curl "$@"
+if [ -z "$secret" ]; then
+    exec curl "$@"
+fi
+printf 'Authorization: Bearer %s\n' "$secret" | curl "$@" --header @-
