@@ -65,6 +65,8 @@ ipv6: false
 
 # REST API
 external-controller: 127.0.0.1:9090
+# Use a strong secret for remote access, DNS hostnames other than localhost,
+# or cross-origin dashboards.
 secret: ""
 # Applying a change to the controller secret requires a restart.
 # Mount a third-party dashboard (metacubexd, yacd, …) at /ui instead of the

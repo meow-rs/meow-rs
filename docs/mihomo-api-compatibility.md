@@ -41,10 +41,13 @@ Status meanings:
 | `POST /cache/dns/flush` | Compatible | Clears resolver cache. |
 | `POST /cache/fakeip/flush` | Compatible | Clears fake-IP allocations. |
 
-Authentication matches mihomo: ordinary HTTP requires the exact
-`Authorization: Bearer <secret>` scheme, while WebSocket upgrades may instead
-use `?token=<secret>`. Authentication failures use
-`{"message":"Unauthorized"}`.
+With a controller secret, HTTP requires the exact `Authorization: Bearer <secret>`
+scheme, and WebSocket upgrades also accept `?token=<secret>`. Authentication
+failures use `{"message":"Unauthorized"}`.
+
+Without a controller secret, use an IP address or `localhost` to access the API.
+Browser API requests and WebSocket upgrades must come from the controller's own
+origin.
 
 ## Deliberate gaps
 

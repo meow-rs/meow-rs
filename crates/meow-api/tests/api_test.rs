@@ -2876,6 +2876,146 @@ async fn select_proxy_roundtrip() {
 // ── Bearer auth middleware ───────────────────────────────────────
 
 #[tokio::test]
+async fn controller_without_secret_restricts_browser_access() {
+    use axum::http::header;
+
+    let app = create_router(test_state_with_secret(""));
+    let cases = [
+        ("/ui", "localhost:9090", None, None, StatusCode::OK),
+        ("/version", "127.0.0.1:9090", None, None, StatusCode::OK),
+        (
+            "/version",
+            "[::1]:9090",
+            Some("http://[::1]:9090"),
+            Some("same-origin"),
+            StatusCode::OK,
+        ),
+        (
+            "/version",
+            "localhost:80",
+            Some("http://localhost"),
+            Some("same-origin"),
+            StatusCode::OK,
+        ),
+        (
+            "/version",
+            "127.0.0.1:9090",
+            Some("http://127.0.0.1:9091"),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "localhost:9090",
+            Some("https://localhost:9090"),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "localhost:9090",
+            Some("null"),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "localhost:9090",
+            None,
+            Some("cross-site"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "controller.example:9090",
+            None,
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+
+    for (path, host, origin, fetch_site, status) in cases {
+        let mut req = Request::get(path).header(header::HOST, host);
+        if let Some(origin) = origin {
+            req = req.header(header::ORIGIN, origin);
+        }
+        if let Some(fetch_site) = fetch_site {
+            req = req.header("sec-fetch-site", fetch_site);
+        }
+        let response = app
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{host} from {origin:?}");
+        assert!(!response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    }
+
+    let response = app
+        .oneshot(
+            Request::post("/rules")
+                .header(header::HOST, "127.0.0.1:9090")
+                .header(header::ORIGIN, "https://dashboard.example")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(axum::body::Body::from(r#"{"rules":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn controller_with_secret_allows_authenticated_cross_origin_dashboards() {
+    use axum::http::{header, Method};
+
+    let app = create_router(test_state_with_secret("test-token"));
+    let preflight = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/version")
+                .header(header::HOST, "controller.example:9090")
+                .header(header::ORIGIN, "https://dashboard.example")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization,content-type",
+                )
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::OK);
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "*"
+    );
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+        "authorization,content-type"
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/version")
+                .header(header::HOST, "controller.example:9090")
+                .header(header::ORIGIN, "https://dashboard.example")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+}
+
+#[tokio::test]
 async fn auth_middleware_table() {
     use axum::http::header::HeaderValue;
 

@@ -15,7 +15,9 @@ Without `external-controller`, the API does not start. See
 
 - **REST auth:** `Authorization: Bearer <secret>`.
 - **WebSocket auth:** the bearer header *or* `?token=<secret>`.
-- **CORS:** permissive (`Access-Control-Allow-Origin: *`).
+- **Browser access:** With a secret, CORS is permissive (`Access-Control-Allow-Origin: *`).
+  Without a secret, use an IP address or `localhost` and keep the dashboard on the
+  controller's origin. This applies to both REST and WebSocket requests.
 
 ```bash
 curl -H 'Authorization: Bearer <secret>' http://127.0.0.1:9090/proxies

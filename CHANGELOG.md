@@ -440,6 +440,11 @@ the canonical, in-repo source a release is cut from.
 - API: request bodies decode as JSON whatever their `Content-Type`, as
   mihomo does — dashboards that PUT a selection as `text/plain` or untyped
   no longer get 415.
+- **Controller browser access.** Without a secret, use an IP address or
+  `localhost` and access the REST API and WebSocket endpoints from the
+  controller's origin. With a secret, cross-origin dashboard preflights
+  explicitly allow the `Authorization` header when requested.
+
 - **UDP flows on the tproxy, TUN and Shadowsocks inbounds now stop on
   termination signals even while an upstream write is pending** (extends
   #893): `write_packet` races the idle timeout, outbound-session flush and
