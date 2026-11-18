@@ -296,6 +296,8 @@ the canonical, in-repo source a release is cut from.
   right after the destination address, as in anytls-go, sing-anytls and
   mihomo. An error SYNACK still ends the stream, and the 3 s session watchdog
   still closes a session whose peer never answers.
+- **WireGuard bridge latency.** Flush ready outgoing datagrams without a fixed
+  delay and continue batching datagrams that are already queued.
 - **DoH speaks HTTP/2.** DoH over TLS offered only the `http/1.1` ALPN, so
   a server that answers only over HTTP/2 failed every query with
   `doh: EOF inside response headers` (Yandex DNS, 77.88.8.8, accepts
