@@ -302,6 +302,9 @@ the canonical, in-repo source a release is cut from.
   HTTP/2 is behind the new app feature `dns-doh-h2` (meow-dns `doh-h2`), in
   `full` and out of `minimal`, where it would be the first user of the `h2`
   crate (ADR-0007); a `minimal` build keeps HTTP/1.1-only DoH.
+- **Concurrent DNS-over-HTTPS startup.** Cold queries share the first TLS
+  handshake and open HTTP/2 streams as soon as the connection is ready.
+  HTTP/1.1 queries dial in parallel once the server selects that protocol.
 - **`ech-opts` on a VLESS REALITY node.** A node with both was refused with
   `reality-opts cannot be combined with ech-opts` once the ECH config was
   known, whether inline or fetched from DNS. `ech-opts` is now ignored with a
