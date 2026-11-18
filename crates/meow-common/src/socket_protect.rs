@@ -610,6 +610,50 @@ pub fn global_interface_name() -> Option<Arc<str>> {
     GLOBAL_INTERFACE_NAME.read().clone()
 }
 
+/// Default HTTP `User-Agent` sent by internal fetches and health checks
+/// when `global-ua` is unset or empty (`clash.meta/<pkg_version>`).
+pub const DEFAULT_USER_AGENT: &str = concat!("clash.meta/", env!("CARGO_PKG_VERSION"));
+
+/// mihomo's top-level `global-ua` (issue #974): overrides the `User-Agent`
+/// on the daemon's own HTTP requests (provider/subscription/geodata
+/// fetches, latency probes). Process-wide like `GLOBAL_INTERFACE_NAME` —
+/// the emitters live in meow-config and meow-proxy and share no config
+/// struct, and every config commit re-asserts it.
+static GLOBAL_UA: RwLock<Option<Arc<str>>> = RwLock::new(None);
+
+/// Whether `value` is a legal HTTP header field value (RFC 9110 §5.5 /
+/// Go `httpguts.ValidHeaderFieldValue`): HTAB, SP..='~', and obs-text
+/// 0x80..=0xFF. Rejects CR, LF, NUL, and all other control bytes — the
+/// emitters format the UA into a raw request head, so an unchecked
+/// newline would be header injection.
+#[inline]
+pub fn is_valid_http_header_value(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|b| b == b'\t' || (b'\x20'..=b'\x7e').contains(&b) || b >= 0x80)
+}
+
+/// Install (or clear with `None` / empty / whitespace-only) the global
+/// `User-Agent`. The value is trimmed; an invalid header value stores
+/// `None` as a backstop — the config parser rejects it upfront (Class A).
+pub fn set_global_ua(ua: Option<&str>) {
+    *GLOBAL_UA.write() = ua
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && is_valid_http_header_value(s))
+        .map(Arc::from);
+}
+
+/// The installed `global-ua` override, if any.
+pub fn global_ua() -> Option<Arc<str>> {
+    GLOBAL_UA.read().clone()
+}
+
+/// The effective `User-Agent` for internal HTTP requests and latency
+/// probes: `global-ua` when set, else [`DEFAULT_USER_AGENT`].
+pub fn effective_user_agent() -> Arc<str> {
+    global_ua().unwrap_or_else(|| Arc::from(DEFAULT_USER_AGENT))
+}
+
 /// Holders of firewall rules that exempt the current routing mark (meow's
 /// managed tproxy tables): while any is alive the mark cannot change at
 /// runtime, or meow's own traffic would stop matching the exemption.

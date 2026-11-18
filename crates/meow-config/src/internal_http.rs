@@ -36,7 +36,6 @@ const MAX_REDIRECTS: u8 = 5;
 /// (BaoLianDeng#79: config update froze the app until force quit).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
-const USER_AGENT: &str = concat!("clash.meta/", env!("CARGO_PKG_VERSION"));
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB hard ceiling
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
@@ -95,12 +94,11 @@ fn is_valid_header_name(name: &str) -> bool {
 /// A valid header field value per RFC 9110/Go's `ValidHeaderFieldValue`:
 /// SP, HTAB, and any byte in the visible range plus 0x80..=0xFF (obs
 /// latin-1 values are tolerated, matching Go); every other CTL (including
-/// CR/LF, 0x00-0x08, 0x0A-0x1F, DEL) is rejected.
+/// CR/LF, 0x00-0x08, 0x0A-0x1F, DEL) is rejected. Shared with `global-ua`
+/// validation as [`meow_common::is_valid_http_header_value`].
 #[inline]
 fn is_valid_header_value(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|b| b == b'\t' || (b'\x20'..=b'\x7e').contains(&b) || b >= 0x80)
+    meow_common::is_valid_http_header_value(value)
 }
 
 /// Resolve a `proxy:`-style download-proxy field against the published route
@@ -383,7 +381,8 @@ async fn fetch_one(
     );
     if !has_custom_ua {
         request.push_str("User-Agent: ");
-        request.push_str(USER_AGENT);
+        // `global-ua` when set, else clash.meta/<version> (issue #974).
+        request.push_str(&meow_common::effective_user_agent());
         request.push_str("\r\n");
     }
     for (name, value) in headers {

@@ -56,16 +56,6 @@ const UNSUPPORTED_KEYS: &[(&str, Option<u32>, &str)] = &[
     ),
     ("lan-allowed-ips", None, "ACL not in proxy kernel scope"),
     ("lan-disallowed-ips", None, "ACL not in proxy kernel scope"),
-    (
-        "global-client-fingerprint",
-        Some(974),
-        "global TLS fingerprint not implemented",
-    ),
-    (
-        "global-ua",
-        None,
-        "HTTP User-Agent override not implemented",
-    ),
     ("tunnels", Some(974), "inbound tunnels not implemented"),
     ("udp-over-tcp", None, "UDP-over-TCP not implemented"),
     ("udp-over-tcp-version", None, "UDP-over-TCP not implemented"),
@@ -109,6 +99,11 @@ const MISPLACED_KEYS: &[(&str, &str)] = &[
         "dialer-proxy",
         "a proxies: entry or a proxy-providers: entry",
     ),
+    (
+        "global-client-fingerprint",
+        "the top-level config (use 'client-fingerprint' on a proxies: entry)",
+    ),
+    ("global-ua", "the top-level config"),
 ];
 
 /// Frequent misspellings of a real mihomo key — the hint renders inline
@@ -501,6 +496,22 @@ pub(crate) fn warn_extra<T>(context: &str, extra: &BTreeMap<String, T>) {
 ///   design, not a warn.
 pub(crate) fn validate_and_warn(raw: &crate::raw::RawConfig) {
     warn_extra("top-level config", &raw.extra);
+
+    // `global-client-fingerprint` names a uTLS profile; an unsupported
+    // name degrades to the TLS backend's defaults on every inheriting
+    // node — warn once per rebuild so the operator sees the effective
+    // hello is unshaped (Class B, matching the per-node contract).
+    if let Some(fp) =
+        crate::proxy_parser::normalize_client_fingerprint(raw.global_client_fingerprint.as_deref())
+    {
+        if !meow_transport::tls::is_supported_fingerprint(&fp) {
+            warn!(
+                "global-client-fingerprint=\"{fp}\" is not a supported uTLS profile \
+                 (expected chrome, firefox, safari, ios, android, edge, or random); \
+                 nodes inheriting it will fall back to default TLS parameters"
+            );
+        }
+    }
 
     if let Some(dns) = &raw.dns {
         warn_extra("dns", &dns.extra);

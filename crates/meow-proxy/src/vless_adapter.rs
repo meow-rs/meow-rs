@@ -647,6 +647,10 @@ impl ProxyAdapter for VlessAdapter {
     fn health(&self) -> &ProxyHealth {
         &self.health
     }
+
+    fn client_fingerprint(&self) -> Option<&str> {
+        self.transport.tls_fingerprint()
+    }
 }
 
 // ─── Crate invariants + struct tests (§E, §I) ────────────────────────────────

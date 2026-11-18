@@ -92,6 +92,8 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `tproxy-port` | ✓ | Linux nftables / macOS pf. Managed-REDIRECT semantic (TCP, host `output` chain) — mihomo's real-TPROXY shorthand maps to `listeners:` `type: tproxy transparent: true` instead. |
 | `redir-port` | ✓ | Deployer-REDIRECT listener, meow owns no rules. Same as `listeners:` `type: redir`. |
 | `routing-mark` | ✓ | Linux only. `SO_MARK` on every outbound socket; the deployer's rules exempt meow's own traffic. |
+| `global-client-fingerprint` | ✓ | Default uTLS ClientHello profile (`chrome`/`firefox`/`safari`/`ios`/`android`/`edge`/`random`, etc.) for `proxies:`/`proxy-providers:` nodes omitting `client-fingerprint`. Node value wins, an omitted or `""` value inherits the global, and an explicit `none` opts out (under VLESS+REALITY the literal `none` passes through to the warn-and-Chrome fallback, as upstream), an unsupported name warns and degrades to backend defaults. Baked at parse — changes ride a full config load, not a `PATCH`. |
+| `global-ua` | ✓ | `User-Agent` override on internal HTTP fetches (providers, subscriptions, geodata, external-ui) and latency probes; `""`/unset = `clash.meta/<version>`. A request-supplied `User-Agent` still wins; values with CR/LF/NUL/control bytes are rejected at admission. `PATCH /configs` applies it live. |
 | `proxy-providers:` | ✓ | http/file sources, provider filters, health checks, and group `use:`. |
 | `geodata:` | ✓ | Path overrides, auto-update, interval, and download URL overrides. |
 | `/metrics` Prometheus endpoint | ✓ | meow-rs enhancement (no Go upstream equiv). |

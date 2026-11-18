@@ -341,6 +341,10 @@ impl ProxyAdapter for AnytlsAdapter {
     fn health(&self) -> &ProxyHealth {
         &self.health
     }
+
+    fn client_fingerprint(&self) -> Option<&str> {
+        self.tls_layer.fingerprint()
+    }
 }
 
 /// An `AnyTlsError::Io` carries the real io error — `raw_os_error` survives

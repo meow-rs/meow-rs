@@ -332,6 +332,30 @@ proxies:
     );
 }
 
+/// Issue #974: the verbatim-mihomo shape — `global-client-fingerprint`
+/// at the top level only, REALITY nodes omitting `client-fingerprint`.
+/// The node inherits the global and passes the uTLS gate.
+#[tokio::test]
+async fn global_client_fingerprint_satisfies_vless_reality_nodes() {
+    let yaml = r#"
+global-client-fingerprint: chrome
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    tls: true
+    reality-opts:
+      public-key: hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo
+"#;
+    let config = load_config_from_str(yaml).await.expect("config must load");
+    assert!(
+        config.proxies.contains_key("v"),
+        "the REALITY node must inherit the global fingerprint"
+    );
+}
+
 #[tokio::test]
 async fn parse_vless_reality_opts_requires_tls_true() {
     let yaml = r#"

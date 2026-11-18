@@ -443,6 +443,17 @@ pub struct RawConfig {
     /// mihomo `unified-delay`: delay probes report the second
     /// request on a warm connection, without the dial/handshake cost.
     pub unified_delay: Option<bool>,
+    /// mihomo's top-level `global-client-fingerprint` (issue #974):
+    /// default uTLS ClientHello profile (`chrome`, `firefox`, `safari`,
+    /// `ios`, `android`, `edge`, `random`) for `proxies:` and
+    /// `proxy-providers:` nodes that omit their own `client-fingerprint`.
+    /// Node-level values win; `"none"`/`""` means unset.
+    pub global_client_fingerprint: Option<String>,
+    /// mihomo's top-level `global-ua` (issue #974): overrides the default
+    /// `User-Agent` (`clash.meta/<version>`) on internal HTTP fetches
+    /// (providers, subscriptions, geodata, external-ui) and latency
+    /// probes. `None`/`""` keeps the built-in default.
+    pub global_ua: Option<String>,
     /// Wall-clock bound, in seconds, on the built-in DIRECT adapter's
     /// `TcpStream::connect`. Unset = unbounded (legacy behaviour, subject
     /// only to the OS connect timeout). Motivated by iOS/macOS

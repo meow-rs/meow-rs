@@ -87,11 +87,12 @@ pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};
 pub use sniffer::SnifferConfig;
 pub use socket_protect::{
     apply_ip_version_filter, bind_udp, bind_udp_for_peer, canonical_socket_addr, connect_tcp,
-    connect_tcp_candidates, connect_tcp_host, dialer_opts, dialer_opts_scope,
-    enlarge_udp_recv_buffer, global_dialer_opts, global_interface_name, pin_routing_mark,
-    resolve_host, resolve_host_all, resolve_host_all_via, routing_mark, routing_mark_pinned,
-    set_global_interface_name, set_routing_mark, DialerOpts, GlobalDialerOpts, IpVersion,
-    RoutingMarkPin,
+    connect_tcp_candidates, connect_tcp_host, dialer_opts, dialer_opts_scope, effective_user_agent,
+    enlarge_udp_recv_buffer, global_dialer_opts, global_interface_name, global_ua,
+    is_valid_http_header_value, pin_routing_mark, resolve_host, resolve_host_all,
+    resolve_host_all_via, routing_mark, routing_mark_pinned, set_global_interface_name,
+    set_global_ua, set_routing_mark, DialerOpts, GlobalDialerOpts, IpVersion, RoutingMarkPin,
+    DEFAULT_USER_AGENT,
 };
 pub use tcp_opts::TcpKeepaliveConfig;
 // Host-resolver hook is cross-platform (iOS installs it without a protector).

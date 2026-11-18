@@ -517,6 +517,9 @@ mod vless_tests {
 
     // ─── H7: VLESS over XHTTP end-to-end round-trip ───────────────────────────
 
+    // XHTTP is an H2 transport — h2/xhttp exist only under `mux`; `vless`
+    // alone must still compile this suite (no-default-features resolution).
+    #[cfg(feature = "mux")]
     #[tokio::test]
     async fn vless_over_xhttp_roundtrip() {
         use bytes::Bytes;

@@ -254,6 +254,9 @@ enum TlsBackend {
 /// the in-tree REALITY path instead.
 pub struct TlsLayer {
     backend: TlsBackend,
+    /// The `client-fingerprint` profile the config resolved (issue #974) —
+    /// kept for observational reads: the `SSL_CTX` shaping itself is opaque.
+    fingerprint: Option<String>,
 }
 
 impl TlsLayer {
@@ -297,6 +300,7 @@ impl TlsLayer {
         if config.reality.is_some() {
             return Ok(Self {
                 backend: TlsBackend::Reality(crate::reality_tls::RealityTlsLayer::new(&config)?),
+                fingerprint: config.fingerprint.clone(),
             });
         }
 
@@ -318,9 +322,19 @@ impl TlsLayer {
             sni = ?config.sni,
             "TLS: BoringSSL backend (lazy init)"
         );
+        let fingerprint = config.fingerprint.clone();
         Ok(Self {
             backend: TlsBackend::Boring(Box::new(LazyBoringInner::new(config))),
+            fingerprint,
         })
+    }
+
+    /// The `client-fingerprint` profile this layer shapes its ClientHello
+    /// with — `None` when unshaped (BoringSSL's default hello). The value
+    /// as configured, even when it names a profile the backend defers to
+    /// defaults over.
+    pub fn fingerprint(&self) -> Option<&str> {
+        self.fingerprint.as_deref()
     }
 
     /// Handshake over a caller-owned stream type, returning the concrete
@@ -405,5 +419,9 @@ impl Transport for TlsLayer {
             TlsBackend::Reality(r) => r.connect(inner).await,
             TlsBackend::Boring(lazy) => lazy.connect(inner).await,
         }
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 }

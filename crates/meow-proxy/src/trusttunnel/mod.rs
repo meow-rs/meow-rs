@@ -113,6 +113,9 @@ pub struct TrustTunnelAdapter {
     /// `dialer-proxy` front takes the UDP-association path for it, while
     /// H2 keeps the trait-default TCP hop.
     hop_udp: bool,
+    /// The `client-fingerprint` resolved at parse (issue #974) — copied
+    /// before `tls` moves into the connector, for observational reads.
+    client_fingerprint: Option<String>,
 }
 impl TrustTunnelAdapter {
     #[allow(
@@ -130,6 +133,7 @@ impl TrustTunnelAdapter {
         dialer: Arc<dyn crate::dialer::TcpDialer>,
     ) -> Result<Self> {
         let mut hop_udp = false;
+        let client_fingerprint = tls.fingerprint.clone();
         let connector = match transport {
             Transport::H2 => Self::h2_connector(server, port, tls, dialer)?,
             #[cfg(feature = "trusttunnel-h3")]
@@ -168,6 +172,7 @@ impl TrustTunnelAdapter {
             udp,
             health: ProxyHealth::new(),
             hop_udp,
+            client_fingerprint,
         })
     }
 
@@ -226,6 +231,9 @@ impl ProxyAdapter for TrustTunnelAdapter {
     }
     fn health(&self) -> &ProxyHealth {
         &self.health
+    }
+    fn client_fingerprint(&self) -> Option<&str> {
+        self.client_fingerprint.as_deref()
     }
     fn reset_sessions(&self) {
         self.client.reset();

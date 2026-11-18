@@ -3634,6 +3634,78 @@ tcp-idl-timeout: 5
         );
     }
 
+    /// Issue #974: both new top-level keys are typed now — they must
+    /// produce no unknown/unsupported warning at all.
+    #[test]
+    fn global_client_fingerprint_and_global_ua_do_not_warn_as_unknown() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+global-client-fingerprint: chrome
+global-ua: my-client/1.0
+"#,
+        );
+        assert!(
+            !logs.contains("global-client-fingerprint") && !logs.contains("global-ua"),
+            "neither supported key may warn: {logs}"
+        );
+    }
+
+    /// An unsupported `global-client-fingerprint` name warns once per
+    /// rebuild pass (Class B) and still loads — nodes inheriting it would
+    /// otherwise send a silently unshaped hello. `rebuild_from_raw` runs
+    /// exactly one pass (startup's two-pass DNS build legitimately warns
+    /// twice).
+    #[test]
+    fn unsupported_global_client_fingerprint_warns_once() {
+        let raw = meow_config::parse_raw_yaml("global-client-fingerprint: bogus-fp\n").unwrap();
+        let (_result, logs) = capture_warns(|| rebuild_from_raw(&raw).unwrap());
+        let hits = logs
+            .matches("global-client-fingerprint=\"bogus-fp\" is not a supported uTLS profile")
+            .count();
+        assert_eq!(hits, 1, "one warn per rebuild pass, got: {logs}");
+    }
+
+    /// `global-ua` with header-injection bytes is a Class A rejection —
+    /// the build fails rather than emit a second request line. NUL and
+    /// other control bytes cannot be spelled inside a YAML scalar, so
+    /// they drive the rebuild's validation gate directly. Edge-position
+    /// bytes (`"evil\r\n"`) are the smuggling case: trimming first would
+    /// strip them before the check, so the validator must inspect the
+    /// untrimmed string.
+    #[test]
+    fn global_ua_rejects_crlf_and_control_bytes() {
+        for bad in [
+            "a\nb",
+            "a\rb",
+            "a\u{0}b",
+            "a\u{1f}b",
+            "a\u{7f}b",
+            "a\u{0b}b",
+            "\r\n",
+            "evil\r\n",
+            "\r\nevil",
+            "evil\u{0b}",
+        ] {
+            let raw = meow_config::raw::RawConfig {
+                global_ua: Some(bad.to_string()),
+                ..Default::default()
+            };
+            let err = rebuild_from_raw(&raw)
+                .err()
+                .unwrap_or_else(|| panic!("global-ua {bad:?} must fail the rebuild"));
+            assert!(
+                err.to_string().contains("global-ua"),
+                "the error must name the key, got: {err}"
+            );
+        }
+        // The same gate fires through the YAML/document path.
+        let raw = meow_config::parse_raw_yaml("global-ua: \"a\\x0ab\"\n").unwrap();
+        assert!(
+            rebuild_from_raw(&raw).is_err(),
+            "a CRLF-injected global-ua must fail at admission"
+        );
+    }
+
     /// Misplaced keys name the surface that honors them — `firewall` under
     /// `dns:` is not a typed field there, so the extra-capture classify
     /// fires (the top-level `firewall` key is typed and warned by its own
@@ -4033,6 +4105,8 @@ strict-bogus-key: 1
             "firewall",
             "geodata",
             "geox-url",
+            "global-client-fingerprint",
+            "global-ua",
             "hosts",
             "interface-name",
             "ipv6",

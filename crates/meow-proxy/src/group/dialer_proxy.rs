@@ -317,6 +317,11 @@ impl ProxyAdapter for DialerProxyAdapter {
     fn health(&self) -> &ProxyHealth {
         self.inner.health()
     }
+
+    /// Transparent wrapper — the baked fingerprint is the leaf's.
+    fn client_fingerprint(&self) -> Option<&str> {
+        self.inner.client_fingerprint()
+    }
 }
 
 impl Proxy for DialerProxyAdapter {

@@ -1089,25 +1089,26 @@ where
     // HEAD with `keep-alive` runs 6 bytes longer than the plain GET.
     use std::io::Write as _;
     let default_port = if parsed.https { 443 } else { 80 };
+    // `global-ua` when set, else clash.meta/<version> — read per request,
+    // so a `PATCH /configs` swap reaches the next probe (issue #974).
+    let ua = meow_common::effective_user_agent();
     let mut buf = Vec::with_capacity(512);
     if parsed.port == default_port {
         write!(
             buf,
             "{method} {path} HTTP/1.1\r\nHost: {host}\r\n\
-             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: {connection}\r\n\r\n",
+             User-Agent: {ua}\r\nAccept: */*\r\nConnection: {connection}\r\n\r\n",
             path = parsed.path,
             host = parsed.host,
-            ver = env!("CARGO_PKG_VERSION"),
         )
     } else {
         write!(
             buf,
             "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\n\
-             User-Agent: clash.meta/{ver}\r\nAccept: */*\r\nConnection: {connection}\r\n\r\n",
+             User-Agent: {ua}\r\nAccept: */*\r\nConnection: {connection}\r\n\r\n",
             path = parsed.path,
             host = parsed.host,
             port = parsed.port,
-            ver = env!("CARGO_PKG_VERSION"),
         )
     }
     .expect("writing to a Vec cannot fail");
@@ -1414,6 +1415,38 @@ mod tests {
                 && (delay as u64) < timeout.as_millis() as u64 + 1000,
             "delay ≈ the probe deadline, got {delay}"
         );
+    }
+
+    /// `global-ua` (issue #974): the probe emits the process-wide override
+    /// when one is set and the `clash.meta/<version>` default otherwise.
+    /// The only `set_global_ua` caller in this crate's tests.
+    #[tokio::test]
+    async fn probe_request_emits_the_effective_user_agent() {
+        let parsed = ParsedUrl::parse("http://probe.test/generate_204").unwrap();
+        let capture = |parsed: &ParsedUrl| {
+            let parsed = parsed.clone();
+            async move {
+                let (mut client, mut server) = tokio::io::duplex(4096);
+                let srv = tokio::spawn(async move {
+                    let mut buf = [0u8; 2048];
+                    let n = server.read(&mut buf).await.unwrap();
+                    String::from_utf8_lossy(&buf[..n]).into_owned()
+                });
+                send_request(&mut client, &parsed, "HEAD", "close")
+                    .await
+                    .unwrap();
+                srv.await.unwrap()
+            }
+        };
+        meow_common::set_global_ua(Some("mihomo/v1.18.0"));
+        let request = capture(&parsed).await;
+        meow_common::set_global_ua(None);
+        assert!(
+            request.contains("User-Agent: mihomo/v1.18.0\r\n"),
+            "{request}"
+        );
+        let request = capture(&parsed).await;
+        assert!(request.contains("User-Agent: clash.meta/"), "{request}");
     }
 
     /// A status line longer than the read buffer drains to its CRLF

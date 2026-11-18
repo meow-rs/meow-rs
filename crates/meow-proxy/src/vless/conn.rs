@@ -604,15 +604,19 @@ impl ProxyPacketConn for VlessPacketConn {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "mux", feature = "vless-vision"))]
     use std::pin::Pin;
+    #[cfg(any(feature = "mux", feature = "vless-vision"))]
     use std::task::{Context, Poll};
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
 
+    #[cfg(any(feature = "mux", feature = "vless-vision"))]
     struct ChunkedStream {
         inner: tokio::io::DuplexStream,
         max_write: usize,
     }
 
+    #[cfg(any(feature = "mux", feature = "vless-vision"))]
     impl AsyncRead for ChunkedStream {
         fn poll_read(
             self: Pin<&mut Self>,
@@ -623,6 +627,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(feature = "mux", feature = "vless-vision"))]
     impl AsyncWrite for ChunkedStream {
         fn poll_write(
             self: Pin<&mut Self>,

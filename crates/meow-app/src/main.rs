@@ -641,6 +641,11 @@ fn run_application_inner(
         // and the loopback exemption outrank it inside the dial scope;
         // `None`/empty clears.
         meow_common::set_global_interface_name(raw.interface_name.as_deref());
+        // `global-ua` (issue #974) — same process-wide shape as
+        // `interface-name`/`routing-mark`: validate and install before the
+        // build's first provider/geodata fetch emits a `User-Agent`.
+        // `build_config` re-asserts it ahead of those fetches.
+        meow_common::set_global_ua(meow_config::validate_global_ua(raw.global_ua.as_deref())?);
 
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);

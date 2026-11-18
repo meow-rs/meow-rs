@@ -20,6 +20,7 @@ pub(crate) fn registry(
                 adapter_type: proxy.adapter_type(),
                 health: ProxyHealth::new(),
                 configured_dialer: proxy.has_configured_dialer(),
+                fingerprint: proxy.client_fingerprint().map(Box::from),
             });
             (name.clone(), bound)
         })
@@ -34,6 +35,13 @@ struct DnsProxy {
     adapter_type: AdapterType,
     health: ProxyHealth,
     configured_dialer: bool,
+    /// The published entry's baked uTLS `client-fingerprint`. Bound at
+    /// construction like `configured_dialer` because the trait's
+    /// `Option<&str>` cannot borrow through `resolve()`'s temporary
+    /// `Arc` — and it need not: `ProxyRegistry::publish` runs once per
+    /// generation cell, so the name resolves to this same adapter for
+    /// the wrapper's whole generation (issue #974 review).
+    fingerprint: Option<Box<str>>,
 }
 
 impl DnsProxy {
@@ -72,6 +80,11 @@ impl ProxyAdapter for DnsProxy {
     }
     fn support_udp(&self) -> bool {
         self.target.resolve().is_some_and(|p| p.support_udp())
+    }
+    /// Forward the published entry's own answer — bound at construction
+    /// because the resolved proxy is a temporary `Arc` (see the field).
+    fn client_fingerprint(&self) -> Option<&str> {
+        self.fingerprint.as_deref()
     }
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         self.resolve()?.dial_tcp(metadata).await

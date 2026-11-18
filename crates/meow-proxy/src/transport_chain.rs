@@ -89,4 +89,17 @@ impl TransportChain {
     pub async fn reuse(&self) -> Option<Box<dyn Stream>> {
         self.layers.last()?.reuse().await
     }
+
+    /// The uTLS `client-fingerprint` profile the chain's TLS layer baked
+    /// at construction (issue #974); `None` on a chain without TLS (or one
+    /// whose TLS runs unshaped).
+    #[doc(hidden)]
+    pub fn tls_fingerprint(&self) -> Option<&str> {
+        self.layers.iter().find_map(|layer| {
+            layer
+                .as_any()?
+                .downcast_ref::<meow_transport::tls::TlsLayer>()?
+                .fingerprint()
+        })
+    }
 }
