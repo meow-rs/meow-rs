@@ -2,7 +2,7 @@ use axum::{
     body::Body,
     extract::ws::{Message, WebSocketUpgrade},
     extract::{FromRequestParts, Path, Query, Request, State},
-    http::{header, request::Parts, StatusCode},
+    http::{header, request::Parts, uri::Authority, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
     routing::{delete, get, patch, post, put},
@@ -21,10 +21,11 @@ use meow_tunnel::{TrackedTcp, Tunnel};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
-use tower_http::cors::CorsLayer;
+use tower_http::cors::{AllowHeaders, CorsLayer};
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "listener-tun")]
@@ -148,9 +149,6 @@ async fn require_auth_ws(
     req: Request,
     next: Next,
 ) -> Response {
-    if !state.auth_required() {
-        return next.run(req).await;
-    }
     let expected = state.secret.as_deref().unwrap_or("");
 
     let bearer = req
@@ -187,6 +185,97 @@ async fn require_auth_ws(
         )
             .into_response()
     }
+}
+
+/// Restrict browser access when the controller has no token. In particular,
+/// an arbitrary DNS name is never a trusted Host, even when Origin matches it.
+async fn require_controller_origin(req: Request, next: Next) -> Response {
+    if controller_origin_allowed(&req) {
+        next.run(req).await
+    } else {
+        (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "message": "Controller requires a secret for this host or origin"
+            })),
+        )
+            .into_response()
+    }
+}
+
+fn controller_origin_allowed(req: &Request) -> bool {
+    let headers = req.headers();
+    // Also reject cross-site browser requests that did not send an Origin.
+    if headers
+        .get("sec-fetch-site")
+        .is_some_and(|site| site != "same-origin" && site != "none")
+    {
+        return false;
+    }
+
+    let host_header;
+    let authority = match (req.uri().authority(), headers.get(header::HOST)) {
+        (Some(authority), _) => Some(authority),
+        (None, Some(host)) => {
+            host_header = host
+                .to_str()
+                .ok()
+                .and_then(|host| host.parse::<Authority>().ok());
+            let Some(authority) = host_header.as_ref() else {
+                return false;
+            };
+            Some(authority)
+        }
+        // Embedded and HTTP/1.0 clients may send neither header.
+        (None, None) => None,
+    };
+
+    if authority.is_some_and(|authority| !allowed_controller_authority(authority)) {
+        return false;
+    }
+
+    let Some(origin) = headers.get(header::ORIGIN) else {
+        return true;
+    };
+    let parsed_origin = origin
+        .to_str()
+        .ok()
+        .and_then(|origin| origin.split_once("://"));
+    let (Some(authority), Some((scheme, origin_authority))) = (authority, parsed_origin) else {
+        return false;
+    };
+    let default_port = match scheme {
+        "http" => 80,
+        "https" => 443,
+        _ => return false,
+    };
+    if scheme != req.uri().scheme_str().unwrap_or("http") {
+        return false;
+    }
+    let Ok(origin_authority) = origin_authority.parse::<Authority>() else {
+        return false;
+    };
+    allowed_controller_authority(&origin_authority)
+        && origin_authority
+            .host()
+            .eq_ignore_ascii_case(authority.host())
+        && origin_authority.port_u16().unwrap_or(default_port)
+            == authority.port_u16().unwrap_or(default_port)
+}
+
+fn allowed_controller_authority(authority: &Authority) -> bool {
+    let host = authority.host();
+    if authority.as_str().contains('@')
+        || (authority.as_str() != host && authority.port_u16().is_none())
+    {
+        return false;
+    }
+    host.eq_ignore_ascii_case("localhost")
+        || host.parse::<Ipv4Addr>().is_ok()
+        || host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .is_some_and(|host| host.parse::<Ipv6Addr>().is_ok())
 }
 
 /// mihomo decodes request bodies as JSON whatever their `Content-Type`
@@ -338,11 +427,16 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(get_rule_provider).put(refresh_rule_provider),
         )
         // Listeners (read-only list)
-        .route("/listeners", get(get_listeners))
-        .route_layer(middleware::from_fn_with_state(
+        .route("/listeners", get(get_listeners));
+    let auth_required = state.auth_required();
+    let api = if auth_required {
+        api.route_layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             require_auth_ws,
-        ));
+        ))
+    } else {
+        api.layer(middleware::from_fn(require_controller_origin))
+    };
 
     // Web UI is intentionally unauthenticated so dashboards can load and then
     // present a token prompt; this matches upstream mihomo behaviour.
@@ -350,23 +444,25 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     // When `external-ui` is configured (issue #223) the static directory is
     // served at `/ui` via tower-http's `ServeDir`; otherwise the built-in
     // single-page panel is served.
-    let router = api;
     let router = if let Some(dir) = state.external_ui.clone() {
         // `ServeDir` resolves `index.html` for the directory root and serves
         // any nested asset; `nest_service("/ui", …)` strips the `/ui` prefix so
         // both `/ui` and `/ui/<asset>` resolve. Dashboards (metacubexd, yacd)
         // use hash routing, so no server-side SPA fallback is required.
-        router.nest_service("/ui", tower_http::services::ServeDir::new(dir))
+        api.nest_service("/ui", tower_http::services::ServeDir::new(dir))
     } else {
-        router
-            .route("/ui", get(ui::serve_ui))
+        api.route("/ui", get(ui::serve_ui))
             .route("/ui/{*rest}", get(ui::serve_ui))
     };
 
-    router
-        .layer(middleware::map_request(assume_json_body))
-        .layer(CorsLayer::permissive())
-        .with_state(state)
+    let router = router.layer(middleware::map_request(assume_json_body));
+    let router = if auth_required {
+        // Fetch requires Authorization to be named explicitly in a preflight.
+        router.layer(CorsLayer::permissive().allow_headers(AllowHeaders::mirror_request()))
+    } else {
+        router
+    };
+    router.with_state(state)
 }
 
 // ── Basic endpoints ──────────────────────────────────────────────────
