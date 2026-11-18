@@ -3220,7 +3220,7 @@ mod tests {
         let local_addr = SocketAddr::from(([192, 0, 2, 4], 41000));
         let conn = Arc::new(RecordingPacketConn::new(sent, local_addr));
         let endpoint = Endpoint::Proxy(meow_wgstack::ProxyEndpoint::new(
-            conn.clone(),
+            Arc::<RecordingPacketConn>::clone(&conn),
             peer,
             local_addr,
         ));
