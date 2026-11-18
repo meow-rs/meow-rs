@@ -905,6 +905,26 @@ mod tests {
         meow_common::clear_host_resolver();
     }
 
+    /// mihomo's flat `geo-auto-update` / `geo-update-interval` spellings
+    /// feed the same resolved `GeoDataConfig` the `auto_update_loop`
+    /// spawn gate consumes — an alias alone enables the periodic path.
+    #[test]
+    fn flat_geo_alias_enables_the_periodic_schedule() {
+        let raw: RawConfig =
+            serde_saphyr::from_str("geo-auto-update: true\ngeo-update-interval: 6\n").unwrap();
+        let geo = meow_config::geodata::parse_geodata(&raw).unwrap();
+        assert!(geo.auto_update);
+        assert_eq!(geo.auto_update_interval, 6);
+
+        // An explicit nested `auto-update: false` still shadows the flat
+        // `true`, so the gate stays off.
+        let raw: RawConfig =
+            serde_saphyr::from_str("geo-auto-update: true\ngeodata:\n  auto-update: false\n")
+                .unwrap();
+        let geo = meow_config::geodata::parse_geodata(&raw).unwrap();
+        assert!(!geo.auto_update);
+    }
+
     /// Issue #543 — the periodic tick itself (not just the startup path)
     /// must republish the resolver: `auto_update_loop`'s per-tick body is
     /// `auto_update_tick`, exercised here directly so no ticker timing is

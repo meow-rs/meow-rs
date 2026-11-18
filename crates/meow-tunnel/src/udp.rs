@@ -340,13 +340,15 @@ pub async fn handle_udp(
 
     // Slow path: all client UDP, including port 53, follows routing policy.
     // `_route` pins this generation's dialer registry across the dial
-    // (issue #533 review).
+    // (issue #533 review). The mutable flow entry point shares this
+    // metadata's lookup memo with the `resolve_udp_dst` probe above —
+    // one socket-table scan per flow at most (issue #974).
     let Some(ResolvedTarget {
         adapter: proxy,
         rule_name,
         rule_payload,
         route: _route,
-    }) = tunnel.resolve_proxy(&metadata).await
+    }) = tunnel.resolve_proxy_flow(&mut metadata).await
     else {
         warn!("no matching rule for UDP {}", metadata.remote_address());
         return;

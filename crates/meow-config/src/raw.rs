@@ -306,9 +306,11 @@ impl<'de> serde::de::Visitor<'de> for ScalarKeyVisitor {
 
 /// `geodata:` YAML subsection — path overrides, download URLs, auto-update.
 ///
-/// Fields `geodata-mode`, `geodata-loader`, and `geoip-matcher` exist in
-/// upstream Go mihomo but are not meaningful here. They are accepted and
-/// produce a `warn!` (Class B per ADR-0002, forward-compat).
+/// Fields `geodata-mode`, `geodata-loader`, `geosite-matcher`, and
+/// `geoip-matcher` exist in upstream Go mihomo but are not meaningful
+/// here. They are accepted and produce a `warn!` (Class B per ADR-0002,
+/// forward-compat); the flat top-level spellings alias onto the same
+/// machinery (`parse_geodata` resolves explicit nested > flat > default).
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawGeoDataConfig {
@@ -319,8 +321,9 @@ pub struct RawGeoDataConfig {
     /// Explicit path to geosite `.mrs` file. Skips discovery chain when set.
     pub geosite_path: Option<String>,
     /// If true, spawn a background task that periodically re-downloads DBs.
-    #[serde(default)]
-    pub auto_update: bool,
+    /// `Option` so an absent key differs from an explicit `false` — only
+    /// the explicit value shadows the `geo-auto-update` flat alias.
+    pub auto_update: Option<bool>,
     /// Hours between update checks. Minimum 1 (sub-hour polling hammers CDN
     /// rate limits). Hard parse error on 0.
     pub auto_update_interval: Option<u32>,
@@ -336,6 +339,9 @@ pub struct RawGeoDataConfig {
     pub geodata_mode: Option<serde_json::Value>,
     pub geodata_loader: Option<serde_json::Value>,
     pub geoip_matcher: Option<serde_json::Value>,
+    /// `geodata.geosite-matcher` — mihomo's nested spelling of the matcher
+    /// selector; opaque like the others, warn-and-ignore.
+    pub geosite_matcher: Option<serde_json::Value>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
     pub extra: BTreeMap<String, UnknownYamlValue>,
@@ -463,6 +469,22 @@ pub struct RawConfig {
     /// Explicit `type: direct` proxy blocks are NOT covered by this
     /// global; they accept their own per-proxy `connect-timeout` field.
     pub tcp_connect_timeout: Option<u64>,
+    /// mihomo's `tcp-concurrent` — the live dial-candidate policy.
+    /// `true` (or unset, the meow-rs default — upstream defaults `false`)
+    /// keeps the candidate race; explicit `false` dials the filtered,
+    /// ordered list strictly sequentially. Applied through the
+    /// `meow_common::dial` process-global at startup/PATCH/PUT-commit,
+    /// never per-node (`NodeDialerOpts` stays untouched) and never UDP.
+    pub tcp_concurrent: Option<bool>,
+    /// mihomo's `find-process-mode` — when the tunnel may walk the OS
+    /// socket table to name a flow's owning process: `always` looks up
+    /// every eligible new inbound flow before mode dispatch, `strict`
+    /// (the default) only at the first reached rule predicate that needs
+    /// it, `off` never (issue #974). Applied to the tunnel's live
+    /// `meow_common::ProcessLookupPolicy`, which the traffic ledger's app
+    /// lookup shares. Invalid spellings fail at the raw boundary even in
+    /// lenient mode, matching upstream's parse.
+    pub find_process_mode: Option<meow_common::ProcessLookupMode>,
     /// `connection-notes: true` records a timestamped account of how each
     /// TCP connection was handled (fake-IP reversal, DNS lookups, matched
     /// rule, dial, close), served by `GET /connections/{id}`. A meow
@@ -492,6 +514,23 @@ pub struct RawConfig {
     /// into [`GeoDataConfig`](crate::GeoDataConfig) by
     /// `geodata::parse_geodata` below `geodata.url.*`.
     pub geox_url: Option<RawGeoXUrl>,
+    /// mihomo's flat `geo-auto-update` — alias for
+    /// `geodata.auto-update`; the explicit nested key wins when both are
+    /// set.
+    pub geo_auto_update: Option<bool>,
+    /// mihomo's flat `geo-update-interval` (hours) — alias for
+    /// `geodata.auto-update-interval`.
+    pub geo_update_interval: Option<u32>,
+    /// mihomo's flat `geodata-mode` — `true` selects the `geoip.dat`
+    /// backend upstream, which meow-rs has no consumer for; accepted and
+    /// warned on, matching the nested selector's contract.
+    pub geodata_mode: Option<bool>,
+    /// mihomo's flat `geodata-loader` — DAT loader selection, unsupported
+    /// here; accepted and warned on.
+    pub geodata_loader: Option<String>,
+    /// mihomo's flat `geosite-matcher` — matcher algorithm selection,
+    /// unsupported here; accepted and warned on.
+    pub geosite_matcher: Option<String>,
     /// TUN inbound (issue #326) — mihomo-compatible `tun:` section.
     /// Requires a build with the `listener-tun` feature.
     pub tun: Option<RawTun>,

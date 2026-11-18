@@ -23,7 +23,7 @@ use meow_common::conn_notes::ConnNotes;
 pub use meow_common::traffic::ProxyTraffic;
 use meow_common::traffic::ProxyTrafficSource;
 use meow_common::traffic_ledger::{self, Route};
-use meow_common::{Metadata, Proxy};
+use meow_common::{Metadata, ProcessLookupMode, ProcessLookupPolicy, Proxy};
 use parking_lot::Mutex;
 use serde::Serialize;
 use smallvec::SmallVec;
@@ -115,10 +115,17 @@ impl LedgerTag {
     /// The tag of a flow to `metadata`'s destination through `route`, or
     /// `None` while the ledger is off or the flow has no leaf; with the
     /// socket whose owner names its app when that takes a lookup.
+    ///
+    /// `policy` is the tunnel's live `find-process-mode`: `off` files no
+    /// app and queues no scan at all; `always` reuses the outcome the
+    /// pre-dispatch lookup already stored in the flow's memo — a miss
+    /// included — instead of submitting a duplicate scan (issue #974).
+    /// Under `strict` the opt-in ledger app lookup is unchanged.
     fn new(
         metadata: &Metadata,
         udp: bool,
         route: impl FnOnce() -> Option<Route>,
+        policy: &ProcessLookupPolicy,
     ) -> Option<(Self, Option<SocketAddr>)> {
         if !traffic_ledger::enabled() {
             return None;
@@ -134,13 +141,22 @@ impl LedgerTag {
         };
         let app = OnceLock::new();
         let mut lookup = None;
-        if !traffic_ledger::apps() {
+        if !traffic_ledger::apps() || policy.get() == ProcessLookupMode::Off {
             let _ = app.set(SmolStr::default());
         } else if !metadata.process.is_empty() || !metadata.process_path.is_empty() {
             let _ = app.set(traffic_ledger::app_name(
                 &metadata.process,
                 &metadata.process_path,
             ));
+        } else if let Some(info) = metadata.flow_lookup.process_outcome() {
+            // The flow's pre-dispatch scan already ran (`always`, or a
+            // probe's `strict` scan): reuse its outcome — a hit names the
+            // app even when the fields were not written back, a miss files
+            // none. No second socket-table walk for one flow.
+            let app_name = info.as_ref().map_or_else(SmolStr::default, |info| {
+                traffic_ledger::app_name(&info.name, &info.path)
+            });
+            let _ = app.set(app_name);
         } else {
             lookup = app_lookup::local_socket(metadata);
             if lookup.is_none() {
@@ -184,8 +200,9 @@ impl ConnCounters {
         metadata: &Metadata,
         udp: bool,
         route: impl FnOnce() -> Option<Route>,
+        policy: &Arc<ProcessLookupPolicy>,
     ) -> Arc<Self> {
-        let (ledger, lookup) = LedgerTag::new(metadata, udp, route)
+        let (ledger, lookup) = LedgerTag::new(metadata, udp, route, policy)
             .map_or((None, None), |(tag, lookup)| (Some(tag), lookup));
         let counters = Arc::new(Self {
             upload: AtomicI::new(0),
@@ -199,7 +216,7 @@ impl ConnCounters {
         // A connection whose app is known is a request now.
         counters.settle_ledger();
         if let Some(local) = lookup {
-            app_lookup::submit(metadata.network, local, &counters);
+            app_lookup::submit(metadata.network, local, &counters, policy);
         }
         counters
     }
@@ -381,6 +398,12 @@ pub struct Statistics {
     /// [`Self::proxy_traffic`] entry to share them from: every one while
     /// headless, and `dialer-proxy` members yet to carry a hop.
     ledger_names: DashMap<Arc<str>, ()>,
+    /// The owning tunnel's live `find-process-mode` — the ledger's app
+    /// lookup honors `off` and reuses an `always` scan's outcome (issue
+    /// #974). Standalone `Statistics` keep their own `strict` cell.
+    /// `Mutex` only guards the Arc pointer for the one-time tunnel
+    /// install; the mode value itself lives in the cell behind it.
+    process_policy: Mutex<Arc<ProcessLookupPolicy>>,
 }
 
 /// How many closed connections with notes [`Statistics`] keeps.
@@ -440,7 +463,20 @@ impl Statistics {
             proxy_traffic: DashMap::new(),
             udp_flows: DashMap::new(),
             ledger_names: DashMap::new(),
+            process_policy: Mutex::new(Arc::new(ProcessLookupPolicy::default())),
         }
+    }
+
+    /// Share the tunnel's `find-process-mode` cell (called once at tunnel
+    /// build): the cell is the live policy — later `set` on it is seen by
+    /// every ledger decision and queued lookup scan alike.
+    pub fn set_process_lookup_policy(&self, policy: Arc<ProcessLookupPolicy>) {
+        *self.process_policy.lock() = policy;
+    }
+
+    /// The live `find-process-mode` cell this ledger consults.
+    fn process_policy(&self) -> Arc<ProcessLookupPolicy> {
+        Arc::clone(&self.process_policy.lock())
     }
 
     pub fn add_upload(&self, n: Int) {
@@ -530,9 +566,14 @@ impl Statistics {
         metadata: &Metadata,
     ) -> Arc<ConnCounters> {
         let proxy = self.proxy_counters(leaf);
-        let counters = ConnCounters::filed(None, proxy, metadata, true, || {
-            Some(self.route(self.proxy_name(leaf), via()))
-        });
+        let counters = ConnCounters::filed(
+            None,
+            proxy,
+            metadata,
+            true,
+            || Some(self.route(self.proxy_name(leaf), via())),
+            &self.process_policy(),
+        );
         if counters.ledger.is_some() {
             self.udp_flows
                 .insert(Arc::as_ptr(&counters).addr(), Arc::clone(&counters));
@@ -629,6 +670,7 @@ impl Statistics {
             &metadata,
             false,
             || Some(self.route(Arc::clone(chains.first()?), via())),
+            &self.process_policy(),
         );
         let info = ConnectionInfo {
             id: uuid,
@@ -663,7 +705,8 @@ impl Statistics {
         route: impl FnOnce() -> Option<Route>,
     ) -> Option<Arc<ConnCounters>> {
         let connections = self.headless_connections.get()?;
-        let counters = ConnCounters::filed(None, None, metadata, false, route);
+        let counters =
+            ConnCounters::filed(None, None, metadata, false, route, &self.process_policy());
         // The guard pins this allocation until after its Drop unregisters it.
         // Even after a reload drains the map, a stale guard keeps its address
         // from being reused by a new connection. The address is only a private
@@ -927,8 +970,13 @@ mod ledger_tests {
             host: host.into(),
             ..Metadata::default()
         };
-        let (mut tag, _) =
-            LedgerTag::new(&metadata, false, || Some(Route::from("DIRECT"))).unwrap();
+        let (mut tag, _) = LedgerTag::new(
+            &metadata,
+            false,
+            || Some(Route::from("DIRECT")),
+            &ProcessLookupPolicy::default(),
+        )
+        .unwrap();
         tag.app = OnceLock::new();
         Arc::new(ConnCounters {
             upload: AtomicI::new(0),
@@ -1007,6 +1055,65 @@ mod ledger_tests {
             let pick = self.picks.load(Ordering::Relaxed) % self.members.len();
             Some(Arc::clone(&self.members[pick]))
         }
+    }
+
+    /// `find-process-mode` reaches the app lane through the shared policy
+    /// cell (issue #974): `off` never queues a socket scan; `always`
+    /// reuses the flow memo's outcome — hit *and* miss — instead of
+    /// walking the table twice; `strict` keeps the opt-in lookup.
+    #[test]
+    fn process_policy_gates_the_app_lane() {
+        use meow_common::process_lookup::{ProcessLookupMode, PROCESS_LOOKUP_SUPPORTED};
+        use meow_common::ProcessInfo;
+
+        let dir = tempfile::tempdir().unwrap();
+        traffic_ledger::install(dir.path(), Options::default()).unwrap();
+
+        let flow = || Metadata {
+            src_ip: Some("127.0.0.1".parse().unwrap()),
+            src_port: 51234,
+            ..Metadata::default()
+        };
+        let route = || Some(Route::from("DIRECT"));
+
+        // Strict: a local source qualifies for the worker lane — the
+        // socket comes back for a queued scan.
+        let strict = ProcessLookupPolicy::default();
+        let (_, lookup) = LedgerTag::new(&flow(), false, route, &strict).unwrap();
+        assert_eq!(lookup.is_some(), PROCESS_LOOKUP_SUPPORTED);
+
+        // Off: no queued scan at all — the app files empty.
+        let off = ProcessLookupPolicy::new(ProcessLookupMode::Off);
+        let (tag, lookup) = LedgerTag::new(&flow(), false, route, &off).unwrap();
+        assert!(lookup.is_none(), "off must not queue a scan");
+        assert_eq!(tag.app.get().map(SmolStr::as_str), Some(""));
+
+        // Always + a memoized hit: the app is the recorded owner and no
+        // second scan is queued.
+        let always = ProcessLookupPolicy::new(ProcessLookupMode::Always);
+        let hit = flow();
+        hit.flow_lookup.record_process(Some(ProcessInfo {
+            name: "hit-app".into(),
+            path: String::new(),
+            uid: None,
+        }));
+        let (tag, lookup) = LedgerTag::new(&hit, false, route, &always).unwrap();
+        assert!(lookup.is_none(), "a memoized hit needs no second scan");
+        assert_eq!(tag.app.get().map(SmolStr::as_str), Some("hit-app"));
+
+        // Always + a memoized miss: filed empty, still no second scan.
+        let miss = flow();
+        miss.flow_lookup.record_process(None);
+        let (tag, lookup) = LedgerTag::new(&miss, false, route, &always).unwrap();
+        assert!(lookup.is_none(), "a memoized miss needs no second scan");
+        assert_eq!(tag.app.get().map(SmolStr::as_str), Some(""));
+
+        // The cell is live: the same Arc reads a later `set`, which is how
+        // a PATCH reaches already-filed lookups' worker recheck.
+        let live = Arc::new(ProcessLookupPolicy::default());
+        live.set(ProcessLookupMode::Off);
+        let (_, lookup) = LedgerTag::new(&flow(), false, route, &live).unwrap();
+        assert!(lookup.is_none(), "a live set to off applies at once");
     }
 
     #[test]

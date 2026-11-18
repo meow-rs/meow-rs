@@ -1114,6 +1114,310 @@ async fn patch_configs_global_ua_lifecycle() {
     }
 }
 
+/// `tcp-concurrent` is a live process-global like `global-ua`: PATCH
+/// flips it without a rebuild, GET reports the live boolean, the
+/// committed raw keeps the last PATCH, a replacement PUT applies its own
+/// value at the swap (omission resets to the meow-rs default `true`),
+/// and a rejected PATCH leaves the running value alone.
+///
+/// The process-global is shared with every config commit — the
+/// assertions run under `CONFIG_MUTATION` like `global_ua`'s.
+#[tokio::test]
+async fn patch_configs_tcp_concurrent_lifecycle() {
+    use base64::Engine as _;
+    let state = test_state_default();
+    let patch = |body: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = body.to_string();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get_concurrent = |state: &Arc<AppState>| {
+        let app = create_router(Arc::clone(state));
+        async move {
+            let json = body_json(
+                app.oneshot(
+                    Request::get("/configs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            json["tcp-concurrent"].as_bool().expect("tcp-concurrent")
+        }
+    };
+    // A racing PUT may have committed either value — PATCH the one this
+    // test needs and observe under the lane, retrying when a sibling
+    // commit legitimately flipped it back.
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"tcp-concurrent":false}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if !meow_common::dial::tcp_concurrent() {
+            assert!(!get_concurrent(&state).await);
+            assert_eq!(
+                state.raw_config.read().tcp_concurrent,
+                Some(false),
+                "the PATCH must persist into committed raw"
+            );
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting tcp-concurrent");
+    }
+
+    // Absent/null PATCHes mean no change — the running `false` survives.
+    for body in [r#"{"log-level":"info"}"#, r#"{"tcp-concurrent":null}"#] {
+        let resp = patch(body).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+    {
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if !meow_common::dial::tcp_concurrent() {
+            assert!(!get_concurrent(&state).await);
+        }
+    }
+
+    // A wrong-type PATCH is refused before any mutation — the live value
+    // and the committed raw must not move.
+    {
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        let before = meow_common::dial::tcp_concurrent();
+        let resp = patch(r#"{"tcp-concurrent":"yes","mode":"direct"}"#).await;
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(meow_common::dial::tcp_concurrent(), before);
+        assert_eq!(
+            state.raw_config.read().tcp_concurrent,
+            Some(false),
+            "a rejected PATCH must not reach the committed raw"
+        );
+        assert_ne!(
+            state.tunnel.mode().to_string(),
+            "direct",
+            "the bundled mode change must be rolled back with the rejection"
+        );
+    }
+
+    // `true` flips it back; GET reports the live policy again.
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"tcp-concurrent":true}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::dial::tcp_concurrent() {
+            assert!(get_concurrent(&state).await);
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting tcp-concurrent");
+    }
+
+    // A replacement PUT installs its own value at the accepted swap.
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let mut attempts = 0;
+    loop {
+        let resp = put("mode: rule\ntcp-concurrent: false\nrules:\n  - MATCH,DIRECT\n").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if !meow_common::dial::tcp_concurrent() {
+            assert!(!get_concurrent(&state).await);
+            assert_eq!(state.raw_config.read().tcp_concurrent, Some(false));
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting tcp-concurrent");
+    }
+    // Omission resets to the meow-rs default `true` (upstream's default
+    // is `false` — the divergence is deliberate).
+    let mut attempts = 0;
+    loop {
+        let resp = put("mode: rule\nrules:\n  - MATCH,DIRECT\n").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::dial::tcp_concurrent() {
+            assert!(get_concurrent(&state).await);
+            assert_eq!(state.raw_config.read().tcp_concurrent, None);
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting tcp-concurrent");
+    }
+}
+
+/// `find-process-mode` rides the same live-policy lane as
+/// `tcp-concurrent`, but per-tunnel: PATCH flips it without a rebuild,
+/// GET reports the live mode, the committed raw keeps the last PATCH, a
+/// replacement PUT applies its own value at the swap (omission resets to
+/// upstream's default `strict`), and a bad spelling is refused before
+/// any bundled mutation lands (issue #974).
+#[tokio::test]
+async fn patch_configs_find_process_mode_lifecycle() {
+    use base64::Engine as _;
+    let state = test_state_default();
+    let patch = |body: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = body.to_string();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get_mode = |state: &Arc<AppState>| {
+        let app = create_router(Arc::clone(state));
+        async move {
+            let json = body_json(
+                app.oneshot(
+                    Request::get("/configs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            json["find-process-mode"]
+                .as_str()
+                .expect("find-process-mode")
+                .to_string()
+        }
+    };
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // Default is upstream's `strict`.
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Strict
+    );
+    assert_eq!(get_mode(&state).await, "strict");
+
+    let resp = patch(r#"{"find-process-mode":"always"}"#).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Always
+    );
+    assert_eq!(get_mode(&state).await, "always");
+    assert_eq!(
+        state.raw_config.read().find_process_mode,
+        Some(meow_common::ProcessLookupMode::Always),
+        "the PATCH must persist into committed raw"
+    );
+
+    // Absent/null PATCHes mean no change — `always` survives both.
+    for body in [r#"{"log-level":"info"}"#, r#"{"find-process-mode":null}"#] {
+        let resp = patch(body).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Always
+    );
+
+    // An unknown spelling fails JSON extraction before anything applies:
+    // the bundled `mode` mutation must not land either.
+    let resp = patch(r#"{"find-process-mode":"sometimes","mode":"direct"}"#).await;
+    assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Always
+    );
+    assert_eq!(
+        state.raw_config.read().find_process_mode,
+        Some(meow_common::ProcessLookupMode::Always)
+    );
+    assert_ne!(
+        state.tunnel.mode().to_string(),
+        "direct",
+        "the bundled mode change must be rolled back with the rejection"
+    );
+
+    // Case-insensitive like the YAML key.
+    let resp = patch(r#"{"find-process-mode":"OFF"}"#).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Off
+    );
+    assert_eq!(get_mode(&state).await, "off");
+
+    // A replacement PUT applies its value at the accepted swap; an
+    // omitted key resets to upstream's `strict` and clears the raw.
+    let resp = put("mode: rule\nfind-process-mode: always\nrules:\n  - MATCH,DIRECT\n").await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Always
+    );
+    assert_eq!(
+        state.raw_config.read().find_process_mode,
+        Some(meow_common::ProcessLookupMode::Always)
+    );
+
+    let resp = put("mode: rule\nrules:\n  - MATCH,DIRECT\n").await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Strict
+    );
+    assert_eq!(get_mode(&state).await, "strict");
+    assert_eq!(state.raw_config.read().find_process_mode, None);
+}
+
 /// Issue #974: `PUT /configs` commits `global-ua` and
 /// `global-client-fingerprint` from the new document — the UA installs
 /// process-wide, the fingerprint lands in the committed raw GET reports.
@@ -7727,6 +8031,158 @@ async fn put_configs_invalid_listeners_rejected_before_commit() {
         state.raw_config.read().listeners.is_none(),
         "the invalid section must not have been committed"
     );
+}
+
+/// mihomo spells the named SOCKS inbound `type: socks` — a full PUT must
+/// admit it through the same `resolve_named_listeners` gate, store the
+/// spelling verbatim, and not rebind anything (listeners stay a startup
+/// snapshot). A malformed entry still 400s before commit.
+#[tokio::test]
+async fn put_configs_socks_listener_alias_admitted() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    let yaml = concat!(
+        "mode: rule\n",
+        "listeners:\n",
+        "  - name: s\n",
+        "    type: socks\n",
+        "    listen: 127.0.0.1:17891\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    {
+        let raw = state.raw_config.read();
+        let listeners = raw.listeners.as_deref().unwrap_or(&[]);
+        assert_eq!(listeners.len(), 1, "the alias must commit verbatim");
+        assert_eq!(listeners[0].listener_type, "socks");
+    }
+    assert!(
+        state.listeners.is_empty(),
+        "admission must not rebind the running listeners"
+    );
+
+    // A malformed entry still 400s before commit.
+    let yaml = yaml.replace("type: socks", "type: socks4");
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    assert!(
+        body["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("unknown listener type")),
+        "the 400 must name the bad listener type, got: {body}"
+    );
+    assert!(
+        state.raw_config.read().listeners.as_deref().unwrap_or(&[])[0].listener_type == "socks",
+        "the rejected PUT must not have overwritten the committed section"
+    );
+}
+
+/// Same admission contract for the geo schedule: an invalid effective
+/// interval (`geo-update-interval: 0`, or a nested `auto-update-interval`
+/// `0` with no valid nested override) must be rejected before commit —
+/// the running auto-update loop is a startup snapshot, so a committed
+/// `0` would only fail the NEXT boot's `build_config`. Even `?force=true`
+/// cannot push it through.
+#[tokio::test]
+async fn put_configs_geo_interval_rejected_before_commit() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    for (yaml, force) in [
+        ("geo-update-interval: 0\n", ""),
+        ("geo-update-interval: 0\n", "?force=true"),
+        (
+            "geo-update-interval: 6\ngeodata:\n  auto-update-interval: 0\n",
+            "",
+        ),
+    ] {
+        let yaml = format!("mode: rule\n{yaml}rules:\n  - MATCH,DIRECT\n");
+        let payload = base64::engine::general_purpose::STANDARD.encode(&yaml);
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/configs{force}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{yaml} (force={force:?}) must be rejected"
+        );
+        let body = body_json(resp).await;
+        assert!(
+            body["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("update-interval")),
+            "the 400 must name the interval key, got: {body}"
+        );
+    }
+
+    // A valid flat schedule validates and commits — stored for the next
+    // restart without replacing the running schedule (the auto-update
+    // loop is a startup snapshot, so nothing here observes a reschedule).
+    let yaml = concat!(
+        "mode: rule\n",
+        "geo-auto-update: true\n",
+        "geo-update-interval: 6\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    );
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let raw = state.raw_config.read();
+    assert_eq!(raw.geo_auto_update, Some(true));
+    assert_eq!(raw.geo_update_interval, Some(6));
 }
 
 /// Same admission contract for `tcp-keepalive*`: values `build_config`

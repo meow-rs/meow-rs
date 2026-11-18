@@ -151,6 +151,80 @@ async fn config_test_does_not_download_missing_geodata() {
     );
 }
 
+/// The flat `geo-*` aliases (mihomo compat, issue #974) change nothing
+/// about that contract: `geo-auto-update` enables the *daemon's* periodic
+/// schedule, which `-t` never starts — validation must neither fetch nor
+/// fail on the alias spellings, and the unsupported selectors warn
+/// without erroring even under `strict: true`.
+#[tokio::test]
+async fn config_test_flat_geo_aliases_stay_offline() {
+    let server = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    server.set_nonblocking(true).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let config = directory.path().join("config.yaml");
+    std::fs::write(&config, format!(
+        "strict: true\ngeo-auto-update: true\ngeo-update-interval: 6\ngeodata-loader: memconservative\ngeosite-matcher: succinct\ngeox-url:\n  mmdb: http://{}/country.mmdb\nrules: ['MATCH,DIRECT']\n",
+        server.local_addr().unwrap()
+    )).unwrap();
+    let output = run_offline(directory.path(), &config).await;
+    assert!(
+        output.status.success(),
+        "flat geo aliases must validate warn-only under strict: {output:?}"
+    );
+    assert_eq!(
+        server.accept().unwrap_err().kind(),
+        std::io::ErrorKind::WouldBlock,
+        "the aliases must not introduce a fetch of their own"
+    );
+}
+
+/// `find-process-mode` end-to-end through `-t` (issue #974): every
+/// spelling parses unquoted and case-insensitively, an unknown spelling
+/// fails validation outright, and `off` plus PROCESS/UID rules validates
+/// under both strictness settings — `off` suppresses the runtime lookup,
+/// not the rules.
+#[tokio::test]
+async fn config_test_find_process_mode_spellings() {
+    for (mode, ok) in [
+        ("always", true),
+        ("strict", true),
+        ("off", true),
+        ("ALWAYS", true),
+        ("Strict", true),
+        ("sometimes", false),
+        ("offx", false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.yaml");
+        std::fs::write(
+            &config,
+            format!("find-process-mode: {mode}\nrules: ['MATCH,DIRECT']\n"),
+        )
+        .unwrap();
+        let output = run_offline(directory.path(), &config).await;
+        assert_eq!(
+            output.status.success(),
+            ok,
+            "find-process-mode {mode:?}: {output:?}"
+        );
+    }
+
+    // `off` is not a rule filter: PROCESS-NAME, PROCESS-PATH and UID
+    // rules still parse and validate under either `strict:` setting.
+    for strict in ["false", "true"] {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.yaml");
+        std::fs::write(&config, format!(
+            "strict: {strict}\nfind-process-mode: off\nrules:\n  - PROCESS-NAME,curl,REJECT\n  - UID,1000,DIRECT\n  - MATCH,DIRECT\n"
+        )).unwrap();
+        let output = run_offline(directory.path(), &config).await;
+        assert!(
+            output.status.success(),
+            "off + process rules must validate under strict: {strict}: {output:?}"
+        );
+    }
+}
+
 /// A `meow -t` command hardened the way this suite requires: kills the
 /// child on drop, strips inherited proxy env vars, and is meant to run
 /// under a timeout — offline validation must never hang on network I/O.

@@ -621,10 +621,12 @@ TCP connections resolve through `Tunnel::resolve_proxy_lazy()`:
    `dialer-proxy` exists to prevent), never falls through to direct egress.
 7. On no match, the tunnel uses DIRECT.
 
-The eager `resolve_proxy()` (process-enrich-then-scan) remains for non-TCP
-paths and non-Rule modes. DNS/IP pre-resolution stays outside the IR: the IR
-consumes the `Metadata` prepared by the tunnel and rule helpers; it does not
-perform DNS or process lookups itself.
+The eager `resolve_proxy_flow()` for non-TCP paths and non-Rule modes runs
+the same demand-stop scan, with IP demand gated off (those callers own
+destination resolution); `find-process-mode` decides whether process demand
+may stop it at all (issue #974). DNS/IP pre-resolution stays outside the IR:
+the IR consumes the `Metadata` prepared by the tunnel and rule helpers; it
+does not perform DNS or process lookups itself.
 
 ## Correctness Invariants
 

@@ -1149,15 +1149,86 @@ pub async fn connect_tcp_host(host: &str, port: u16) -> io::Result<TcpStream> {
 /// retain their socket protection/binding and configured per-connect timeout —
 /// under a deadline that per-connect timeout is a ceiling the fairness window
 /// may tighten, so no candidate is guaranteed its full configured slice.
+///
+/// `tcp-concurrent: false` (the [`crate::dial::tcp_concurrent`] live policy)
+/// switches this to a strictly sequential walk of `addrs` — same order, one
+/// live connect at a time, no family interleave — while keeping the shared
+/// deadline's fair-share ceiling per non-final candidate. The policy is read
+/// once here; a running selection keeps the snapshot it started with.
 pub async fn connect_tcp_candidates<T, F, Fut>(addrs: Vec<SocketAddr>, dial: F) -> io::Result<T>
 where
     F: Fn(SocketAddr) -> Fut + Sync,
     Fut: std::future::Future<Output = io::Result<T>>,
 {
-    match crate::dial::dial_deadline() {
-        Some(deadline) => connect_candidates_before(addrs, deadline, dial).await,
-        None => connect_resolved_candidates(addrs, dial).await,
+    dispatch_tcp_candidates(addrs, dial, crate::dial::tcp_concurrent()).await
+}
+
+/// The scheduling decision [`connect_tcp_candidates`] makes, with the policy
+/// explicit so tests drive it without touching the process-global.
+async fn dispatch_tcp_candidates<T, F, Fut>(
+    addrs: Vec<SocketAddr>,
+    dial: F,
+    concurrent: bool,
+) -> io::Result<T>
+where
+    F: Fn(SocketAddr) -> Fut + Sync,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    match (crate::dial::dial_deadline(), concurrent) {
+        (Some(deadline), true) => connect_candidates_before(addrs, deadline, dial).await,
+        (Some(deadline), false) => connect_candidates_sequential(addrs, deadline, dial).await,
+        (None, true) => connect_resolved_candidates(addrs, dial).await,
+        // The plain serial loop already walks the list in order, one live
+        // connect at a time — `tcp-concurrent: false` with no caller deadline.
+        (None, false) => connect_address_family(addrs, &dial).await,
     }
+}
+
+/// Sequential candidate dial under a shared deadline (`tcp-concurrent:
+/// false`): the already filtered and ordered list is walked in order with at
+/// most one live connect. A non-final candidate gets
+/// `min(remaining / remaining_candidates, 10 s)` — the same fairness idea
+/// [`connect_candidates_before`] staggers by, minus the overlap — and the
+/// last candidate gets whatever budget remains. A timed-out candidate's
+/// future is dropped before the next dial starts.
+async fn connect_candidates_sequential<T, F, Fut>(
+    addrs: Vec<SocketAddr>,
+    deadline: tokio::time::Instant,
+    dial: F,
+) -> io::Result<T>
+where
+    F: Fn(SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    use tokio::time::{timeout_at, Duration, Instant};
+    const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(10);
+    let total = addrs.len();
+    let mut last_err = None;
+    for (tried, addr) in addrs.into_iter().enumerate() {
+        let now = Instant::now();
+        let Some(remaining) = deadline.checked_duration_since(now) else {
+            return Err(last_err.unwrap_or_else(|| io::ErrorKind::TimedOut.into()));
+        };
+        let left = total - tried;
+        let ceiling = if left == 1 {
+            remaining
+        } else {
+            (remaining / left as u32).min(ATTEMPT_TIMEOUT)
+        };
+        let attempt = dial(addr);
+        tokio::pin!(attempt);
+        last_err = match timeout_at(now + ceiling, &mut attempt).await {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(error)) => crate::MeowError::prefer_errno_io(last_err, error),
+            Err(_) => crate::MeowError::prefer_errno_io(
+                last_err,
+                io::Error::new(io::ErrorKind::TimedOut, "TCP candidate timed out"),
+            ),
+        };
+    }
+    Err(last_err.unwrap_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "no TCP candidate addresses")
+    }))
 }
 
 async fn connect_candidates_before<T, F, Fut>(
@@ -2911,5 +2982,456 @@ mod same_family_progress {
             .await
             .is_err());
         assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+}
+
+#[cfg(test)]
+mod tcp_concurrent_policy {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    /// Mixed-family list: `connect_candidates_before` interleaves
+    /// families — under `false` the call order must be the *resolver*
+    /// order instead (the deliberate divergence documented on
+    /// `connect_tcp_candidates`).
+    const MIXED: [&str; 4] = [
+        "[2001:db8::1]:443",
+        "192.0.2.1:443",
+        "[2001:db8::2]:443",
+        "192.0.2.2:443",
+    ];
+
+    fn addrs(list: &[&str]) -> Vec<SocketAddr> {
+        list.iter().map(|s| s.parse().unwrap()).collect()
+    }
+
+    struct LiveCount(Arc<AtomicUsize>);
+    impl Drop for LiveCount {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// Sequential under a shared deadline walks the list strictly in
+    /// order — no family interleave, at most one live connect even past
+    /// the 250 ms the racer would have staggered by.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_preserves_list_order_without_overlap() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let calls = Mutex::new(Vec::<SocketAddr>::new());
+        let addrs = addrs(&MIXED);
+        let result = crate::dial::with_dial_timeout("seq order", async {
+            Ok(dispatch_tcp_candidates(
+                addrs.clone(),
+                |addr| {
+                    let calls = &calls;
+                    let live = &live;
+                    let win = addrs[2];
+                    async move {
+                        assert_eq!(
+                            live.fetch_add(1, Ordering::SeqCst),
+                            0,
+                            "a second connect must never overlap"
+                        );
+                        calls.lock().unwrap().push(addr);
+                        // Past the 250 ms stagger the race would have used.
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                        live.fetch_sub(1, Ordering::SeqCst);
+                        if addr == win {
+                            Ok(addr)
+                        } else {
+                            Err(io::ErrorKind::ConnectionRefused.into())
+                        }
+                    }
+                },
+                false,
+            )
+            .await?)
+        })
+        .await;
+        assert_eq!(result.unwrap(), addrs[2]);
+        assert_eq!(*calls.lock().unwrap(), addrs[..3]);
+    }
+
+    /// A black-holed first candidate gets only its fair share — every
+    /// later candidate still runs (the primary regression risk).
+    #[tokio::test(start_paused = true)]
+    async fn sequential_stalled_candidate_gets_only_its_share() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let started = Mutex::new(Vec::<SocketAddr>::new());
+        let addrs = addrs(&MIXED[..3]);
+        let start = tokio::time::Instant::now();
+        let result = crate::dial::with_dial_timeout("seq stall", async {
+            Ok(dispatch_tcp_candidates(
+                addrs.clone(),
+                |addr| {
+                    let started = &started;
+                    let live = &live;
+                    let win = addrs[2];
+                    async move {
+                        assert_eq!(live.fetch_add(1, Ordering::SeqCst), 0);
+                        let _guard = LiveCount(Arc::clone(live));
+                        started.lock().unwrap().push(addr);
+                        if addr == win {
+                            return Ok(addr);
+                        }
+                        std::future::pending::<io::Result<SocketAddr>>().await
+                    }
+                },
+                false,
+            )
+            .await?)
+        })
+        .await;
+        assert_eq!(result.unwrap(), addrs[2]);
+        assert_eq!(*started.lock().unwrap(), addrs);
+        // c1: 5s/3 = ~1667ms; c2: (5s − ~1667ms)/2 = ~1667ms → c3 at ~3333ms.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < crate::dial::DIAL_TIMEOUT,
+            "later candidates must run before the shared deadline: {elapsed:?}"
+        );
+    }
+
+    /// The budget share recomputes after each attempt: an instant failure
+    /// hands the next candidate the larger remaining slice.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_recomputes_share_after_fast_failures() {
+        let addrs = addrs(&MIXED[..3]);
+        let start = tokio::time::Instant::now();
+        let stalls = Mutex::new(Vec::<SocketAddr>::new());
+        let result = crate::dial::with_dial_timeout("seq recompute", async {
+            Ok(dispatch_tcp_candidates(
+                addrs.clone(),
+                |addr| {
+                    let stalls = &stalls;
+                    let first = addrs[0];
+                    let second = addrs[1];
+                    async move {
+                        if addr == first {
+                            return Err(io::ErrorKind::ConnectionRefused.into());
+                        }
+                        if addr == second {
+                            stalls.lock().unwrap().push(addr);
+                            std::future::pending::<io::Result<SocketAddr>>().await
+                        } else {
+                            Ok(addr)
+                        }
+                    }
+                },
+                false,
+            )
+            .await?)
+        })
+        .await;
+        assert_eq!(result.unwrap(), addrs[2]);
+        // c2 stalled on a recomputed ~2.5s share ((5s − ~0)/2), not 5/3.
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed > Duration::from_secs(2),
+            "c2 must get the recomputed larger share, elapsed {elapsed:?}"
+        );
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "c2 must still be dropped in time for c3, elapsed {elapsed:?}"
+        );
+        assert_eq!(*stalls.lock().unwrap(), vec![addrs[1]]);
+    }
+
+    /// Every candidate pending: the deadline splits fairly — all of them
+    /// get an attempt before the shared budget expires.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_all_stalled_still_attempts_every_candidate() {
+        let started = AtomicUsize::new(0);
+        let addrs = addrs(&MIXED);
+        let start = tokio::time::Instant::now();
+        let result = crate::dial::with_dial_timeout::<_, SocketAddr>("seq all stall", async {
+            dispatch_tcp_candidates(
+                addrs,
+                |_| {
+                    started.fetch_add(1, Ordering::SeqCst);
+                    std::future::pending::<io::Result<SocketAddr>>()
+                },
+                false,
+            )
+            .await
+            .map_err(crate::MeowError::Io)
+        })
+        .await;
+        assert!(result.is_err());
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            4,
+            "each candidate deserves its share before the deadline"
+        );
+        assert_eq!(start.elapsed(), crate::dial::DIAL_TIMEOUT);
+    }
+
+    /// Immediate failure then success, in order, with no delay.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_fast_fail_then_success() {
+        let calls = Mutex::new(Vec::<SocketAddr>::new());
+        let addrs = addrs(&MIXED[..2]);
+        let start = tokio::time::Instant::now();
+        let winner = crate::dial::with_dial_timeout("seq fail-ok", async {
+            Ok(dispatch_tcp_candidates(
+                addrs.clone(),
+                |addr| {
+                    calls.lock().unwrap().push(addr);
+                    let first = addrs[0];
+                    async move {
+                        if addr == first {
+                            Err(io::ErrorKind::ConnectionRefused.into())
+                        } else {
+                            Ok(addr)
+                        }
+                    }
+                },
+                false,
+            )
+            .await?)
+        })
+        .await
+        .unwrap();
+        assert_eq!(winner, addrs[1]);
+        assert_eq!(*calls.lock().unwrap(), addrs);
+        assert_eq!(start.elapsed(), Duration::ZERO);
+    }
+
+    /// An errno-backed error outranks later context-only failures —
+    /// including the synthesized per-candidate timeout.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_errno_preference_survives_timeout_tail() {
+        let addrs = addrs(&MIXED[..3]);
+        let err = crate::dial::with_dial_timeout::<_, SocketAddr>("seq errno", async {
+            dispatch_tcp_candidates(
+                addrs,
+                |addr| async move {
+                    if addr.port() == 443 && addr.ip().is_ipv6() {
+                        Err(io::Error::from_raw_os_error(61))
+                    } else if addr.ip().is_ipv4() {
+                        std::future::pending::<io::Result<SocketAddr>>().await
+                    } else {
+                        Err(io::Error::other("context only"))
+                    }
+                },
+                false,
+            )
+            .await
+            .map_err(crate::MeowError::Io)
+        })
+        .await
+        .unwrap_err();
+        let crate::MeowError::Io(err) = err else {
+            panic!("expected io error, got {err:?}");
+        };
+        assert_eq!(err.raw_os_error(), Some(61));
+    }
+
+    /// Empty input fails immediately; a singleton runs under the same
+    /// rules and a stalled singleton burns the whole remaining budget —
+    /// it IS the final candidate.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_empty_and_singleton() {
+        let err = crate::dial::with_dial_timeout::<_, ()>("seq empty", async {
+            dispatch_tcp_candidates(Vec::new(), |_| async { Ok(()) }, false)
+                .await
+                .map_err(crate::MeowError::Io)
+        })
+        .await
+        .unwrap_err();
+        let crate::MeowError::Io(err) = err else {
+            panic!("expected io error, got {err:?}");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+
+        let addr = addrs(&["192.0.2.7:443"])[0];
+        let winner = crate::dial::with_dial_timeout("seq singleton", async {
+            Ok(dispatch_tcp_candidates(vec![addr], |a| async move { Ok(a) }, false).await?)
+        })
+        .await
+        .unwrap();
+        assert_eq!(winner, addr);
+
+        let start = tokio::time::Instant::now();
+        let err = crate::dial::with_dial_timeout::<_, SocketAddr>("seq singleton stall", async {
+            dispatch_tcp_candidates(
+                vec![addr],
+                |_| std::future::pending::<io::Result<SocketAddr>>(),
+                false,
+            )
+            .await
+            .map_err(crate::MeowError::Io)
+        })
+        .await
+        .unwrap_err();
+        let crate::MeowError::Io(err) = err else {
+            panic!("expected io error, got {err:?}");
+        };
+        assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(
+            start.elapsed(),
+            crate::dial::DIAL_TIMEOUT,
+            "the final candidate owns the remaining budget"
+        );
+    }
+
+    /// Without a caller deadline the plain serial loop runs — same order,
+    /// no injected timeout, no family stagger.
+    #[tokio::test(start_paused = true)]
+    async fn sequential_without_deadline_uses_plain_serial_loop() {
+        let calls = Mutex::new(Vec::<SocketAddr>::new());
+        let addrs = addrs(&MIXED[..3]);
+        let winner = dispatch_tcp_candidates(
+            addrs.clone(),
+            |addr| {
+                let calls = &calls;
+                let win = addrs[1];
+                async move {
+                    calls.lock().unwrap().push(addr);
+                    if addr == win {
+                        // Well past the 250 ms family stagger; nothing races.
+                        tokio::time::sleep(Duration::from_secs(6)).await;
+                        Ok(addr)
+                    } else {
+                        Err(io::ErrorKind::ConnectionRefused.into())
+                    }
+                }
+            },
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(winner, addrs[1]);
+        assert_eq!(*calls.lock().unwrap(), addrs[..2]);
+    }
+
+    /// `true` keeps both deadline and deadline-free race behaviour: the
+    /// fallback candidate wins on the 250 ms stagger while the stalled
+    /// preferred candidate is still live.
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_true_keeps_the_race() {
+        for deadline in [true, false] {
+            let live = Arc::new(AtomicUsize::new(0));
+            let max_live = Arc::new(AtomicUsize::new(0));
+            let addrs = addrs(&["[2001:db8::1]:443", "192.0.2.1:443"]);
+            let start = tokio::time::Instant::now();
+            let dial = |addr: SocketAddr| {
+                let live = Arc::clone(&live);
+                let max_live = Arc::clone(&max_live);
+                async move {
+                    let n = live.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_live.fetch_max(n, Ordering::SeqCst);
+                    let _guard = LiveCount(live);
+                    if addr.is_ipv6() {
+                        std::future::pending::<io::Result<SocketAddr>>().await
+                    } else {
+                        Ok(addr)
+                    }
+                }
+            };
+            let run = dispatch_tcp_candidates(addrs, dial, true);
+            let winner = if deadline {
+                crate::dial::with_dial_timeout("race", async { Ok(run.await?) })
+                    .await
+                    .unwrap()
+            } else {
+                run.await.unwrap()
+            };
+            assert!(winner.is_ipv4());
+            assert_eq!(max_live.load(Ordering::SeqCst), 2, "the race must overlap");
+            assert_eq!(start.elapsed(), Duration::from_millis(250));
+        }
+    }
+
+    /// Dropping the selector future mid-attempt cancels the in-flight
+    /// connect — the candidate's guard unwinds.
+    #[tokio::test(start_paused = true)]
+    async fn dropped_selector_cancels_inflight_attempt() {
+        let live = Arc::new(AtomicUsize::new(0));
+        let addrs = addrs(&["192.0.2.1:443"]);
+        let counter = Arc::clone(&live);
+        let handle = tokio::spawn(crate::dial::with_dial_timeout("seq cancel", async move {
+            let _ = dispatch_tcp_candidates(
+                addrs,
+                move |_| {
+                    let live = Arc::clone(&counter);
+                    async move {
+                        live.fetch_add(1, Ordering::SeqCst);
+                        let _guard = LiveCount(live);
+                        std::future::pending::<io::Result<SocketAddr>>().await
+                    }
+                },
+                false,
+            )
+            .await;
+            Ok::<(), crate::MeowError>(())
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(live.load(Ordering::SeqCst), 1);
+        handle.abort();
+        let _ = handle.await;
+        assert_eq!(live.load(Ordering::SeqCst), 0);
+    }
+
+    /// The shared selector honours the process-global: `connect_tcp_host`
+    /// and `DirectAdapter::dial_tcp` both delegate to
+    /// `connect_tcp_candidates` — the function driven here — so one
+    /// toggle proves the policy reaches both production paths. The flag
+    /// is restored on drop even through a panic; `false` can only ever
+    /// make a sibling test's selector call *more* conservative, so the
+    /// brief window cannot flip another test's expectation.
+    #[tokio::test(start_paused = true)]
+    async fn selector_reads_the_live_global_once() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::dial::set_tcp_concurrent(true);
+            }
+        }
+        let _reset = Reset;
+        crate::dial::set_tcp_concurrent(false);
+
+        let live = Arc::new(AtomicUsize::new(0));
+        let addrs = addrs(&["[2001:db8::1]:443", "192.0.2.1:443"]);
+        let start = tokio::time::Instant::now();
+        let winner = crate::dial::with_dial_timeout("selector", async {
+            Ok(connect_tcp_candidates(addrs.clone(), |addr| {
+                let live = &live;
+                async move {
+                    assert_eq!(live.fetch_add(1, Ordering::SeqCst), 0);
+                    let _guard = LiveCount(Arc::clone(live));
+                    if addr.is_ipv6() {
+                        std::future::pending::<io::Result<SocketAddr>>().await
+                    } else {
+                        Ok(addr)
+                    }
+                }
+            })
+            .await?)
+        })
+        .await
+        .unwrap();
+        assert!(winner.is_ipv4());
+        // Sequential: v6 burned its 5s/2 share before v4 ran.
+        assert_eq!(start.elapsed(), Duration::from_millis(2500));
+
+        crate::dial::set_tcp_concurrent(true);
+        let winner = crate::dial::with_dial_timeout("selector", async {
+            Ok(connect_tcp_candidates(addrs, |addr| async move {
+                if addr.is_ipv6() {
+                    std::future::pending::<io::Result<SocketAddr>>().await
+                } else {
+                    Ok(addr)
+                }
+            })
+            .await?)
+        })
+        .await
+        .unwrap();
+        assert!(winner.is_ipv4());
+        assert_eq!(start.elapsed(), Duration::from_millis(2750));
     }
 }

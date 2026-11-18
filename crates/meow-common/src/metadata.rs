@@ -83,6 +83,14 @@ pub struct Metadata {
     /// claiming it.
     #[serde(skip)]
     pub internal: bool,
+    /// Flow-local lookup state (issue #974 `find-process-mode`): the
+    /// owning-process scan's one-shot memo, `Arc`-shared with every clone
+    /// the routing passes, the UDP route probe and tracking make of this
+    /// metadata — the scan runs at most once per flow and a miss is
+    /// remembered too. Runtime-only: not part of the flow's API-visible
+    /// identity.
+    #[serde(skip)]
+    pub flow_lookup: std::sync::Arc<crate::FlowLookup>,
 }
 
 /// The JSON form of [`Metadata::dscp`]: always a number, `0` when the
@@ -166,6 +174,7 @@ impl Default for Metadata {
             in_user: None,
             special_proxy: SmolStr::default(),
             internal: false,
+            flow_lookup: std::sync::Arc::default(),
         }
     }
 }
@@ -302,6 +311,9 @@ impl Metadata {
             in_user: None,
             special_proxy: SmolStr::default(),
             internal: self.internal,
+            // The tracked copy shares the flow's lookup memo: the ledger
+            // reuses an `always` scan (miss included) instead of rescanning.
+            flow_lookup: std::sync::Arc::clone(&self.flow_lookup),
         }
     }
 }

@@ -971,6 +971,15 @@ struct ConfigResponse {
     /// it at parse, so it cannot hot-swap.
     #[serde(rename = "global-client-fingerprint")]
     global_client_fingerprint: String,
+    /// mihomo's `tcp-concurrent` — the live dial policy (always reported:
+    /// the process-global the next candidate selection reads, not the
+    /// document's).
+    #[serde(rename = "tcp-concurrent")]
+    tcp_concurrent: bool,
+    /// mihomo's `find-process-mode` — the tunnel's live lookup policy
+    /// (`always`/`strict`/`off`), not the document's (issue #974).
+    #[serde(rename = "find-process-mode")]
+    find_process_mode: String,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -1033,6 +1042,13 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
             raw.global_client_fingerprint.as_deref(),
         )
         .unwrap_or_default(),
+        // The live dial policy likewise — what the next candidate run
+        // observes; a PATCH can flip it without a committed-document
+        // round-trip (like `unified-delay` above).
+        tcp_concurrent: meow_common::dial::tcp_concurrent(),
+        // The live policy on the tunnel — a PATCH can change it without a
+        // committed-document round-trip, like `tcp-concurrent` above.
+        find_process_mode: state.tunnel.process_lookup_mode().to_string(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
@@ -1151,6 +1167,16 @@ struct UpdateConfigRequest {
     /// default UA. Rejected when it carries CR/LF/NUL/control bytes.
     #[serde(rename = "global-ua")]
     global_ua: Option<String>,
+    /// mihomo's `tcp-concurrent` — live dial policy; absent/null leaves
+    /// the running value alone.
+    #[serde(rename = "tcp-concurrent")]
+    tcp_concurrent: Option<bool>,
+    /// mihomo's `find-process-mode` — live lookup policy; absent/null
+    /// leaves the running mode alone. Case-insensitive like the YAML key;
+    /// an unknown spelling fails JSON extraction with 422 before anything
+    /// is applied (issue #974).
+    #[serde(rename = "find-process-mode")]
+    find_process_mode: Option<meow_common::ProcessLookupMode>,
     tun: Option<TunFields>,
 }
 
@@ -1249,12 +1275,19 @@ async fn update_configs(
             candidate.routing_mark = body.routing_mark;
         }
         // `interface-name` and `global-ua` ride the same commit
-        // (issue #974).
+        // (issue #974). `tcp-concurrent` does too — the swap installs it
+        // with the rest of the process-globals.
         if body.interface_name.is_some() {
             candidate.interface_name = body.interface_name.clone();
         }
         if body.global_ua.is_some() {
             candidate.global_ua = body.global_ua.clone();
+        }
+        if body.tcp_concurrent.is_some() {
+            candidate.tcp_concurrent = body.tcp_concurrent;
+        }
+        if body.find_process_mode.is_some() {
+            candidate.find_process_mode = body.find_process_mode;
         }
         let preinstalled = preinstall_global_route_binding(&candidate);
         // No routing publish runs here, so tracked TCP predating a
@@ -1317,6 +1350,24 @@ async fn update_configs(
         meow_common::set_global_ua(Some(ua.trim()));
         info!("global-ua changed to {}", ua.trim());
         raw.global_ua = Some(ua);
+    }
+    if let Some(concurrent) = body.tcp_concurrent {
+        // Dial policy is a live process-global like `global-ua`: commit
+        // here after every fallible step above. A riding `tun:` patch
+        // already installed the same value through the swap's commit;
+        // re-asserting is idempotent.
+        meow_common::dial::set_tcp_concurrent(concurrent);
+        info!("tcp-concurrent changed to {concurrent}");
+        raw.tcp_concurrent = Some(concurrent);
+    }
+    if let Some(mode) = body.find_process_mode {
+        // The tunnel's live policy — the traffic ledger shares the cell,
+        // so queued app lookups recheck it too (issue #974). Same
+        // idempotent re-assertion as `tcp-concurrent` when a `tun:` patch
+        // rode the swap.
+        state.tunnel.set_process_lookup_mode(mode);
+        info!("find-process-mode changed to {mode}");
+        raw.find_process_mode = Some(mode);
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -3640,7 +3691,15 @@ async fn swap_config_and_reconcile_tun(
     // Snapshot the candidate (only on an off→on transition, before it is
     // moved into the lock) so the parking_lot write guard — which is
     // !Send — is dropped before the first .await below.
-    let (old_enable, tun_changed, snapshot, specs, new_log_level, (logbook_enable, ledger)) = {
+    let (
+        old_enable,
+        tun_changed,
+        snapshot,
+        specs,
+        new_log_level,
+        (logbook_enable, ledger),
+        geo_schedule_changed,
+    ) = {
         let mut guard = state.raw_config.write();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
@@ -3729,6 +3788,11 @@ async fn swap_config_and_reconcile_tun(
         let new_log_level =
             (guard.log_level != candidate.log_level).then(|| candidate.log_level.clone());
         let logbook_enable = meow_config::raw::RawLogbook::enabled(candidate.logbook.as_ref());
+        // The geo update schedule is a startup snapshot (`auto_update_loop`
+        // captured it at boot) — a committed change lands on restart; flag
+        // that to the operator rather than letting it sit silently stale.
+        let geo_schedule_changed = meow_config::geodata::update_schedule(&guard)
+            != meow_config::geodata::update_schedule(&candidate);
         // Commit point: a rejected candidate never reaches here.
         meow_proxy::health::set_unified_delay(candidate.unified_delay.unwrap_or(false));
         // Commit point (mihomo re-applies `routing-mark` on every load); a
@@ -3742,6 +3806,19 @@ async fn swap_config_and_reconcile_tun(
         // here, after the candidate passed every gate, so a rejected
         // rebuild never mutates the live override (issue #974).
         meow_common::set_global_ua(candidate.global_ua.as_deref());
+        // `tcp-concurrent` on the same lane: the accepted candidate's
+        // value (omission resets to the meow-rs default `true`); candidate
+        // fetches ran under the previous live policy — only the next
+        // candidate run sees this.
+        meow_common::dial::set_tcp_concurrent(meow_config::effective_tcp_concurrent(
+            candidate.tcp_concurrent,
+        ));
+        // `find-process-mode` on the same lane: the accepted candidate's
+        // value (omission resets to the upstream default `strict`); flows
+        // already mid-resolution keep the mode they read (issue #974).
+        state
+            .tunnel
+            .set_process_lookup_mode(candidate.find_process_mode.unwrap_or_default());
         let ledger = candidate.traffic_ledger.as_ref();
         let ledger = (
             meow_config::raw::RawTrafficLedger::enabled(ledger),
@@ -3755,8 +3832,16 @@ async fn swap_config_and_reconcile_tun(
             specs,
             new_log_level,
             (logbook_enable, ledger),
+            geo_schedule_changed,
         )
     };
+    if geo_schedule_changed {
+        warn!(
+            "geodata update schedule changed (geo-auto-update / geo-update-interval / \
+             geodata.auto-update*): the running schedule is a startup snapshot — \
+             restart meow to apply it"
+        );
+    }
     logbook::reconfigure(logbook_enable);
     // Opening or closing the ledger waits on its database.
     let _ = tokio::task::spawn_blocking(move || {
@@ -4172,6 +4257,20 @@ async fn put_configs(
         } else {
             return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
         }
+    }
+
+    // The geo schedule resolves inside `parse_geodata`, which the rebuild
+    // reaches only when it gets that far — a forced fallback would commit
+    // the verbatim poison and the next boot's `build_config` hard-errors
+    // on it. So the gate is unconditional (like duplicate subscription
+    // names): `force` cannot push an invalid effective interval through.
+    // It must run BEFORE the rebuild — the force early-return below
+    // commits `raw_config` when nothing builds.
+    if let Err(e) = meow_config::geodata::parse_geodata(&raw_config) {
+        return reload_rejected(
+            StatusCode::BAD_REQUEST,
+            &format!("geodata config error: {e}"),
+        );
     }
 
     // Semantic rebuild (proxy/rule parsing). Share the tunnel's resolver

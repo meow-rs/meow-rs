@@ -1,7 +1,7 @@
 use meow_common::{ConnType, DnsMode, Metadata, Network, Rule, RuleType};
 use meow_config::load_config_from_str;
 use meow_tunnel::match_engine::{match_rules, DomainIndex};
-use meow_tunnel::rule_ir::{CompiledRuleSet, LazyMatchOutcome};
+use meow_tunnel::rule_ir::{CompiledRuleSet, DemandGate, LazyMatchOutcome};
 use meow_tunnel::Statistics;
 use smallvec::smallvec;
 use smol_str::SmolStr;
@@ -417,12 +417,12 @@ fn lazy_match_zero_alloc_on_clean_scan() {
     let meta = test_metadata();
 
     // Warm up.
-    let _ = compiled.match_rules_lazy(&meta, &rules, &|_: &str| true);
+    let _ = compiled.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL);
 
     reset_counts();
     let n = 1000;
     for _ in 0..n {
-        let outcome = compiled.match_rules_lazy(&meta, &rules, &|_: &str| true);
+        let outcome = compiled.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL);
         assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
         let _ = std::hint::black_box(outcome);
     }
@@ -462,12 +462,12 @@ fn lazy_match_zero_alloc_with_dead_target_skips() {
     let no_ghosts = |name: &str| !name.starts_with("GHOST");
 
     // Warm up.
-    let _ = compiled.match_rules_lazy(&meta, &rules, &no_ghosts);
+    let _ = compiled.match_rules_lazy(&meta, &rules, &no_ghosts, DemandGate::ALL);
 
     reset_counts();
     let n = 1000;
     for _ in 0..n {
-        let outcome = compiled.match_rules_lazy(&meta, &rules, &no_ghosts);
+        let outcome = compiled.match_rules_lazy(&meta, &rules, &no_ghosts, DemandGate::ALL);
         assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
         let _ = std::hint::black_box(outcome);
     }

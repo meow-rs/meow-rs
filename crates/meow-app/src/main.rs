@@ -646,6 +646,13 @@ fn run_application_inner(
         // build's first provider/geodata fetch emits a `User-Agent`.
         // `build_config` re-asserts it ahead of those fetches.
         meow_common::set_global_ua(meow_config::validate_global_ua(raw.global_ua.as_deref())?);
+        // `tcp-concurrent` — live dial policy on the same process-global
+        // lane: installed before the build's first provider fetch dials,
+        // so those candidates already honor it. `-t` validation never
+        // reaches here; PUT/PATCH re-assert at their commit points.
+        meow_common::dial::set_tcp_concurrent(meow_config::effective_tcp_concurrent(
+            raw.tcp_concurrent,
+        ));
 
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);
@@ -1530,6 +1537,10 @@ async fn run(
     tunnel.set_mode(config.general.mode);
     tunnel.set_connection_notes(config.general.connection_notes);
     tunnel.set_tcp_idle_timeout(config.general.tcp_idle_timeout);
+    // `find-process-mode` — install before dispatch starts: the cell is
+    // shared with the traffic ledger's app lookup (issue #974). `-t`
+    // validation never reaches here; PUT/PATCH re-assert at commit.
+    tunnel.set_process_lookup_mode(config.general.find_process_mode);
     tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
     tunnel.spawn_background_tasks();
 

@@ -12,7 +12,9 @@
 //! LAN gateway) have no app, and cost no scan.
 
 use crate::statistics::ConnCounters;
-use meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED;
+use meow_common::process_lookup::{
+    ProcessLookupMode, ProcessLookupPolicy, PROCESS_LOOKUP_SUPPORTED,
+};
 use meow_common::{find_process, traffic_ledger, ConnType, Metadata, Network};
 use smol_str::SmolStr;
 use std::net::{IpAddr, SocketAddr};
@@ -26,6 +28,9 @@ struct Lookup {
     network: Network,
     local: SocketAddr,
     counters: Arc<ConnCounters>,
+    /// The submitting tunnel's live `find-process-mode`, rechecked at scan
+    /// time: `off` cancels even work queued before the switch (issue #974).
+    policy: Arc<ProcessLookupPolicy>,
 }
 
 /// The lookup thread's queue, started with the first lookup; `None` when
@@ -132,12 +137,19 @@ fn interface_addresses() -> Vec<IpAddr> {
 }
 
 /// Look up the app of the flow `counters` count, from `local`, and hand it
-/// to them; no app when the queue is full.
-pub(crate) fn submit(network: Network, local: SocketAddr, counters: &Arc<ConnCounters>) {
+/// to them; no app when the queue is full. `policy` is the live
+/// `find-process-mode` the worker rechecks before scanning.
+pub(crate) fn submit(
+    network: Network,
+    local: SocketAddr,
+    counters: &Arc<ConnCounters>,
+    policy: &Arc<ProcessLookupPolicy>,
+) {
     let lookup = Lookup {
         network,
         local,
         counters: Arc::clone(counters),
+        policy: Arc::clone(policy),
     };
     let Some(lookups) = LOOKUPS.get_or_init(start) else {
         counters.resolve_app(SmolStr::default());
@@ -160,12 +172,14 @@ fn start() -> Option<SyncSender<Lookup>> {
                 network,
                 local,
                 counters,
+                policy,
             } in queue
             {
-                // No scan once the ledger or its apps went off, nor for a
-                // LAN client's flow.
+                // No scan once the ledger or its apps went off, under
+                // `find-process-mode: off`, nor for a LAN client's flow.
                 let scan = traffic_ledger::enabled()
                     && traffic_ledger::apps()
+                    && policy.get() != ProcessLookupMode::Off
                     && addresses.contains(local.ip());
                 // A panic in a platform scan files the flow under no app
                 // rather than leave its counters waiting.

@@ -169,6 +169,58 @@ fn save_roundtrips_global_client_fingerprint_and_global_ua() {
     assert!(!loaded.extra.contains_key("global-ua"));
 }
 
+/// Issue #974: the flat `geo-*` aliases and the nested `geodata:` block
+/// are typed fields — a committed save keeps both spellings under their
+/// mihomo kebab-case names and the reload restores them, including an
+/// explicit `auto-update: false` (an `Option<bool>` now, so absence and
+/// `false` differ in the merge).
+#[test]
+fn save_roundtrips_geo_flat_aliases_and_nested() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    let path_str = path.to_str().unwrap();
+
+    let mut raw = minimal_raw_config();
+    raw.geo_auto_update = Some(true);
+    raw.geo_update_interval = Some(12);
+    raw.geodata_mode = Some(false);
+    raw.geodata_loader = Some("memconservative".into());
+    raw.geosite_matcher = Some("succinct".into());
+    raw.geodata = Some(serde_saphyr::from_str("auto-update: false").unwrap());
+    save_raw_config(path_str, &raw).unwrap();
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    for want in [
+        "geo-auto-update: true",
+        "geo-update-interval: 12",
+        "geodata-mode: false",
+        "geodata-loader: memconservative",
+        "geosite-matcher: succinct",
+        "auto-update: false",
+    ] {
+        assert!(content.contains(want), "missing '{want}' in: {content}");
+    }
+    let loaded: RawConfig = serde_saphyr::from_str(&content).unwrap();
+    assert_eq!(loaded.geo_auto_update, Some(true));
+    assert_eq!(loaded.geo_update_interval, Some(12));
+    assert_eq!(loaded.geodata_mode, Some(false));
+    assert_eq!(loaded.geodata_loader.as_deref(), Some("memconservative"));
+    assert_eq!(loaded.geosite_matcher.as_deref(), Some("succinct"));
+    assert_eq!(loaded.geodata.unwrap().auto_update, Some(false));
+    for key in [
+        "geo-auto-update",
+        "geo-update-interval",
+        "geodata-mode",
+        "geodata-loader",
+        "geosite-matcher",
+    ] {
+        assert!(
+            !loaded.extra.contains_key(key),
+            "{key} is typed — it must not land in the unknown-key bucket"
+        );
+    }
+}
+
 #[test]
 fn save_overwrites_previous_backup() {
     let dir = tempfile::tempdir().unwrap();
