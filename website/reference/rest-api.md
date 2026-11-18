@@ -15,7 +15,9 @@ Without `external-controller`, the API does not start. See
 
 - **REST auth:** `Authorization: Bearer <secret>`.
 - **WebSocket auth:** the bearer header *or* `?token=<secret>`.
-- **CORS:** permissive (`Access-Control-Allow-Origin: *`).
+- **Browser access:** With a secret, CORS is permissive (`Access-Control-Allow-Origin: *`).
+  Without a secret, use an IP address or `localhost` and keep the dashboard on the
+  controller's origin. This applies to both REST and WebSocket requests.
 
 ```bash
 curl -H 'Authorization: Bearer <secret>' http://127.0.0.1:9090/proxies
@@ -154,6 +156,8 @@ saved.
 `PUT /configs` accepts `{ "path": "/path/to/config.yaml" }` or
 `{ "payload": "<base64-yaml>" }`. Add `?force=true` to apply despite validation errors
 (logged). Returns 204 on success, or 400 `{ message }` on a parse/validation failure.
+Changing or removing the configured `secret` requires a restart. A reload that changes
+it returns 400 even with `?force=true`.
 For `subscriptions:` entries kept by name+URL the daemon carries its
 `applied-*` contribution tracking forward — a PUT that omits those
 bookkeeping fields does not orphan the subscription's tracked content.

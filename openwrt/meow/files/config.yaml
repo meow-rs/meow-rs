@@ -13,7 +13,7 @@ ipv6: false
 
 # REST API + built-in web panel (served at /ui). The init script overrides
 # the address with `--ext-ctl 0.0.0.0:<panel_port>` and, when set, the secret
-# with `--secret <secret>` from /etc/config/meow, so LuCI always knows how to
+# through a private runtime file from /etc/config/meow, so LuCI knows how to
 # reach it. OpenWrt's default firewall still blocks WAN-side access.
 external-controller: 0.0.0.0:9090
 secret: ""

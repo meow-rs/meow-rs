@@ -624,15 +624,14 @@ impl ProxyProvider {
         }
     }
 
-    /// Persist a parsed-and-committed HTTP payload for offline fallback,
-    /// atomically ([`write_atomic`]).
-    async fn write_cache(&self, text: &str) {
+    /// Persist an accepted HTTP payload atomically for offline fallback.
+    async fn write_cache(&self, text: String) {
         if let Vehicle::Http {
             cache_path: Some(cache_path),
             ..
         } = &self.vehicle
         {
-            write_atomic(cache_path, text.as_bytes()).await;
+            crate::private_file::write_cache(cache_path, text.into_bytes()).await;
         }
     }
 
@@ -665,7 +664,9 @@ impl ProxyProvider {
             return;
         };
         match userinfo {
-            Some(userinfo) => write_atomic(&path, userinfo.to_string().as_bytes()).await,
+            Some(userinfo) => {
+                crate::private_file::write_cache(&path, userinfo.to_string().into_bytes()).await;
+            }
             None => {
                 let _ = tokio::fs::remove_file(&path).await;
             }
@@ -734,7 +735,7 @@ impl ProxyProvider {
         let (proxies, ech_resolved) = self.parse_proxies(&content, ech).await?;
         match source {
             Source::Fetched(userinfo) => {
-                self.write_cache(&content).await;
+                self.write_cache(content).await;
                 // Rewritten with the cache whether it changed or not, so
                 // the two on disk always come from the same fetch.
                 self.set_userinfo(userinfo);
@@ -1771,36 +1772,6 @@ fn content_hash(content: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut h);
     h.finish()
-}
-
-/// Write `bytes` to `path` atomically: write-then-rename on a unique
-/// scratch, since the manual-refresh endpoint, an interval tick, and a
-/// detached initial fetch can race these writes unlaned, and a torn file
-/// would poison the next read (issue #543 review). Best-effort.
-async fn write_atomic(path: &Path, bytes: &[u8]) {
-    if let Some(parent) = path.parent() {
-        let _ = tokio::fs::create_dir_all(parent).await;
-    }
-    // Sweep scratch siblings a crashed writer left behind (issue #621) — on
-    // the blocking pool so the dir walk never stalls the worker.
-    {
-        let sweep_target = path.to_path_buf();
-        let _ = crate::spawn_blocking_with_current_dispatcher(move || {
-            meow_common::fs_util::sweep_scratch_siblings(
-                &sweep_target,
-                meow_common::fs_util::SCRATCH_STALE_AGE,
-            );
-        })
-        .await;
-    }
-    let tmp = crate::unique_scratch_path(path);
-    let saved = match tokio::fs::write(&tmp, bytes).await {
-        Ok(()) => tokio::fs::rename(&tmp, path).await.is_ok(),
-        Err(_) => false,
-    };
-    if !saved {
-        let _ = tokio::fs::remove_file(&tmp).await;
-    }
 }
 
 async fn read_cache(path: Option<&Path>, name: &str) -> Result<String, String> {
@@ -4022,6 +3993,56 @@ header:
             total,
             ..SubscriptionUserinfo::default()
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn http_cache_and_usage_are_private_on_refresh() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let origin = Origin::spawn(Some(ONE_NODE), true).await;
+        *origin.userinfo.lock() = Some("upload=3; total=4");
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("provider_p.yaml");
+        let sidecar = dir.path().join("provider_p.yaml.subscription-userinfo");
+        let raw = raw_http_provider(&origin.url, None);
+        let provider = ProxyProvider::new(
+            "p",
+            &raw,
+            Some(dir.path()),
+            false,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+
+        provider.refresh().await.unwrap();
+        for path in [&cache, &sidecar] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        fs::set_permissions(&cache, fs::Permissions::from_mode(0o644)).unwrap();
+        fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o400)).unwrap();
+        *origin.body.lock() = Some(TWO_NODES);
+        *origin.userinfo.lock() = Some("upload=7; total=10");
+        provider.refresh().await.unwrap();
+        assert_eq!(
+            fs::metadata(&cache).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(
+            fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+            0o400
+        );
+        assert_eq!(fs::read_to_string(cache).unwrap(), TWO_NODES);
+        assert_eq!(
+            fs::read_to_string(sidecar).unwrap(),
+            "upload=7; download=0; total=10; expire=0"
+        );
     }
 
     /// Startup serves the usage persisted with the cache, and the

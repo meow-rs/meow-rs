@@ -431,19 +431,33 @@ where
 /// code otherwise under `--release`).
 #[cfg(all(feature = "encrypted", debug_assertions))]
 async fn start_doh_stub_with(framing: DohFraming) -> DohStub {
+    start_doh_stub_gated(framing, None).await
+}
+
+/// Optionally wait for a batch of TLS handshakes before answering any
+/// requests on those connections.
+#[cfg(all(feature = "encrypted", debug_assertions))]
+async fn start_doh_stub_gated(framing: DohFraming, initial_batch: Option<usize>) -> DohStub {
     let (acceptor, root) = tls_acceptor(&["doh-stub.test"]);
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepts = Arc::new(AtomicUsize::new(0));
     let server_accepts = Arc::clone(&accepts);
+    let barrier = initial_batch.map(|batch| Arc::new(tokio::sync::Barrier::new(batch)));
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
-            server_accepts.fetch_add(1, Ordering::SeqCst);
+            let index = server_accepts.fetch_add(1, Ordering::SeqCst);
             let acceptor = acceptor.clone();
+            let barrier = barrier
+                .clone()
+                .filter(|_| initial_batch.is_some_and(|batch| index < batch));
             tokio::spawn(async move {
                 let Ok(mut stream) = tokio_boring::accept(&acceptor, tcp).await else {
                     return;
                 };
+                if let Some(barrier) = barrier {
+                    barrier.wait().await;
+                }
                 serve_doh_conn(&mut stream, framing).await;
             });
         }
@@ -1369,6 +1383,8 @@ enum H2StubCoding {
     GzipUnlessIdentityAsked,
     /// gzip whatever the request asks for.
     AlwaysGzip,
+    /// gzip only the first answer.
+    FirstGzip,
 }
 
 #[cfg(all(feature = "doh-h2", debug_assertions))]
@@ -1378,6 +1394,8 @@ struct H2StubOpts {
     streams_per_conn: Option<usize>,
     /// Hold the stub's very first answer this long.
     first_answer_delay: Option<Duration>,
+    /// Wait for this many streams before answering the initial batch.
+    initial_batch: Option<usize>,
     coding: H2StubCoding,
 }
 
@@ -1395,6 +1413,7 @@ async fn start_h2_doh_stub_with(opts: H2StubOpts) -> H2DohStub {
     let H2StubOpts {
         streams_per_conn,
         first_answer_delay,
+        initial_batch,
         coding,
     } = opts;
     let ck = rcgen::generate_simple_self_signed(vec!["doh-stub.test".to_string()]).unwrap();
@@ -1419,9 +1438,11 @@ async fn start_h2_doh_stub_with(opts: H2StubOpts) -> H2DohStub {
         Arc::clone(&h2_conns),
         Arc::clone(&h2_streams),
     );
+    let barrier = initial_batch.map(|batch| Arc::new(tokio::sync::Barrier::new(batch)));
     tokio::spawn(async move {
         while let Ok((tcp, _)) = listener.accept().await {
             let acceptor = acceptor.clone();
+            let barrier = barrier.clone();
             let (h1, h2c, streams) = (
                 Arc::clone(&counters.0),
                 Arc::clone(&counters.1),
@@ -1448,6 +1469,9 @@ async fn start_h2_doh_stub_with(opts: H2StubOpts) -> H2DohStub {
                     assert_eq!(request.method(), http::Method::POST);
                     assert_eq!(request.uri().path(), "/dns-query");
                     let index = streams.fetch_add(1, Ordering::SeqCst);
+                    let barrier = barrier
+                        .clone()
+                        .filter(|_| initial_batch.is_some_and(|batch| index < batch));
                     let gzip = match coding {
                         H2StubCoding::Identity => false,
                         H2StubCoding::GzipUnlessIdentityAsked => request
@@ -1455,10 +1479,14 @@ async fn start_h2_doh_stub_with(opts: H2StubOpts) -> H2DohStub {
                             .get("accept-encoding")
                             .is_none_or(|v| v.as_bytes() != b"identity"),
                         H2StubCoding::AlwaysGzip => true,
+                        H2StubCoding::FirstGzip => index == 0,
                     };
                     // Each stream answers on its own task, so concurrent
                     // queries really share the conn.
                     tokio::spawn(async move {
+                        if let Some(barrier) = barrier {
+                            barrier.wait().await;
+                        }
                         if index == 0 {
                             if let Some(delay) = first_answer_delay {
                                 tokio::time::sleep(delay).await;
@@ -1543,6 +1571,54 @@ async fn doh_negotiates_h2_and_shares_one_connection() {
         "every query after the first rides the shared h2 conn"
     );
     assert_eq!(stub.h2_streams.load(Ordering::SeqCst), 11);
+}
+
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_cold_burst_shares_one_connection_before_any_answers() {
+    const BURST: usize = 16;
+    let stub = start_h2_doh_stub_with(H2StubOpts {
+        initial_batch: Some(BURST),
+        ..H2StubOpts::default()
+    })
+    .await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
+
+    futures::future::join_all((0..BURST).map(|index| {
+        let client = &client;
+        async move { query_ok(client, &format!("cold-{index}.example.com")).await }
+    }))
+    .await;
+
+    assert_eq!(stub.http1_conns.load(Ordering::SeqCst), 0);
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 1);
+    assert_eq!(stub.h2_streams.load(Ordering::SeqCst), BURST);
+    query_ok(&client, "warm.example.com").await;
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 1);
+}
+
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_http1_cold_burst_dials_before_first_answer() {
+    const BURST: usize = 8;
+    let stub = start_doh_stub_gated(DohFraming::ContentLength, Some(BURST)).await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
+
+    futures::future::join_all((0..BURST).map(|index| {
+        let client = &client;
+        async move {
+            let msg = client
+                .query(&format!("cold-{index}.example.com"), RecordType::A)
+                .await
+                .unwrap();
+            assert_example_answer(&msg);
+        }
+    }))
+    .await;
+
+    assert_eq!(stub.accepts.load(Ordering::SeqCst), BURST);
 }
 
 /// The same over a `?proxy=` dial: one proxied dial serves every query.
@@ -1642,14 +1718,43 @@ async fn doh_h2_refuses_a_content_coding() {
     .await;
     let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
         .with_tls_additional_roots(stub.root.clone());
-    let err = timeout(T, client.query("a.example.com", RecordType::A))
-        .await
-        .expect("must not stall")
-        .expect_err("a gzip answer must be refused");
-    assert!(
-        err.to_string().contains("unsupported content-encoding"),
-        "unexpected error: {err}"
+    for name in ["a.example.com", "b.example.com"] {
+        let err = timeout(T, client.query(name, RecordType::A))
+            .await
+            .expect("must not stall")
+            .expect_err("a gzip answer must be refused");
+        assert!(
+            err.to_string().contains("unsupported content-encoding"),
+            "unexpected error: {err}"
+        );
+    }
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 2);
+}
+
+#[cfg(all(feature = "doh-h2", debug_assertions))]
+#[tokio::test]
+async fn doh_h2_can_reuse_with_one_validated_cold_response() {
+    let stub = start_h2_doh_stub_with(H2StubOpts {
+        initial_batch: Some(2),
+        coding: H2StubCoding::FirstGzip,
+        ..H2StubOpts::default()
+    })
+    .await;
+    let client = DnsClient::doh(stub.addr, "doh-stub.test", "/dns-query")
+        .with_tls_additional_roots(stub.root.clone());
+
+    let (first, second) = tokio::join!(
+        client.query("a.example.com", RecordType::A),
+        client.query("b.example.com", RecordType::A)
     );
+    let (response, error) = match (first, second) {
+        (Ok(response), Err(error)) | (Err(error), Ok(response)) => (response, error),
+        outcomes => panic!("expected one valid response and one failure, got {outcomes:?}"),
+    };
+    assert_example_answer(&response);
+    assert!(error.to_string().contains("unsupported content-encoding"));
+    query_ok(&client, "warm.example.com").await;
+    assert_eq!(stub.h2_conns.load(Ordering::SeqCst), 1);
 }
 
 /// A shared conn whose first answer was too slow to reuse (est. RTT at or

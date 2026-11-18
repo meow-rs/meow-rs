@@ -43,6 +43,7 @@ use meow_listener::WireGuardListener;
 use meow_tunnel::Tunnel;
 use parking_lot::RwLock;
 use std::net::{IpAddr, SocketAddr};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
@@ -102,6 +103,10 @@ struct Args {
     /// Override secret for RESTful API
     #[arg(long = "secret")]
     secret: Option<String>,
+
+    /// Read the REST API secret from a single-line file
+    #[arg(long = "secret-file", conflicts_with = "secret")]
+    secret_file: Option<PathBuf>,
 
     /// Set post-up script
     #[arg(long = "post-up")]
@@ -217,7 +222,7 @@ fn main() -> Result<()> {
     let _profiler = dhat::Profiler::new_heap();
 
     // nyanpasu uses -v to query version (mihomo format)
-    if std::env::args().any(|a| a == "-v") {
+    if std::env::args_os().any(|a| a == "-v") {
         println!("Meow Meta {}", env!("MEOW_VERSION"));
         return Ok(());
     }
@@ -505,6 +510,12 @@ fn run_application_inner(
 ) -> Result<()> {
     info!("meow-rs starting...");
 
+    let file_secret = args
+        .secret_file
+        .as_deref()
+        .map(read_api_secret)
+        .transpose()?;
+
     // Raise RLIMIT_NOFILE before the runtime and any listener come up —
     // every proxied conn costs two fds (inbound + outbound), and the
     // macOS/launchd default of 256 EMFILEs at ~120 live conns while the
@@ -645,8 +656,11 @@ fn run_application_inner(
         meow_proxy::health::set_unified_delay(config.raw.unified_delay.unwrap_or(false));
 
         // Apply CLI overrides to the loaded config.
-        if let Some(ref s) = args.secret {
-            config.api.secret = Some(s.clone());
+        if let Some(secret) = file_secret {
+            config.api.secret = Some(secret);
+            info!("API secret overridden by --secret-file");
+        } else if let Some(secret) = args.secret {
+            config.api.secret = Some(secret);
             info!("API secret overridden by --secret");
         }
         if let Some(ref ctl) = args.ext_ctl {
@@ -681,6 +695,22 @@ fn run_application_inner(
         )
         .await
     })
+}
+
+fn read_api_secret(path: &Path) -> Result<String> {
+    let mut secret = std::fs::read_to_string(path)
+        .with_context(|| format!("--secret-file: could not read {}", path.display()))?;
+    let line = secret
+        .strip_suffix("\r\n")
+        .or_else(|| secret.strip_suffix('\n'))
+        .unwrap_or(&secret);
+    if line.is_empty() || line.ends_with(' ') || !line.bytes().all(|b| matches!(b, b' '..=b'~')) {
+        anyhow::bail!(
+            "--secret-file: expected a nonempty line of printable ASCII without trailing spaces"
+        );
+    }
+    secret.truncate(line.len());
+    Ok(secret)
 }
 
 /// Owner of the outbound-interface binding installed ahead of the config
@@ -2185,6 +2215,48 @@ async fn publish_tun_if_committed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn api_secret_file_requires_a_valid_single_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("controller-secret");
+        assert!(read_api_secret(&path).is_err());
+
+        for contents in [
+            "synthetic token",
+            "synthetic token\n",
+            "synthetic token\r\n",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert_eq!(read_api_secret(&path).unwrap(), "synthetic token");
+        }
+
+        for contents in [
+            b"".as_slice(),
+            b"\n",
+            b"synthetic token \n",
+            b"synthetic token\n\n",
+            b"synthetic\r token",
+            b"synthetic\ttoken",
+            b"synthetic token\0",
+            b"synthetic token\xff",
+        ] {
+            std::fs::write(&path, contents).unwrap();
+            assert!(read_api_secret(&path).is_err());
+        }
+    }
+
+    #[test]
+    fn api_secret_file_conflicts_with_inline_secret() {
+        let result = Args::try_parse_from([
+            "meow",
+            "--secret",
+            "synthetic-token",
+            "--secret-file",
+            "controller-secret",
+        ]);
+        assert!(matches!(result, Err(e) if e.kind() == clap::error::ErrorKind::ArgumentConflict));
+    }
 
     // Upstream `MRS\x01` fixture writers — the same shapes the
     // `meow_rules::mrs_parser` tests build (their encoders are

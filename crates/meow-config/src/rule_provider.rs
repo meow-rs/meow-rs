@@ -7,11 +7,11 @@
 //! [`crate::rule_provider_refresh::RefreshSupervisor`].
 //!
 //! HTTP payloads load cache-first: a provider with an on-disk cache starts
-//! from it without a request, and the ones without download concurrently
-//! (bounded by [`crate::provider_fetch_deadline`]). Whatever the load left
-//! owing — a cache to revalidate, an empty set to fill, a download still
-//! running at the deadline — is fetched in the background once the provider
-//! is committed ([`RuleProvider::spawn_initial_fetch`]).
+//! from it without a request, and the ones without download with bounded
+//! concurrency. The load waits up to [`crate::provider_fetch_deadline`].
+//! Once a provider is committed, [`RuleProvider::spawn_initial_fetch`]
+//! revalidates a cache, retries a failed fetch, or adopts an unfinished
+//! download from the prefetch worker.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -166,7 +166,7 @@ enum InitialFetch {
     Revalidate,
     /// Loaded empty: fetch until a payload lands.
     Retry,
-    /// Loaded empty while its startup download was still running at the
+    /// Loaded empty while its startup download was unfinished at the
     /// fetch deadline: adopt that download before fetching again.
     Adopt(PendingFetch),
 }
@@ -410,7 +410,7 @@ impl RuleProvider {
     ///   loop with the cached rules installed;
     /// - loaded empty: retry with backoff (5 s doubling to 5 min) until a
     ///   payload lands;
-    /// - its startup download was still running at the fetch deadline: wait
+    /// - its startup download was unfinished at the fetch deadline: wait
     ///   for that download first, so it is not requested twice.
     ///
     /// Ends early once any refresh — an `interval` tick or a manual one —
@@ -623,8 +623,8 @@ impl Prefetched {
 
 type DownloadResult = Result<Arc<Vec<u8>>, Arc<str>>;
 
-/// A download the fetch deadline left running. It keeps going on its own
-/// thread; the provider built for it adopts the result when it lands.
+/// An unfinished download at the fetch deadline. The worker still runs
+/// it and the provider built for it adopts the result when it lands.
 #[derive(Clone)]
 struct PendingFetch(tokio::sync::watch::Receiver<Option<DownloadResult>>);
 
@@ -648,7 +648,7 @@ struct Download {
 }
 
 enum DownloadState {
-    Running,
+    Unfinished,
     Done(Result<Vec<u8>, String>),
     /// The deadline passed first: the result goes to whoever adopts it.
     Detached(tokio::sync::watch::Sender<Option<DownloadResult>>),
@@ -668,7 +668,7 @@ impl DownloadBoard {
             DownloadState::Detached(adopter) => {
                 adopter.send_replace(Some(result.map(Arc::new).map_err(Arc::from)));
             }
-            DownloadState::Running => {
+            DownloadState::Unfinished => {
                 states[index] = DownloadState::Done(result);
                 self.changed.notify_all();
             }
@@ -677,7 +677,7 @@ impl DownloadBoard {
     }
 }
 
-/// Fails every download still running when the worker exits, however it
+/// Fails every unfinished download when the worker exits, however it
 /// exits — the prefetch must never wait on a result that cannot come.
 struct AbandonRemaining(Arc<DownloadBoard>, usize);
 
@@ -690,9 +690,13 @@ impl Drop for AbandonRemaining {
     }
 }
 
-/// Download every payload concurrently on one worker thread and wait for
-/// them until `deadline`. Downloads still running then keep going and are
-/// returned as [`Prefetched::Pending`].
+/// Bound in-flight requests on the prefetch worker. Completed payloads
+/// remain available to both load passes.
+const MAX_CONCURRENT_RULE_DOWNLOADS: usize = 4;
+
+/// Download the payloads on one worker thread and wait until `deadline`.
+/// Queued and running downloads continue on that worker and are returned
+/// as [`Prefetched::Pending`].
 fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(String, Prefetched)> {
     if downloads.is_empty() {
         return Vec::new();
@@ -700,7 +704,7 @@ fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(St
     let count = downloads.len();
     let names: Vec<String> = downloads.iter().map(|d| d.name.clone()).collect();
     let board = Arc::new(DownloadBoard {
-        states: parking_lot::Mutex::new((0..count).map(|_| DownloadState::Running).collect()),
+        states: parking_lot::Mutex::new((0..count).map(|_| DownloadState::Unfinished).collect()),
         changed: parking_lot::Condvar::new(),
     });
     let deadline_at = deadline.and_then(|d| std::time::Instant::now().checked_add(d));
@@ -722,20 +726,26 @@ fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(St
                     }
                 };
                 runtime.block_on(async {
+                    let mut downloads = downloads.into_iter().enumerate();
                     let mut tasks = tokio::task::JoinSet::new();
-                    let mut indexes = HashMap::with_capacity(count);
-                    for (index, d) in downloads.into_iter().enumerate() {
-                        let task = tasks.spawn(async move {
-                            internal_http::fetch(&d.url, d.proxy.as_ref(), &d.headers).await
-                        });
-                        indexes.insert(task.id(), index);
-                    }
-                    while let Some(joined) = tasks.join_next_with_id().await {
+                    let mut indexes = HashMap::with_capacity(MAX_CONCURRENT_RULE_DOWNLOADS);
+                    loop {
+                        let slots = MAX_CONCURRENT_RULE_DOWNLOADS - tasks.len();
+                        for (index, d) in downloads.by_ref().take(slots) {
+                            let task = tasks.spawn(async move {
+                                internal_http::fetch(&d.url, d.proxy.as_ref(), &d.headers).await
+                            });
+                            indexes.insert(task.id(), index);
+                        }
+                        let Some(joined) = tasks.join_next_with_id().await else {
+                            break;
+                        };
                         let (id, result) = match joined {
                             Ok((id, result)) => (id, result.map_err(|e| format!("{e:#}"))),
                             Err(e) => (e.id(), Err(format!("download task failed: {e}"))),
                         };
-                        worker_board.complete(indexes[&id], result);
+                        let index = indexes.remove(&id).expect("each download has a board slot");
+                        worker_board.complete(index, result);
                     }
                 });
             });
@@ -749,7 +759,10 @@ fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(St
     }
 
     let mut states = board.states.lock();
-    while states.iter().any(|s| matches!(s, DownloadState::Running)) {
+    while states
+        .iter()
+        .any(|s| matches!(s, DownloadState::Unfinished))
+    {
         match deadline_at {
             None => board.changed.wait(&mut states),
             Some(at) => {
@@ -772,7 +785,7 @@ fn download_all(downloads: Vec<Download>, deadline: Option<Duration>) -> Vec<(St
                     debug!("rule-provider '{name}': download failed: {e}");
                     Prefetched::Failed(e)
                 }
-                DownloadState::Running => {
+                DownloadState::Unfinished => {
                     let (adopter, pending) = tokio::sync::watch::channel(None);
                     *state = DownloadState::Detached(adopter);
                     Prefetched::Pending(PendingFetch(pending))
@@ -825,9 +838,9 @@ fn effective_download_proxy(
 /// - An http provider with an on-disk cache is served from it without a
 ///   request (mihomo's fetcher reads its local file first too); the load
 ///   marks it for a background revalidation.
-/// - The remaining http payloads download concurrently. The wait is bounded
-///   by [`crate::provider_fetch_deadline`] (unbounded by default); a download
-///   still running then keeps going and is handed to its provider.
+/// - The remaining http payloads download with bounded concurrency. The wait
+///   is bounded by [`crate::provider_fetch_deadline`] (unbounded by default).
+///   The worker finishes queued and running downloads for their providers.
 ///
 /// Failures are recorded (and logged at debug — the load pass reports them),
 /// so `load_providers_prefetched` registers those providers empty instead of
@@ -1001,7 +1014,7 @@ pub fn load_providers(
 }
 
 /// Same as [`load_providers`] but reuses the payloads [`prefetch_payloads`]
-/// acquired; a download it recorded as failed or still running registers the
+/// acquired; a download it recorded as failed or unfinished registers the
 /// provider empty without another request. Providers absent from
 /// `prefetched` acquire their payload themselves (cache first).
 /// `dialer_registry` should be the registry generation the resolved download
@@ -1087,7 +1100,7 @@ pub fn load_providers_prefetched(
                 // upstream's failed-provider registration both prefer the
                 // retryable shape.
                 warn!("rule-provider '{name}': payload unavailable, starting empty: {e:#}");
-                // A download still running at the deadline is not a
+                // A download unfinished at the deadline is not a
                 // failure; the adopted download records its own outcome.
                 if !matches!(*provider.initial_fetch.lock(), InitialFetch::Adopt(_)) {
                     *provider.load_note.lock() = Some(LoadNote::Failed(format!("{e:#}")));
@@ -3202,34 +3215,44 @@ header:
         );
     }
 
-    /// A download still running at the deadline keeps going, and the
-    /// provider adopts it when it lands instead of requesting it again.
+    /// Work queued or running at the deadline stays on the bounded worker.
+    /// Each provider adopts the result once.
     #[tokio::test]
-    async fn deadline_hands_the_running_download_to_the_provider() {
+    async fn deadline_hands_queued_and_running_downloads_to_providers() {
         let origin = Origin::spawn(Some(NEW_RULES), false).await;
         let dir = tempfile::tempdir().unwrap();
-        let raw = HashMap::from([("p".to_string(), http_provider(&origin.url, 0))]);
+        let raw = (0..=MAX_CONCURRENT_RULE_DOWNLOADS)
+            .map(|i| (format!("p{i}"), http_provider(&origin.url, 0)))
+            .collect();
 
         let prefetched = prefetch_within(&raw, dir.path(), Some(Duration::from_millis(100))).await;
         let providers = load_pass(&raw, dir.path(), &prefetched, false).await;
-        let p = &providers["p"];
-        assert_eq!(p.rule_count(), 0);
+        eventually("the in-flight window to start", || {
+            origin.hits() >= MAX_CONCURRENT_RULE_DOWNLOADS
+        })
+        .await;
+        assert_eq!(origin.hits(), MAX_CONCURRENT_RULE_DOWNLOADS);
 
-        let fetch = p
-            .spawn_initial_fetch()
-            .expect("the running download is owed");
+        let fetches: Vec<_> = providers
+            .values()
+            .map(|p| {
+                assert_eq!(p.rule_count(), 0);
+                p.spawn_initial_fetch().expect("the download is still owed")
+            })
+            .collect();
         origin.gate.send_replace(true);
-        fetch.await.unwrap();
-        assert_eq!(p.rule_count(), 2);
-        assert_eq!(
-            origin.hits(),
-            1,
-            "the straggler is adopted, not re-requested"
-        );
-        assert_eq!(
-            std::fs::read_to_string(cache_file(dir.path(), "p")).unwrap(),
-            NEW_RULES
-        );
+        for fetch in fetches {
+            fetch.await.unwrap();
+        }
+        assert_eq!(origin.hits(), raw.len());
+        for (name, provider) in providers {
+            assert_eq!(provider.rule_count(), 2);
+            assert!(provider.spawn_initial_fetch().is_none());
+            assert_eq!(
+                std::fs::read_to_string(cache_file(dir.path(), &name)).unwrap(),
+                NEW_RULES
+            );
+        }
     }
 
     /// Logbook: a provider's first payload is its load. Adopted after the

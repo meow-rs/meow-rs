@@ -2794,6 +2794,146 @@ async fn select_proxy_roundtrip() {
 // ── Bearer auth middleware ───────────────────────────────────────
 
 #[tokio::test]
+async fn controller_without_secret_restricts_browser_access() {
+    use axum::http::header;
+
+    let app = create_router(test_state_with_secret(""));
+    let cases = [
+        ("/ui", "localhost:9090", None, None, StatusCode::OK),
+        ("/version", "127.0.0.1:9090", None, None, StatusCode::OK),
+        (
+            "/version",
+            "[::1]:9090",
+            Some("http://[::1]:9090"),
+            Some("same-origin"),
+            StatusCode::OK,
+        ),
+        (
+            "/version",
+            "localhost:80",
+            Some("http://localhost"),
+            Some("same-origin"),
+            StatusCode::OK,
+        ),
+        (
+            "/version",
+            "127.0.0.1:9090",
+            Some("http://127.0.0.1:9091"),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "localhost:9090",
+            Some("https://localhost:9090"),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "localhost:9090",
+            Some("null"),
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "localhost:9090",
+            None,
+            Some("cross-site"),
+            StatusCode::FORBIDDEN,
+        ),
+        (
+            "/version",
+            "controller.example:9090",
+            None,
+            None,
+            StatusCode::FORBIDDEN,
+        ),
+    ];
+
+    for (path, host, origin, fetch_site, status) in cases {
+        let mut req = Request::get(path).header(header::HOST, host);
+        if let Some(origin) = origin {
+            req = req.header(header::ORIGIN, origin);
+        }
+        if let Some(fetch_site) = fetch_site {
+            req = req.header("sec-fetch-site", fetch_site);
+        }
+        let response = app
+            .clone()
+            .oneshot(req.body(axum::body::Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{host} from {origin:?}");
+        assert!(!response
+            .headers()
+            .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    }
+
+    let response = app
+        .oneshot(
+            Request::post("/rules")
+                .header(header::HOST, "127.0.0.1:9090")
+                .header(header::ORIGIN, "https://dashboard.example")
+                .header(header::CONTENT_TYPE, "text/plain")
+                .body(axum::body::Body::from(r#"{"rules":[]}"#))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn controller_with_secret_allows_authenticated_cross_origin_dashboards() {
+    use axum::http::{header, Method};
+
+    let app = create_router(test_state_with_secret("test-token"));
+    let preflight = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method(Method::OPTIONS)
+                .uri("/version")
+                .header(header::HOST, "controller.example:9090")
+                .header(header::ORIGIN, "https://dashboard.example")
+                .header(header::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+                .header(
+                    header::ACCESS_CONTROL_REQUEST_HEADERS,
+                    "authorization,content-type",
+                )
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(preflight.status(), StatusCode::OK);
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "*"
+    );
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+        "authorization,content-type"
+    );
+
+    let response = app
+        .oneshot(
+            Request::get("/version")
+                .header(header::HOST, "controller.example:9090")
+                .header(header::ORIGIN, "https://dashboard.example")
+                .header(header::AUTHORIZATION, "Bearer test-token")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+}
+
+#[tokio::test]
 async fn auth_middleware_table() {
     use axum::http::header::HeaderValue;
 
@@ -5623,6 +5763,57 @@ async fn put_configs_swaps_running_dns_resolver() {
         StatusCode::NO_CONTENT,
         "restore PUT must succeed so the host-resolver hook is cleared"
     );
+}
+
+#[tokio::test]
+async fn put_configs_requires_restart_to_change_the_controller_secret() {
+    use base64::Engine as _;
+
+    let state = test_state_with_secret("startup-override");
+    state.raw_config.write().secret = Some("original-yaml-value".into());
+    let app = create_router(Arc::clone(&state));
+
+    for (uri, candidate, status) in [
+        (
+            "/configs?force=true",
+            "mode: global\nsecret: new-yaml-value\n",
+            StatusCode::BAD_REQUEST,
+        ),
+        ("/configs", "mode: global\n", StatusCode::BAD_REQUEST),
+        (
+            "/configs",
+            "mode: direct\nsecret: original-yaml-value\n",
+            StatusCode::NO_CONTENT,
+        ),
+    ] {
+        let payload = base64::engine::general_purpose::STANDARD.encode(candidate);
+        let response = app
+            .clone()
+            .oneshot(
+                Request::put(uri)
+                    .header("authorization", "Bearer startup-override")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status);
+        if status == StatusCode::BAD_REQUEST {
+            assert_eq!(
+                body_json(response).await["message"],
+                "changing the controller secret requires a restart"
+            );
+            assert_eq!(state.raw_config.read().mode.as_deref(), Some("rule"));
+        }
+        assert_eq!(
+            state.raw_config.read().secret.as_deref(),
+            Some("original-yaml-value")
+        );
+    }
+    assert_eq!(state.raw_config.read().mode.as_deref(), Some("direct"));
 }
 
 /// A `PUT /configs` parse failure surfaces the tree error through the 400

@@ -775,6 +775,13 @@ impl WgActor {
     /// batches come back (a returned-short batch means the endpoint went
     /// quiet mid-drain).
     fn drain_wire(&mut self) -> usize {
+        self.drain_wire_with(BridgedEndpoint::try_recv_from)
+    }
+
+    fn drain_wire_with(
+        &mut self,
+        mut recv_from: impl FnMut(&mut BridgedEndpoint, &mut [u8]) -> io::Result<(usize, SocketAddr)>,
+    ) -> usize {
         let mut slots = std::mem::take(&mut self.rx_slots);
         let mut got = 0usize;
         let mut jobs: Vec<CryptoJob> = Vec::new();
@@ -802,7 +809,7 @@ impl WgActor {
             for (i, slot) in slots.iter_mut().enumerate() {
                 // `slots` stays `WIRE_DRAIN_BUDGET` long — the recv loop
                 // just stops early on WouldBlock/error.
-                let (n, src) = match self.endpoint.try_recv_from(slot) {
+                let (n, src) = match recv_from(&mut self.endpoint, slot) {
                     Ok(x) => x,
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                     Err(e) => {
@@ -3489,134 +3496,74 @@ mod tests {
         got
     }
 
-    /// F1 regression pin — a `send_batch_to` that stops short replays
-    /// the boundary datagram, sees `WouldBlock`, and must requeue
-    /// `[boundary, successors…]` *ahead* of whatever the outbox already
-    /// held, losing nothing (per-destination addressing preserved).
-    ///
-    /// Under the `BridgedEndpoint` the deterministic boundary is the
-    /// *TX channel's* capacity (`4 * WIRE_DRAIN_BUDGET`), not a kernel
-    /// errno: this `current_thread` test never awaits inside the flush,
-    /// so the TX bridge cannot run and the channel fills at exactly
-    /// queue depth — the `WouldBlock` verdict lands on the same index
-    /// on every platform.
-    ///
-    /// The second flush runs after `arm_writable` yielded the task —
-    /// the bridge drained the channel into the kernel — so the
-    /// requeued tail and the old datagrams land on the wire in queue
-    /// order behind the first queue-full.
+    /// A short batch must requeue the boundary and its successors
+    /// ahead of the old tail, with each destination intact.
     #[tokio::test(flavor = "current_thread")]
     async fn flush_outbox_wouldblock_requeue_preserves_order() {
-        let receiver_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
-        receiver_std
-            .set_nonblocking(true)
-            .expect("receiver nonblocking");
-        let peer = receiver_std.local_addr().expect("receiver addr");
-        let mut actor = actor_with_spec(WgListenerSpec {
-            private_key: [0x5E; 32],
-            peers: vec![WgPeerSpec {
-                public_key: [0xA0; 32],
-                preshared_key: None,
-                allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
-                name: SmolStr::new(""),
-                reserved: None,
-            }],
-            mtu: 1420,
-            udp: true,
-            udp_timeout: Duration::from_secs(60),
-        });
-
-        // QUEUE datagrams past the bridge channel's depth (tags
-        // 0..QUEUE+64) ahead of two older queued datagrams
-        // (tags 0xF0/0xF1) — all addressed to the same peer. Each Vec
-        // carries `scratch_len` capacity so `return_scratch` pools it;
-        // the tag bytes make content order observable (two tag bytes:
-        // indices past 255 need the second byte to stay unique).
         const QUEUE: usize = 4 * WIRE_DRAIN_BUDGET;
-        const STAGED: usize = QUEUE + 64;
-        const OLD: [u8; 2] = [0xF0, 0xF1];
-        let tag_of = |i: usize| vec![(i >> 8) as u8, i as u8];
-        let scratch_len = actor.scratch_len;
-        let tag = move |t: u8| {
-            let mut v = Vec::with_capacity(scratch_len);
-            v.push(t);
-            v
-        };
-        for i in 0..STAGED {
-            let mut v = Vec::with_capacity(scratch_len);
-            v.extend_from_slice(&tag_of(i));
-            actor.outbox.push_back((peer, v));
+        const PRIMED: usize = 16;
+        const TOTAL: usize = QUEUE + WIRE_DRAIN_BUDGET + 2;
+        const RECEIVERS: usize = 32;
+
+        // Spread the burst so each peer buffers at most 32 datagrams
+        // before the next flush. Receivers can drain after the bridge
+        // sends without racing the kernel receive buffer.
+        let mut peers = Vec::with_capacity(RECEIVERS);
+        for _ in 0..RECEIVERS {
+            let receiver = tokio::net::UdpSocket::bind("127.0.0.1:0")
+                .await
+                .expect("bind receiver");
+            socket2::SockRef::from(&receiver)
+                .set_recv_buffer_size(128 * 1024)
+                .expect("size receive buffer");
+            let addr = receiver.local_addr().expect("receiver addr");
+            peers.push((receiver, addr));
         }
-        for t in OLD {
-            actor.outbox.push_back((peer, tag(t)));
+
+        let expected: Vec<_> = (0..TOTAL)
+            .map(|i| (peers[i % RECEIVERS].1, (i as u16).to_be_bytes().to_vec()))
+            .collect();
+        let mut actor = test_actor();
+
+        // Prime part of the channel so it fills mid-batch. The bridge
+        // cannot consume anything until this task yields.
+        for (addr, pkt) in &expected[..PRIMED] {
+            actor
+                .endpoint
+                .try_send_to(pkt, *addr)
+                .expect("prime channel");
+        }
+        for (addr, pkt) in &expected[PRIMED..] {
+            let mut scratch = Vec::with_capacity(actor.scratch_len);
+            scratch.extend_from_slice(pkt);
+            actor.outbox.push_back((*addr, scratch));
         }
 
         actor.flush_outbox();
-
-        // The batch stopped exactly at channel depth — `send_batch_to`
-        // accepts what the channel holds and the boundary datagram's
-        // `try_send_to` reports `WouldBlock`.
-        let sent = STAGED + OLD.len() - actor.outbox.len();
-        assert_eq!(sent, QUEUE, "the flush fills the TX channel exactly");
-
-        // The pre-F1 bug pushed the boundary first, then its
-        // successors ahead of it — [s1.., b, old]. The contract is
-        // [b, s…, old]: a strictly consecutive tag run at the
-        // front (staged[sent] onward), then the old tail.
-        let expected: Vec<u8> = (sent..STAGED).flat_map(tag_of).chain(OLD).collect();
-        let got: Vec<u8> = actor
-            .outbox
-            .iter()
-            .flat_map(|(_, v)| v.iter().take(2).copied().collect::<Vec<u8>>())
-            .collect();
-        assert_eq!(
-            got, expected,
-            "requeue must keep the boundary datagram ahead of its successors, ahead of the old tail"
-        );
         assert!(
-            actor.outbox.iter().all(|(a, _)| *a == peer),
-            "per-datagram destinations survive the requeue"
+            actor.outbox.iter().eq(&expected[QUEUE..]),
+            "outbox preserves the boundary, its successors, and the old tail with their destinations"
         );
 
-        // The successors stay behind the boundary on the wire too:
-        // yield so the bridge drains the channel into the kernel, flush
-        // once more, and the receiver must see every datagram in queue
-        // order. A dedicated std thread drains the receiver because
-        // loopback rx queues cannot hold the whole run's skbuff
-        // accounting on every CI box (rmem_max) — wire ORDER is the
-        // subject under test, not kernel buffer depth.
-        const EXPECTED: usize = STAGED + OLD.len();
-        let drain = std::thread::spawn(move || {
-            let mut got: Vec<Vec<u8>> = Vec::with_capacity(EXPECTED);
-            let mut buf = vec![0u8; 65536];
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while got.len() < EXPECTED && std::time::Instant::now() < deadline {
-                match receiver_std.recv(&mut buf) {
-                    Ok(n) => got.push(buf[..n].to_vec()),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::yield_now();
-                    }
-                    Err(_) => break,
+        // Confirm delivery of the first queue-full before retrying.
+        // Check ordering and addressing separately at each peer.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut buf = [0; 16];
+            for (i, (_, want)) in expected.iter().enumerate() {
+                if i == QUEUE {
+                    actor.flush_outbox();
+                    assert!(actor.outbox.is_empty(), "drained channel takes the requeue");
                 }
+                let n = peers[i % RECEIVERS]
+                    .0
+                    .recv(&mut buf)
+                    .await
+                    .expect("receive datagram");
+                assert_eq!(&buf[..n], want.as_slice(), "datagram {i}");
             }
-            got
-        });
-        arm_writable(&mut actor.endpoint).await;
-        actor.flush_outbox();
-        assert!(actor.outbox.is_empty(), "drained channel takes the requeue");
-        // A second yield lets the TX bridge emit the requeued tail
-        // before the drain thread's deadline is examined.
-        arm_writable(&mut actor.endpoint).await;
-
-        let got = drain.join().expect("drain thread");
-        let expected: Vec<Vec<u8>> = (0..STAGED)
-            .map(tag_of)
-            .chain(OLD.iter().map(|&t| vec![t]))
-            .collect();
-        assert_eq!(
-            got, expected,
-            "wire order must match queue order across the requeue"
-        );
+        })
+        .await
+        .expect("TX bridge must deliver both flushes");
     }
 
     /// A datagram the kernel refuses (oversized → `EMSGSIZE` on every
@@ -3803,7 +3750,39 @@ mod tests {
             };
             sender.send_to(&wire, actor_addr).expect("send data");
         }
-        feed_pending(&mut actor).await;
+        // Collect the full burst from the UDP bridge before draining.
+        // Even on loopback, receiving the first datagram cannot prove
+        // the bridge has already enqueued the rest.
+        let mut pending = tokio::time::timeout(Duration::from_secs(5), async {
+            let (n, src) = actor
+                .endpoint
+                .recv_from(&mut actor.recv_buf)
+                .await
+                .expect("first datagram ready");
+            actor.demux_one(src, n);
+
+            let mut pending = VecDeque::with_capacity(N - 1);
+            for _ in 1..N {
+                let (n, src) = actor
+                    .endpoint
+                    .recv_from(&mut actor.recv_buf)
+                    .await
+                    .expect("batch datagram ready");
+                pending.push_back((src, actor.recv_buf[..n].to_vec()));
+            }
+            pending
+        })
+        .await
+        .expect("RX bridge must deliver the burst");
+
+        let drained = actor.drain_wire_with(|_, slot| {
+            let (src, pkt) = pending
+                .pop_front()
+                .ok_or_else(|| io::Error::from(io::ErrorKind::WouldBlock))?;
+            slot[..pkt.len()].copy_from_slice(&pkt);
+            Ok((pkt.len(), src))
+        });
+        assert_eq!(drained, N - 1, "batch exceeds the pool's inline cutoff");
 
         // Every admitted segment reached smoltcp in wire order — the
         // first through `demux_one`'s serial path, the rest through the

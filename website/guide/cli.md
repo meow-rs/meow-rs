@@ -16,6 +16,7 @@ meow [OPTIONS] [COMMAND]
 | `--config-string <B64>` | Base64-encoded YAML config; replaces `-f` as the source entirely (mihomo compat). No backing file exists: `POST /api/config/save` is refused, subscription changes apply in memory only (add/refresh report `"persisted": false`), and `meow install` rejects the combination — a service unit must point at a real `-f` file |
 | `-d, --directory <DIR>` | Home directory for resource discovery (geodata, caches); relative config paths resolve under it |
 | `-t, --test` | Validate the config and exit without starting — performs no network access (validates `--config-string` when given) |
+| `--secret-file <PATH>` | Read the controller secret from a private file containing a single line of printable ASCII without trailing spaces. Overrides the YAML `secret` and conflicts with `--secret` |
 
 ```bash
 # build, validate, run
@@ -99,8 +100,8 @@ decode fine) are skipped and reported as a warning with the count.
 
 ## Hot reload
 
-You don't have to restart to apply config changes. The REST API can reload the whole file
-in place:
+The REST API can reload the configuration in place. Applying a change to the controller
+secret requires a restart.
 
 ```bash
 curl -X PUT 'http://127.0.0.1:9090/configs' \

@@ -29,7 +29,6 @@
 //! tokio's cached readiness, so a cold (never-polled) socket still
 //! reaches the kernel; see [`BatchEndpoint::BATCHED_SYSCALLS`].
 
-use std::collections::VecDeque;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -699,22 +698,7 @@ impl BatchEndpoint {
 /// staged (wg-perf, paired with the `WIRE_DRAIN_BUDGET` raise).
 const PROXY_ENDPOINT_QUEUE: usize = 4 * WIRE_DRAIN_BUDGET;
 
-/// Coalescing bound of the TX bridge's staged flush queue: below this
-/// depth the task waits up to `TX_COALESCE` for the producer to deepen
-/// the batch, so a wire datagram rides one `sendmsg_x` with its
-/// neighbours instead of spending a syscall alone. 32 covers a typical
-/// inner-TCP burst without paying more than the window in latency.
-const TX_COALESCE_MIN: usize = 32;
-
-/// How long the TX bridge waits for the producer to deepen a shallow
-/// staged batch. Tokio's timer granularity makes sub-millisecond
-/// windows ineffective, so 1 ms is the finest meaningful bound —
-/// long enough to fold a producer burst into one `sendmsg_x`, short
-/// enough that a sparse first datagram is delayed less than a pump
-/// pass.
-const TX_COALESCE: Duration = Duration::from_millis(1);
-
-/// The symmetric bound on the RX thread's side: after a short
+/// The coalescing bound on the RX thread's side: after a short
 /// `recv_batch` the socket is nearly dry, so re-poll briefly for more
 /// arrivals instead of spending a fresh `poll`+`recvmsg_x` round on
 /// every straggler.
@@ -1271,7 +1255,7 @@ const BRIDGE_SLOT: usize = 4096;
 ///   channel never full. A full channel parks `blocking_send` —
 ///   pressure falls back onto `SO_RCVBUF`, the designed absorber,
 ///   instead of unbounded memory.
-/// - **TX task** drains a bounded channel through `send_batch_to`,
+/// - **TX task** drains a bounded channel with batched socket sends,
 ///   replaying the short-count boundary datagram with `try_send*` to
 ///   split `WouldBlock` (await `writable`, retry) from a real errno
 ///   (log, drop *that* datagram, continue — the kernel-error verdict
@@ -1368,55 +1352,23 @@ impl BridgedEndpoint {
                 // see `RxStopOnDrop`.
                 let _rx_pulse = rx_pulse;
                 let mut pump_rx = pump_rx;
-                // Staged flush batch: `sendq` grows only from channel
-                // pops, so it is bounded by `PROXY_ENDPOINT_QUEUE` plus
-                // one in-flight datagram — the channel itself is the
-                // backpressure edge, not this queue.
-                let mut sendq: VecDeque<(SocketAddr, Bytes)> = VecDeque::new();
+                let mut sendq: Vec<(SocketAddr, Bytes)> = Vec::new();
                 'outer: loop {
-                    if sendq.is_empty() {
-                        match tokio::select! {
-                            biased;
-                            _ = shutdown.notified() => break,
-                            p = pump_rx.recv() => p,
-                        } {
-                            Some(p) => sendq.push_back(p),
-                            // Channel closed — endpoint teardown.
-                            None => break,
-                        }
+                    // Wait for the first packet, then take up to one
+                    // wire drain of ready packets without adding a timer.
+                    let count = tokio::select! {
+                        biased;
+                        _ = shutdown.notified() => break,
+                        n = pump_rx.recv_many(&mut sendq, WIRE_DRAIN_BUDGET) => n,
+                    };
+                    if count == 0 {
+                        break;
                     }
-                    // Top up the staged batch without blocking so one
-                    // `send_batch_to` covers the whole queued burst.
-                    while let Ok(p) = pump_rx.try_recv() {
-                        sendq.push_back(p);
-                    }
-                    // Coalesce: under a trickle the channel feeds
-                    // `sendq` a datagram at a time and an immediate
-                    // flush would spend a `sendmsg_x` syscall on each
-                    // wire datagram. Park briefly so the producer can
-                    // deepen the batch — the flood path never comes
-                    // here, and sparse bursts pay at most `TX_COALESCE`
-                    // on their first datagram.
-                    if sendq.len() < TX_COALESCE_MIN {
-                        tokio::select! {
-                            biased;
-                            _ = shutdown.notified() => break 'outer,
-                            _ = tokio::time::sleep(TX_COALESCE) => {},
-                        }
-                        while let Ok(p) = pump_rx.try_recv() {
-                            sendq.push_back(p);
-                        }
-                    }
-                    while !sendq.is_empty() {
-                        let sent = {
-                            let refs: Vec<(SocketAddr, &[u8])> =
-                                sendq.iter().map(|(a, b)| (*a, &b[..])).collect();
-                            ep.send_batch_to(&refs)
-                        };
-                        if sent > 0 {
-                            sendq.drain(..sent);
-                        }
-                        let Some((addr, pkt)) = sendq.front() else {
+                    let mut sent = 0;
+                    while sent < count {
+                        sent += ep
+                            .send_batch_inner(&sendq[sent..], |(addr, pkt)| (*addr, pkt.as_ref()));
+                        let Some((addr, pkt)) = sendq.get(sent) else {
                             break;
                         };
                         // The short-count boundary datagram gets the
@@ -1432,7 +1384,7 @@ impl BridgedEndpoint {
                         };
                         match boundary {
                             Ok(_) => {
-                                sendq.pop_front();
+                                sent += 1;
                             }
                             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
                                 let w = tokio::select! {
@@ -1448,10 +1400,11 @@ impl BridgedEndpoint {
                                 tracing::debug!(
                                     "wireguard endpoint send error (datagram dropped): {e}"
                                 );
-                                sendq.pop_front();
+                                sent += 1;
                             }
                         }
                     }
+                    sendq.clear();
                 }
             }
         });
@@ -3153,6 +3106,29 @@ mod tests {
             .try_send(b"one too many")
             .expect_err("a full channel is WouldBlock");
         assert_eq!(err.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn bridged_tx_sends_single_datagram_without_timer() {
+        let (ep, receiver) = bridged_pair();
+        receiver.set_nonblocking(false).expect("blocking receiver");
+        // Give the receive a real deadline so it does not move the
+        // virtual clock used to detect a delay in the TX bridge.
+        receiver
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("receive deadline");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::thread::spawn(move || {
+            let mut buf = [0; 16];
+            let received = receiver.recv(&mut buf).map(|n| (buf, n));
+            let _ = tx.send(received);
+        });
+
+        let start = tokio::time::Instant::now();
+        ep.try_send(b"sparse").expect("enqueue datagram");
+        let (buf, n) = rx.await.expect("receiver thread").expect("datagram");
+        assert_eq!(&buf[..n], b"sparse");
+        assert_eq!(tokio::time::Instant::now(), start);
     }
 
     /// A kernel send error drops only the offending datagram: an

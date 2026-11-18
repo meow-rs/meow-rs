@@ -42,8 +42,9 @@ external-controller: 127.0.0.1:9090
 secret: "a-long-random-string"
 ```
 
-- An empty or absent `secret` means **no auth** — only safe on a fully trusted loopback
-  bind.
+- An empty or absent `secret` leaves the controller unauthenticated. Use this mode only
+  on a trusted loopback bind. Connect by IP address or `localhost`. Browser API and
+  WebSocket requests must come from the controller's own origin.
 - REST requests authenticate with a bearer header: `Authorization: Bearer <secret>`.
 - WebSocket endpoints (`/logs`, `/traffic`, `/memory`) accept either the bearer header or
   a `?token=<secret>` query parameter.
@@ -51,5 +52,7 @@ secret: "a-long-random-string"
 
 ::: warning Exposing the controller
 If you bind `external-controller` to a non-loopback address, always set a strong `secret`.
-CORS is permissive (`*`) so any origin can reach the API once it has the token.
+Set a secret for cross-origin dashboards and reverse proxies serving the controller
+over a custom hostname. With a secret, CORS allows any origin and API requests still
+require the token. Changing the secret requires a restart.
 :::

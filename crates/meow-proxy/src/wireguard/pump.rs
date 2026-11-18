@@ -3202,12 +3202,9 @@ mod tests {
         assert_eq!(returned.len(), n);
     }
 
-    /// PATCH(18): `drain_wire`'s parallel path end to end — a real
-    /// session (`session_up`), then a DATA burst over the real endpoint
-    /// socket. The first datagram rides `endpoint.recv` →
-    /// `decapsulate_wire` — the production select arm's shape, which
-    /// also arms the reactor readiness the fallback `try_recv_buf`
-    /// gates on — and the rest batch through `recv_batch` →
+    /// `drain_wire`'s parallel path end to end with a real WireGuard
+    /// session and a pre-queued burst. The first datagram rides
+    /// `endpoint.recv` → `decapsulate_wire`, and the rest batch through `recv_batch` →
     /// `classify_incoming` → the crypto pool → `handle_decrypted_data`.
     /// Order is asserted off `rx_queue` (every decrypted inner lands in
     /// wire order) and the consumed slots come back at full capacity.
@@ -3218,18 +3215,21 @@ mod tests {
         let server_secret = x25519::StaticSecret::from([0x92; 32]);
         let server_public = x25519::PublicKey::from(&server_secret);
 
-        // A real socket pair: the pump's endpoint OS-connected to the
-        // responder's sender, so `recv_batch` only ever sees the one
-        // peer — exactly the connected-endpoint contract.
-        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
-        let sender_addr = sender.local_addr().expect("sender addr");
-        let pump_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind pump socket");
-        pump_std.connect(sender_addr).expect("connect pump socket");
-        let pump_addr = pump_std.local_addr().expect("pump addr");
-        let mut pump = pump_with_socket(
+        let (sent, _sent_rx) = mpsc::channel(1);
+        let peer = SocketAddr::from(([203, 0, 113, 7], 51820));
+        let local_addr = SocketAddr::from(([192, 0, 2, 4], 41000));
+        let conn = Arc::new(RecordingPacketConn::new(sent, local_addr));
+        let endpoint = Endpoint::Proxy(meow_wgstack::ProxyEndpoint::new(
+            conn.clone(),
+            peer,
+            local_addr,
+        ));
+        let (_tx, rx) = mpsc::channel(4);
+        let mut pump = WgPump::new(
             &test_config(&client_secret, &server_public),
-            pump_std,
-            sender_addr,
+            endpoint,
+            peer,
+            rx,
         );
         let mut server = Tunn::new(server_secret, client_public, None, None, 0, None);
         session_up(&mut pump, &mut server);
@@ -3255,12 +3255,14 @@ mod tests {
                 b.to_vec()
             };
             inners.push(inner);
-            sender.send_to(&datagram, pump_addr).expect("send data");
+            conn.incoming.lock().push_back(datagram);
         }
 
-        // The production receive arm: async `recv` for the datagram
-        // that woke the reactor (feeds `decapsulate_wire` serially and
-        // arms the `try_*` readiness), then `drain_wire` for the rest.
+        // The next read request proves the bridge has enqueued the entire
+        // burst. Receiving the first packet alone cannot prove that.
+        tokio::time::timeout(Duration::from_secs(5), conn.incoming_drained.notified())
+            .await
+            .expect("RX bridge must enqueue the burst");
         let n = pump
             .endpoint
             .recv(&mut pump.recv_buf)
@@ -3270,7 +3272,10 @@ mod tests {
         pump.recv_buf = pump
             .decapsulate_wire(pkt, n)
             .unwrap_or_else(|| vec![0u8; pump.scratch_len]);
-        pump.drain_wire(CryptoPool::run_shared);
+        pump.drain_wire(|jobs| {
+            assert_eq!(jobs.len(), N - 1, "the burst must reach the worker path");
+            CryptoPool::run_shared(jobs);
+        });
 
         // Every decrypted inner reached smoltcp in wire order — the
         // first through the serial arm, the rest through the pool pass.
@@ -4484,46 +4489,88 @@ mod tests {
 
     // ── flush_outbox / scratch-pool pins ─────────────────────────
 
+    struct RecordingPacketConn {
+        sent: mpsc::Sender<Vec<u8>>,
+        incoming: parking_lot::Mutex<VecDeque<Vec<u8>>>,
+        incoming_drained: tokio::sync::Notify,
+        local_addr: SocketAddr,
+    }
+
+    impl RecordingPacketConn {
+        fn new(sent: mpsc::Sender<Vec<u8>>, local_addr: SocketAddr) -> Self {
+            Self {
+                sent,
+                incoming: Default::default(),
+                incoming_drained: Default::default(),
+                local_addr,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyPacketConn for RecordingPacketConn {
+        async fn read_packet(&self, buf: &mut [u8]) -> Result<(usize, SocketAddr)> {
+            let packet = self.incoming.lock().pop_front();
+            if let Some(packet) = packet {
+                buf[..packet.len()].copy_from_slice(&packet);
+                return Ok((packet.len(), self.local_addr));
+            }
+            self.incoming_drained.notify_one();
+            std::future::pending().await
+        }
+
+        async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> Result<usize> {
+            self.sent
+                .send(buf.to_vec())
+                .await
+                .map_err(|_| MeowError::Proxy("recording receiver closed".into()))?;
+            Ok(buf.len())
+        }
+
+        fn local_addr(&self) -> Result<SocketAddr> {
+            Ok(self.local_addr)
+        }
+
+        fn close(&self) -> Result<()> {
+            Ok(())
+        }
+    }
+
     /// F1 regression pin — a `send_batch` that stops short replays the
     /// boundary datagram, sees `WouldBlock`, and must requeue
     /// `[boundary, successors…]` *ahead* of whatever the outbox already
     /// held, losing nothing.
-    ///
-    /// Under the `BridgedEndpoint` the deterministic boundary is the
-    /// *TX channel's* capacity (`4 * WIRE_DRAIN_BUDGET`), not a kernel
-    /// errno: this `current_thread` test never awaits inside the flush,
-    /// so the TX bridge cannot run and the channel fills at exactly
-    /// queue depth — the `WouldBlock` verdict lands on the same index
-    /// on every platform.
-    ///
-    /// The second flush runs after `arm_writable` yielded the task —
-    /// the bridge drained the channel into the kernel — so the
-    /// requeued tail and the old datagrams land on the wire in queue
-    /// order behind the first queue-full.
     #[tokio::test(flavor = "current_thread")]
     async fn flush_outbox_wouldblock_requeue_preserves_order() {
         let client_secret = x25519::StaticSecret::from([0x99; 32]);
         let server_public = x25519::PublicKey::from(&x25519::StaticSecret::from([0xAA; 32]));
 
-        let receiver_std = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind receiver");
-        receiver_std
-            .set_nonblocking(true)
-            .expect("receiver nonblocking");
-        let peer = receiver_std.local_addr().expect("receiver addr");
-        // A connected endpoint socket so `send_batch` takes the
-        // nameless `send()`/`sendmmsg` path the production pump uses.
-        let sender = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind sender");
-        sender.connect(peer).expect("connect sender");
-        let mut pump = pump_with_socket(&test_config(&client_secret, &server_public), sender, peer);
+        // Both endpoint variants use the same bounded TX queue. Record
+        // its output without relying on the loopback UDP receive buffer.
+        let peer = SocketAddr::from(([203, 0, 113, 7], 51820));
+        let local_addr = SocketAddr::from(([192, 0, 2, 4], 41000));
+        let (sent, mut received) = mpsc::channel(WIRE_DRAIN_BUDGET);
+        let conn = Arc::new(RecordingPacketConn::new(sent, local_addr));
+        let endpoint = Endpoint::Proxy(meow_wgstack::ProxyEndpoint::new(conn, peer, local_addr));
+        let (_tx, rx) = mpsc::channel(4);
+        let mut pump = WgPump::new(
+            &test_config(&client_secret, &server_public),
+            endpoint,
+            peer,
+            rx,
+        );
 
-        // QUEUE datagrams past the bridge channel's depth (tags
-        // 0..QUEUE+64, two tag bytes because indices pass 255) ahead of
-        // two older queued datagrams (tags 0xF0/0xF1).
+        // Prime part of the channel so it fills mid-batch. With no
+        // awaits, the bridge cannot consume from this runtime yet.
         const QUEUE: usize = 4 * WIRE_DRAIN_BUDGET;
-        const STAGED: usize = QUEUE + 64;
+        const PRIMED: usize = 16;
+        const STAGED: usize = QUEUE + WIRE_DRAIN_BUDGET;
         const OLD: [u8; 2] = [0xF0, 0xF1];
-        let tag_of = |i: usize| vec![(i >> 8) as u8, i as u8];
-        for i in 0..STAGED {
+        let tag_of = |i: usize| (i as u16).to_be_bytes();
+        for i in 0..PRIMED {
+            pump.endpoint.try_send(&tag_of(i)).expect("prime channel");
+        }
+        for i in PRIMED..STAGED {
             let mut v = Vec::with_capacity(pump.scratch_len);
             v.extend_from_slice(&tag_of(i));
             pump.outbox.push_back(v);
@@ -4535,66 +4582,28 @@ mod tests {
 
         pump.flush_outbox();
 
-        // The batch stopped exactly at channel depth — `send_batch`
-        // accepts what the channel holds and the boundary datagram's
-        // `try_send` reports `WouldBlock`.
-        let sent = STAGED + OLD.len() - pump.outbox.len();
-        assert_eq!(sent, QUEUE, "the flush fills the TX channel exactly");
-
-        // The pre-F1 bug pushed the boundary first, then its
-        // successors ahead of it — [s1..s63, b, old]. The contract is
-        // [b, s…, old]: a strictly consecutive tag run at the
-        // front (staged[sent] onward), then the old tail.
-        let expected: Vec<u8> = (sent..STAGED).flat_map(tag_of).chain(OLD).collect();
-        let got: Vec<u8> = pump
-            .outbox
-            .iter()
-            .flat_map(|v| v.iter().take(2).copied().collect::<Vec<u8>>())
-            .collect();
-        assert_eq!(
-            got, expected,
-            "requeue must keep the boundary datagram ahead of its successors, ahead of the old tail"
-        );
-
-        // The successors stay behind the boundary on the wire too:
-        // yield so the bridge drains the channel into the kernel, flush
-        // once more, and the receiver must see every datagram in queue
-        // order. A dedicated std thread drains the receiver because a
-        // loopback rx queue can't hold the whole run's skbuff
-        // accounting on every CI box (rmem_max) — wire ORDER is the
-        // subject under test, not kernel buffer depth.
-        const EXPECTED: usize = STAGED + OLD.len();
-        let drain = std::thread::spawn(move || {
-            let mut got: Vec<Vec<u8>> = Vec::with_capacity(EXPECTED);
-            let mut buf = vec![0u8; 65536];
-            let deadline = std::time::Instant::now() + Duration::from_secs(10);
-            while got.len() < EXPECTED && std::time::Instant::now() < deadline {
-                match receiver_std.recv(&mut buf) {
-                    Ok(n) => got.push(buf[..n].to_vec()),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::yield_now();
-                    }
-                    Err(_) => break,
-                }
-            }
-            got
-        });
-        arm_writable(&mut pump.endpoint).await;
-        pump.flush_outbox();
-        assert!(pump.outbox.is_empty(), "drained channel takes the requeue");
-        // A second yield lets the TX bridge emit the requeued tail
-        // before the drain thread's deadline is examined.
-        arm_writable(&mut pump.endpoint).await;
-
-        let got = drain.join().expect("drain thread");
         let expected: Vec<Vec<u8>> = (0..STAGED)
-            .map(tag_of)
-            .chain(OLD.iter().map(|&t| vec![t]))
+            .map(|i| tag_of(i).to_vec())
+            .chain(OLD.map(|tag| vec![tag]))
             .collect();
-        assert_eq!(
-            got, expected,
-            "wire order must match queue order across the requeue"
+        assert!(
+            pump.outbox.iter().eq(&expected[QUEUE..]),
+            "outbox keeps the boundary, its successors, and the old tail in order"
         );
+
+        // Receiving the first queue-full is the signal to flush again.
+        // Check the complete order across the requeue at the receiver.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for (i, want) in expected.iter().enumerate() {
+                if i == QUEUE {
+                    pump.flush_outbox();
+                    assert!(pump.outbox.is_empty(), "drained channel takes the requeue");
+                }
+                assert_eq!(received.recv().await.as_ref(), Some(want), "datagram {i}");
+            }
+        })
+        .await
+        .expect("TX bridge must deliver both flushes");
     }
 
     /// A datagram the kernel refuses (oversized → `EMSGSIZE` on every

@@ -140,8 +140,8 @@ build_meow() {
 
     install -m 755 "$binary" "$d/usr/bin/meow"
     install -m 755 "$SCRIPT_DIR/meow/files/meow.init" "$d/etc/init.d/meow"
-    install -m 644 "$SCRIPT_DIR/meow/files/meow.config" "$d/etc/config/meow"
-    install -m 644 "$SCRIPT_DIR/meow/files/config.yaml" "$d/etc/meow/config.yaml"
+    install -m 600 "$SCRIPT_DIR/meow/files/meow.config" "$d/etc/config/meow"
+    install -m 600 "$SCRIPT_DIR/meow/files/config.yaml" "$d/etc/meow/config.yaml"
     install -m 755 "$SCRIPT_DIR/meow/files/gateway.sh" "$d/usr/share/meow/gateway.sh"
     install -m 755 "$SCRIPT_DIR/meow/files/arp-hijack.sh" "$d/usr/share/meow/arp-hijack.sh"
     install -m 755 "$SCRIPT_DIR/meow/files/meow-arp.init" "$d/etc/init.d/meow-arp"

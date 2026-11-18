@@ -82,6 +82,31 @@ async fn ws_connect(url: &str) -> WsStream {
     ws
 }
 
+#[tokio::test]
+async fn logs_websocket_without_secret_requires_a_same_origin_browser() {
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, http::StatusCode, Error};
+
+    let (state, _) = make_state();
+    let (addr, server) = spawn_server(state).await;
+    let url = format!("ws://{addr}/logs");
+
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("origin", format!("http://{addr}").parse().unwrap());
+    let (ws, response) = tokio_tungstenite::connect_async(req).await.unwrap();
+    assert_eq!(response.status(), StatusCode::SWITCHING_PROTOCOLS);
+    drop(ws);
+
+    let mut req = url.as_str().into_client_request().unwrap();
+    req.headers_mut()
+        .insert("origin", "https://dashboard.example".parse().unwrap());
+    let result = tokio_tungstenite::connect_async(req).await;
+    server.abort();
+    assert!(
+        matches!(result, Err(Error::Http(response)) if response.status() == StatusCode::FORBIDDEN)
+    );
+}
+
 /// Receive one text frame, timing out at 500 ms.
 async fn recv_text(ws: &mut WsStream) -> String {
     tokio::time::timeout(Duration::from_millis(500), ws.next())

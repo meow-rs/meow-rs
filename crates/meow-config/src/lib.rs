@@ -18,6 +18,7 @@ pub mod ech_dns;
 pub mod external_ui;
 pub mod geodata;
 pub mod internal_http;
+mod private_file;
 pub mod proxy_parser;
 pub mod proxy_provider;
 pub mod proxy_provider_refresh;
@@ -1146,7 +1147,9 @@ pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
     PathBuf::from(name)
 }
 
-/// Save a RawConfig back to disk with atomic write (.tmp → rename) and .bak backup.
+/// Save a RawConfig atomically and keep a best-effort .bak copy of the
+/// previous regular file. On Unix, new files use owner-only permissions
+/// and preserve any stricter owner permissions on existing files.
 ///
 /// Unique scratch names keep concurrent saves from tearing, but file
 /// *order* is only guaranteed when callers serialize under the
@@ -1159,30 +1162,7 @@ pub(crate) fn unique_scratch_path(path: &Path) -> PathBuf {
 /// hand-edited original (pre-existing shape).
 pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_saphyr::to_string_with_options(raw, yaml_ser_options())?;
-    // Scratch files orphaned by a crash between create and rename
-    // accumulate forever otherwise — sweep stale ones on each save
-    // (issue #621).
-    meow_common::fs_util::sweep_scratch_siblings(
-        Path::new(path),
-        meow_common::fs_util::SCRATCH_STALE_AGE,
-    );
-    let tmp_path = unique_scratch_path(Path::new(path));
-    let bak_path = format!("{path}.bak");
-    // Unique scratch names would accumulate on repeated failures — sweep
-    // the scratch on each fallible step so a chronic error (ENOSPC, a
-    // denied rename) can't fill the config dir.
-    if let Err(e) = std::fs::write(&tmp_path, &yaml) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
-    if std::path::Path::new(path).exists() {
-        // Keep one backup
-        let _ = std::fs::rename(path, &bak_path);
-    }
-    if let Err(e) = std::fs::rename(&tmp_path, path) {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e.into());
-    }
+    private_file::save_config(Path::new(path), &yaml)?;
     info!("Config saved to {}", path);
     Ok(())
 }
@@ -1192,32 +1172,7 @@ pub fn save_raw_config(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::E
 /// the `CONFIG_MUTATION` lane so file order follows commit order (issue #543).
 pub async fn save_raw_config_async(path: &str, raw: &raw::RawConfig) -> Result<(), anyhow::Error> {
     let yaml = serde_saphyr::to_string_with_options(raw, yaml_ser_options())?;
-    // Same crash-leftover sweep as the sync variant (issue #621), off the
-    // async worker since it walks the config dir.
-    {
-        let dir_target = PathBuf::from(path);
-        spawn_blocking_with_current_dispatcher(move || {
-            meow_common::fs_util::sweep_scratch_siblings(
-                &dir_target,
-                meow_common::fs_util::SCRATCH_STALE_AGE,
-            );
-        })
-        .await
-        .ok();
-    }
-    let tmp_path = unique_scratch_path(Path::new(path));
-    let bak_path = format!("{path}.bak");
-    if let Err(e) = tokio::fs::write(&tmp_path, &yaml).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e.into());
-    }
-    if tokio::fs::metadata(path).await.is_ok() {
-        let _ = tokio::fs::rename(path, &bak_path).await;
-    }
-    if let Err(e) = tokio::fs::rename(&tmp_path, path).await {
-        let _ = tokio::fs::remove_file(&tmp_path).await;
-        return Err(e.into());
-    }
+    private_file::save_config_async(Path::new(path), yaml).await?;
     info!("Config saved to {}", path);
     Ok(())
 }
@@ -1236,6 +1191,61 @@ mod save_scratch_tests {
             .map(|e| e.file_name())
             .filter(|n| n.to_string_lossy().ends_with(".tmp"))
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_config_and_backup_with_private_modes() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let backup = dir.path().join("config.yaml.bak");
+        let raw = raw::RawConfig::default();
+
+        save_raw_config(path.to_str().unwrap(), &raw).unwrap();
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        fs::write(&path, "mode: rule\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        save_raw_config(path.to_str().unwrap(), &raw).unwrap();
+        for file in [&path, &backup] {
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "mode: rule\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn async_save_preserves_stricter_owner_permissions() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        let backup = dir.path().join("config.yaml.bak");
+        fs::write(&path, "mode: rule\n").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400)).unwrap();
+        fs::write(&backup, "mode: global\n").unwrap();
+        fs::set_permissions(&backup, fs::Permissions::from_mode(0o600)).unwrap();
+
+        save_raw_config_async(path.to_str().unwrap(), &raw::RawConfig::default())
+            .await
+            .unwrap();
+        for file in [&path, &backup] {
+            assert_eq!(
+                fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o400
+            );
+        }
+        assert_eq!(fs::read_to_string(&backup).unwrap(), "mode: rule\n");
     }
 
     #[test]
@@ -1340,15 +1350,12 @@ mod save_scratch_tests {
         let dir = tempfile::tempdir().unwrap();
         let raw: raw::RawConfig = serde_saphyr::from_str("mode: rule\n").unwrap();
 
-        // Rename step fails: `as-dir.bak` is a non-empty directory, so the
-        // backup rotate fails silently and `as-dir` stays put — the final
-        // rename then hits EISDIR and must sweep its scratch.
+        // The final rename cannot replace a directory with a file and
+        // must remove its scratch.
         let bad = dir.path().join("as-dir");
         std::fs::create_dir(&bad).unwrap();
-        std::fs::create_dir(dir.path().join("as-dir.bak")).unwrap();
-        std::fs::write(dir.path().join("as-dir.bak").join("x"), "").unwrap();
-        let bad = bad.to_string_lossy().into_owned();
-        assert!(save_raw_config(&bad, &raw).is_err());
+        assert!(save_raw_config(bad.to_str().unwrap(), &raw).is_err());
+        assert!(bad.is_dir());
         assert!(
             leftovers(dir.path()).is_empty(),
             "rename failure must sweep its scratch: {:?}",
