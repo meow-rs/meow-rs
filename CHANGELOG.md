@@ -285,6 +285,10 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- On Unix, saved configurations, backups, downloaded proxy-provider caches,
+  and subscription usage files use owner-only permissions. Saves preserve
+  stricter owner permissions and replace each file atomically. (#978)
+
 - **AnyTLS streams no longer wait for SYNACK.** A new stream used to wait up
   to 30 s for the server's SYNACK before the caller could send its first
   byte, adding a round trip to every connection and stalling every stream to
