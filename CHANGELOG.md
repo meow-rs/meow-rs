@@ -402,6 +402,8 @@ the canonical, in-repo source a release is cut from.
 - Internal HTTP fetch errors omit full request/redirect URLs and response
   body snippets from provider diagnostics, preserving the HTTP status and
   failure category without copying subscription credentials into logs.
+- **Provider download memory.** Buffer each response body once and limit
+  each rule-provider prefetch worker to four concurrent downloads.
 
 - **Hysteria 2 UDP relay no longer collapses under load.** A full
   driver queue reported `Closed`, so the tunnel tore the association
