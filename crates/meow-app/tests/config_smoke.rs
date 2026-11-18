@@ -119,6 +119,11 @@ fn load_realworld_verbatim_config_deserializes() {
     let raw: meow_config::raw::RawConfig = meow_config::parse_raw_yaml(REALWORLD_VERBATIM_YAML)
         .expect("verbatim config should deserialize");
 
+    // Issue #974: the `global-client-fingerprint: chrome` this fixture
+    // carries is a typed key now — not an `extra` unknown-key.
+    assert_eq!(raw.global_client_fingerprint.as_deref(), Some("chrome"));
+    assert!(!raw.extra.contains_key("global-client-fingerprint"));
+
     assert!(raw.proxy_groups.is_some());
     let groups = raw.proxy_groups.as_ref().unwrap();
     let hk = groups.iter().find(|g| g.name == "香港").unwrap();

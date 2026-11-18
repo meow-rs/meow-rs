@@ -36,7 +36,6 @@ const MAX_REDIRECTS: u8 = 5;
 /// (BaoLianDeng#79: config update froze the app until force quit).
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const READ_TIMEOUT: Duration = Duration::from_secs(60);
-const USER_AGENT: &str = concat!("clash.meta/", env!("CARGO_PKG_VERSION"));
 pub(crate) const MAX_BODY_BYTES: usize = 256 * 1024 * 1024; // 256 MiB hard ceiling
 const MAX_HEADER_BYTES: usize = 64 * 1024;
 const MAX_CHUNK_LINE_BYTES: usize = 8 * 1024;
@@ -95,12 +94,11 @@ fn is_valid_header_name(name: &str) -> bool {
 /// A valid header field value per RFC 9110/Go's `ValidHeaderFieldValue`:
 /// SP, HTAB, and any byte in the visible range plus 0x80..=0xFF (obs
 /// latin-1 values are tolerated, matching Go); every other CTL (including
-/// CR/LF, 0x00-0x08, 0x0A-0x1F, DEL) is rejected.
+/// CR/LF, 0x00-0x08, 0x0A-0x1F, DEL) is rejected. Shared with `global-ua`
+/// validation as [`meow_common::is_valid_http_header_value`].
 #[inline]
 fn is_valid_header_value(value: &str) -> bool {
-    value
-        .bytes()
-        .all(|b| b == b'\t' || (b'\x20'..=b'\x7e').contains(&b) || b >= 0x80)
+    meow_common::is_valid_http_header_value(value)
 }
 
 /// Resolve a `proxy:`-style download-proxy field against the published route
@@ -383,7 +381,8 @@ async fn fetch_one(
     );
     if !has_custom_ua {
         request.push_str("User-Agent: ");
-        request.push_str(USER_AGENT);
+        // `global-ua` when set, else clash.meta/<version> (issue #974).
+        request.push_str(&meow_common::effective_user_agent());
         request.push_str("\r\n");
     }
     for (name, value) in headers {
@@ -1497,6 +1496,66 @@ mod tests {
         assert!(
             err.to_string().contains("HTTP 500"),
             "the post-dial 5xx must stay loud, no direct retry: {err}"
+        );
+    }
+
+    /// `global-ua` (issue #974): the process-wide override reaches the
+    /// wire, while a request-supplied `User-Agent` still replaces it —
+    /// one field line, like Go's `req.Header` set (mihomo parity).
+    #[tokio::test]
+    async fn fetch_emits_global_ua_and_request_ua_wins() {
+        let _serial = crate::test_support::global_ua_serial().lock().await;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                meow_common::set_global_ua(None);
+            }
+        }
+        let _reset = Reset;
+        meow_common::set_global_ua(Some("mihomo/v1.18.0"));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/x", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                requests.push(read_request(&mut stream).await);
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        let body = fetch(&url, None, &[]).await.unwrap();
+        assert_eq!(body, b"ok");
+        let body = fetch(&url, None, &[("USER-AGENT".into(), "custom/1".into())])
+            .await
+            .unwrap();
+        assert_eq!(body, b"ok");
+        let requests = server.await.unwrap();
+        assert!(
+            requests[0].contains("user-agent: mihomo/v1.18.0\r\n"),
+            "the configured global UA must reach the wire: {}",
+            requests[0]
+        );
+        assert!(
+            !requests[1].contains("mihomo/v1.18.0"),
+            "the request UA replaces the global: {}",
+            requests[1]
+        );
+        assert!(
+            requests[1].contains("user-agent: custom/1\r\n"),
+            "{}",
+            requests[1]
+        );
+        assert_eq!(
+            requests[1]
+                .lines()
+                .filter(|line| line.starts_with("user-agent:"))
+                .count(),
+            1
         );
     }
 }

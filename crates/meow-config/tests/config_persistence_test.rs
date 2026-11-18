@@ -141,6 +141,34 @@ fn save_roundtrip_with_proxy_groups() {
     assert_eq!(groups[0].tolerance, Some(150));
 }
 
+/// Issue #974: `global-client-fingerprint` / `global-ua` are typed
+/// top-level fields — a committed save keeps them under their mihomo
+/// kebab-case names instead of dropping into the `extra` unknown-key
+/// bucket, and the reload restores both verbatim.
+#[test]
+fn save_roundtrips_global_client_fingerprint_and_global_ua() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("config.yaml");
+    let path_str = path.to_str().unwrap();
+
+    let mut raw = minimal_raw_config();
+    raw.global_client_fingerprint = Some("chrome".into());
+    raw.global_ua = Some("mihomo/v1.18.0".into());
+    save_raw_config(path_str, &raw).unwrap();
+
+    let content = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        content.contains("global-client-fingerprint: chrome"),
+        "{content}"
+    );
+    assert!(content.contains("global-ua: mihomo/v1.18.0"), "{content}");
+    let loaded: RawConfig = serde_saphyr::from_str(&content).unwrap();
+    assert_eq!(loaded.global_client_fingerprint.as_deref(), Some("chrome"));
+    assert_eq!(loaded.global_ua.as_deref(), Some("mihomo/v1.18.0"));
+    assert!(!loaded.extra.contains_key("global-client-fingerprint"));
+    assert!(!loaded.extra.contains_key("global-ua"));
+}
+
 #[test]
 fn save_overwrites_previous_backup() {
     let dir = tempfile::tempdir().unwrap();

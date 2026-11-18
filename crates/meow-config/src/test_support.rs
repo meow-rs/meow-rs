@@ -202,6 +202,15 @@ pub(crate) fn ech_dns_serial() -> &'static tokio::sync::Mutex<()> {
     SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
+/// Serializes tests that write `meow_common::set_global_ua` — a
+/// process-global the internal-HTTP/health emitters read per request, so a
+/// parallel test's setter would race the wire check. Callers must restore
+/// the cleared state before returning.
+pub(crate) fn global_ua_serial() -> &'static tokio::sync::Mutex<()> {
+    static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// How a [`ScriptedProxy`]'s `dial_tcp` behaves.
 #[derive(Clone, Copy)]
 pub(crate) enum Dial {

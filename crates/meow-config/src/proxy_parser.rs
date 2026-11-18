@@ -477,23 +477,86 @@ fn parse_node_dialer_opts(
     })
 }
 
+/// Normalize a raw `global-client-fingerprint` or per-node
+/// `client-fingerprint` value: trim whitespace and ASCII-lowercase.
+/// Empty or `"none"` returns `None` (issue #974, mihomo's `len == 0`).
+pub fn normalize_client_fingerprint(raw: Option<&str>) -> Option<String> {
+    let s = raw?.trim();
+    if s.is_empty() || s.eq_ignore_ascii_case("none") {
+        return None;
+    }
+    Some(s.to_ascii_lowercase())
+}
+
+/// Resolve a node's `client-fingerprint` against the top-level
+/// `global-client-fingerprint` (issue #974, mihomo's per-constructor
+/// `option.ClientFingerprint == ""` fallback — applied at parse time):
+/// absent / `null` / `""` / whitespace-only inherits the (normalized)
+/// global; an explicit `none` opts out — except under `keep_none_literal`
+/// (vless+REALITY, where no uTLS hello exists to send unshaped) which
+/// passes `"none"` through so `HelloProfile::resolve` warns and uses
+/// Chrome. Non-string values are a hard error, as `trusttunnel`/`anytls`
+/// already did.
+// Every consumer arm is feature-gated; a `default-features = false`
+// downstream (meow-api) compiles them all out.
+#[cfg_attr(
+    not(any(
+        feature = "ss",
+        feature = "trusttunnel",
+        feature = "vless",
+        feature = "anytls",
+        feature = "vmess"
+    )),
+    allow(dead_code)
+)]
+fn resolve_node_client_fingerprint(
+    config: &HashMap<String, serde_json::Value>,
+    context: &str,
+    global_client_fingerprint: Option<&str>,
+    keep_none_literal: bool,
+) -> std::result::Result<Option<String>, String> {
+    match config.get("client-fingerprint") {
+        None | Some(serde_json::Value::Null) => {
+            Ok(normalize_client_fingerprint(global_client_fingerprint))
+        }
+        Some(serde_json::Value::String(s)) => {
+            let trimmed = s.trim();
+            if trimmed.is_empty() {
+                Ok(normalize_client_fingerprint(global_client_fingerprint))
+            } else if trimmed.eq_ignore_ascii_case("none") {
+                if keep_none_literal {
+                    Ok(Some("none".to_string()))
+                } else {
+                    Ok(None)
+                }
+            } else {
+                Ok(Some(trimmed.to_ascii_lowercase()))
+            }
+        }
+        Some(_) => Err(format!("{context}: client-fingerprint must be a string")),
+    }
+}
+
 pub fn parse_proxy(
     config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let dialer: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
         std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
-    parse_proxy_with_dialer(config, &dialer, ipv6)
+    parse_proxy_with_dialer_and_fp(config, &dialer, ipv6, None)
 }
 
 /// [`parse_proxy`] for a static `proxies:` entry. A `type: direct` entry
 /// without its own `dns:` also follows `resolver`'s
 /// `dns.direct-nameserver`, like the built-in DIRECT
 /// ([`DirectAdapter::with_direct_resolver_slot`]).
+/// `global_client_fingerprint` is the config's top-level
+/// `global-client-fingerprint` (issue #974).
 pub(crate) fn parse_static_proxy(
     config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
     resolver: Option<&meow_dns::ResolverSlot>,
+    global_client_fingerprint: Option<&str>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     match (config.get("type").and_then(|v| v.as_str()), resolver) {
         (Some("direct"), Some(slot)) => {
@@ -507,7 +570,11 @@ pub(crate) fn parse_static_proxy(
                     .with_node_dialer_opts(parse_node_dialer_opts(config, name)?),
             ))
         }
-        _ => parse_proxy(config, ipv6),
+        _ => {
+            let dialer: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+                std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+            parse_proxy_with_dialer_and_fp(config, &dialer, ipv6, global_client_fingerprint)
+        }
     }
 }
 
@@ -614,6 +681,20 @@ pub fn parse_proxy_provider_node(
     allow_external_plugin: bool,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
+    parse_proxy_provider_node_with_fp(config, ipv6, allow_external_plugin, dialer, None)
+}
+
+/// [`parse_proxy_provider_node`] honoring the config's top-level
+/// `global-client-fingerprint` (issue #974): the provider snapshot is
+/// parsed under the fingerprint committed for that config load, so a
+/// fingerprint change forces the provider adapters to rebuild.
+pub fn parse_proxy_provider_node_with_fp(
+    config: &HashMap<String, serde_json::Value>,
+    ipv6: bool,
+    allow_external_plugin: bool,
+    dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
+    global_client_fingerprint: Option<&str>,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
     if !allow_external_plugin && node_selects_external_plugin(config) {
         let name = config.get("name").and_then(|v| v.as_str()).unwrap_or("?");
         let plugin = config.get("plugin").and_then(|v| v.as_str()).unwrap_or("");
@@ -625,7 +706,7 @@ pub fn parse_proxy_provider_node(
         ));
     }
     let _ = allow_external_plugin;
-    parse_proxy_with_dialer(config, dialer, ipv6)
+    parse_proxy_with_dialer_and_fp(config, dialer, ipv6, global_client_fingerprint)
 }
 
 /// Like [parse_proxy] but injects a custom [meow_proxy::dialer::TcpDialer]
@@ -637,6 +718,18 @@ pub fn parse_proxy_with_dialer(
     config: &HashMap<String, serde_json::Value>,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
     ipv6: bool,
+) -> std::result::Result<Arc<dyn Proxy>, String> {
+    parse_proxy_with_dialer_and_fp(config, dialer, ipv6, None)
+}
+
+/// [`parse_proxy_with_dialer`] honoring the config's top-level
+/// `global-client-fingerprint` (issue #974). The fingerprint is baked
+/// into the adapters this call constructs — there is no runtime global.
+pub fn parse_proxy_with_dialer_and_fp(
+    config: &HashMap<String, serde_json::Value>,
+    dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
+    ipv6: bool,
+    global_client_fingerprint: Option<&str>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let name = config
         .get("name")
@@ -651,10 +744,15 @@ pub fn parse_proxy_with_dialer(
     // wrapper the leaf produces. Provider nodes reach the same fields
     // through this single parse path.
     let node_opts = parse_node_dialer_opts(config, name)?;
+    // Every consumer arm below is feature-gated; a build with none of the
+    // uTLS-aware protocols compiled in would otherwise warn it unused.
+    let _ = global_client_fingerprint;
 
     match proxy_type {
         #[cfg(feature = "trusttunnel")]
-        "trusttunnel" => parse_trusttunnel(name, config, dialer, node_opts),
+        "trusttunnel" => {
+            parse_trusttunnel(name, config, dialer, node_opts, global_client_fingerprint)
+        }
         #[cfg(feature = "ss")]
         "ss" => {
             let server = config
@@ -685,7 +783,8 @@ pub fn parse_proxy_with_dialer(
                 Some(value) => Some(value.as_str().ok_or("ss: `plugin` must be a string")?),
             };
             let plugin_opts_str = config.get("plugin-opts").and_then(serialize_plugin_opts);
-            let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
+            let client_fingerprint =
+                resolve_node_client_fingerprint(config, "ss", global_client_fingerprint, false)?;
 
             // A SIP003 *external* plugin is a local subprocess spawned by
             // `ShadowsocksAdapter::new`, and the adapter deliberately dials it
@@ -724,7 +823,7 @@ pub fn parse_proxy_with_dialer(
                 udp,
                 plugin,
                 plugin_opts_str.as_deref(),
-                client_fingerprint,
+                client_fingerprint.as_deref(),
                 Arc::clone(dialer),
             )
             .map_err(|e| format!("ss: {e}"))?;
@@ -804,7 +903,7 @@ pub fn parse_proxy_with_dialer(
         }
         #[cfg(feature = "vless")]
         "vless" => {
-            let adapter = parse_vless(name, config, dialer)?;
+            let adapter = parse_vless(name, config, dialer, global_client_fingerprint)?;
             Ok(Arc::new(
                 WrappedProxy::new(Box::new(adapter))
                     .with_node_dialer_opts(node_opts)
@@ -836,7 +935,7 @@ pub fn parse_proxy_with_dialer(
         }
         #[cfg(feature = "anytls")]
         "anytls" => {
-            let adapter = parse_anytls(name, config)?;
+            let adapter = parse_anytls(name, config, global_client_fingerprint)?;
             // WireGuard-shaped injection: a proxy dialer becomes the
             // client's per-session transport dialer — the raw chained
             // stream the client layers its own TLS + session pool on — so
@@ -873,7 +972,7 @@ pub fn parse_proxy_with_dialer(
         }
         #[cfg(feature = "vmess")]
         "vmess" => {
-            let adapter = parse_vmess(name, config, dialer)?;
+            let adapter = parse_vmess(name, config, dialer, global_client_fingerprint)?;
             Ok(Arc::new(
                 WrappedProxy::new(Box::new(adapter))
                     .with_node_dialer_opts(node_opts)
@@ -1435,6 +1534,7 @@ fn parse_trusttunnel(
     config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
     node_opts: meow_common::NodeDialerOpts,
+    global_client_fingerprint: Option<&str>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let required = |key: &str| {
         config
@@ -1539,9 +1639,13 @@ fn parse_trusttunnel(
     tls.verify_name = text("name-cert-verify")?
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
-    tls.fingerprint = text("client-fingerprint")?
-        .filter(|s| !s.is_empty())
-        .map(str::to_owned);
+    // `quic: true` already rejected a per-node `client-fingerprint` above;
+    // the global fallback is TCP uTLS-only and does not apply to H3 either.
+    tls.fingerprint = if quic {
+        None
+    } else {
+        resolve_node_client_fingerprint(config, "trusttunnel", global_client_fingerprint, false)?
+    };
     let mut options = meow_proxy::trusttunnel::Options::new(
         required("username")?.into(),
         required("password")?.into(),
@@ -1676,6 +1780,7 @@ fn parse_trusttunnel(
 fn parse_anytls(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
+    global_client_fingerprint: Option<&str>,
 ) -> std::result::Result<meow_proxy::AnytlsAdapter, String> {
     let server = config
         .get("server")
@@ -1720,7 +1825,12 @@ fn parse_anytls(
         skip_cert_verify,
         fingerprint: optional_string("fingerprint")?,
         name_cert_verify: optional_string("name-cert-verify")?,
-        client_fingerprint: optional_string("client-fingerprint")?,
+        client_fingerprint: resolve_node_client_fingerprint(
+            config,
+            &format!("anytls[{name}]"),
+            global_client_fingerprint,
+            false,
+        )?,
         alpn,
     };
     meow_proxy::AnytlsAdapter::new_with_tls(name, server, port, password, &options, udp)
@@ -2744,6 +2854,7 @@ fn parse_vless(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+    global_client_fingerprint: Option<&str>,
 ) -> std::result::Result<VlessAdapter, String> {
     let server = config
         .get("server")
@@ -2794,10 +2905,19 @@ fn parse_vless(
         .get("network")
         .and_then(|v| v.as_str())
         .unwrap_or("tcp");
-    let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
 
     // ── Reality opts ──────────────────────────────────────────────────────
     let reality = parse_vless_reality_opts(name, config)?;
+    // `global-client-fingerprint` (issue #974) fills an omitted node
+    // fingerprint; under REALITY an explicit `none` stays the literal
+    // "none" so `HelloProfile::resolve` warns and falls back to Chrome —
+    // mihomo's behavior, since no unshaped hello exists to send there.
+    let client_fingerprint = resolve_node_client_fingerprint(
+        config,
+        "vless",
+        global_client_fingerprint,
+        reality.is_some(),
+    )?;
     if reality.is_some() {
         if !tls {
             return Err("vless: reality-opts requires `tls: true`".into());
@@ -2942,7 +3062,7 @@ fn parse_vless(
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
         tls_cfg.alpn = default_transport_alpn(network, alpn);
-        tls_cfg.fingerprint = client_fingerprint.map(std::string::ToString::to_string);
+        tls_cfg.fingerprint = client_fingerprint;
         tls_cfg.reality = reality;
 
         // ── ECH opts ────────────────────────────────────────────────────
@@ -3912,6 +4032,7 @@ fn parse_vmess(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+    global_client_fingerprint: Option<&str>,
 ) -> std::result::Result<meow_proxy::VmessAdapter, String> {
     use meow_proxy::vmess::header::Security;
 
@@ -3992,7 +4113,8 @@ fn parse_vmess(
         .get("network")
         .and_then(|v| v.as_str())
         .unwrap_or("tcp");
-    let client_fingerprint = config.get("client-fingerprint").and_then(|v| v.as_str());
+    let client_fingerprint =
+        resolve_node_client_fingerprint(config, "vmess", global_client_fingerprint, false)?;
 
     // Build transport chain (same pattern as VLESS)
     let mut chain = TransportChain::empty();
@@ -4007,7 +4129,7 @@ fn parse_vmess(
         let mut tls_cfg = TlsConfig::new(sni);
         tls_cfg.skip_cert_verify = skip_cert_verify;
         tls_cfg.alpn = default_transport_alpn(network, alpn);
-        tls_cfg.fingerprint = client_fingerprint.map(std::string::ToString::to_string);
+        tls_cfg.fingerprint = client_fingerprint;
         let tls_layer =
             TlsLayer::new(&tls_cfg).map_err(|e| format!("vmess: TLS layer error: {e}"))?;
         chain.push(Box::new(tls_layer));
@@ -4496,6 +4618,157 @@ mod tests {
         assert_eq!(decoded.len(), 32);
         // Garbage is still rejected.
         assert!(decode_raw_url_base64_lenient("!!!not base64!!!").is_none());
+    }
+
+    // ─── global-client-fingerprint (issue #974) ─────────────────────────
+
+    #[test]
+    fn normalize_client_fingerprint_trims_lowercases_and_clears() {
+        for (raw, expected) in [
+            (None, None),
+            (Some(""), None),
+            (Some("   "), None),
+            (Some("none"), None),
+            (Some(" NoNe "), None),
+            (Some(" Chrome "), Some("chrome")),
+            (Some("FIREFOX120"), Some("firefox120")),
+            (Some("random"), Some("random")),
+        ] {
+            assert_eq!(
+                normalize_client_fingerprint(raw).as_deref(),
+                expected,
+                "{raw:?}"
+            );
+        }
+    }
+
+    /// The per-node resolution contract (mihomo's `ClientFingerprint == ""`
+    /// fallback): absent/null/empty/whitespace inherits the normalized
+    /// global, an explicit `none` opts out — literally under REALITY, where
+    /// no unshaped hello exists — and an explicit value always wins.
+    #[test]
+    fn resolve_node_client_fingerprint_precedence() {
+        let node = |extra: &str| -> HashMap<String, serde_json::Value> {
+            serde_saphyr::from_str(&format!("name: n\ntype: socks5\n{extra}")).unwrap()
+        };
+        for cfg in [
+            node(""),
+            node("client-fingerprint: null\n"),
+            node("client-fingerprint: \"\"\n"),
+            node("client-fingerprint: \"  \"\n"),
+        ] {
+            assert_eq!(
+                resolve_node_client_fingerprint(&cfg, "ss", Some(" Chrome "), false)
+                    .unwrap()
+                    .as_deref(),
+                Some("chrome"),
+                "{cfg:?} must inherit the global"
+            );
+            assert_eq!(
+                resolve_node_client_fingerprint(&cfg, "ss", None, false).unwrap(),
+                None,
+                "{cfg:?} must stay unset with no global"
+            );
+        }
+        let opt_out = node("client-fingerprint: none\n");
+        assert_eq!(
+            resolve_node_client_fingerprint(&opt_out, "ss", Some("chrome"), false).unwrap(),
+            None,
+            "explicit none must opt out of the global"
+        );
+        assert_eq!(
+            resolve_node_client_fingerprint(&opt_out, "vless", Some("chrome"), true)
+                .unwrap()
+                .as_deref(),
+            Some("none"),
+            "REALITY keeps the literal so profile resolution warns + falls back"
+        );
+        let winner = node("client-fingerprint: Safari\n");
+        assert_eq!(
+            resolve_node_client_fingerprint(&winner, "ss", Some("chrome"), false)
+                .unwrap()
+                .as_deref(),
+            Some("safari"),
+            "an explicit node value wins, normalized"
+        );
+    }
+
+    #[test]
+    fn resolve_node_client_fingerprint_rejects_non_string() {
+        let cfg: HashMap<String, serde_json::Value> =
+            serde_saphyr::from_str("name: n\ntype: vmess\nclient-fingerprint: [chrome]\n").unwrap();
+        assert_eq!(
+            resolve_node_client_fingerprint(&cfg, "vmess", None, false).unwrap_err(),
+            "vmess: client-fingerprint must be a string"
+        );
+    }
+
+    /// VLESS + REALITY is the headline contract: a verbatim mihomo config
+    /// declares the fingerprint only at the top level, so the node must
+    /// inherit it — while the same node with neither a node nor a global
+    /// fingerprint keeps the uTLS hard error.
+    #[cfg(feature = "vless")]
+    #[test]
+    fn vless_reality_inherits_global_client_fingerprint() {
+        const NODE: &str = "name: v\ntype: vless\nserver: example.com\nport: 443\nuuid: b831381d-6324-4d53-ad4f-8cda48b30811\ntls: true\nreality-opts:\n  public-key: hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo\n";
+        let direct: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+            std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+
+        let bare = proxy_config(NODE);
+        let err = parse_proxy_with_dialer_and_fp(&bare, &direct, false, None)
+            .err()
+            .expect("REALITY without any fingerprint must stay refused");
+        assert!(
+            err.contains("REALITY is based on uTLS, please set a client-fingerprint"),
+            "{err}"
+        );
+        parse_proxy_with_dialer_and_fp(&bare, &direct, false, Some("chrome"))
+            .expect("the global fingerprint must satisfy REALITY");
+
+        // An explicit node fingerprint wins over the global; an explicit
+        // `none` stays the REALITY literal (warn + Chrome fallback), which
+        // counts as set for the uTLS gate.
+        let own = proxy_config(&format!("{NODE}client-fingerprint: firefox\n"));
+        parse_proxy_with_dialer_and_fp(&own, &direct, false, Some("chrome"))
+            .expect("the node fingerprint must apply");
+        let none = proxy_config(&format!("{NODE}client-fingerprint: none\n"));
+        parse_proxy_with_dialer_and_fp(&none, &direct, false, Some("chrome"))
+            .expect("explicit none stays the REALITY literal, not a parse error");
+    }
+
+    /// `quic: true` runs over quiche — no uTLS exists to shape, so the
+    /// global must not be inherited there, while a per-node
+    /// `client-fingerprint` keeps its "cannot honor" rejection.
+    #[cfg(feature = "trusttunnel-h3")]
+    #[test]
+    fn trusttunnel_quic_ignores_global_client_fingerprint() {
+        let direct: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+            std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+        let quic = proxy_config(
+            "name: t\ntype: trusttunnel\nserver: t.test\nport: 443\nusername: u\npassword: p\nquic: true\n",
+        );
+        parse_proxy_with_dialer_and_fp(&quic, &direct, false, Some("chrome"))
+            .expect("the global fingerprint is TCP-only — H3 must not inherit it");
+        let with_node = proxy_config(
+            "name: t\ntype: trusttunnel\nserver: t.test\nport: 443\nusername: u\npassword: p\nquic: true\nclient-fingerprint: chrome\n",
+        );
+        let err = parse_proxy_with_dialer_and_fp(&with_node, &direct, false, Some("chrome"))
+            .err()
+            .expect("a per-node fingerprint under H3 stays refused");
+        assert!(err.contains("cannot honor client-fingerprint"), "{err}");
+    }
+
+    /// Hysteria2's `fingerprint` is certificate pinning, a different field —
+    /// the global uTLS fallback must not reach it.
+    #[cfg(feature = "hysteria2")]
+    #[test]
+    fn hysteria2_is_unaffected_by_global_client_fingerprint() {
+        let direct: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
+            std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
+        let cfg =
+            proxy_config("name: h\ntype: hysteria2\nserver: h.test\nport: 443\npassword: p\n");
+        parse_proxy_with_dialer_and_fp(&cfg, &direct, false, Some("chrome"))
+            .expect("hysteria2 must ignore the uTLS global entirely");
     }
 
     /// `support-x25519mlkem768` reaches `RealityConfig` verbatim; absent
@@ -5135,7 +5408,7 @@ tls: true
         let slot = meow_dns::new_resolver_slot(Arc::new(main));
 
         let cfg = direct_config("name: 直连\ntype: direct\n");
-        let proxy = parse_static_proxy(&cfg, true, Some(&slot)).unwrap();
+        let proxy = parse_static_proxy(&cfg, true, Some(&slot), None).unwrap();
         let meta = Metadata {
             network: meow_common::Network::Udp,
             host: "node.test".into(),

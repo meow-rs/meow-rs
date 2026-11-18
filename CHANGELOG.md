@@ -10,6 +10,24 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- `global-client-fingerprint` and `global-ua` — mihomo's two top-level
+  globals (issue #974). `global-client-fingerprint` is the default uTLS
+  ClientHello profile for `proxies:`/`proxy-providers:` nodes omitting
+  `client-fingerprint`: the node value wins, an explicit `none`/`""` opts
+  out — under VLESS+REALITY the literal `none` passes through to the
+  warn-and-Chrome fallback, matching upstream — and an unsupported name
+  warns once per rebuild and degrades to the TLS backend's defaults. The
+  value is config-threaded, not a process global: it is baked into the
+  adapters at parse, so a `PUT /configs` change rebuilds inheriting
+  nodes, and a changed global fails provider identity so provider feeds
+  re-parse too. `global-ua` overrides the `User-Agent` internal HTTP
+  fetches (providers, subscriptions, geodata, external-ui) and latency
+  probes send — `clash.meta/<version>` by default, `""` clears, and a
+  request-supplied `User-Agent` still wins. Values carrying CR/LF/NUL or
+  other control bytes are rejected at admission; a rejected `PUT`/`PATCH`
+  candidate never mutates the live override. `PATCH /configs` applies
+  `global-ua` immediately and `GET /configs` reports both keys.
+
 - **WireGuard outbound** (`type: wireguard`) — userspace WireGuard via a vendored
   patch of `boringtun 0.7.1` (ring replaced by workspace RustCrypto crates) over
   smoltcp; full mihomo config surface except `dns` (Phase-1: ignored) and

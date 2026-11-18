@@ -980,6 +980,177 @@ async fn patch_configs_interface_name_lifecycle() {
     assert_eq!(get_iface(&state).await, "");
 }
 
+/// Issue #974: `PATCH /configs` with `global-ua` installs the process-wide
+/// UA override the internal fetchers and probes send, GET echoes it, `""`
+/// clears back to `clash.meta/<version>`, and a value carrying header bytes
+/// is rejected without mutating the live override or the committed raw.
+/// `global-client-fingerprint` is exposed on GET but not PATCHable —
+/// adapters bake it at parse, so it only changes through `PUT /configs`.
+///
+/// `GLOBAL_UA` is process-wide state every config commit re-asserts —
+/// like `global_interface_name` above, the set-side assertions retry under
+/// `CONFIG_MUTATION` against racing writers.
+#[tokio::test]
+async fn patch_configs_global_ua_lifecycle() {
+    let state = test_state_default();
+    let patch = |body: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = body.to_string();
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(payload))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get_ua = |state: &Arc<AppState>| {
+        let app = create_router(Arc::clone(state));
+        async move {
+            let json = body_json(
+                app.oneshot(
+                    Request::get("/configs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await;
+            (
+                json["global-ua"].as_str().unwrap().to_string(),
+                json["global-client-fingerprint"]
+                    .as_str()
+                    .unwrap()
+                    .to_string(),
+            )
+        }
+    };
+
+    // Unset: the mihomo-compatible empty string, both keys exposed.
+    assert_eq!(get_ua(&state).await, ("".into(), "".into()));
+
+    // Set → the live global, the raw, and GET all carry it (retry loop:
+    // a parallel writer's commit can reset the shared global).
+    let mut attempts = 0;
+    loop {
+        let resp = patch(r#"{"global-ua":"mihomo/v1.18.0"}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua().as_deref() == Some("mihomo/v1.18.0") {
+            assert_eq!(get_ua(&state).await, ("mihomo/v1.18.0".into(), "".into()));
+            assert_eq!(
+                state.raw_config.read().global_ua.as_deref(),
+                Some("mihomo/v1.18.0")
+            );
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting the global UA");
+    }
+
+    // Header bytes are refused — `state.raw_config` is this test's own
+    // cell, so the unmutated check is race-free.
+    let resp = patch("{\"global-ua\":\"bad\\r\\nua\"}").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        state.raw_config.read().global_ua.as_deref(),
+        Some("mihomo/v1.18.0"),
+        "a rejected PATCH must not reach the committed raw"
+    );
+    assert_ne!(
+        meow_common::global_ua().as_deref(),
+        Some("bad\r\nua"),
+        "a rejected PATCH must never install its value"
+    );
+
+    // `""` clears the live override — race-free to observe since every
+    // other writer commits `None`.
+    let resp = patch(r#"{"global-ua":""}"#).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    assert!(meow_common::global_ua().is_none());
+    assert_eq!(get_ua(&state).await, ("".into(), "".into()));
+}
+
+/// Issue #974: `PUT /configs` commits `global-ua` and
+/// `global-client-fingerprint` from the new document — the UA installs
+/// process-wide, the fingerprint lands in the committed raw GET reports.
+/// A document whose `global-ua` carries header bytes is refused and
+/// never mutates the live override.
+#[tokio::test]
+async fn put_configs_commits_global_ua_and_client_fingerprint() {
+    use base64::Engine as _;
+    let state = test_state_default();
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    // A document with header-injection bytes in `global-ua` fails at
+    // candidate validation — the live override is untouched (whatever a
+    // racing writer last committed — never this bad value).
+    let resp = put("global-ua: \"bad\\r\\nua\"\n").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_ne!(meow_common::global_ua().as_deref(), Some("bad\r\nua"));
+    assert!(state.raw_config.read().global_ua.is_none());
+
+    // The happy path: both keys commit together.
+    let mut attempts = 0;
+    loop {
+        let resp = put("global-ua: mihomo/v1.18.0\nglobal-client-fingerprint: chrome\n").await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            state.raw_config.read().global_client_fingerprint.as_deref(),
+            Some("chrome")
+        );
+        assert_eq!(
+            state.raw_config.read().global_ua.as_deref(),
+            Some("mihomo/v1.18.0")
+        );
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        if meow_common::global_ua().as_deref() == Some("mihomo/v1.18.0") {
+            // GET inside the lane: the live UA it reports can't be reset
+            // by a racing commit while it's held.
+            let json = body_json(
+                create_router(Arc::clone(&state))
+                    .oneshot(
+                        Request::get("/configs")
+                            .body(axum::body::Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(json["global-ua"], "mihomo/v1.18.0");
+            assert_eq!(json["global-client-fingerprint"], "chrome");
+            break;
+        }
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting the global UA");
+    }
+}
+
 #[tokio::test]
 async fn get_traffic() {
     let state = test_state_default();
@@ -8846,6 +9017,7 @@ async fn state_with_providers(
         false,
         false,
         &Default::default(),
+        None,
         None,
         &mut meow_config::DroppedProviders::default(),
     )

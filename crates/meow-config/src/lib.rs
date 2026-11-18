@@ -535,6 +535,23 @@ fn validate_connection_limit(value: usize) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Validate the raw `global-ua` value (issue #974): trim; `None`/empty
+/// resolves to the default UA. A value with CR/LF/NUL/control bytes is a
+/// Class A rejection — the emitters format it into a raw request head,
+/// so an unchecked newline is header injection. Returns the trimmed
+/// value on success.
+pub fn validate_global_ua(raw_ua: Option<&str>) -> Result<Option<&str>, anyhow::Error> {
+    let trimmed = raw_ua.map(str::trim).filter(|s| !s.is_empty());
+    if let Some(ua) = trimmed {
+        anyhow::ensure!(
+            meow_common::is_valid_http_header_value(ua),
+            "global-ua contains bytes that are not legal in an HTTP header \
+             value (newline/NUL/control characters are rejected)"
+        );
+    }
+    Ok(trimmed)
+}
+
 /// Parse and validate the raw `tun:` block. Returns `TunConfig::default()`
 /// (disabled) when the block is absent. `fake_ip_range` is the config's
 /// `dns.fake-ip-range`, which sets the default `inet4-address`.
@@ -2265,6 +2282,7 @@ fn parse_dialered_leaf(
     ipv6: bool,
     strict: bool,
     registry: &meow_proxy::dialer::ProxyRegistry,
+    global_client_fingerprint: Option<&str>,
 ) -> Result<ParsedLeaf, anyhow::Error> {
     // Edged blocks always carry `name:` — `collect_dialer_edges` only emits
     // an edge for a block whose name parses.
@@ -2276,7 +2294,12 @@ fn parse_dialered_leaf(
     let target = meow_proxy::dialer::DialerTarget::new(dialer.clone(), registry);
     let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
         Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(key.clone()));
-    match proxy_parser::parse_proxy_with_dialer(raw_proxy, &proxy_dialer, ipv6) {
+    match proxy_parser::parse_proxy_with_dialer_and_fp(
+        raw_proxy,
+        &proxy_dialer,
+        ipv6,
+        global_client_fingerprint,
+    ) {
         // The `ChainedProxy` marker pins the #969 fail-closed verdict on
         // injected entries: unlike the relay-based wrapper below, an
         // injected leaf carries no `DialerProxyAdapter` to report the
@@ -2295,7 +2318,12 @@ fn parse_dialered_leaf(
                  (strict mode): {chain_err}"
             ))
         }
-        Err(chain_err) => match proxy_parser::parse_static_proxy(raw_proxy, ipv6, resolver) {
+        Err(chain_err) => match proxy_parser::parse_static_proxy(
+            raw_proxy,
+            ipv6,
+            resolver,
+            global_client_fingerprint,
+        ) {
             Ok(inner) => {
                 warn!(
                     "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
@@ -2379,6 +2407,7 @@ fn insert_parsed_leaves(
     strict: bool,
     registry: &meow_proxy::dialer::ProxyRegistry,
     dialer_edges: &HashMap<usize, SmolStr>,
+    global_client_fingerprint: Option<&str>,
 ) -> Result<std::collections::HashSet<SmolStr>, anyhow::Error> {
     let mut placeholder_names = std::collections::HashSet::new();
     for (index, raw_proxy) in raw_proxies.iter().enumerate() {
@@ -2392,12 +2421,18 @@ fn insert_parsed_leaves(
                 ipv6,
                 strict,
                 registry,
+                global_client_fingerprint,
             )? {
                 Some(bound) => bound,
                 None => continue,
             }
         } else {
-            match proxy_parser::parse_static_proxy(raw_proxy, ipv6, resolver) {
+            match proxy_parser::parse_static_proxy(
+                raw_proxy,
+                ipv6,
+                resolver,
+                global_client_fingerprint,
+            ) {
                 Ok(proxy) => (proxy, false),
                 Err(e) if strict => {
                     let name = raw_proxy
@@ -2543,21 +2578,23 @@ fn materialize_proxy_providers(
         return Ok(HashMap::new());
     };
     let ipv6 = effective_ipv6(raw.ipv6);
+    let global_fp = raw.global_client_fingerprint.as_deref();
     let mut out = HashMap::with_capacity(raw_map.len());
     for (name, def) in raw_map {
         if let Some(provider) = live.get(name) {
-            if provider.matches_def(def, ipv6) {
+            if provider.matches_def(def, ipv6, global_fp) {
                 out.insert(name.clone(), Arc::clone(provider));
                 continue;
             }
         }
-        match ProxyProvider::new(
+        match ProxyProvider::new_with_client_fingerprint(
             name,
             def,
             cache_dir,
             ipv6,
             strict,
             provider_dialer_registry.clone(),
+            global_fp,
         ) {
             Ok(provider) => {
                 // A new `file:` provider's payload is local content —
@@ -2693,6 +2730,11 @@ fn build_proxy_layer(
     let raw_proxies = raw.proxies.as_deref().unwrap_or(&[]);
     let dialer_edges = collect_dialer_edges(raw_proxies, strict)?;
 
+    // `global-client-fingerprint` (issue #974) is normalized once per
+    // build and baked into each adapter that inherits it — config-threaded,
+    // not a runtime global, so a `PUT /configs` flip rebuilds cleanly.
+    let global_fp =
+        proxy_parser::normalize_client_fingerprint(raw.global_client_fingerprint.as_deref());
     insert_parsed_leaves(
         &mut proxies,
         &mut static_proxy_names,
@@ -2702,6 +2744,7 @@ fn build_proxy_layer(
         strict,
         registry,
         &dialer_edges.by_index,
+        global_fp.as_deref(),
     )?;
 
     let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
@@ -3175,6 +3218,10 @@ fn rebuild_from_raw_impl(
     // and validation/test rebuilds must not reach the network.
     fetch_geodata: bool,
 ) -> Result<RebuildResult, anyhow::Error> {
+    // `global-ua` gate first: an invalid UA is a Class A rejection for
+    // every candidate — validate only; the live process-global is
+    // installed at the commit point (issue #974).
+    validate_global_ua(raw.global_ua.as_deref())?;
     dns_parser::validate_node_policy_sources(raw)?;
     // Warn-only unknown-key reporting (issue #974): classify-and-warn every
     // key the typed schema dropped. Runs on every rebuild pass — startup's
@@ -5529,6 +5576,11 @@ pub async fn build_config(
     cache_dir: Option<&Path>,
 ) -> Result<Config, anyhow::Error> {
     dns_parser::validate_node_policy_sources(&raw)?;
+    // `global-ua` (issue #974): validate, then install the process-global
+    // *before* any provider/subscription/geodata/ECH fetch below emits a
+    // `User-Agent`. A `PUT`/`PATCH` candidate does not reach this lane —
+    // the API's commit point re-asserts it there.
+    meow_common::set_global_ua(validate_global_ua(raw.global_ua.as_deref())?);
     // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
     // sync `parse_proxy` path that follows can stay sync. Failures warn
     // and leave the map unchanged — except the `enable: true` with no
@@ -5602,6 +5654,7 @@ pub async fn build_config(
                 general.ipv6,
                 raw.strict.unwrap_or(false),
                 &provider_dialer_registry,
+                raw.global_client_fingerprint.as_deref(),
                 provider_fetch_deadline(),
                 &mut dropped_providers,
             )
@@ -5944,6 +5997,7 @@ mod missing_plugin_placeholder_tests {
             false,
             &meow_proxy::dialer::ProxyRegistry::default(),
             &HashMap::new(),
+            None,
         )
         .unwrap();
         let bound = proxies
@@ -5968,6 +6022,7 @@ mod missing_plugin_placeholder_tests {
             true,
             &meow_proxy::dialer::ProxyRegistry::default(),
             &HashMap::new(),
+            None,
         )
         .unwrap_err();
         assert!(
@@ -6149,6 +6204,7 @@ mod missing_plugin_placeholder_tests {
             false,
             &meow_proxy::dialer::ProxyRegistry::default(),
             &HashMap::new(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -6174,6 +6230,7 @@ mod missing_plugin_placeholder_tests {
             false,
             &meow_proxy::dialer::ProxyRegistry::default(),
             &HashMap::new(),
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -6292,6 +6349,7 @@ mod dialer_proxy_tests {
             false,
             &registry,
             &edges.by_index,
+            None,
         )?;
         apply_dialer_proxies_validate(proxies, &edges.declared, raw_groups)?;
         for group in raw_groups {
@@ -7047,6 +7105,7 @@ mod dialer_proxy_tests {
                 false,
                 &meow_proxy::dialer::ProxyRegistry::default(),
                 &HashMap::new(),
+                None,
             )
             .unwrap();
         });

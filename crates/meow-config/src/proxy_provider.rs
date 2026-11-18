@@ -85,6 +85,11 @@ pub struct ProxyProvider {
     /// Atomic so a committed `strict`-flip (`PUT /configs`) reaches provider
     /// objects that were reused across the rebuild.
     strict: AtomicBool,
+    /// Normalized `global-client-fingerprint` committed for the config
+    /// generation this provider was built under (issue #974). Nodes
+    /// inherit it at parse, so a changed global must fail `matches_def`
+    /// and rebuild the provider rather than reuse stale adapters.
+    global_client_fingerprint: Option<String>,
     /// Registry every provider node's `dialer-proxy` resolves against
     /// (issue #489). Unlike the per-build registry handed to static proxies,
     /// this handle is republished on every routing install, so provider
@@ -264,6 +269,21 @@ impl ProxyProvider {
         strict: bool,
         dialer_registry: meow_proxy::dialer::ProxyRegistry,
     ) -> Result<Self, String> {
+        Self::new_with_client_fingerprint(name, raw, cache_dir, ipv6, strict, dialer_registry, None)
+    }
+
+    /// [`ProxyProvider::new`] under the config's top-level
+    /// `global-client-fingerprint` (issue #974): provider nodes that omit
+    /// `client-fingerprint` inherit it at parse time.
+    pub fn new_with_client_fingerprint(
+        name: &str,
+        raw: &RawProxyProvider,
+        cache_dir: Option<&Path>,
+        ipv6: bool,
+        strict: bool,
+        dialer_registry: meow_proxy::dialer::ProxyRegistry,
+        global_client_fingerprint: Option<&str>,
+    ) -> Result<Self, String> {
         // Any on-disk location (read or write) must stay inside `cache_dir`
         // (issue #429): `path:` — and the provider *name* feeding the implicit
         // cache location — are attacker-influenced when the config document
@@ -442,6 +462,9 @@ impl ProxyProvider {
             ipv6,
             allow_external_plugin: raw.allow_external_plugin.unwrap_or(false),
             strict: AtomicBool::new(strict),
+            global_client_fingerprint: crate::proxy_parser::normalize_client_fingerprint(
+                global_client_fingerprint,
+            ),
             dialer_registry,
             download_proxy,
             deferred_initial: AtomicBool::new(false),
@@ -482,12 +505,23 @@ impl ProxyProvider {
     }
 
     /// `true` when this provider was built from `def` under the same
-    /// effective `ipv6` — the identity check `use:`/`include-all` rebuilds
-    /// apply before deciding to reuse the live object. A changed
-    /// declaration rebuilds the provider instead of silently fetching the
-    /// old source forever (issue #533 review).
-    pub fn matches_def(&self, def: &RawProxyProvider, ipv6: bool) -> bool {
-        self.ipv6 == ipv6 && self.def == Self::def_identity(def)
+    /// effective `ipv6` and `global-client-fingerprint` — the identity
+    /// check `use:`/`include-all` rebuilds apply before deciding to reuse
+    /// the live object. A changed declaration rebuilds the provider
+    /// instead of silently fetching the old source forever (issue #533
+    /// review); a changed global fingerprint rebuilds it because the
+    /// adapters it parses bake that profile in (issue #974).
+    pub fn matches_def(
+        &self,
+        def: &RawProxyProvider,
+        ipv6: bool,
+        global_client_fingerprint: Option<&str>,
+    ) -> bool {
+        self.ipv6 == ipv6
+            && self.global_client_fingerprint.as_deref()
+                == crate::proxy_parser::normalize_client_fingerprint(global_client_fingerprint)
+                    .as_deref()
+            && self.def == Self::def_identity(def)
     }
 
     /// Create a live filtered view of this provider's proxies for one group
@@ -1276,22 +1310,24 @@ impl ProxyProvider {
             .or(self.provider_dialer.as_deref())
             .or(node_dialer)
         else {
-            return proxy_parser::parse_proxy_provider_node(
+            return proxy_parser::parse_proxy_provider_node_with_fp(
                 raw_map,
                 self.ipv6,
                 self.allow_external_plugin,
                 &direct,
+                self.global_client_fingerprint.as_deref(),
             );
         };
         // `override.dialer-proxy: ""` is the upstream "clear the chain"
         // knob — the override wrote over both lower levels, so the node
         // dials direct by operator intent, not by a missing field.
         if dialer_name.is_empty() {
-            return proxy_parser::parse_proxy_provider_node(
+            return proxy_parser::parse_proxy_provider_node_with_fp(
                 raw_map,
                 self.ipv6,
                 self.allow_external_plugin,
                 &direct,
+                self.global_client_fingerprint.as_deref(),
             );
         }
         if dialer_name == raw_name {
@@ -1301,11 +1337,12 @@ impl ProxyProvider {
         let target = meow_proxy::dialer::DialerTarget::new(dialer_name, &self.dialer_registry);
         let chained: Arc<dyn meow_proxy::dialer::TcpDialer> =
             Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(raw_name));
-        let proxy = match proxy_parser::parse_proxy_provider_node(
+        let proxy = match proxy_parser::parse_proxy_provider_node_with_fp(
             raw_map,
             self.ipv6,
             self.allow_external_plugin,
             &chained,
+            self.global_client_fingerprint.as_deref(),
         ) {
             // The `ChainedProxy` marker pins the #969 fail-closed verdict
             // on injected entries, identical to the static `proxies:`
@@ -1318,11 +1355,12 @@ impl ProxyProvider {
                 // The adapter type cannot carry an injected dialer — or the
                 // node is unparseable, in which case the direct re-parse
                 // surfaces the real error.
-                let inner = proxy_parser::parse_proxy_provider_node(
+                let inner = proxy_parser::parse_proxy_provider_node_with_fp(
                     raw_map,
                     self.ipv6,
                     self.allow_external_plugin,
                     &direct,
+                    self.global_client_fingerprint.as_deref(),
                 )?;
                 warn!(
                     provider = %self.name,
@@ -1513,6 +1551,7 @@ pub async fn load_proxy_providers(
         ipv6,
         strict,
         dialer_registry,
+        None,
         crate::provider_fetch_deadline(),
         &mut DroppedProviders::default(),
     )
@@ -1522,25 +1561,34 @@ pub async fn load_proxy_providers(
 /// [`load_proxy_providers`] with an explicit fetch deadline instead of the
 /// process-wide [`crate::provider_fetch_deadline`]. Providers left out
 /// leniently go into `dropped`, for the commit to record.
+/// `global_client_fingerprint` is the committed top-level
+/// `global-client-fingerprint` (issue #974) the providers' nodes inherit.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent config-build input; bundling \
+              them would only rename the same list"
+)]
 pub async fn load_proxy_providers_within(
     raw_map: &HashMap<String, RawProxyProvider>,
     cache_dir: Option<&Path>,
     ipv6: bool,
     strict: bool,
     dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    global_client_fingerprint: Option<&str>,
     deadline: Option<Duration>,
     dropped: &mut DroppedProviders,
 ) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
     let mut result = HashMap::new();
     let mut fetches = Vec::new();
     for (name, raw) in raw_map {
-        let provider = match ProxyProvider::new(
+        let provider = match ProxyProvider::new_with_client_fingerprint(
             name,
             raw,
             cache_dir,
             ipv6,
             strict,
             dialer_registry.clone(),
+            global_client_fingerprint,
         ) {
             Ok(provider) => Arc::new(provider),
             Err(e) if strict => {
@@ -3825,6 +3873,7 @@ header:
             false,
             false,
             &Default::default(),
+            None,
             deadline,
             &mut DroppedProviders::default(),
         )
@@ -4147,6 +4196,7 @@ header:
             true,
             &Default::default(),
             None,
+            None,
             &mut DroppedProviders::default(),
         )
         .await
@@ -4187,6 +4237,7 @@ header:
             true,
             &Default::default(),
             None,
+            None,
             &mut DroppedProviders::default(),
         )
         .await
@@ -4213,6 +4264,7 @@ header:
             true,
             &Default::default(),
             None,
+            None,
             &mut DroppedProviders::default(),
         )
         .await
@@ -4234,6 +4286,7 @@ header:
             false,
             true,
             &Default::default(),
+            None,
             None,
             &mut DroppedProviders::default(),
         )
@@ -4277,6 +4330,65 @@ header:
         assert!(
             p.initial_load_blocking(true).is_err(),
             "a strict file payload defect fails the candidate"
+        );
+    }
+
+    /// Issue #974: a provider node omitting `client-fingerprint` inherits
+    /// the global the provider was built under — and a changed global
+    /// fails `matches_def`, so a `PUT /configs` fingerprint flip rebuilds
+    /// the provider instead of reusing adapters baked under the old one.
+    #[cfg(feature = "vless")]
+    #[test]
+    fn global_client_fingerprint_reaches_provider_nodes_and_identity() {
+        const REALITY_NODE: &str = "proxies:\n  - {name: v, type: vless, server: example.com, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, tls: true, reality-opts: {public-key: hSDwCYkwp1R0i33ctD73Wg2_Og0mOBr066SpjqqbTmo}}\n";
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("nodes.yaml"), REALITY_NODE).unwrap();
+        let def = raw_file_provider("nodes.yaml");
+
+        // No global: the uTLS-less REALITY node stays refused (warn-drop).
+        let p = ProxyProvider::new(
+            "p",
+            &def,
+            Some(dir.path()),
+            false,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        assert!(p.initial_load_blocking(false).unwrap());
+        assert!(
+            p.proxies().is_empty(),
+            "without a global fingerprint the REALITY node must drop"
+        );
+
+        // With a global: the same payload parses through inheritance.
+        let p = ProxyProvider::new_with_client_fingerprint(
+            "p",
+            &def,
+            Some(dir.path()),
+            false,
+            false,
+            Default::default(),
+            Some("chrome"),
+        )
+        .unwrap();
+        assert!(p.initial_load_blocking(false).unwrap());
+        assert_eq!(
+            p.proxies().len(),
+            1,
+            "the node must inherit the global fingerprint"
+        );
+
+        // Identity: only a normalized-equal global still matches.
+        assert!(p.matches_def(&def, false, Some(" Chrome ")));
+        assert!(p.matches_def(&def, false, Some("chrome")));
+        assert!(
+            !p.matches_def(&def, false, Some("firefox")),
+            "a changed global fingerprint must rebuild the provider"
+        );
+        assert!(
+            !p.matches_def(&def, false, None),
+            "clearing the global fingerprint must rebuild the provider"
         );
     }
 
@@ -4469,6 +4581,7 @@ header:
             true,
             &Default::default(),
             None,
+            None,
             &mut DroppedProviders::default(),
         )
         .await
@@ -4513,6 +4626,7 @@ header:
                 false,
                 true,
                 &Default::default(),
+                None,
                 Some(Duration::from_millis(50)),
                 &mut DroppedProviders::default(),
             ),
