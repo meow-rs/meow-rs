@@ -861,6 +861,10 @@ struct ConfigResponse {
     skip_auth_prefixes: Vec<String>,
     #[serde(rename = "routing-mark")]
     routing_mark: u32,
+    /// mihomo's top-level `interface-name` (issue #974) — the live global
+    /// binding ("" when unset), like `routing-mark` above.
+    #[serde(rename = "interface-name")]
+    interface_name: String,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -906,6 +910,11 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
         skip_auth_prefixes: raw.skip_auth_prefixes.clone().unwrap_or_default(),
         // The live mark (what outbound sockets carry), not the document's.
         routing_mark: meow_common::routing_mark(),
+        // The live global interface binding likewise (issue #974).
+        interface_name: meow_common::global_interface_name()
+            .as_deref()
+            .unwrap_or("")
+            .to_string(),
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
@@ -1017,6 +1026,9 @@ struct UpdateConfigRequest {
     log_level: Option<String>,
     #[serde(rename = "routing-mark")]
     routing_mark: Option<u32>,
+    /// mihomo's top-level `interface-name` (issue #974); `""` clears.
+    #[serde(rename = "interface-name")]
+    interface_name: Option<String>,
     tun: Option<TunFields>,
 }
 
@@ -1107,6 +1119,10 @@ async fn update_configs(
         if body.routing_mark.is_some() {
             candidate.routing_mark = body.routing_mark;
         }
+        // `interface-name` rides the same commit (issue #974).
+        if body.interface_name.is_some() {
+            candidate.interface_name = body.interface_name.clone();
+        }
         let preinstalled = preinstall_global_route_binding(&candidate);
         // No routing publish runs here, so tracked TCP predating a
         // pre-installed global-route binding is still live.
@@ -1152,6 +1168,15 @@ async fn update_configs(
         meow_common::set_routing_mark(Some(mark));
         raw.routing_mark = Some(mark);
         info!("routing-mark changed to {mark}");
+    }
+    if let Some(name) = body.interface_name {
+        // The setter normalizes the same way as the node parser (issue
+        // #974): trimmed, empty meaning unset — so `interface-name: ""`
+        // clears.
+        let trimmed = name.trim();
+        meow_common::set_global_interface_name(Some(trimmed));
+        info!("interface-name changed to {trimmed}");
+        raw.interface_name = Some(name);
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -3560,6 +3585,10 @@ async fn swap_config_and_reconcile_tun(
         // Commit point (mihomo re-applies `routing-mark` on every load); a
         // change under pinned managed rules was refused before this.
         meow_common::set_routing_mark(candidate.routing_mark);
+        // `interface-name` re-applies on every load the same way
+        // (issue #974); the setter normalizes — trimmed, empty meaning
+        // unset.
+        meow_common::set_global_interface_name(candidate.interface_name.as_deref());
         let ledger = candidate.traffic_ledger.as_ref();
         let ledger = (
             meow_config::raw::RawTrafficLedger::enabled(ledger),

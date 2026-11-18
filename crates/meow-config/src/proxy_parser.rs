@@ -39,6 +39,14 @@ pub struct WrappedProxy {
     adapter: Box<dyn ProxyAdapter>,
     /// The `dialer-proxy` the adapter dials its server through.
     hop: Option<DialerHop>,
+    /// The `proxies:` entry's per-node dialer fields (issue #974):
+    /// `routing-mark`, `interface-name`, `ip-version`, `tfo`, `mptcp`.
+    /// Resolved over [`meow_common::global_dialer_opts`] at dial time and
+    /// installed as the task-local [`meow_common::dialer_opts_scope`]
+    /// around every adapter dial — so the socket helpers see the node's
+    /// own options wherever the dial leads, including the WireGuard
+    /// endpoint socket bound inside `ensure_pump`.
+    node_opts: meow_common::NodeDialerOpts,
 }
 
 /// An outbound's injected `dialer-proxy` dialer, and the server it dials
@@ -51,7 +59,27 @@ struct DialerHop {
 
 impl WrappedProxy {
     pub fn new(adapter: Box<dyn ProxyAdapter>) -> Self {
-        Self { adapter, hop: None }
+        Self {
+            adapter,
+            hop: None,
+            node_opts: meow_common::NodeDialerOpts::default(),
+        }
+    }
+
+    /// Attach the dialer fields the leaf's `proxies:` block declared
+    /// (issue #974). Every leaf parse path calls this; the built-in
+    /// DIRECT/REJECT wrappers keep the default — no config block exists
+    /// to parse them from.
+    pub fn with_node_dialer_opts(mut self, opts: meow_common::NodeDialerOpts) -> Self {
+        self.node_opts = opts;
+        self
+    }
+
+    /// The node's fields resolved over the *live* globals — read per
+    /// dial, so a `PATCH /configs` `interface-name`/`routing-mark` lands
+    /// on the next dial rather than the next reload.
+    fn effective_dialer_opts(&self) -> meow_common::DialerOpts {
+        meow_common::DialerOpts::resolve(&self.node_opts, &meow_common::global_dialer_opts())
     }
 
     /// `self`, whose adapter the block `config` built with `dialer`
@@ -105,17 +133,35 @@ impl ProxyAdapter for WrappedProxy {
         self.adapter.support_udp()
     }
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-        self.adapter.dial_tcp(metadata).await
+        // The node's resolved dialer opts scope the whole adapter call:
+        // server/target resolution, the TCP socket, and — for WireGuard —
+        // the endpoint UDP socket bound lazily inside `ensure_pump`
+        // (issue #974; `dialer_opts_scope` REPLACES on nesting, so a
+        // chained front hop installs its own opts for the socket it
+        // opens rather than inheriting this node's).
+        meow_common::dialer_opts_scope(
+            self.effective_dialer_opts(),
+            self.adapter.dial_tcp(metadata),
+        )
+        .await
     }
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-        self.adapter.dial_udp(metadata).await
+        meow_common::dialer_opts_scope(
+            self.effective_dialer_opts(),
+            self.adapter.dial_udp(metadata),
+        )
+        .await
     }
     async fn connect_over(
         &self,
         stream: Box<dyn ProxyConn>,
         metadata: &Metadata,
     ) -> Result<Box<dyn ProxyConn>> {
-        self.adapter.connect_over(stream, metadata).await
+        meow_common::dialer_opts_scope(
+            self.effective_dialer_opts(),
+            self.adapter.connect_over(stream, metadata),
+        )
+        .await
     }
 
     /// Forward the peek/commit walk — a wrapped group-typed adapter would
@@ -351,6 +397,86 @@ impl Proxy for ChainedProxy {
     }
 }
 
+/// The mihomo per-node dialer fields shared by every leaf `type:`
+/// (issue #974): `routing-mark`, `interface-name`, `ip-version`, `tfo`,
+/// `mptcp`. Parsed once from the `proxies:` map and carried on the leaf's
+/// [`WrappedProxy`]; `proxy-groups:` entries never reach here, so a group
+/// cannot carry dialer fields at all — matching mihomo v1.19, which
+/// removed group-level dialer options.
+///
+/// Normalization lands here, before [`meow_common::NodeDialerOpts`] sees
+/// it: `routing-mark: 0` and an empty/`null` `interface-name` mean
+/// "unset" (inherit the global); a non-string field or an unknown
+/// `ip-version` is a hard parse error — mihomo fails the node the same
+/// way rather than defaulting.
+fn parse_node_dialer_opts(
+    config: &HashMap<String, serde_json::Value>,
+    name: &str,
+) -> std::result::Result<meow_common::NodeDialerOpts, String> {
+    let routing_mark = match config.get("routing-mark") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let raw = value
+                .as_u64()
+                .ok_or_else(|| format!("{name}: `routing-mark` must be a non-negative integer"))?;
+            let mark = u32::try_from(raw)
+                .map_err(|_| format!("{name}: `routing-mark` {raw} exceeds u32::MAX"))?;
+            (mark != 0).then_some(mark)
+        }
+    };
+    let interface_name = match config.get("interface-name") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(value) => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| format!("{name}: `interface-name` must be a string"))?;
+            let trimmed = raw.trim();
+            // A NUL is a hard error, not normalization: Linux
+            // `SO_BINDTODEVICE` would silently truncate the name at it
+            // and bind the wrong interface (spec §1.2).
+            if trimmed.contains('\0') {
+                return Err(format!(
+                    "{name}: `interface-name` must not contain NUL bytes"
+                ));
+            }
+            (!trimmed.is_empty()).then(|| std::sync::Arc::from(trimmed))
+        }
+    };
+    let ip_version = match config.get("ip-version") {
+        None | Some(serde_json::Value::Null) => meow_common::IpVersion::Dual,
+        Some(value) => {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| format!("{name}: `ip-version` must be a string"))?;
+            meow_common::IpVersion::from_name(raw).ok_or_else(|| {
+                format!(
+                    "{name}: unknown `ip-version` '{raw}' — expected \
+                     dual|ipv4|ipv6|ipv4-prefer|ipv6-prefer"
+                )
+            })?
+        }
+    };
+    let tfo = match config.get("tfo") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| format!("{name}: `tfo` must be a boolean"))?,
+    };
+    let mptcp = match config.get("mptcp") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| format!("{name}: `mptcp` must be a boolean"))?,
+    };
+    Ok(meow_common::NodeDialerOpts {
+        routing_mark,
+        interface_name,
+        ip_version,
+        tfo,
+        mptcp,
+    })
+}
+
 pub fn parse_proxy(
     config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
@@ -376,7 +502,10 @@ pub(crate) fn parse_static_proxy(
                 .and_then(|v| v.as_str())
                 .ok_or("missing proxy name")?;
             let adapter = parse_direct(name, config, ipv6, Some(slot))?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(parse_node_dialer_opts(config, name)?),
+            ))
         }
         _ => parse_proxy(config, ipv6),
     }
@@ -517,10 +646,15 @@ pub fn parse_proxy_with_dialer(
         .get("type")
         .and_then(|v| v.as_str())
         .ok_or("missing proxy type")?;
+    // The shared per-node dialer fields (issue #974) — protocol-agnostic,
+    // so they parse once before the type dispatch and attach to whichever
+    // wrapper the leaf produces. Provider nodes reach the same fields
+    // through this single parse path.
+    let node_opts = parse_node_dialer_opts(config, name)?;
 
     match proxy_type {
         #[cfg(feature = "trusttunnel")]
-        "trusttunnel" => parse_trusttunnel(name, config, dialer),
+        "trusttunnel" => parse_trusttunnel(name, config, dialer, node_opts),
         #[cfg(feature = "ss")]
         "ss" => {
             let server = config
@@ -610,7 +744,9 @@ pub fn parse_proxy_with_dialer(
             #[cfg(not(feature = "mux"))]
             parse_mux_options(name, config)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         #[cfg(feature = "trojan")]
@@ -661,32 +797,42 @@ pub fn parse_proxy_with_dialer(
             #[cfg(not(feature = "mux"))]
             parse_mux_options(name, config)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         #[cfg(feature = "vless")]
         "vless" => {
             let adapter = parse_vless(name, config, dialer)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         "http" => {
             let adapter = parse_http(name, config, dialer)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         "socks5" => {
             let adapter = parse_socks5(name, config, dialer)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         "direct" => {
             reject_unthreaded_dialer(name, "direct", dialer)?;
             let adapter = parse_direct(name, config, ipv6, None)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+            Ok(Arc::new(
+                WrappedProxy::new(Box::new(adapter)).with_node_dialer_opts(node_opts),
+            ))
         }
         #[cfg(feature = "anytls")]
         "anytls" => {
@@ -703,7 +849,9 @@ pub fn parse_proxy_with_dialer(
                 adapter
             };
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         #[cfg(feature = "hysteria2")]
@@ -718,21 +866,27 @@ pub fn parse_proxy_with_dialer(
             // endpoint bind error.
             let adapter = parse_hysteria2(name, config, dialer)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         #[cfg(feature = "vmess")]
         "vmess" => {
             let adapter = parse_vmess(name, config, dialer)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         #[cfg(feature = "snell")]
         "snell" => {
             let adapter = parse_snell(name, config, dialer)?;
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         // WireGuard accepts the mihomo spellings "wireguard" and
@@ -755,7 +909,9 @@ pub fn parse_proxy_with_dialer(
                 adapter
             };
             Ok(Arc::new(
-                WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+                WrappedProxy::new(Box::new(adapter))
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
             ))
         }
         #[cfg(not(feature = "trusttunnel"))]
@@ -1278,6 +1434,7 @@ fn parse_trusttunnel(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
     dialer: &Arc<dyn meow_proxy::dialer::TcpDialer>,
+    node_opts: meow_common::NodeDialerOpts,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let required = |key: &str| {
         config
@@ -1493,7 +1650,9 @@ fn parse_trusttunnel(
     )
     .map_err(|error| error.to_string())?;
     Ok(Arc::new(
-        WrappedProxy::new(Box::new(adapter)).dialing_through(config, dialer),
+        WrappedProxy::new(Box::new(adapter))
+            .with_node_dialer_opts(node_opts)
+            .dialing_through(config, dialer),
     ))
 }
 
@@ -7110,6 +7269,305 @@ tls: true
             placeholder_adapter_type(&cfg),
             Some(meow_common::AdapterType::Shadowsocks),
             "the lenient classifier still lands the node on the placeholder arm"
+        );
+    }
+
+    // ─── per-node dialer opts (issue #974) ─────────────────────────────────
+
+    /// Downcast a parsed leaf to its `WrappedProxy` — every `proxies:`
+    /// entry lands in one.
+    fn wrapped(proxy: &Arc<dyn Proxy>) -> &WrappedProxy {
+        proxy
+            .as_any()
+            .and_then(|any| any.downcast_ref::<WrappedProxy>())
+            .expect("a parsed leaf is a WrappedProxy")
+    }
+
+    /// Every field a `proxies:` entry carries reaches the wrapper.
+    #[test]
+    fn node_dialer_opts_parse_onto_the_leaf_wrapper() {
+        let cfg = proxy_config(
+            "name: d\ntype: direct\nrouting-mark: 8888\ninterface-name: en0\n\
+             ip-version: ipv4-prefer\ntfo: true\nmptcp: true\n",
+        );
+        let proxy = parse_proxy(&cfg).expect("dialer fields parse");
+        let opts = &wrapped(&proxy).node_opts;
+        assert_eq!(opts.routing_mark, Some(8888));
+        assert_eq!(opts.interface_name.as_deref(), Some("en0"));
+        assert_eq!(opts.ip_version, meow_common::IpVersion::Ipv4Prefer);
+        assert!(opts.tfo);
+        assert!(opts.mptcp);
+    }
+
+    /// `routing-mark: 0` and an empty `interface-name` normalize to
+    /// "inherit the global", matching mihomo's zero-means-unset.
+    #[test]
+    fn node_dialer_opts_normalization() {
+        for (yaml, want_mark, want_iface) in [
+            ("routing-mark: 0\ninterface-name: ''\n", None, None),
+            ("routing-mark: 0\n", None, None),
+            ("interface-name: '  '\n", None, None),
+            (
+                "routing-mark: 1\ninterface-name: lo0\n",
+                Some(1),
+                Some("lo0"),
+            ),
+        ] {
+            let cfg = proxy_config(&format!("name: d\ntype: direct\n{yaml}"));
+            let proxy = parse_proxy(&cfg).expect("normalizing fields parse");
+            let opts = &wrapped(&proxy).node_opts;
+            assert_eq!(opts.routing_mark, want_mark, "{yaml}");
+            assert_eq!(opts.interface_name.as_deref(), want_iface, "{yaml}");
+        }
+        // Absent fields keep the defaults.
+        let cfg = proxy_config("name: d\ntype: direct\n");
+        let binding = parse_proxy(&cfg).unwrap();
+        let opts = &wrapped(&binding).node_opts;
+        assert_eq!(opts.routing_mark, None);
+        assert_eq!(opts.interface_name, None);
+        assert_eq!(opts.ip_version, meow_common::IpVersion::Dual);
+        assert!(!opts.tfo && !opts.mptcp);
+    }
+
+    /// An unknown `ip-version` is a hard parse error — mihomo fails the
+    /// node the same way rather than silently keeping `dual`.
+    #[test]
+    fn node_dialer_opts_rejects_unknown_ip_version() {
+        let cfg = proxy_config("name: d\ntype: direct\nip-version: quad\n");
+        let err = parse_proxy(&cfg)
+            .err()
+            .expect("unknown ip-version must error");
+        assert!(err.contains("unknown `ip-version`"), "{err}");
+        // A non-string value is malformed the same way.
+        let cfg = proxy_config("name: d\ntype: direct\nip-version: 4\n");
+        assert!(parse_proxy(&cfg).is_err());
+        // And each accepted spelling lands (the `from_name` table).
+        for (spelling, want) in [
+            ("dual", meow_common::IpVersion::Dual),
+            ("ipv4", meow_common::IpVersion::Ipv4),
+            ("ipv6", meow_common::IpVersion::Ipv6),
+            ("ipv4-prefer", meow_common::IpVersion::Ipv4Prefer),
+            ("ipv6-prefer", meow_common::IpVersion::Ipv6Prefer),
+        ] {
+            let cfg = proxy_config(&format!("name: d\ntype: direct\nip-version: {spelling}\n"));
+            let proxy = parse_proxy(&cfg).expect(spelling);
+            assert_eq!(wrapped(&proxy).node_opts.ip_version, want, "{spelling}");
+        }
+    }
+
+    /// Malformed dialer fields fail the node rather than parsing past
+    /// them — non-integer marks, non-string names, non-bool flags.
+    #[test]
+    fn node_dialer_opts_rejects_malformed_fields() {
+        for yaml in [
+            "routing-mark: -1\n",
+            "routing-mark: 'abc'\n",
+            "routing-mark: 4294967296\n",
+            "interface-name: 7\n",
+            "tfo: 'yes'\n",
+            "mptcp: 1\n",
+        ] {
+            let cfg = proxy_config(&format!("name: d\ntype: direct\n{yaml}"));
+            assert!(parse_proxy(&cfg).is_err(), "{yaml}");
+        }
+    }
+
+    /// A NUL-bearing `interface-name` is a hard parse error, not the
+    /// empty-means-unset normalization: Linux `SO_BINDTODEVICE` would
+    /// silently truncate the name at the NUL and bind the *wrong*
+    /// interface — the one misconfiguration worse than a missing one.
+    #[test]
+    fn node_dialer_opts_rejects_nul_interface_name() {
+        let mut cfg = proxy_config("name: d\ntype: direct\n");
+        cfg.insert(
+            "interface-name".to_string(),
+            serde_json::Value::String("en0\0x".to_string()),
+        );
+        match parse_proxy(&cfg) {
+            Err(err) => assert!(err.contains("NUL"), "{err}"),
+            Ok(_) => panic!("a NUL interface-name must error"),
+        }
+    }
+
+    /// A `dialer-proxy` chain keeps the leaf's own opts — the wrapper
+    /// carries them even when the injected dialer is a proxy. The leaf
+    /// hop's socket is opened by the front under its own scope.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn node_dialer_opts_survive_dialer_proxy_parse() {
+        let registry = meow_proxy::dialer::ProxyRegistry::default();
+        let target = meow_proxy::dialer::DialerTarget::new("front", &registry);
+        let dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
+            Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target));
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 192.0.2.1\nport: 8388\npassword: p\n\
+             cipher: aes-128-gcm\ndialer-proxy: front\nrouting-mark: 42\n",
+        );
+        let proxy =
+            super::parse_proxy_with_dialer(&cfg, &dialer, true).expect("chained leaf parses");
+        assert_eq!(wrapped(&proxy).node_opts.routing_mark, Some(42));
+    }
+
+    /// A `proxy-groups:` entry never carries dialer fields — mihomo
+    /// removed group-level dialer options in v1.19. The group schema has
+    /// no such keys at all, so they drop at deserialization and nothing
+    /// calls `parse_node_dialer_opts` for a group block.
+    #[test]
+    fn groups_do_not_parse_dialer_opts() {
+        let raw: crate::raw::RawProxyGroup = serde_saphyr::from_str(
+            "name: g\ntype: select\nproxies: [a]\ninterface-name: en0\n\
+             ip-version: ipv4\nrouting-mark: 7\ntfo: true\nmptcp: true\n",
+        )
+        .expect("unknown keys on a group block are ignored");
+        let member = parse_proxy(&proxy_config("name: a\ntype: direct\n")).unwrap();
+        let proxies = HashMap::from([(SmolStr::from("a"), member)]);
+        let group = parse_proxy_group(&raw, &proxies, &[], &Default::default());
+        assert!(group.is_ok(), "group blocks ignore dialer fields");
+    }
+
+    /// Records the [`meow_common::dialer_opts`] a dial ran under — the
+    /// scope probe every `WrappedProxy`/`ChainedProxy` coverage test
+    /// shares (issue #974).
+    type Seen = std::sync::Arc<parking_lot::Mutex<Option<meow_common::DialerOpts>>>;
+
+    struct Capture {
+        health: ProxyHealth,
+        seen: Seen,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyAdapter for Capture {
+        fn name(&self) -> &str {
+            "capture"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn meow_common::ProxyConn>> {
+            *self.seen.lock() = Some(meow_common::dialer_opts());
+            Err(meow_common::MeowError::Proxy("captured".into()))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> Result<Box<dyn meow_common::ProxyPacketConn>> {
+            *self.seen.lock() = Some(meow_common::dialer_opts());
+            Err(meow_common::MeowError::Proxy("captured".into()))
+        }
+        async fn connect_over(
+            &self,
+            _stream: Box<dyn meow_common::ProxyConn>,
+            _metadata: &Metadata,
+        ) -> Result<Box<dyn meow_common::ProxyConn>> {
+            *self.seen.lock() = Some(meow_common::dialer_opts());
+            Err(meow_common::MeowError::Proxy("captured".into()))
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    fn scoped_leaf(seen: &Seen) -> WrappedProxy {
+        WrappedProxy::new(Box::new(Capture {
+            health: ProxyHealth::new(),
+            seen: std::sync::Arc::clone(seen),
+        }))
+        .with_node_dialer_opts(meow_common::NodeDialerOpts {
+            ip_version: meow_common::IpVersion::Ipv6,
+            routing_mark: Some(4242),
+            ..Default::default()
+        })
+    }
+
+    fn test_metadata() -> Metadata {
+        Metadata {
+            host: "h.test".into(),
+            dst_port: 443,
+            ..Default::default()
+        }
+    }
+
+    /// The wrapper installs its resolved opts as the task-local scope
+    /// around the adapter's dial — the mechanism every socket helper
+    /// reads (issue #974). The stub captures `dialer_opts()` mid-dial to
+    /// prove the scope landed and did not leak past it.
+    #[tokio::test]
+    async fn wrapped_dial_installs_the_scope() {
+        let seen: Seen = Default::default();
+        let proxy = scoped_leaf(&seen);
+        let metadata = test_metadata();
+        // Both dial paths install the node's resolved opts.
+        assert!(proxy.dial_tcp(&metadata).await.is_err());
+        {
+            let captured = seen.lock();
+            let opts = captured.as_ref().expect("the dial ran under the scope");
+            assert_eq!(opts.ip_version, meow_common::IpVersion::Ipv6);
+            assert_eq!(opts.routing_mark, Some(4242));
+        }
+        *seen.lock() = None;
+        assert!(proxy.dial_udp(&metadata).await.is_err());
+        assert_eq!(
+            seen.lock().as_ref().map(|o| o.ip_version),
+            Some(meow_common::IpVersion::Ipv6)
+        );
+        // …and nothing leaks past the call.
+        assert_eq!(
+            meow_common::dialer_opts().ip_version,
+            meow_common::IpVersion::Dual
+        );
+    }
+
+    /// `connect_over` — the relay-chain dial path — installs the same
+    /// scope (issue #974): an injected leaf's transport handshake and any
+    /// socket it opens run under the node's fields too.
+    #[tokio::test]
+    async fn wrapped_connect_over_installs_the_scope() {
+        let seen: Seen = Default::default();
+        let proxy = scoped_leaf(&seen);
+        let metadata = test_metadata();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stream = tokio::net::TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let stream: Box<dyn meow_common::ProxyConn> = Box::new(stream);
+        assert!(proxy.connect_over(stream, &metadata).await.is_err());
+        let captured = seen.lock();
+        let opts = captured.as_ref().expect("connect_over ran under the scope");
+        assert_eq!(opts.ip_version, meow_common::IpVersion::Ipv6);
+        assert_eq!(opts.routing_mark, Some(4242));
+    }
+
+    /// `ChainedProxy` is observational only: it must not install a
+    /// (default) scope of its own over the inner `WrappedProxy`'s —
+    /// every method delegates verbatim, so a chained dial still sees the
+    /// leaf's resolved opts, never the empty defaults a re-scope would
+    /// leave (issue #974 review).
+    #[tokio::test]
+    async fn chained_proxy_delegates_without_rescoping() {
+        let seen: Seen = Default::default();
+        let inner: Arc<dyn Proxy> = Arc::new(scoped_leaf(&seen));
+        let chained = ChainedProxy::new(inner);
+        let metadata = test_metadata();
+        assert!(chained.dial_tcp(&metadata).await.is_err());
+        {
+            let captured = seen.lock();
+            let opts = captured
+                .as_ref()
+                .expect("the chained dial reached the leaf's scope");
+            assert_eq!(opts.ip_version, meow_common::IpVersion::Ipv6);
+            assert_eq!(opts.routing_mark, Some(4242));
+        }
+        *seen.lock() = None;
+        assert!(chained.dial_udp(&metadata).await.is_err());
+        assert_eq!(
+            seen.lock().as_ref().map(|o| o.ip_version),
+            Some(meow_common::IpVersion::Ipv6)
         );
     }
 }

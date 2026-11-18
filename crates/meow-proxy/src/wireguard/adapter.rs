@@ -252,7 +252,17 @@ impl WireGuardAdapter {
                 self.config.name
             )));
         }
-        self.resolve_checked(host, metadata.dst_port)
+        // The node's `ip-version` governs the endpoint socket, not the
+        // destination the tunnel carries (issue #974): `resolve_all`'s
+        // shared scope filter would otherwise refuse a v6 target under a
+        // v4-preferring node even with a v6 tunnel address configured.
+        // Clear just the family filter for this one lookup — the mark and
+        // interface options stay (a nameserver socket still honors them).
+        let unfiltered = meow_common::DialerOpts {
+            ip_version: meow_common::IpVersion::Dual,
+            ..meow_common::dialer_opts()
+        };
+        meow_common::dialer_opts_scope(unfiltered, self.resolve_checked(host, metadata.dst_port))
             .await?
             .into_iter()
             .next()
@@ -682,7 +692,7 @@ mod tests {
 
     use std::collections::VecDeque;
     use std::io;
-    use std::net::Ipv4Addr;
+    use std::net::{Ipv4Addr, Ipv6Addr};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use bytes::Bytes;
@@ -1149,5 +1159,45 @@ mod tests {
             "endpoint_addr must be a real address, not 0.0.0.0:port"
         );
         drop(endpoint);
+    }
+
+    /// Issue #974: the dial scope's `ip-version` filters the *endpoint*
+    /// lookup (`resolve_checked` → `resolve_all` → the shared hook
+    /// filter), but a `remote_dns_resolve` destination inside the tunnel
+    /// keeps both families — the option governs the endpoint socket, not
+    /// the tunneled target (the tunnel address check stays in charge).
+    #[tokio::test]
+    async fn resolve_destination_ignores_scope_ip_version() {
+        let v6 = IpAddr::V6(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 9));
+        let adapter = WireGuardAdapter::new(WireGuardConfig {
+            server: "wg.test".into(),
+            ..test_config()
+        })
+        .expect("valid config")
+        .with_resolver(Arc::new(FixedResolver(vec![v6])));
+
+        let metadata = Metadata {
+            host: "dest.test".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let scoped = meow_common::DialerOpts {
+            ip_version: meow_common::IpVersion::Ipv4,
+            ..Default::default()
+        };
+        // The destination inside the tunnel is family-free…
+        let got =
+            meow_common::dialer_opts_scope(scoped.clone(), adapter.resolve_destination(&metadata))
+                .await
+                .expect("a v6 target resolves under an ipv4 scope");
+        assert_eq!(got, SocketAddr::new(v6, 443));
+        // …while the endpoint's own lookup honors the filter and fails
+        // closed when no candidate of the family remains.
+        assert!(
+            meow_common::dialer_opts_scope(scoped, adapter.resolve_checked("wg.test", 51820),)
+                .await
+                .is_err(),
+            "endpoint lookup keeps the scope's ip-version filter"
+        );
     }
 }

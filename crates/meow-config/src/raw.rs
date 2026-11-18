@@ -239,6 +239,11 @@ pub struct RawConfig {
     pub redir_port: Option<u16>,
     pub tproxy_sni: Option<bool>,
     pub routing_mark: Option<u32>,
+    /// mihomo's top-level `interface-name` (issue #974): every outbound
+    /// socket binds to this interface unless a `proxies:` node's own
+    /// `interface-name` overrides it or the peer is loopback. Resolved
+    /// name→index per dial; `None`/empty = unset.
+    pub interface_name: Option<String>,
     /// mihomo `unified-delay`: delay probes report the second
     /// request on a warm connection, without the dial/handshake cost.
     pub unified_delay: Option<bool>,

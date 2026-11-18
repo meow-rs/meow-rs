@@ -1743,13 +1743,23 @@ impl ProxyAdapter for ShadowsocksAdapter {
         let conn = self.core.dial_tcp_stream(addr.clone(), internal).await?;
         if matches!(self.core.plugin, PluginKind::Obfs(BuiltinObfs::Http { .. })) {
             let core = Arc::clone(&self.core);
+            // The redial fires later, from `FirstFlight`'s poll_read /
+            // poll_write on the relay copy task — long after this dial's
+            // `dialer_opts_scope` unwound. Capture the resolved opts now
+            // so the deferred re-dial keeps this node's
+            // routing-mark/interface-name/tfo/mptcp (issue #974).
+            let dialer_opts = meow_common::dialer_opts();
             let redial: crate::first_flight::Redial = Arc::new(move || {
                 let core = Arc::clone(&core);
                 let addr = addr.clone();
+                let dialer_opts = dialer_opts.clone();
                 Box::pin(async move {
-                    core.dial_tcp_stream(addr, internal)
-                        .await
-                        .map_err(|e| e.into_io_error("ss obfs redial"))
+                    meow_common::dialer_opts_scope(dialer_opts, async move {
+                        core.dial_tcp_stream(addr, internal)
+                            .await
+                            .map_err(|e| e.into_io_error("ss obfs redial"))
+                    })
+                    .await
                 })
             });
             return Ok(Box::new(crate::first_flight::FirstFlight::new(

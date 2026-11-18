@@ -36,8 +36,8 @@ Status meanings:
 | `GET /providers/proxies/{name}/healthcheck` | Compatible | Uses provider health-check configuration and returns 204. |
 | `GET /providers/proxies/{provider}/{proxy}[/healthcheck]` | Compatible | Provider member detail and delay probe; members carry `provider-name`. |
 | `GET/PUT /providers/rules[/{name}]` | Compatible | Includes format (`YamlRule`, `TextRule` or `MrsRule`: what the payload parsed as), vehicle type, rule count, and RFC 3339 update time. |
-| `GET/PATCH /configs` | Partial | Mode, log level, `routing-mark` and `tun` are mutable. A `routing-mark` patch applies `SO_MARK` to outbound sockets opened after the commit (`0` clears); it is refused with 400 while meow's managed tproxy firewall holds an exemption for the current mark, and a refused patch leaves mode/log/tun untouched. A `tun` patch is merged over the current section and the TUN listener is started, stopped or restarted from the result, matching mihomo, with two differences: an omitted `enable` keeps the current state instead of turning TUN off, and a TUN that fails to start answers 500 instead of 204. Only the `tun` keys meow implements apply; the rest are ignored. `GET` reports `tun` with `enable` as the running state. `GET` reports `sniffing` (the resolved value — the deprecated `tproxy-sni` alias counts as enabled when no `sniffer:` block overrides it) and `skip-auth-prefixes`, but a `PATCH` of them is ignored: both are wired into the listeners at startup. Ports, `allow-lan`, `bind-address`, `ipv6`, `tcp-concurrent`, `find-process-mode`, `interface-name`, TUIC and the other dynamic listeners are unavailable. |
-| `PUT /configs` | Partial | Reloads proxies/rules/mode while retaining providers and selection persistence; the DNS runtime is republished on input changes and the TUN listener restarts on `tun:` diffs, but ordinary listener hot replacement is unavailable. `routing-mark` applies with the commit and is refused while a managed tproxy firewall pins the current mark (same gate as `PATCH`). A JSON config document is legal YAML 1.2 input, but map order then comes from the submitted text's literal order — meow-rs never re-sorts, so clients needing deterministic `nameserver-policy`/`hosts` order should submit YAML. |
+| `GET/PATCH /configs` | Partial | Mode, log level, `routing-mark`, `interface-name` and `tun` are mutable. A `routing-mark` patch applies `SO_MARK` to outbound sockets opened after the commit (`0` clears); it is refused with 400 while meow's managed tproxy firewall holds an exemption for the current mark, and a refused patch leaves mode/log/tun untouched. An `interface-name` patch binds outbound sockets opened after the commit to that interface (`""` clears); it is never pin-refused the way `routing-mark` is — no managed firewall matches on an interface — and the name resolves to an index fresh per dial (no cache to invalidate), so an interface destroyed and recreated is followed while a missing one fails the dial closed; a node's own `interface-name` still wins, and loopback peers stay exempt. A `tun` patch is merged over the current section and the TUN listener is started, stopped or restarted from the result, matching mihomo, with two differences: an omitted `enable` keeps the current state instead of turning TUN off, and a TUN that fails to start answers 500 instead of 204. Only the `tun` keys meow implements apply; the rest are ignored. `GET` reports `tun` with `enable` as the running state. `GET` reports `sniffing` (the resolved value — the deprecated `tproxy-sni` alias counts as enabled when no `sniffer:` block overrides it), `skip-auth-prefixes` and the live `interface-name`, but a `PATCH` of sniffing/skip-auth-prefixes is ignored: both are wired into the listeners at startup. Ports, `allow-lan`, `bind-address`, `ipv6`, `tcp-concurrent`, `find-process-mode`, TUIC and the other dynamic listeners are unavailable. |
+| `PUT /configs` | Partial | Reloads proxies/rules/mode while retaining providers and selection persistence; the DNS runtime is republished on input changes and the TUN listener restarts on `tun:` diffs, but ordinary listener hot replacement is unavailable. `routing-mark` applies with the commit and is refused while a managed tproxy firewall pins the current mark (same gate as `PATCH`); `interface-name` re-applies with the commit the same way. A JSON config document is legal YAML 1.2 input, but map order then comes from the submitted text's literal order — meow-rs never re-sorts, so clients needing deterministic `nameserver-policy`/`hosts` order should submit YAML. |
 | `POST /cache/dns/flush` | Compatible | Clears resolver cache. |
 | `POST /cache/fakeip/flush` | Compatible | Clears fake-IP allocations. |
 
@@ -63,6 +63,18 @@ UDP connection entries are also intentionally omitted until their
 underlying tracking exists, and rule `missCount`/`missAt` stay zero/epoch
 by design (the compiled matcher short-circuits, so a rule that was never
 reached is not a "miss").
+
+One per-node dialer-option divergence is worth calling out here since it
+surfaces as a dial error an API client can observe: `mptcp: true` on a
+kernel without Multipath TCP (Linux <5.6, or built without
+`CONFIG_MPTCP`) fails the node's dial at `socket()` with
+`EPROTONOSUPPORT` — fail-closed like every other socket-option failure —
+where mihomo silently degrades to plain TCP. On kernels with MPTCP the
+kernel itself handles the protocol-level fallback to a non-MPTCP peer.
+Likewise `tfo`, `mptcp` and `routing-mark` on non-Linux platforms warn
+once and are skipped rather than failing, and `interface-name` fails
+closed with `Unsupported` on platforms that have no per-socket binding —
+a configured interface must never be silently ignored.
 
 ## Meow-rs extensions
 

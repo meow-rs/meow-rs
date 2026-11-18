@@ -157,7 +157,9 @@ impl DirectAdapter {
                     metadata.host, metadata.dst_port
                 )));
             }
-            return Ok(addrs);
+            // The node's `ip-version` applies here exactly as it does to
+            // the resolver paths above (issue #974).
+            return apply_ip_version(addrs, metadata);
         }
 
         Err(MeowError::Proxy(
@@ -199,10 +201,12 @@ impl DirectAdapter {
         metadata: &Metadata,
     ) -> Result<Vec<SocketAddr>> {
         match resolver.resolve_ips(&metadata.host).await {
-            Ok(Some(ips)) if !ips.is_empty() => Ok(ips
-                .into_iter()
-                .map(|ip| SocketAddr::new(ip, metadata.dst_port))
-                .collect()),
+            Ok(Some(ips)) if !ips.is_empty() => apply_ip_version(
+                ips.into_iter()
+                    .map(|ip| SocketAddr::new(ip, metadata.dst_port))
+                    .collect(),
+                metadata,
+            ),
             // The lookup itself failed — the io error keeps its
             // raw_os_error, so a local EMFILE while opening the
             // resolver socket stays `is_local_resource_error`
@@ -218,6 +222,25 @@ impl DirectAdapter {
             ))),
         }
     }
+}
+
+/// The node's `ip-version` (issue #974) applied to *resolved* direct
+/// candidates: the dial scope `WrappedProxy` installs names the egress
+/// family — a `dual`/unscoped read is the identity, so the built-in
+/// DIRECT's callers never observe it. Literal/`dst_ip` candidates return
+/// above, ahead of any resolution, so they bypass the filter — matching
+/// the `resolve_addrs` chokepoint, where a literal short-circuits too.
+/// The io error keeps `InvalidInput` — no `raw_os_error`, so a filtered
+/// family miss is a dial failure, not a local-resource one (#682/#668).
+fn apply_ip_version(addrs: Vec<SocketAddr>, metadata: &Metadata) -> Result<Vec<SocketAddr>> {
+    meow_common::apply_ip_version_filter(addrs, meow_common::dialer_opts().ip_version).map_err(
+        |e| {
+            MeowError::Io(std::io::Error::new(
+                e.kind(),
+                format!("direct: {}:{}: {e}", metadata.host, metadata.dst_port),
+            ))
+        },
+    )
 }
 
 impl Default for DirectAdapter {
@@ -1019,6 +1042,60 @@ mod tests {
         assert_eq!(
             own.resolve_targets(&metadata).await.unwrap(),
             vec![SocketAddr::new(main_ip, 443)]
+        );
+    }
+
+    /// Issue #974: a `type: direct` node's `ip-version` selects the egress
+    /// family of the *destination* — resolved candidates only. `dst_ip`
+    /// and literal hosts still short-circuit above the filter.
+    #[tokio::test]
+    async fn resolve_targets_applies_scope_ip_version() {
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
+        let v6 = IpAddr::V6(Ipv6Addr::LOCALHOST);
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+        hosts.insert("node.test", vec![v4, v6].into());
+        let resolver = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+        let adapter = DirectAdapter::new().with_resolver(Arc::new(resolver));
+
+        let scoped = meow_common::DialerOpts {
+            ip_version: meow_common::IpVersion::Ipv6,
+            ..Default::default()
+        };
+        let got = meow_common::dialer_opts_scope(
+            scoped,
+            adapter.resolve_targets(&tcp_metadata("node.test", 443)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, vec![SocketAddr::new(v6, 443)]);
+
+        // A literal destination bypasses the filter — it never resolved.
+        let scoped_v4 = meow_common::DialerOpts {
+            ip_version: meow_common::IpVersion::Ipv4,
+            ..Default::default()
+        };
+        let mut literal = tcp_metadata("[::1]", 443);
+        literal.dst_ip = None;
+        assert_eq!(
+            meow_common::dialer_opts_scope(scoped_v4, adapter.resolve_targets(&literal),)
+                .await
+                .unwrap(),
+            vec!["[::1]:443".parse().unwrap()]
+        );
+        // A pre-resolved dst_ip likewise.
+        let mut pre = tcp_metadata("node.test", 443);
+        pre.dst_ip = Some(v4);
+        assert_eq!(
+            meow_common::dialer_opts_scope(
+                meow_common::DialerOpts {
+                    ip_version: meow_common::IpVersion::Ipv6,
+                    ..Default::default()
+                },
+                adapter.resolve_targets(&pre),
+            )
+            .await
+            .unwrap(),
+            vec![SocketAddr::new(v4, 443)]
         );
     }
 
