@@ -519,6 +519,8 @@ the canonical, in-repo source a release is cut from.
   Windows (Linux bound loopback TCP too), everything else — LAN,
   link-local and multicast included — keeps it. IPv4-mapped destinations
   get an IPv4 socket; native IPv6 keeps its scope id.
+- Update the workspace's locked `rustix` dependency to `1.1.6` to address
+  [RUSTSEC-2026-0486](https://rustsec.org/advisories/RUSTSEC-2026-0486.html) (#973).
 - **A UDP flow matched to a `dialer-proxy`-chained target whose inner is
   non-transparent now fails loudly at the named rule** instead of sliding
   to a later rule that may resolve to `DIRECT` (issue #969): the chain
