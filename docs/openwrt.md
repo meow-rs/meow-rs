@@ -160,13 +160,17 @@ not reimplement a dashboard:
   newest entry; text filter, level filter (all / warnings and errors / errors),
   errors in red and warnings in orange, Pause/Resume, and Download.
 
-`panel_port` and `secret` are authoritative: the init script passes them to
-meow as `--ext-ctl 0.0.0.0:<panel_port>` and `--secret <secret>`, overriding
-`external-controller` / `secret:` in the YAML. OpenWrt's default firewall
-blocks WAN-side access; set a secret if untrusted hosts share your LAN. If
-LuCI is served over HTTPS, the Panel view offers a new-tab link instead of
-embedding mixed content. Overview API requests stay on LuCI's authenticated
-origin; the packaged curl helper contacts only the router's loopback API.
+The init script uses `panel_port` for the controller address. It binds to
+loopback when the UCI `secret` is empty and to `0.0.0.0` when the secret is
+set. The UCI secret overrides the YAML secret through a root-only runtime
+file passed with `--secret-file`. Use a single line of printable ASCII
+without trailing spaces. The package sets `/etc/config/meow` and
+`/etc/meow/config.yaml` to mode `0600` on install and upgrade.
+
+OpenWrt's default firewall blocks WAN-side access. If LuCI is served over
+HTTPS, the Panel view offers a new-tab link to avoid mixed content. Overview
+API requests stay on LuCI's authenticated origin and the packaged curl helper
+contacts only the router's loopback API.
 
 ## Transparent proxy (gateway / side router)
 

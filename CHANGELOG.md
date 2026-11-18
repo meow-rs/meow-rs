@@ -563,6 +563,10 @@ the canonical, in-repo source a release is cut from.
   `update_timers` makes on a rekey timeout, throttled at the same 5 s
   floor.
 
+- **OpenWrt controller credentials.** The service reads its secret from a
+  root-only runtime file, and the LuCI API helper sends the bearer header
+  through standard input. Managed UCI and YAML files use mode `0600`.
+
 ## [0.29.0] - 2026-11-05
 
 ### Added
