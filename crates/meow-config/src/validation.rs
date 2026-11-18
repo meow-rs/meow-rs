@@ -69,7 +69,12 @@ const UNSUPPORTED_KEYS: &[(&str, Option<u32>, &str)] = &[
     ("tunnels", Some(974), "inbound tunnels not implemented"),
     ("udp-over-tcp", None, "UDP-over-TCP not implemented"),
     ("udp-over-tcp-version", None, "UDP-over-TCP not implemented"),
-    ("timeout", None, "group probe timeout not modeled"),
+    (
+        "timeout",
+        None,
+        "per-group/per-node timeout not modeled \
+         (sniffer, nftset, provider health-check honor it)",
+    ),
     ("max-failed-times", None, "group probe tuning not modeled"),
     ("disable-udp", None, "per-group UDP disable not modeled"),
 ];
@@ -472,8 +477,9 @@ pub(crate) fn warn_unknown_node_keys(
 
 /// Emit the extra-map warnings for one section of a parsed config —
 /// shared by `validate_and_warn` and the `listeners:` build loop (which
-/// owns its own warn site for spec context).
-pub(crate) fn warn_extra(context: &str, extra: &BTreeMap<String, serde_json::Value>) {
+/// owns its own warn site for spec context). Only the keys matter, so
+/// the map's value type is left generic.
+pub(crate) fn warn_extra<T>(context: &str, extra: &BTreeMap<String, T>) {
     emit_unknown_keys_warn(context, &extra.keys().cloned().collect::<Vec<_>>());
 }
 

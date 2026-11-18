@@ -504,6 +504,23 @@ fn raw_config_extra_keys_roundtrip_sorted() {
     );
 }
 
+/// Non-string scalar keys inside an unknown-key subtree must not fail the
+/// parse — serde's flatten buffer hands typed keys to the extra map, which
+/// `serde_json::Value`'s own visitor rejects (review F1). They stringify
+/// (`123` → `"123"`) and write back as ordinary string keys.
+#[test]
+fn raw_config_extra_nested_scalar_keys_roundtrip() {
+    let raw: RawConfig = serde_saphyr::from_str("x-tpl: {123: 1.1.1.1, true: x}\n").unwrap();
+    assert_eq!(
+        raw.extra["x-tpl"].0,
+        serde_json::json!({"123": "1.1.1.1", "true": "x"})
+    );
+
+    let yaml = to_yaml(&raw);
+    let loaded: RawConfig = serde_saphyr::from_str(&yaml).unwrap();
+    assert_eq!(loaded.extra, raw.extra);
+}
+
 #[test]
 fn raw_subscription_serde() {
     let sub = RawSubscription {

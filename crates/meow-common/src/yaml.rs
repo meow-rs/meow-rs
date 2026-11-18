@@ -66,7 +66,9 @@ pub const PARSE_STACK_SIZE: usize = 8 << 20;
 ///
 /// `doc` is passed separately and re-borrowed inside the scoped spawn so
 /// callers keep `&str` documents — no copy — while `parse` (non-capturing
-/// at every call site) stays `'static`.
+/// at every call site) stays `'static`. The caller's tracing dispatcher
+/// is carried onto the parse thread so log/warn lines emitted inside
+/// `parse` reach the subscriber in effect at the call site.
 ///
 /// A panic inside `parse` is re-thrown to the caller. An `Err` return
 /// means the parse thread could not be spawned (OS thread exhaustion) —
@@ -78,11 +80,14 @@ where
     F: FnOnce(&str) -> T + Send + 'static,
     T: Send + 'static,
 {
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     std::thread::scope(|scope| {
         std::thread::Builder::new()
             .name("yaml-parse".into())
             .stack_size(PARSE_STACK_SIZE)
-            .spawn_scoped(scope, move || parse(doc))
+            .spawn_scoped(scope, move || {
+                tracing::dispatcher::with_default(&dispatch, || parse(doc))
+            })
             .map(|handle| match handle.join() {
                 Ok(value) => value,
                 Err(payload) => std::panic::resume_unwind(payload),

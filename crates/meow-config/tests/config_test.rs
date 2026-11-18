@@ -4011,18 +4011,72 @@ strict-bogus-key: 1
     }
 
     /// TI-1: serialized `RawConfig::default()` exposes exactly the typed
-    /// fields (the `extra` flatten contributes nothing when empty). A new
-    /// field bumps the count — the failure tells the author to confirm it
-    /// is modeled deliberately rather than landing in `extra`.
+    /// fields (the `extra` flatten contributes nothing when empty). The
+    /// exact list, not a count — a `skip_serializing_if`-gated addition
+    /// would evade a bare `len()` check, as would one name for another.
+    /// (Still not airtight: a field that never serializes leaves no mark.)
     #[test]
     fn raw_config_field_inventory_is_pinned() {
         let v = serde_json::to_value(meow_config::raw::RawConfig::default()).unwrap();
-        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        let keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        let expected = [
+            "allow-lan",
+            "authentication",
+            "bind-address",
+            "connection-notes",
+            "disable-keep-alive",
+            "dns",
+            "external-controller",
+            "external-ui",
+            "external-ui-name",
+            "external-ui-url",
+            "firewall",
+            "geodata",
+            "geox-url",
+            "hosts",
+            "interface-name",
+            "ipv6",
+            "keep-alive-idle",
+            "keep-alive-interval",
+            "listeners",
+            "log-level",
+            "logbook",
+            "max-connections",
+            "mixed-port",
+            "mode",
+            "port",
+            "proxies",
+            "proxy-groups",
+            "proxy-providers",
+            "redir-port",
+            "routing-mark",
+            "rule-providers",
+            "rules",
+            "secret",
+            "skip-auth-prefixes",
+            "sniffer",
+            "socks-port",
+            "strict",
+            "sub-rules",
+            "subscriptions",
+            "tcp-connect-timeout",
+            "tcp-idle-timeout",
+            "tcp-keepalive",
+            "tcp-keepalive-idle",
+            "tcp-keepalive-interval",
+            "tcp-keepalive-probes",
+            "tproxy-port",
+            "tproxy-sni",
+            "traffic-ledger",
+            "tun",
+            "udp",
+            "udp-timeout",
+            "unified-delay",
+        ];
         assert_eq!(
-            keys.len(),
-            52,
-            "RawConfig field count changed — if a typed field was added, \
-             bump this; unknown keys must keep flowing into `extra`: {keys:?}"
+            keys, expected,
+            "RawConfig serialized fields changed — confirm a new typed field \
+             is deliberate; unknown keys must keep flowing into `extra`"
         );
     }
 
@@ -4047,5 +4101,44 @@ proxies:
             config.proxies.contains_key("s"),
             "node must load despite the unknown key"
         );
+    }
+
+    /// Review F1 regression: an unknown key whose *value* nests a map with
+    /// non-string scalar keys must still load — serde's flatten buffer
+    /// hands typed keys (`123` as `u64`) to the extra map, which used to
+    /// fail the whole parse. The nested keys stringify for the
+    /// warn + save round-trip; the outer key warns as before.
+    #[test]
+    fn unknown_key_with_nonstring_nested_keys_loads() {
+        let (config, logs) = load_and_capture_warns(
+            "mode: rule\nx-tpl: &h {123: 1.1.1.1, true: x, 1.5: y}\nrules: [MATCH,DIRECT]\n",
+        );
+        assert!(
+            logs.contains("unknown keys in top-level config: x-tpl"),
+            "got: {logs}"
+        );
+        assert_eq!(
+            config.raw.extra["x-tpl"].0,
+            serde_json::json!({"123": "1.1.1.1", "1.5": "y", "true": "x"}),
+            "nested scalar keys must stringify, not fail the parse"
+        );
+    }
+
+    /// Same F1 regression through the production ingest path —
+    /// `parse_raw_yaml`'s `yaml_tree` deserializer types nested keys the
+    /// same way, so the boundary must hold there too. A null key keeps
+    /// erroring (the `String` map key rejected it before).
+    #[test]
+    fn parse_raw_yaml_unknown_key_nonstring_nested_keys() {
+        let raw = meow_config::parse_raw_yaml("mode: rule\nx-tpl: &h {123: 1.1.1.1, true: x}\n")
+            .expect("non-string scalar keys inside an unknown key must load");
+        assert_eq!(
+            raw.extra["x-tpl"].0,
+            serde_json::json!({"123": "1.1.1.1", "true": "x"})
+        );
+
+        let err = meow_config::parse_raw_yaml("x-tpl: {~: v}\n")
+            .expect_err("a null mapping key must still fail");
+        assert!(err.to_string().contains("null"), "got: {err}");
     }
 }

@@ -4097,20 +4097,26 @@ fn ensure_geodata_blocking(
     {
         return;
     }
+    // Carry the scoped dispatcher onto the download thread so its warns
+    // reach the caller's subscriber (same propagation
+    // `spawn_blocking_with_current_dispatcher` applies).
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     let joined = std::thread::scope(|scope| {
         scope
             .spawn(|| {
-                let rt = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                rt.block_on(ensure_geodata(
-                    raw,
-                    geo,
-                    scan_lines,
-                    Some(map),
-                    chained_providers,
-                ));
-                Ok::<(), std::io::Error>(())
+                tracing::dispatcher::with_default(&dispatch, || {
+                    let rt = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()?;
+                    rt.block_on(ensure_geodata(
+                        raw,
+                        geo,
+                        scan_lines,
+                        Some(map),
+                        chained_providers,
+                    ));
+                    Ok::<(), std::io::Error>(())
+                })
             })
             .join()
     });

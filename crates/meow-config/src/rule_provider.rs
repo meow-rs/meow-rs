@@ -1786,12 +1786,18 @@ fn fetch_http_blocking(
     let thread_url = url.clone();
     let proxy = proxy.cloned();
     let headers = headers.to_vec();
+    // The spawn sees no caller context — carry the scoped dispatcher so
+    // warns inside the fetch reach the subscriber in effect here (same
+    // propagation `spawn_blocking_with_current_dispatcher` applies).
+    let dispatch = tracing::dispatcher::get_default(Clone::clone);
     std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("building temporary tokio runtime for rule-provider fetch")?;
-        rt.block_on(fetch_http_async(&thread_url, proxy.as_ref(), &headers))
+        tracing::dispatcher::with_default(&dispatch, || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("building temporary tokio runtime for rule-provider fetch")?;
+            rt.block_on(fetch_http_async(&thread_url, proxy.as_ref(), &headers))
+        })
     })
     .join()
     .map_err(|payload| {

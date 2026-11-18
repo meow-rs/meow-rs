@@ -117,6 +117,193 @@ where
     deserializer.deserialize_any(StatusOrInt)
 }
 
+/// Element of a `#[serde(flatten)] extra` map: a `serde_json::Value`
+/// whose nested map keys need not be strings.
+///
+/// serde's flatten capture buffers an unknown key's subtree through
+/// `deserialize_any`, so a nested mapping's keys arrive *typed* —
+/// `x: {123: a}` hands the inner map a `u64` key where `Value`'s own
+/// visitor demands a string and used to fail the whole config load (the
+/// subtree previously dropped via `IgnoredAny`, so it loaded). Scalar
+/// keys stringify instead (`123` → `"123"`, `true` → `"true"`); null and
+/// container keys keep erroring, as a `String`-keyed map did.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(transparent)]
+pub struct UnknownYamlValue(pub serde_json::Value);
+
+impl<'de> Deserialize<'de> for UnknownYamlValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(UnknownValueVisitor).map(Self)
+    }
+}
+
+struct UnknownValueVisitor;
+
+// Scalar visits mirror `serde_json::Value`'s own visitor so a captured
+// subtree keeps identical values — ints narrow through `Number`, a
+// non-finite float becomes `Null`.
+impl<'de> serde::de::Visitor<'de> for UnknownValueVisitor {
+    type Value = serde_json::Value;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("any valid YAML value")
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Bool(v))
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::from(v))
+    }
+
+    fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<Self::Value, E> {
+        serde_json::Number::deserialize(serde::de::value::I128Deserializer::new(v))
+            .map(serde_json::Value::Number)
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::from(v))
+    }
+
+    fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<Self::Value, E> {
+        serde_json::Number::deserialize(serde::de::value::U128Deserializer::new(v))
+            .map(serde_json::Value::Number)
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        Ok(serde_json::Number::from_f64(v)
+            .map_or(serde_json::Value::Null, serde_json::Value::Number))
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(v.to_owned()))
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::String(v))
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Ok(serde_json::Value::Null)
+    }
+
+    fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
+        UnknownYamlValue::deserialize(d).map(|w| w.0)
+    }
+
+    fn visit_newtype_struct<D: serde::Deserializer<'de>>(
+        self,
+        d: D,
+    ) -> Result<Self::Value, D::Error> {
+        UnknownYamlValue::deserialize(d).map(|w| w.0)
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+        let mut items = Vec::new();
+        while let Some(v) = seq.next_element::<UnknownYamlValue>()? {
+            items.push(v.0);
+        }
+        Ok(serde_json::Value::Array(items))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+        let mut out = serde_json::Map::new();
+        while let Some(k) = map.next_key::<ScalarKey>()? {
+            out.insert(k.0, map.next_value::<UnknownYamlValue>()?.0);
+        }
+        Ok(serde_json::Value::Object(out))
+    }
+}
+
+/// A nested map key inside an unknown-key subtree — see
+/// [`UnknownYamlValue`]. Only the *nested* keys need this: the `extra`
+/// map's own keys are struct-adjacent names that arrive through
+/// `deserialize_identifier`, which yields source-spelling strings.
+struct ScalarKey(String);
+
+impl<'de> Deserialize<'de> for ScalarKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(ScalarKeyVisitor).map(Self)
+    }
+}
+
+struct ScalarKeyVisitor;
+
+impl<'de> serde::de::Visitor<'de> for ScalarKeyVisitor {
+    type Value = String;
+
+    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.write_str("a scalar mapping key")
+    }
+
+    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+        Ok(v.to_owned())
+    }
+
+    fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+        Ok(v)
+    }
+
+    fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_i128<E: serde::de::Error>(self, v: i128) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_u128<E: serde::de::Error>(self, v: u128) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_char<E: serde::de::Error>(self, v: char) -> Result<Self::Value, E> {
+        Ok(v.to_string())
+    }
+
+    fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Err(E::custom("null mapping key"))
+    }
+
+    fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+        Err(E::custom("null mapping key"))
+    }
+
+    fn visit_seq<A: serde::de::SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+        Err(<A::Error as serde::de::Error>::custom(
+            "non-scalar mapping key",
+        ))
+    }
+
+    fn visit_map<A: serde::de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+        Err(<A::Error as serde::de::Error>::custom(
+            "non-scalar mapping key",
+        ))
+    }
+}
+
 /// `geodata:` YAML subsection — path overrides, download URLs, auto-update.
 ///
 /// Fields `geodata-mode`, `geodata-loader`, and `geoip-matcher` exist in
@@ -151,7 +338,7 @@ pub struct RawGeoDataConfig {
     pub geoip_matcher: Option<serde_json::Value>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// `geodata.url.*` — download URL overrides.
@@ -163,7 +350,7 @@ pub struct RawGeoDataUrls {
     pub geosite: Option<String>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// Top-level `geox-url:` block (mihomo's flat alias for `geodata.url.*`).
@@ -185,7 +372,7 @@ pub struct RawGeoXUrl {
     pub geoip: Option<String>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default)]
@@ -364,7 +551,7 @@ pub struct RawConfig {
     /// dropping them silently (issue #974). `BTreeMap` so the save path
     /// writes them back in sorted order.
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 impl RawConfig {
@@ -478,7 +665,7 @@ pub struct RawTun {
     pub exclude_uid: Option<serde_json::Value>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// `tun.auto-route` value: mihomo's boolean or a #375 mode string.
@@ -553,7 +740,7 @@ pub struct RawListener {
     /// consumer warn-and-ignore them by name (forward-compat, ADR-0002)
     /// instead of serde dropping them silently.
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// One `peers:` element of a `type: wireguard` listener (kebab-case).
@@ -582,7 +769,7 @@ pub struct RawWgPeer {
     /// them by name (ADR-0002) — e.g. a `pre-shared-key` typo otherwise
     /// drops the peer's PSK silently.
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// Raw `simple-obfs:` block for a shadowsocks listener.
@@ -594,7 +781,7 @@ pub struct RawSimpleObfs {
     pub mode: Option<String>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// `dns.nftset`: `family#table#set` per address family and
@@ -607,7 +794,7 @@ pub struct RawNftset {
     pub timeout: Option<u64>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 impl RawNftset {
@@ -698,7 +885,7 @@ pub struct RawDns {
     pub prefer_h3: Option<bool>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// A nameserver-policy value: either a single URL string or a list of URLs.
@@ -773,7 +960,7 @@ pub struct RawFallbackFilter {
     pub domain: Option<Vec<String>>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
@@ -821,7 +1008,7 @@ pub struct RawProxyGroup {
     /// Keys no field above models land here — `validation` warns on them
     /// (e.g. `test-timeout`, which mihomo spells `timeout`; issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -868,7 +1055,7 @@ pub struct RawProxyProvider {
     pub override_: Option<HashMap<String, serde_json::Value>>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -887,7 +1074,7 @@ pub struct RawHealthCheck {
     pub lazy: Option<bool>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// A single entry in the top-level `rule-providers:` map.
@@ -919,7 +1106,7 @@ pub struct RawRuleProvider {
     pub payload: Option<Vec<String>>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// `traffic-ledger:` section.
@@ -936,7 +1123,7 @@ pub struct RawTrafficLedger {
     pub apps: Option<bool>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 // `serde_json::Value` cannot derive `Eq` but never holds NaN, so its
@@ -966,7 +1153,7 @@ pub struct RawLogbook {
     pub enable: Option<bool>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 // Same `serde_json::Value`-in-`Eq` justification as `RawTrafficLedger`.
@@ -1001,7 +1188,7 @@ pub struct RawSniffer {
     pub skip_domain: Option<Vec<String>>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
@@ -1011,7 +1198,7 @@ pub struct RawSniffProtocol {
     pub ports: Option<Vec<u16>>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// Cumulative cap on expanded sniff port entries: the u16 space holds at
@@ -1196,7 +1383,7 @@ pub struct RawSubscription {
     pub applied_rules: Vec<String>,
     /// Unmodelled keys — warned on by `validation` (issue #974).
     #[serde(flatten)]
-    pub extra: BTreeMap<String, serde_json::Value>,
+    pub extra: BTreeMap<String, UnknownYamlValue>,
 }
 
 /// `subscriptions[].proxy`: absent/`""` → unset (fetches direct); a

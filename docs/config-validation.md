@@ -66,8 +66,10 @@ Rules:
   design.
 - `strict: true` does not promote unknown-key warnings to errors.
 - Warnings re-emit on every config rebuild — `meow -t`, startup load,
-  and `PUT`/`PATCH /configs` — and on provider/subscription refreshes
-  for the nodes they expand.
+  and `PUT`/`PATCH /configs` — for keys in the document itself.
+  Provider-node warns fire only at provider ingest/refresh: a provider
+  reused without re-parse does not re-warn on rebuild, while an
+  ECH-deferred re-ingest can emit a node's warns twice.
 
 ## Save round-trip
 
