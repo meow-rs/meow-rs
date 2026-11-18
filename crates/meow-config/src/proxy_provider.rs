@@ -539,7 +539,7 @@ impl ProxyProvider {
     /// `global-client-fingerprint` leg — `true` on a candidate whose
     /// `matches_def` differs *only* in the fingerprint the adapters were
     /// parsed under. That rebuild inherits the predecessor's last
-    /// committed payload ([`Self::retained_payload`]) instead of serving
+    /// committed payload (`retained_payload`) instead of serving
     /// an empty slot until the post-commit fetch lands (issue #974
     /// review).
     pub fn matches_def_modulo_fingerprint(&self, def: &RawProxyProvider, ipv6: bool) -> bool {
@@ -1062,7 +1062,7 @@ impl ProxyProvider {
     /// [`initial_load_unrecorded`](Self::initial_load_unrecorded) minus the
     /// acquisition: re-parse `content` — the payload a
     /// fingerprint-only-rebuild predecessor last committed
-    /// ([`Self::retained_payload`]) — into this fresh provider under its
+    /// (`retained_payload`) — into this fresh provider under its
     /// own `global-client-fingerprint`, so a `--config-string`/no-cache
     /// rebuild serves the inherited nodes until the detached post-commit
     /// fetch lands instead of an empty slot (issue #974 review).
