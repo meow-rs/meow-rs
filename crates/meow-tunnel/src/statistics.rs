@@ -23,7 +23,7 @@ use meow_common::conn_notes::ConnNotes;
 pub use meow_common::traffic::ProxyTraffic;
 use meow_common::traffic::ProxyTrafficSource;
 use meow_common::traffic_ledger::{self, Route};
-use meow_common::{Metadata, ProcessLookupMode, ProcessLookupPolicy, Proxy};
+use meow_common::{Metadata, ProcessInfo, ProcessLookupMode, ProcessLookupPolicy, Proxy};
 use parking_lot::Mutex;
 use serde::Serialize;
 use smallvec::SmallVec;
@@ -111,22 +111,43 @@ struct LedgerTag {
     settled_download: AtomicI,
 }
 
+/// What [`LedgerTag::new`] cannot settle inline for a flow's app: the
+/// socket a queued [`app_lookup`] scan resolves, a memoized owner whose
+/// locality only the worker's interface read settles, or the flow memo's
+/// in-flight routing scan to follow instead — one OS walk per flow
+/// (issue #974).
+enum AppLookup {
+    Scan(SocketAddr),
+    /// A memoized owner whose source's locality is undecided inline —
+    /// Tun/Redir/TProxy inbounds also carry other hosts' traffic, so the
+    /// worker's `LocalAddresses` gate decides, exactly as for a queued
+    /// scan.
+    Confirm(SocketAddr, ProcessInfo),
+    FollowFlow(SocketAddr),
+}
+
 impl LedgerTag {
     /// The tag of a flow to `metadata`'s destination through `route`, or
     /// `None` while the ledger is off or the flow has no leaf; with the
-    /// socket whose owner names its app when that takes a lookup.
+    /// work naming its app when that is not settled inline.
     ///
-    /// `policy` is the tunnel's live `find-process-mode`: `off` files no
-    /// app and queues no scan at all; `always` reuses the outcome the
-    /// pre-dispatch lookup already stored in the flow's memo — a miss
-    /// included — instead of submitting a duplicate scan (issue #974).
-    /// Under `strict` the opt-in ledger app lookup is unchanged.
+    /// `policy` is the tunnel's live `find-process-mode`: a supplied
+    /// app names the flow even under `off` — it costs no scan; `off`
+    /// files nothing else and queues no scan at all; `always` reuses the
+    /// outcome the pre-dispatch lookup already stored in the flow's memo
+    /// — a miss included — instead of submitting a duplicate scan
+    /// (issue #974). A memo hit is filed only when the source proves this
+    /// host's — the same locality gate a queued scan passes on the
+    /// worker, deferred there when [`app_lookup::local_socket`] cannot
+    /// settle it inline — so a LAN client's wildcard-table hit cannot
+    /// misattribute the flow to a local app. Under `strict` the opt-in
+    /// ledger app lookup is unchanged.
     fn new(
         metadata: &Metadata,
         udp: bool,
         route: impl FnOnce() -> Option<Route>,
         policy: &ProcessLookupPolicy,
-    ) -> Option<(Self, Option<SocketAddr>)> {
+    ) -> Option<(Self, Option<AppLookup>)> {
         if !traffic_ledger::enabled() {
             return None;
         }
@@ -141,26 +162,49 @@ impl LedgerTag {
         };
         let app = OnceLock::new();
         let mut lookup = None;
-        if !traffic_ledger::apps() || policy.get() == ProcessLookupMode::Off {
+        if !traffic_ledger::apps() {
             let _ = app.set(SmolStr::default());
         } else if !metadata.process.is_empty() || !metadata.process_path.is_empty() {
+            // Inbound-supplied attribution — filed under `off` too: it
+            // costs no scan.
             let _ = app.set(traffic_ledger::app_name(
                 &metadata.process,
                 &metadata.process_path,
             ));
+        } else if policy.get() == ProcessLookupMode::Off {
+            let _ = app.set(SmolStr::default());
         } else if let Some(info) = metadata.flow_lookup.process_outcome() {
             // The flow's pre-dispatch scan already ran (`always`, or a
             // probe's `strict` scan): reuse its outcome — a hit names the
             // app even when the fields were not written back, a miss files
-            // none. No second socket-table walk for one flow.
-            let app_name = info.as_ref().map_or_else(SmolStr::default, |info| {
-                traffic_ledger::app_name(&info.name, &info.path)
-            });
-            let _ = app.set(app_name);
+            // none. No second socket-table walk for one flow. The hit
+            // files only for a source of this host, the same locality gate
+            // a queued scan passes on the worker: loopback settles inline;
+            // Tun/Redir/TProxy carry other hosts' traffic too, so their
+            // read defers to the worker's interface list.
+            match (info, app_lookup::local_socket(metadata)) {
+                (Some(info), Some(local)) if local.ip().is_loopback() => {
+                    let _ = app.set(traffic_ledger::app_name(&info.name, &info.path));
+                }
+                (Some(info), Some(local)) => {
+                    lookup = Some(AppLookup::Confirm(local, info.clone()));
+                }
+                _ => {
+                    let _ = app.set(SmolStr::default());
+                }
+            }
         } else {
-            lookup = app_lookup::local_socket(metadata);
-            if lookup.is_none() {
-                let _ = app.set(SmolStr::default());
+            match app_lookup::local_socket(metadata) {
+                // A routing scan on this flow is in flight: follow the
+                // memo's outcome rather than queue a second OS walk for
+                // the same tuple.
+                Some(local) if metadata.flow_lookup.scan_pending() => {
+                    lookup = Some(AppLookup::FollowFlow(local));
+                }
+                Some(local) => lookup = Some(AppLookup::Scan(local)),
+                None => {
+                    let _ = app.set(SmolStr::default());
+                }
             }
         }
         let tag = Self {
@@ -215,8 +259,44 @@ impl ConnCounters {
         });
         // A connection whose app is known is a request now.
         counters.settle_ledger();
-        if let Some(local) = lookup {
-            app_lookup::submit(metadata.network, local, &counters, policy);
+        match lookup {
+            Some(AppLookup::Scan(local)) => {
+                app_lookup::submit(metadata.network, local, &counters, policy);
+            }
+            Some(AppLookup::Confirm(local, info)) => {
+                app_lookup::submit_known(metadata.network, local, info, &counters, policy);
+            }
+            Some(AppLookup::FollowFlow(local)) => {
+                let flow_lookup = Arc::clone(&metadata.flow_lookup);
+                let counters = Arc::clone(&counters);
+                let policy = Arc::clone(policy);
+                let network = metadata.network;
+                // The routing scan in flight on this flow's memo names the
+                // app when it lands — queueing the worker here too would be
+                // a second OS walk for the same tuple (issue #974). A
+                // loopback source files directly; another inbound's read
+                // of "is this host's" still defers to the worker's
+                // interface list, exactly as a queued scan's does. No
+                // runtime to await on (a sync caller outside Tokio) files
+                // no app rather than pay that.
+                if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                    runtime.spawn(async move {
+                        match flow_lookup.process_or_wait().await {
+                            Some(info) if local.ip().is_loopback() => {
+                                counters
+                                    .resolve_app(traffic_ledger::app_name(&info.name, &info.path));
+                            }
+                            Some(info) => {
+                                app_lookup::submit_known(network, local, info, &counters, &policy);
+                            }
+                            None => counters.resolve_app(SmolStr::default()),
+                        }
+                    });
+                } else {
+                    counters.resolve_app(SmolStr::default());
+                }
+            }
+            None => {}
         }
         counters
     }
@@ -963,6 +1043,10 @@ mod ledger_tests {
     use super::*;
     use meow_common::traffic_ledger::{self, GroupBy, Options, Query};
 
+    /// The traffic ledger is process-global — tests that (un)install it
+    /// or read `enabled()` serialize here, like `global_ua`'s lane.
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     /// The counters of a connection whose app is being looked up, and that
     /// no table holds: one that closed while the notes keep it.
     fn looked_up(host: &str) -> Arc<ConnCounters> {
@@ -1058,14 +1142,18 @@ mod ledger_tests {
     }
 
     /// `find-process-mode` reaches the app lane through the shared policy
-    /// cell (issue #974): `off` never queues a socket scan; `always`
-    /// reuses the flow memo's outcome — hit *and* miss — instead of
-    /// walking the table twice; `strict` keeps the opt-in lookup.
+    /// cell (issue #974): `off` never queues a socket scan but keeps
+    /// inbound-supplied attribution; `always` reuses the flow memo's
+    /// outcome — hit *and* miss — instead of walking the table twice;
+    /// `strict` keeps the opt-in lookup.
     #[test]
     fn process_policy_gates_the_app_lane() {
         use meow_common::process_lookup::{ProcessLookupMode, PROCESS_LOOKUP_SUPPORTED};
-        use meow_common::ProcessInfo;
+        use meow_common::{Network, ProcessInfo};
 
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         traffic_ledger::install(dir.path(), Options::default()).unwrap();
 
@@ -1080,13 +1168,27 @@ mod ledger_tests {
         // socket comes back for a queued scan.
         let strict = ProcessLookupPolicy::default();
         let (_, lookup) = LedgerTag::new(&flow(), false, route, &strict).unwrap();
-        assert_eq!(lookup.is_some(), PROCESS_LOOKUP_SUPPORTED);
+        assert_eq!(
+            matches!(lookup, Some(AppLookup::Scan(_))),
+            PROCESS_LOOKUP_SUPPORTED
+        );
 
         // Off: no queued scan at all — the app files empty.
         let off = ProcessLookupPolicy::new(ProcessLookupMode::Off);
         let (tag, lookup) = LedgerTag::new(&flow(), false, route, &off).unwrap();
         assert!(lookup.is_none(), "off must not queue a scan");
         assert_eq!(tag.app.get().map(SmolStr::as_str), Some(""));
+
+        // Off keeps inbound-supplied attribution — filing it costs no
+        // scan, so it must not be dropped with the lookup.
+        let supplied = Metadata {
+            process: "supplied-app".into(),
+            process_path: "/usr/bin/supplied".into(),
+            ..flow()
+        };
+        let (tag, lookup) = LedgerTag::new(&supplied, false, route, &off).unwrap();
+        assert!(lookup.is_none(), "supplied attribution needs no scan");
+        assert_eq!(tag.app.get().map(SmolStr::as_str), Some("supplied-app"));
 
         // Always + a memoized hit: the app is the recorded owner and no
         // second scan is queued.
@@ -1101,6 +1203,41 @@ mod ledger_tests {
         assert!(lookup.is_none(), "a memoized hit needs no second scan");
         assert_eq!(tag.app.get().map(SmolStr::as_str), Some("hit-app"));
 
+        // A memoized hit from a LAN source files no app — the same
+        // locality gate the queued lane applies (a wildcard table row
+        // belongs to a local app only for a local source).
+        let lan = Metadata {
+            src_ip: Some("192.0.2.7".parse().unwrap()),
+            conn_type: meow_common::ConnType::Http,
+            ..hit.clone()
+        };
+        let (tag, lookup) = LedgerTag::new(&lan, false, route, &always).unwrap();
+        assert!(lookup.is_none());
+        assert_eq!(
+            tag.app.get().map(SmolStr::as_str),
+            Some(""),
+            "a LAN flow must not file a local app"
+        );
+
+        // A Tun/Redir/TProxy inbound cannot settle locality inline —
+        // it also carries other hosts' traffic — so the read defers to
+        // the worker's interface list, as a queued scan's would.
+        let lan_tun = Metadata {
+            src_ip: Some("192.0.2.7".parse().unwrap()),
+            conn_type: meow_common::ConnType::Tun,
+            ..hit
+        };
+        let (tag, lookup) = LedgerTag::new(&lan_tun, false, route, &always).unwrap();
+        if PROCESS_LOOKUP_SUPPORTED {
+            assert!(
+                matches!(lookup, Some(AppLookup::Confirm(..))),
+                "a Tun source's locality is decided on the worker"
+            );
+            assert!(tag.app.get().is_none(), "the app awaits the worker");
+        } else {
+            assert!(lookup.is_none());
+        }
+
         // Always + a memoized miss: filed empty, still no second scan.
         let miss = flow();
         miss.flow_lookup.record_process(None);
@@ -1114,10 +1251,58 @@ mod ledger_tests {
         live.set(ProcessLookupMode::Off);
         let (_, lookup) = LedgerTag::new(&flow(), false, route, &live).unwrap();
         assert!(lookup.is_none(), "a live set to off applies at once");
+
+        // A job the worker dequeues while `off` is rechecked there: no
+        // scan runs and the flow resolves with no app.
+        let counters = looked_up("www.off-queued.example");
+        app_lookup::submit(
+            Network::Tcp,
+            "127.0.0.1:51234".parse().unwrap(),
+            &counters,
+            &Arc::new(ProcessLookupPolicy::new(ProcessLookupMode::Off)),
+        );
+        // A memoized owner queued for the locality read files only when
+        // the worker's interface list calls the source this host's —
+        // TEST-NET-3 is no address of this host.
+        let lan_counters = looked_up("www.lan-confirm.example");
+        app_lookup::submit_known(
+            Network::Tcp,
+            "192.0.2.7:51234".parse().unwrap(),
+            ProcessInfo {
+                name: "hit-app".into(),
+                path: String::new(),
+                uid: None,
+            },
+            &lan_counters,
+            &live,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        for (counters, want) in [(&counters, ""), (&lan_counters, "")] {
+            loop {
+                let tag_app = counters
+                    .ledger
+                    .as_ref()
+                    .and_then(|tag| tag.app.get().map(SmolStr::as_str));
+                if let Some(app) = tag_app {
+                    assert_eq!(app, want);
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the worker never resolved the flow's app"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+
+        traffic_ledger::uninstall();
     }
 
     #[test]
     fn connections_and_udp_flows_reach_the_ledger() {
+        let _serial = SERIAL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let dir = tempfile::tempdir().unwrap();
         traffic_ledger::install(dir.path(), Options::default()).unwrap();
         let stats = Arc::new(Statistics::new());

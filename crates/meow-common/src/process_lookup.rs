@@ -235,6 +235,10 @@ impl ProcessLookupPolicy {
 pub struct FlowLookup {
     /// `None` until a scan ran; `Some(None)` records the miss.
     process: OnceLock<Option<ProcessInfo>>,
+    /// Held across a scan's run-and-record so a concurrent caller waits
+    /// out the in-flight walk and consumes its outcome instead of
+    /// walking the socket table twice for one flow (issue #974).
+    scan: tokio::sync::Mutex<()>,
 }
 
 impl FlowLookup {
@@ -248,6 +252,48 @@ impl FlowLookup {
     /// treats a process demand as no longer actionable.
     pub fn process_attempted(&self) -> bool {
         self.process.get().is_some()
+    }
+
+    /// Whether a scan is running right now — the submission lock is held
+    /// and no outcome is recorded yet.
+    pub fn scan_pending(&self) -> bool {
+        self.process.get().is_none() && self.scan.try_lock().is_err()
+    }
+
+    /// The flow's one outcome: the recorded one if any, else `scan`'s —
+    /// run while the submission lock is held so a racing caller waits
+    /// and then consumes this record rather than duplicating the OS
+    /// walk. If the running caller is cancelled before it records, the
+    /// next waiter retries; no two walks ever run concurrently and the
+    /// recorded outcome is the same for every consumer.
+    pub async fn process_or_scan<F, Fut>(&self, scan: F) -> Option<ProcessInfo>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<ProcessInfo>>,
+    {
+        if let Some(outcome) = self.process.get() {
+            return outcome.clone();
+        }
+        let _permit = self.scan.lock().await;
+        if let Some(outcome) = self.process.get() {
+            return outcome.clone();
+        }
+        let info = scan().await;
+        let _ = self.process.set(info.clone());
+        info
+    }
+
+    /// Wait out a pending scan and consume the recorded outcome — `None`
+    /// when none was running, or it finished without recording (the
+    /// caller was cancelled). For consumers that must not submit a scan
+    /// of their own (the ledger's app lane): the lock handoff is what
+    /// guarantees the in-flight scan's record lands first.
+    pub async fn process_or_wait(&self) -> Option<ProcessInfo> {
+        if let Some(outcome) = self.process.get() {
+            return outcome.clone();
+        }
+        let _permit = self.scan.lock().await;
+        self.process.get().cloned().flatten()
     }
 
     /// Record the outcome of the flow's one lookup; first writer wins.

@@ -275,6 +275,12 @@ fn warn_unusable_target(adapter_name: &str, rule: &dyn Rule) {
 /// Async counterpart of [`maybe_enrich_with_process`]: the platform socket
 /// scan runs on the blocking pool so a large `/proc` table cannot stall the
 /// Tokio worker the match executes on (issue #515).
+///
+/// Production dispatch must NOT use this — it bypasses the flow's
+/// `FlowLookup` memo and pays a scan per call. Routing goes through
+/// `TunnelInner::resolve_proxy_flow`, whose `find-process-mode` demand
+/// gate runs the same scan once per flow (issue #974); these helpers
+/// remain for tests.
 pub async fn maybe_enrich_with_process_async(metadata: &Metadata) -> Option<Metadata> {
     if !metadata.process.is_empty() {
         return None;
@@ -292,6 +298,10 @@ pub async fn maybe_enrich_with_process_async(metadata: &Metadata) -> Option<Meta
 /// callers MUST use [`maybe_enrich_with_process_async`]: the platform
 /// socket scan can walk a large `/proc` tree and would stall the Tokio
 /// worker this runs on (issue #515).
+///
+/// Like its async counterpart this bypasses the flow's `FlowLookup`
+/// memo — production dispatch belongs to `TunnelInner::resolve_proxy_flow`
+/// (issue #974).
 pub fn maybe_enrich_with_process(metadata: &Metadata) -> Option<Metadata> {
     if !metadata.process.is_empty() {
         return None;

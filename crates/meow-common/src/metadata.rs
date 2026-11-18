@@ -84,11 +84,12 @@ pub struct Metadata {
     #[serde(skip)]
     pub internal: bool,
     /// Flow-local lookup state (issue #974 `find-process-mode`): the
-    /// owning-process scan's one-shot memo, `Arc`-shared with every clone
-    /// the routing passes, the UDP route probe and tracking make of this
-    /// metadata — the scan runs at most once per flow and a miss is
-    /// remembered too. Runtime-only: not part of the flow's API-visible
-    /// identity.
+    /// owning-process scan's one-shot memo and submission lock,
+    /// `Arc`-shared with every clone the routing passes, the UDP route
+    /// probe and tracking make of this metadata — the scan runs at most
+    /// once per flow, a concurrent caller waits out the one in flight
+    /// rather than walking the table twice, and a miss is remembered
+    /// too. Runtime-only: not part of the flow's API-visible identity.
     #[serde(skip)]
     pub flow_lookup: std::sync::Arc<crate::FlowLookup>,
 }

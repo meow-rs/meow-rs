@@ -2902,6 +2902,10 @@ mod same_family_progress {
     use std::time::Duration;
     #[tokio::test(start_paused = true)]
     async fn surviving_candidate_reclaims_budget_after_others_fail() {
+        // `connect_tcp_candidates` reads the `tcp-concurrent` process-global
+        // — serialize against the `tcp_concurrent_policy` test that flips
+        // it, or this run would take the sequential walk (issue #974).
+        let _serial = crate::dial::tcp_concurrent_serial().lock().await;
         let addrs = (1..=3)
             .map(|p| SocketAddr::from(([192, 0, 2, 1], p)))
             .collect();
@@ -2923,6 +2927,7 @@ mod same_family_progress {
     }
     #[tokio::test(start_paused = true)]
     async fn stalled_same_family_addresses_do_not_starve_later_candidates() {
+        let _serial = crate::dial::tcp_concurrent_serial().lock().await;
         let addresses = (1..=3)
             .map(|port| SocketAddr::from(([192, 0, 2, 1], port)))
             .collect();
@@ -2942,6 +2947,7 @@ mod same_family_progress {
     }
     #[tokio::test(start_paused = true)]
     async fn no_caller_deadline_does_not_introduce_five_second_limit() {
+        let _serial = crate::dial::tcp_concurrent_serial().lock().await;
         let addr = SocketAddr::from(([192, 0, 2, 1], 1));
         let start = tokio::time::Instant::now();
         let result = connect_tcp_candidates(vec![addr], |address| async move {
@@ -2957,6 +2963,7 @@ mod same_family_progress {
     #[tokio::test(start_paused = true)]
     async fn shared_deadline_race_bounds_and_drops_pending_attempts() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        let _serial = crate::dial::tcp_concurrent_serial().lock().await;
         struct Live(Arc<AtomicUsize>);
         impl Drop for Live {
             fn drop(&mut self) {
@@ -3385,6 +3392,9 @@ mod tcp_concurrent_policy {
     /// brief window cannot flip another test's expectation.
     #[tokio::test(start_paused = true)]
     async fn selector_reads_the_live_global_once() {
+        // Mutating the process-global must not leak into a sibling's
+        // `connect_tcp_candidates` walk — the serial excludes them.
+        let _serial = crate::dial::tcp_concurrent_serial().lock().await;
         struct Reset;
         impl Drop for Reset {
             fn drop(&mut self) {

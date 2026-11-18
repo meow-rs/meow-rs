@@ -1125,6 +1125,15 @@ async fn patch_configs_global_ua_lifecycle() {
 #[tokio::test]
 async fn patch_configs_tcp_concurrent_lifecycle() {
     use base64::Engine as _;
+    // The process-global must return to `true` even if this test panics —
+    // a leaked `false` silently sequentializes every sibling's dials.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            meow_common::dial::set_tcp_concurrent(true);
+        }
+    }
+    let _reset = Reset;
     let state = test_state_default();
     let patch = |body: &str| {
         let app = create_router(Arc::clone(&state));
@@ -1184,11 +1193,20 @@ async fn patch_configs_tcp_concurrent_lifecycle() {
         let resp = patch(body).await;
         assert_eq!(resp.status(), StatusCode::NO_CONTENT);
     }
-    {
+    // Observe `false` unconditionally under the lane — a sibling commit
+    // that flipped it is retried like the flips above, not skipped over.
+    let mut attempts = 0;
+    loop {
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         if !meow_common::dial::tcp_concurrent() {
             assert!(!get_concurrent(&state).await);
+            break;
         }
+        drop(_lane);
+        let resp = patch(r#"{"tcp-concurrent":false}"#).await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        attempts += 1;
+        assert!(attempts < 20, "writers kept resetting tcp-concurrent");
     }
 
     // A wrong-type PATCH is refused before any mutation — the live value
@@ -8886,7 +8904,12 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
 
     let resp = patch_configs(
         &state,
-        serde_json::json!({"mode": "direct", "tun": {"enable": true, "mtu": 1400}}),
+        serde_json::json!({
+            "mode": "direct",
+            "tun": {"enable": true, "mtu": 1400},
+            "tcp-concurrent": false,
+            "find-process-mode": "off",
+        }),
     )
     .await;
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -8902,6 +8925,25 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
     let tun = state.raw_config.read().tun.clone().unwrap();
     assert!(!tun.enable, "a failed start must roll `enable` back");
     assert_eq!(tun.mtu, Some(1400));
+    // Riding the same swap, the live globals it commits before the
+    // fallible reconcile must be restored too — not just `tun.enable`
+    // (issue #974 review).
+    {
+        let raw = state.raw_config.read();
+        assert_eq!(
+            raw.tcp_concurrent, None,
+            "the riding tcp-concurrent must not commit"
+        );
+        assert_eq!(
+            raw.find_process_mode, None,
+            "the riding find-process-mode must not commit"
+        );
+    }
+    assert_eq!(
+        state.tunnel.process_lookup_mode(),
+        meow_common::ProcessLookupMode::Strict,
+        "the live find-process-mode must be restored"
+    );
     let configs = get_configs_json(&state).await;
     assert_eq!(configs["tun"]["enable"], false);
     assert_eq!(

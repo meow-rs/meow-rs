@@ -323,6 +323,14 @@ fn ip_missing(input: &MatchInput<'_>) -> bool {
 
 /// Process info is absent but discoverable: a source socket exists to look
 /// up. Mirrors the guards in `match_engine::maybe_enrich_with_process`.
+///
+/// The demand is process-granular, not field-granular: a UID-only rule
+/// sets the same `demands_process` bit as a PROCESS-NAME one, so a flow
+/// carrying `uid` but no `process` still pays one scan for the name it
+/// may not need. Splitting the bit per field would mean threading a
+/// `should_find_process` field-set through every `Rule` impl, the
+/// composites and the provider sets — not worth it for a cost bounded at
+/// one scan per flow (issue #974).
 fn process_missing(metadata: &Metadata) -> bool {
     metadata.process.is_empty() && metadata.src_ip.is_some() && metadata.src_port != 0
 }

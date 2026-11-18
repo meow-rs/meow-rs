@@ -1266,7 +1266,8 @@ async fn update_configs(
     // create), so such a PATCH leaves mode and log level as they were. The
     // TUN change runs the reload path's reconcile, rollback included.
     if let Some(tun) = tun {
-        let mut candidate = state.raw_config.read().clone();
+        let prior = state.raw_config.read().clone();
+        let mut candidate = prior.clone();
         candidate.tun = Some(tun);
         // Carry a patched routing-mark through the same commit path
         // (`set_routing_mark` inside the swap applies it; the write below
@@ -1289,6 +1290,18 @@ async fn update_configs(
         if body.find_process_mode.is_some() {
             candidate.find_process_mode = body.find_process_mode;
         }
+        // The swap commits the riding live globals and the raw before its
+        // fallible TUN reconcile — snapshot both so a failed spawn leaves
+        // the PATCH as it found them (`tun.enable`'s own rollback below
+        // stands; the pre-installed binding reverts on drop).
+        let live = (
+            meow_proxy::health::unified_delay(),
+            meow_common::routing_mark(),
+            meow_common::global_interface_name(),
+            meow_common::global_ua(),
+            meow_common::dial::tcp_concurrent(),
+            state.tunnel.process_lookup_mode(),
+        );
         let preinstalled = preinstall_global_route_binding(&candidate);
         // No routing publish runs here, so tracked TCP predating a
         // pre-installed global-route binding is still live.
@@ -1302,6 +1315,17 @@ async fn update_configs(
         )
         .await
         {
+            meow_proxy::health::set_unified_delay(live.0);
+            meow_common::set_routing_mark(Some(live.1));
+            meow_common::set_global_interface_name(live.2.as_deref());
+            meow_common::set_global_ua(live.3.as_deref());
+            meow_common::dial::set_tcp_concurrent(live.4);
+            state.tunnel.set_process_lookup_mode(live.5);
+            let mut raw = state.raw_config.write();
+            let tun_left = raw.tun.take();
+            *raw = prior;
+            raw.tun = tun_left;
+            drop(raw);
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "message": e })),
