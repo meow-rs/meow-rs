@@ -36,6 +36,7 @@ skip-auth-prefixes:
 ## REST API auth
 
 The [REST API](../reference/rest-api) is protected by a single shared secret.
+Applying a change to that secret requires a restart.
 
 ```yaml
 external-controller: 127.0.0.1:9090

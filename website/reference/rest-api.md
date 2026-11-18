@@ -154,6 +154,8 @@ saved.
 `PUT /configs` accepts `{ "path": "/path/to/config.yaml" }` or
 `{ "payload": "<base64-yaml>" }`. Add `?force=true` to apply despite validation errors
 (logged). Returns 204 on success, or 400 `{ message }` on a parse/validation failure.
+Changing or removing the configured `secret` requires a restart. A reload that changes
+it returns 400 even with `?force=true`.
 For `subscriptions:` entries kept by name+URL the daemon carries its
 `applied-*` contribution tracking forward — a PUT that omits those
 bookkeeping fields does not orphan the subscription's tracked content.
