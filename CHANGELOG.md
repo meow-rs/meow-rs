@@ -285,6 +285,13 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- **WireGuard bridge latency.** Flush ready outgoing datagrams without a fixed
+  delay and continue batching datagrams that are already queued.
+- **Concurrent DNS-over-HTTPS startup.** Share the first HTTP/2 connection
+  across concurrent queries and keep concurrent connections for HTTP/1.1.
+- **Provider download memory.** Buffer each response body once and limit
+  concurrent rule-provider downloads within each prefetch worker.
+
 - **AnyTLS streams no longer wait for SYNACK.** A new stream used to wait up
   to 30 s for the server's SYNACK before the caller could send its first
   byte, adding a round trip to every connection and stalling every stream to
@@ -562,6 +569,15 @@ the canonical, in-repo source a release is cut from.
   re-armed by packet pressure — the same forced-resend call
   `update_timers` makes on a rekey timeout, throttled at the same 5 s
   floor.
+
+### Security
+
+- Require same-origin browser access and an IP address or `localhost` for
+  controllers without a secret. Restart meow to change the controller secret.
+- Restrict permissions on configuration files, backups and provider caches on
+  Unix. OpenWrt binds a controller with an empty UCI secret to loopback and
+  passes a configured secret in a root-only runtime file.
+- Update `rustix` to 1.1.6.
 
 ## [0.29.0] - 2026-11-05
 
