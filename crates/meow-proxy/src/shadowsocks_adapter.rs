@@ -40,7 +40,7 @@ use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::time::Sleep;
 use tracing::debug;
-#[cfg(any(feature = "restls", feature = "jls"))]
+#[cfg(any(feature = "restls", feature = "jls", feature = "ech-tls-tunnel"))]
 use tracing::warn;
 
 /// Built-in (native, no external process) simple-obfs configuration.
