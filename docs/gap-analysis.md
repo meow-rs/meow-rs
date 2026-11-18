@@ -261,8 +261,9 @@ Upstream config keys documented at https://wiki.metacubex.one/. Checking `crates
 
 `global-client-fingerprint` (issue #974) is the default uTLS ClientHello
 profile for `proxies:`/`proxy-providers:` nodes that omit
-`client-fingerprint` — the node value wins, an explicit `none`/`""`
-opts out, and an unsupported name warns and falls back to the TLS
+`client-fingerprint` — the node value wins, an omitted or `""`
+value inherits the global, an explicit `none` opts out, and an
+unsupported name warns and falls back to the TLS
 backend's defaults. It is baked into the adapters at parse time, so it
 changes only through a full config load. `global-ua` (issue #974)
 overrides the `User-Agent` internal HTTP fetches (providers,
