@@ -672,16 +672,16 @@ pub fn parse_tun_config(
         None => default_tun_inet4_address(fake_ip_range),
     };
 
-    // Absent: on. An empty list turns it off. Any usable entry hijacks
-    // every UDP :53 flow.
+    // Absent: on. An empty list turns it off. Only the exact wildcard
+    // :53 forms enable the UDP hijack.
     let mut dns_hijack = r.dns_hijack.is_none();
     for entry in r.dns_hijack.as_deref().unwrap_or(&[]) {
-        let port = entry.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
-        match port {
-            Some(53) => dns_hijack = true,
-            _ => warn!(
-                "tun.dns-hijack: entry '{entry}' is not a :53 target; meow-rs only hijacks \
-                 UDP port 53 — entry ignored"
+        match dns_hijack_entry(entry) {
+            true => dns_hijack = true,
+            false => warn!(
+                "tun.dns-hijack: entry '{entry}' is not a wildcard UDP :53 target \
+                 {DNS_HIJACK_FORMS}; meow-rs hijacks UDP/53 only — entry ignored",
+                DNS_HIJACK_FORMS = DNS_HIJACK_FORMS
             ),
         }
     }
@@ -875,18 +875,19 @@ pub fn parse_named_tun_config(
     }
     let outbound_interface = outbound_interface.filter(|_| global);
 
-    // Absent: on. An empty list turns it off. `0.0.0.0:53`/`any:53` and
-    // every other :53 target hijack UDP :53 flows; any other entry warns
-    // and is ignored rather than reinterpreted (upstream accepts only
-    // :53 for meow's wildcard-hijack capability).
+    // Absent: on. An empty list turns it off. Only the exact wildcard
+    // :53 forms enable the UDP hijack — a `tcp:` target (the pump has no
+    // TCP/53 diversion), a specific address, or any other shape warns and
+    // is ignored rather than broadening what the device diverts.
     let mut dns_hijack = raw_l.dns_hijack.is_none();
     for entry in raw_l.dns_hijack.as_deref().unwrap_or(&[]) {
-        let port = entry.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
-        match port {
-            Some(53) => dns_hijack = true,
-            _ => warn!(
-                "listeners[{name}].dns-hijack: entry '{entry}' is not a :53 target; \
-                 meow-rs only hijacks UDP port 53 — entry ignored"
+        match dns_hijack_entry(entry) {
+            true => dns_hijack = true,
+            false => warn!(
+                "listeners[{name}].dns-hijack: entry '{entry}' is not a wildcard \
+                 UDP :53 target {DNS_HIJACK_FORMS}; meow-rs hijacks UDP/53 only — \
+                 entry ignored",
+                DNS_HIJACK_FORMS = DNS_HIJACK_FORMS
             ),
         }
     }
@@ -971,6 +972,17 @@ fn parse_named_tun_stack(
              system, mixed, gvisor, mips, or lwip)"
         )),
     }
+}
+
+/// The `dns-hijack` targets meow admits — the wildcard UDP/53 spellings
+/// only. `tcp:`-schemed targets name a TCP diversion meow does not
+/// implement; a specific host address or another port is outside the
+/// hijack's "every UDP :53 flow" contract.
+const DNS_HIJACK_FORMS: &str = "(0.0.0.0:53, any:53, *:53, [::]:53)";
+
+/// Whether `entry` is one of [`DNS_HIJACK_FORMS`]' exact spellings.
+fn dns_hijack_entry(entry: &str) -> bool {
+    matches!(entry, "0.0.0.0:53" | "any:53" | "*:53" | "[::]:53")
 }
 
 /// The CIDR string of an `inet{4,6}-address`: a string or mihomo's list
@@ -3770,6 +3782,11 @@ fn rebuild_from_raw_impl(
         }
     }
 
+    // `listeners[].proxy` forced targets resolve against this same map —
+    // validating here makes `-t`, startup and every rebuild-driven
+    // mutation reject the same dangling name identically.
+    validate_listener_proxy_targets(raw, &proxies, &candidate_providers)?;
+
     // The provider set is returned, not swapped: the committing caller
     // publishes it into the live registry only after every fallible check
     // has passed, so a rejected candidate never leaves its fetch contexts
@@ -5502,6 +5519,102 @@ pub fn resolve_named_listeners(raw: &raw::RawConfig) -> Result<Vec<NamedListener
     build_named_listeners(raw, &bind_addr, global_tproxy_sni)
 }
 
+/// Why a `listeners[].proxy` name cannot force a route in this rebuilt
+/// map — `None` when it resolves. Built-ins count the way
+/// `resolve_listener_proxy` sees them: DIRECT/REJECT/PASS/COMPATIBLE and
+/// the auto-created GLOBAL are all ordinary map entries. A proxy-provider
+/// name is rejected explicitly: a provider feeds groups and is not a
+/// target — naming it would check against nothing and fail closed per
+/// flow. Shared by the build admission below and the API's prospective
+/// route guard so every publication path diagnoses the same way.
+pub fn listener_proxy_target_err(
+    name: &str,
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    proxy_providers: &HashMap<String, Arc<ProxyProvider>>,
+) -> Option<String> {
+    if proxy_providers.contains_key(name) {
+        return Some(format!(
+            "'{name}' is a proxy-provider — providers feed groups and are \
+             not forced-route targets"
+        ));
+    }
+    (!proxies.contains_key(name))
+        .then(|| format!("'{name}' does not name a built proxy or proxy group"))
+}
+
+/// Admission check for `listeners[].proxy`: every forced target must
+/// name a proxy or group in the rebuilt map (`rule:` selects a
+/// `sub-rules:` block instead — `build_named_listeners` already gates
+/// that name against `raw.sub_rules`). Runs inside every
+/// `rebuild_from_raw_*` pass so `-t`, startup, `PUT /configs` and every
+/// warm mutation reject the same dangling reference with the same error
+/// instead of committing a document the inbound would only fail closed
+/// on per flow.
+pub fn validate_listener_proxy_targets(
+    raw: &raw::RawConfig,
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    proxy_providers: &HashMap<String, Arc<ProxyProvider>>,
+) -> Result<(), anyhow::Error> {
+    for l in raw.listeners.as_deref().unwrap_or(&[]) {
+        let Some(name) = l.proxy.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if let Some(why) = listener_proxy_target_err(name, proxies, proxy_providers) {
+            anyhow::bail!("listeners[{}].proxy: {why}", l.name);
+        }
+    }
+    Ok(())
+}
+
+/// The document-shape half of listener-proxy admission: a forced target
+/// must name something the document itself declares — a `proxies:` entry,
+/// a `proxy-groups:` entry, or a built-in the route table always carries.
+/// Provider members are not registry keys, so a name outside the declared
+/// set can never resolve; that defect is in the document, not the build —
+/// `PUT /configs` refuses it even when `force` would persist a declared
+/// name that merely failed to build. Returns the first offending
+/// listener's message.
+pub fn listener_proxy_target_shape_err(raw: &raw::RawConfig) -> Option<String> {
+    for l in raw.listeners.as_deref().unwrap_or(&[]) {
+        let Some(name) = l.proxy.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if raw
+            .proxy_providers
+            .as_ref()
+            .is_some_and(|pp| pp.contains_key(name))
+        {
+            return Some(format!(
+                "listeners[{}].proxy: '{name}' is a proxy-provider — providers \
+                 feed groups and are not forced-route targets",
+                l.name
+            ));
+        }
+        let declared = raw
+            .proxies
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            || raw
+                .proxy_groups
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|g| g.name == name)
+            || BUILTIN_ADAPTER_NAMES.contains(&name)
+            || name == "GLOBAL";
+        if !declared {
+            return Some(format!(
+                "listeners[{}].proxy: '{name}' names no declared proxy, \
+                 proxy group, or built-in",
+                l.name
+            ));
+        }
+    }
+    None
+}
+
 /// Resolve `tcp-keepalive*` into the [`meow_common::TcpKeepaliveConfig`]
 /// every inbound listener applies to its accepted sockets, enforcing
 /// `build_config`'s semantics: all three knobs are bounded at the limits
@@ -6162,8 +6275,31 @@ fn build_named_listeners(
         // `listeners[].routing-mark` marks the LISTENER socket at bind
         // (ingress SO_MARK, upstream `InboundOption.RoutingMark`) —
         // Linux-only; the top-level `routing-mark` outbound key is a
-        // different consumer and is not altered.
-        let routing_mark = raw_l.routing_mark;
+        // different consumer and is not altered. `0` normalizes to
+        // "unset" like the top-level key — a literal mark-0 `setsockopt`
+        // would tag the socket 0, the firewall-exempt wildcard.
+        // TPROXY (`redir` lowers to it) and WireGuard have no ingress
+        // mark contract — steered/responder sockets are not marked, so
+        // the key warns and ignores there.
+        let routing_mark = match spec {
+            ListenerSpec::TProxy { .. } | ListenerSpec::WireGuard(_) => {
+                if raw_l.routing_mark.is_some() {
+                    warn!(
+                        "listeners[{}].routing-mark: has no effect on `type: {}` — \
+                         only socket listeners with a client-facing bind honour it \
+                         (mixed/socks5/http/shadowsocks); ignored",
+                        raw_l.name,
+                        if is_redir {
+                            "redir"
+                        } else {
+                            raw_l.listener_type.as_str()
+                        }
+                    );
+                }
+                None
+            }
+            _ => raw_l.routing_mark.filter(|m| *m != 0),
+        };
         #[cfg(not(target_os = "linux"))]
         if routing_mark.is_some() {
             warn!(
@@ -11594,5 +11730,149 @@ mod connection_limit_tests {
             parse_tun_config(None, None, None).unwrap().max_connections,
             256
         );
+    }
+}
+
+#[cfg(test)]
+mod listener_surface_tests {
+    use super::*;
+
+    fn proxies_with_direct() -> HashMap<SmolStr, Arc<dyn Proxy>> {
+        HashMap::from([(
+            SmolStr::from("DIRECT"),
+            Arc::new(proxy_parser::WrappedProxy::new(Box::new(
+                meow_proxy::DirectAdapter::new(),
+            ))) as Arc<dyn Proxy>,
+        )])
+    }
+
+    #[test]
+    fn routing_mark_zero_normalizes_to_unset() {
+        // `0` is the firewall-exempt wildcard, not a real mark — it must
+        // never reach `setsockopt`.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    routing-mark: 0\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        assert_eq!(listeners[0].routing_mark, None);
+    }
+
+    #[test]
+    fn routing_mark_drops_on_transparent_and_responder_listeners() {
+        // Marking a TPROXY/WireGuard socket would tag the steered reply
+        // packets the policy rules must route back — the key is ignored
+        // there even when nonzero.
+        for ty in ["tproxy", "redir"] {
+            let raw: raw::RawConfig = crate::parse_raw_yaml(&format!(
+                "listeners:\n  - name: t\n    type: {ty}\n    port: 0\n    routing-mark: 7\n"
+            ))
+            .unwrap();
+            let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+            assert_eq!(listeners[0].routing_mark, None, "{ty}");
+        }
+        // WireGuard responder: same drop arm, a real key pair is needed to
+        // reach the mark resolution (RFC 7748 Alice scalar + Bob public).
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: w\n    type: wireguard\n    port: 0\n    routing-mark: 7\n    private-key: \"dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=\"\n    peers:\n      - public-key: \"3p7bfXt9wbTTW2HC7OQ1Nz+DQ8hbeGdNrfx+FG+IK08=\"\n        allowed-ips: [10.0.0.0/8]\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        assert_eq!(listeners[0].routing_mark, None, "wireguard");
+    }
+
+    #[test]
+    fn routing_mark_survives_on_socket_listeners() {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    routing-mark: 7\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        assert_eq!(listeners[0].routing_mark, Some(7));
+    }
+
+    #[test]
+    fn routing_mark_negative_is_a_parse_error() {
+        // Upstream rejected nonnumeric marks; a negative one is no "unset"
+        // spelling and must not coerce — u32 decode fails outright.
+        let err = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    routing-mark: -1\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("routing-mark"), "{err}");
+    }
+
+    /// Admission accepts the references the listener surface supports: a
+    /// `proxy:` naming a rebuilt group and a `rule:` naming a `sub-rules:`
+    /// block — the pair a `-t`/startup/PUT pass must let through
+    /// (spec §2).
+    #[test]
+    fn listener_group_and_block_references_admit() {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "proxy-groups:\n  - name: pick\n    type: select\n    proxies: [DIRECT]\nsub-rules:\n  side:\n    - DOMAIN,example.com,DIRECT\nlisteners:\n  - name: m\n    type: mixed\n    port: 0\n    proxy: pick\n    rule: side\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        let over = listeners[0].route_override.as_ref().unwrap();
+        assert_eq!(over.proxy.as_deref(), Some("pick"));
+        assert_eq!(over.rule.as_deref(), Some("side"));
+        // The map-level gate admits the same pair — no false positive
+        // from validating `proxy` against leaf names only.
+        let built = rebuild_from_raw(&raw).unwrap();
+        validate_listener_proxy_targets(&raw, &built.proxies, &built.proxy_providers).unwrap();
+    }
+
+    #[test]
+    fn listener_proxy_target_err_names_only_built_targets() {
+        let proxies = proxies_with_direct();
+        let dir = tempfile::tempdir().unwrap();
+        let raw_def: raw::RawProxyProvider =
+            serde_saphyr::from_str("type: file\npath: p.yaml\n").unwrap();
+        let provider = ProxyProvider::new(
+            "feed",
+            &raw_def,
+            Some(dir.path()),
+            false,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        let providers: HashMap<String, Arc<ProxyProvider>> =
+            HashMap::from([("feed".to_string(), Arc::new(provider))]);
+        // A missing name and a provider name fail; a built adapter passes.
+        assert!(listener_proxy_target_err("ghost", &proxies, &providers).is_some());
+        let err = listener_proxy_target_err("feed", &proxies, &providers).unwrap();
+        assert!(err.contains("proxy-provider"), "{err}");
+        assert!(listener_proxy_target_err("DIRECT", &proxies, &providers).is_none());
+    }
+
+    /// The PUT `force`-floor half: an undeclared name or a provider name
+    /// fails at the document level, while every *declared* name — leaf,
+    /// group, built-in, auto GLOBAL — is admitted so a name that merely
+    /// fails to build stays force-degradable (environment, not shape).
+    #[test]
+    fn listener_proxy_target_shape_err_gates_undeclared_names() {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "proxies:\n  - {name: leaf, type: direct}\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [leaf]\nproxy-providers:\n  feed:\n    type: file\n    path: p.yaml\nlisteners:\n  - name: bad\n    type: mixed\n    port: 0\n    proxy: ghost\n  - name: worse\n    type: mixed\n    port: 0\n    proxy: feed\n",
+        )
+        .unwrap();
+        for (decl, want) in [
+            ("ghost", true),
+            ("feed", true),
+            ("leaf", false),
+            ("g", false),
+            ("DIRECT", false),
+            ("GLOBAL", false),
+        ] {
+            let mut probe = raw.clone();
+            probe.listeners.as_mut().unwrap()[0].proxy = Some(decl.to_string());
+            probe.listeners.as_mut().unwrap()[1].proxy = None;
+            assert_eq!(
+                listener_proxy_target_shape_err(&probe).is_some(),
+                want,
+                "{decl}"
+            );
+        }
     }
 }

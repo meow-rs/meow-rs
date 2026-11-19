@@ -55,6 +55,10 @@ pub async fn run_loop(
     proxy_provider_refresh: Arc<
         meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor,
     >,
+    // The running named listeners (startup snapshot — refreshes never
+    // rebind them): their `proxy:`/`rule:` overrides gate every route
+    // the loop would publish.
+    running_listeners: Vec<meow_config::NamedListener>,
 ) {
     // Same provider-cache directory `load_config` used at startup — trusted
     // rebuilds of the daemon's own config must keep resolving relative
@@ -298,6 +302,30 @@ pub async fn run_loop(
                                 }
                                 continue;
                             }
+                            // Same prospective-route sweep as
+                            // `apply_raw_to_tunnel`: a refresh that drops a
+                            // running listener's forced proxy or selected
+                            // block must not publish — the inbound cannot
+                            // be re-pointed without a restart.
+                            if let Err((_status, msg)) = meow_api::routes::listener_route_deps_guard(
+                                &running_listeners,
+                                &candidate,
+                                &new_proxies,
+                                &new_sub_rules,
+                                &new_proxy_providers,
+                            ) {
+                                warn!("subscription '{name}': {msg}; NOT committing");
+                                meow_api::routes::subscription_failed(&name, &msg);
+                                let mut live = raw_config.write();
+                                if let Some(sub) = live
+                                    .subscriptions
+                                    .as_mut()
+                                    .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+                                {
+                                    sub.last_updated = Some(now);
+                                }
+                                continue;
+                            }
                             // A swapped proxy set changes the objects a
                             // `#name` nameserver or `rule-set:` policy key
                             // references — reconcile BEFORE the raw write so
@@ -345,6 +373,37 @@ pub async fn run_loop(
                                 }
                             };
 
+                            // The named-TUN fake-IP guard from
+                            // `commit_raw_candidate`: a refresh moving the
+                            // pool under a running named device strands
+                            // its pinned range — refuse before anything
+                            // publishes (the next interval retries).
+                            if let (Some(dns), Some(meow_tunnel::TunOwner::Named(tun_name))) =
+                                (&dns, tunnel.tun_owner())
+                            {
+                                if meow_api::routes::tun_fake_ip_changed(
+                                    &tunnel.resolver(),
+                                    &dns.resolver,
+                                ) {
+                                    let msg = format!(
+                                        "resolver change moves the fake-IP pool while \
+                                         named `type: tun` listener '{tun_name}' is running \
+                                         — the device pins the pool it started with; \
+                                         restart meow to apply it"
+                                    );
+                                    warn!("subscription '{name}': {msg}; NOT committing");
+                                    meow_api::routes::subscription_failed(&name, &msg);
+                                    let mut live = raw_config.write();
+                                    if let Some(sub) = live
+                                        .subscriptions
+                                        .as_mut()
+                                        .and_then(|subs| subs.iter_mut().find(|s| s.name == name))
+                                    {
+                                        sub.last_updated = Some(now);
+                                    }
+                                    continue;
+                                }
+                            }
                             // Publish the rebuilt resolver to every
                             // consumer before the route swap drops the old
                             // registry cell — a `#name` upstream resolving

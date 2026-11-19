@@ -55,11 +55,17 @@ use tracing::{info, warn};
 /// Parse inputs are invariant under `update_rules` (`route.proxies` /
 /// `dialer_registry` are unchanged by it; `prior` is just the old
 /// resolver), so computing them before the rules commit is equivalent.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent input the refresh \
+              republishes; bundling them would only rename the list"
+)]
 async fn republish_dns_for_geo_dbs(
     raw: &RawConfig,
     cache_dir: Option<&std::path::Path>,
     rule_providers: &std::collections::HashMap<String, Arc<RuleProvider>>,
     rules: Vec<Box<dyn meow_common::rule::Rule>>,
+    sub_rules: std::collections::HashMap<String, meow_rules::sub_rule::SubRuleBlock>,
     tunnel: &Tunnel,
     dns_server: &RwLock<Option<meow_api::routes::DnsServerHandle>>,
     label: &str,
@@ -96,8 +102,11 @@ async fn republish_dns_for_geo_dbs(
     }
     let _abort_guard = AbortOnDrop(parse.abort_handle());
     let parsed = parse.await;
-    // Commits — synchronous, adjacent, no await between.
-    tunnel.update_rules(rules);
+    // Commits — synchronous, adjacent, no await between. The rebuilt
+    // `sub_rules` publish in the same route swap: a named `sub-rules:`
+    // block referencing the refreshed GEOSITE/GEOIP DB must not keep
+    // matching the pre-download table (issue #543 follow-up).
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
     match parsed {
         Ok(Ok(dns)) => meow_api::routes::publish_dns(tunnel, dns_server, &dns).await,
         Ok(Err(e)) => warn!("{label}: dns republish skipped: {e:#}"),
@@ -384,6 +393,7 @@ async fn auto_update_tick(
                 cache_dir,
                 &rebuild.rule_providers,
                 rebuild.rules,
+                rebuild.sub_rules,
                 tunnel,
                 dns_server,
                 "geodata auto-update",
@@ -498,6 +508,7 @@ mod tests {
             Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
+            rebuild.sub_rules,
             &tunnel,
             &dns_server,
             "test",
@@ -569,6 +580,7 @@ mod tests {
             Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
+            rebuild.sub_rules,
             &tunnel,
             &dns_server,
             "test",
@@ -669,6 +681,7 @@ mod tests {
             Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
+            rebuild.sub_rules,
             &tunnel,
             &dns_server,
             "test",
@@ -728,6 +741,7 @@ mod tests {
             Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
+            rebuild.sub_rules,
             &tunnel,
             &dns_server,
             "test",
@@ -790,6 +804,7 @@ mod tests {
             Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
+            rebuild.sub_rules,
             &tunnel,
             &dns_server,
             "test",
@@ -871,6 +886,7 @@ mod tests {
             Some(dir.path()),
             &rebuild.rule_providers,
             rebuild.rules,
+            rebuild.sub_rules,
             &tunnel,
             &dns_server,
             "test",

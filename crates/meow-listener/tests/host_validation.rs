@@ -92,8 +92,10 @@ async fn socks5_connect_domain(tunnel: &meow_tunnel::Tunnel, host: &[u8]) -> [u8
     let tunnel = tunnel.clone();
     let src: SocketAddr = "127.0.0.1:1".parse().unwrap();
     tokio::spawn(async move {
-        meow_listener::socks5::handle_socks5(&tunnel, server, src, None, None, "socks", 0, None)
-            .await;
+        meow_listener::socks5::handle_socks5(
+            &tunnel, server, src, None, None, "socks", 0, None, None,
+        )
+        .await;
     });
     client.write_all(&[5, 1, 0]).await.unwrap();
     let mut method = [0u8; 2];

@@ -36,6 +36,11 @@ pub struct MixedListener {
     /// stamped onto every flow's `Metadata` (upstream `BaseOption`
     /// Additions). `None` = plain routing.
     route_override: Option<InboundRouteOverride>,
+    /// `listeners[].routing-mark` — carried to the SOCKS5 UDP-associate
+    /// relay socket this listener binds per association (the TCP listen
+    /// socket itself is marked by the caller at bind; accepted sockets
+    /// inherit it, the separately bound UDP relay does not). Linux only.
+    routing_mark: Option<u32>,
 }
 
 impl MixedListener {
@@ -50,6 +55,7 @@ impl MixedListener {
             tcp_keepalive: TcpKeepaliveConfig::default(),
             lan_acl: None,
             route_override: None,
+            routing_mark: None,
         }
     }
 
@@ -95,6 +101,14 @@ impl MixedListener {
     /// stamped onto every accepted flow's `Metadata` before routing.
     pub fn with_route_override(mut self, ov: Option<InboundRouteOverride>) -> Self {
         self.route_override = ov;
+        self
+    }
+
+    /// `listeners[].routing-mark` for the UDP-associate relay socket —
+    /// the only socket this listener binds itself (the caller marks the
+    /// TCP listen socket). Linux only; `None` writes no sockopt.
+    pub fn with_routing_mark(mut self, mark: Option<u32>) -> Self {
+        self.routing_mark = mark;
         self
     }
 
@@ -209,6 +223,7 @@ impl MixedListener {
             let port = bound_addr.port();
             let auth = self.auth.clone();
             let route_override = self.route_override.clone();
+            let routing_mark = self.routing_mark;
             tokio::spawn(async move {
                 handle_connection(
                     tunnel,
@@ -219,6 +234,7 @@ impl MixedListener {
                     port,
                     auth,
                     route_override,
+                    routing_mark,
                 )
                 .await;
                 drop(permit);
@@ -241,6 +257,7 @@ async fn handle_connection(
     port: u16,
     auth: Option<Arc<AuthConfig>>,
     route_override: Option<InboundRouteOverride>,
+    routing_mark: Option<u32>,
 ) {
     // Peek the first byte to determine protocol
     let mut peek = [0u8; 1];
@@ -268,6 +285,7 @@ async fn handle_connection(
             &name,
             port,
             route_override.as_ref(),
+            routing_mark,
         )
         .await;
     } else {

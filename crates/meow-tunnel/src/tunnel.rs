@@ -90,18 +90,7 @@ impl RouteTable {
         );
         let domain_index = DomainIndex::build(&rules);
         let compiled_rules = CompiledRuleSet::build_masked(&rules, |i| rule_stats.is_disabled(i));
-        let sub_rules = sub_rules
-            .into_iter()
-            .map(|(name, block)| {
-                (
-                    SmolStr::from(name),
-                    SubRuleRoute {
-                        compiled: CompiledRuleSet::build(&block),
-                        rules: block,
-                    },
-                )
-            })
-            .collect();
+        let sub_rules = compile_sub_rule_routes(sub_rules);
         Self {
             rule_stats: Arc::new(rule_stats),
             rules: Arc::new(rules),
@@ -140,6 +129,41 @@ impl RouteTable {
             rule_stats: Arc::clone(&self.rule_stats),
         }
     }
+
+    /// Whether any scannable rule set demands a resolved `dst_ip`:
+    /// top-level rules OR a `sub-rules:` block a listener `rule:`
+    /// override selects (its compiled set is reachable only via the
+    /// override, so its demand must reach the eager `pre_resolve` gate
+    /// the same way — a block of IP-CIDR/GEOIP rules otherwise never
+    /// sees a resolved destination).
+    fn needs_ip_resolution(&self) -> bool {
+        self.compiled_rules.needs_ip_resolution()
+            || self
+                .sub_rules
+                .values()
+                .any(|b| b.compiled.needs_ip_resolution())
+    }
+}
+
+/// Compile each `sub-rules:` block for a route snapshot — shared by
+/// [`RouteTable::new`] and the rules-only republish
+/// ([`Tunnel::update_rules_with_sub_rules`]) so both produce identical
+/// `SubRuleRoute`s.
+fn compile_sub_rule_routes(
+    sub_rules: HashMap<String, meow_rules::sub_rule::SubRuleBlock>,
+) -> HashMap<SmolStr, SubRuleRoute> {
+    sub_rules
+        .into_iter()
+        .map(|(name, block)| {
+            (
+                SmolStr::from(name),
+                SubRuleRoute {
+                    compiled: CompiledRuleSet::build(&block),
+                    rules: block,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Whether [`Tunnel::flush_for_outbound_interface_change`] cancels tracked
@@ -678,25 +702,29 @@ impl TunnelInner {
     fn resolve_listener_proxy(&self, metadata: &Metadata, record_hit: bool) -> ResolvedTarget {
         let route = self.route();
         let name = metadata.special_proxy.as_str();
-        let (adapter, action) = if name == "DIRECT" {
-            (Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>, "DIRECT")
-        } else {
-            match route.proxies.get(name) {
-                Some(p) if metadata.network == Network::Udp && !p.support_udp() => {
-                    warn!("listener '{name}': forced proxy does not support UDP; rejecting flow");
-                    (Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>, "REJECT")
-                }
-                Some(p) => (
-                    Arc::clone(p) as Arc<dyn ProxyAdapter>,
-                    proxy_action(p.adapter_type()),
-                ),
-                None => {
-                    warn!(
-                        "listener forced proxy '{name}' is not in the route table; \
-                         rejecting flow (upstream: proxy {name} not found)"
-                    );
-                    (Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>, "REJECT")
-                }
+        // Built-ins resolve through the map like any other name: the
+        // published DIRECT carries the build's resolver slot and
+        // `tcp-connect-timeout`, so a forced `proxy: DIRECT` must dial
+        // with the configured adapter, not the tunnel's private one
+        // (which only backstops an absent map entry).
+        let (adapter, action) = match route.proxies.get(name) {
+            Some(p) if metadata.network == Network::Udp && !p.support_udp() => {
+                warn!("listener '{name}': forced proxy does not support UDP; rejecting flow");
+                (Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>, "REJECT")
+            }
+            Some(p) => (
+                Arc::clone(p) as Arc<dyn ProxyAdapter>,
+                proxy_action(p.adapter_type()),
+            ),
+            None if name == "DIRECT" => {
+                (Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>, "DIRECT")
+            }
+            None => {
+                warn!(
+                    "listener forced proxy '{name}' is not in the route table; \
+                     rejecting flow (upstream: proxy {name} not found)"
+                );
+                (Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>, "REJECT")
             }
         };
         if record_hit {
@@ -774,6 +802,13 @@ impl TunnelInner {
         // direct/global/rule dispatch — it overrides every mode,
         // including when `rule:` is also set.
         if !metadata.special_proxy.is_empty() {
+            // The `always`-mode lookup this early return skips is a real
+            // skip, not "untried": record it like `maybe_lookup_flow_process`
+            // does so the ledger's app lane does not queue an OS scan for
+            // a flow routing already decided (issue #974 shape).
+            if process_mode == ProcessLookupMode::Always {
+                metadata.flow_lookup.record_process(None);
+            }
             return Some(self.resolve_listener_proxy(metadata, record_hit));
         }
         if record_hit {
@@ -829,7 +864,7 @@ impl TunnelInner {
                 let result = self
                     .match_rule_route(&route, scan, metadata, false, process_mode)
                     .await;
-                Some(self.materialize_rule_match(&route, result, record_hit, scan.stats))
+                Some(self.materialize_rule_match(&route, result, record_hit, scan.stats, metadata))
             }
         }
     }
@@ -862,7 +897,7 @@ impl TunnelInner {
         let result = self
             .match_rule_route(&route, scan, metadata, true, process_mode)
             .await;
-        Some(self.materialize_rule_match(&route, result, true, scan.stats))
+        Some(self.materialize_rule_match(&route, result, true, scan.stats, metadata))
     }
 
     /// The rule-table scan both dispatch paths share: a demand-stop pass,
@@ -1078,6 +1113,7 @@ impl TunnelInner {
         result: Option<CompiledMatchResult<'_>>,
         record_hit: bool,
         hit_stats: Option<&crate::rule_stats::RuleStats>,
+        metadata: &Metadata,
     ) -> ResolvedTarget {
         match result {
             Some(m) => {
@@ -1093,6 +1129,19 @@ impl TunnelInner {
                     _ => "PROXY",
                 };
                 let proxy: Arc<dyn ProxyAdapter> = match route.proxies.get(target).cloned() {
+                    // A `sub-rules` block match on a UDP-incapable target
+                    // fails closed rather than dial it: the override owns
+                    // the flow's whole policy (same fail-closed contract
+                    // as a forced `proxy:`), so the outcome is REJECT,
+                    // not a doomed relay session.
+                    Some(p)
+                        if hit_stats.is_none()
+                            && metadata.network == Network::Udp
+                            && !p.support_udp() =>
+                    {
+                        action = "REJECT";
+                        Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>
+                    }
                     Some(p) => p as Arc<dyn ProxyAdapter>,
                     // DIRECT needs no registry entry: the tunnel owns a direct
                     // adapter for exactly this.
@@ -1448,6 +1497,14 @@ impl TargetProbe for RouteTargetProbe<'_> {
             if p.is_dialer_proxy_non_transparent() {
                 return TargetCheck::Unusable;
             }
+            // A `sub-rules` block scan (`stats` is `None`) fails closed
+            // the same way: the listener's `rule:` override replaced the
+            // whole policy for this flow, so sliding past a matched rule
+            // to block-exhaustion DIRECT would silently reroute what the
+            // override pinned — matching the forced `proxy:` contract.
+            if self.stats.is_none() {
+                return TargetCheck::Unusable;
+            }
             return TargetCheck::Missing;
         }
         TargetCheck::Usable
@@ -1638,6 +1695,27 @@ impl Tunnel {
     }
 
     pub fn update_rules(&self, rules: Vec<Box<dyn Rule>>) {
+        self.update_rules_inner(rules, None);
+    }
+
+    /// [`Self::update_rules`] plus the `sub-rules:` blocks from the same
+    /// rebuild in one snapshot. Refresh paths that rebuild both (geodata)
+    /// must republish both — otherwise a listener `rule:` block keeps
+    /// matching the superseded DB generation while the top-level list
+    /// already binds the new one.
+    pub fn update_rules_with_sub_rules(
+        &self,
+        rules: Vec<Box<dyn Rule>>,
+        sub_rules: HashMap<String, meow_rules::sub_rule::SubRuleBlock>,
+    ) {
+        self.update_rules_inner(rules, Some(sub_rules));
+    }
+
+    fn update_rules_inner(
+        &self,
+        rules: Vec<Box<dyn Rule>>,
+        sub_rules: Option<HashMap<String, meow_rules::sub_rule::SubRuleBlock>>,
+    ) {
         let rule_stats = {
             let prior = self.route_snapshot();
             crate::rule_stats::RuleStats::carried(&prior.rules, &prior.rule_stats, &rules)
@@ -1648,22 +1726,24 @@ impl Tunnel {
         // raw rule list: rules pruned by the IR clean-up passes (dead after
         // MATCH, provable never-match) must not force per-connection DNS
         // pre-resolution or process lookup.
-        let needs_ip = compiled_rules.needs_ip_resolution();
         let needs_proc = compiled_rules.needs_process_lookup();
+        let sub_rules = sub_rules.map(compile_sub_rule_routes);
         // Build a new route table on top of the current proxies map. The
         // current proxies are cloned (Arc bumps for adapter handles, one
         // HashMap clone) — paid only on config-reload, not the hot path.
         // The write lock is held across the read-modify-write so a
         // concurrent `update_proxies` cannot be lost.
-        let old = {
+        let (old, needs_ip) = {
             let mut route = self.inner.route.write();
             let new_route = RouteTable {
                 rule_stats: Arc::new(rule_stats),
                 rules: Arc::new(rules),
                 domain_index: Arc::new(new_index),
                 compiled_rules: Arc::new(compiled_rules),
+                sub_rules: sub_rules.map_or_else(|| Arc::clone(&route.sub_rules), Arc::new),
                 ..route.inherit()
             };
+            let needs_ip = new_route.needs_ip_resolution();
             self.publish_dialer_registry(&new_route);
             // Published inside the write section like `install_routing`
             // and `set_rules_disabled`: a reader between install and
@@ -1671,7 +1751,10 @@ impl Tunnel {
             self.inner
                 .needs_ip_resolution
                 .store(needs_ip, Ordering::Relaxed);
-            std::mem::replace(&mut *route, Arc::new(new_route))
+            (
+                std::mem::replace(&mut *route, Arc::new(new_route)),
+                needs_ip,
+            )
         };
         // The superseded table's destructor cascade (rules, adapters,
         // possibly the last registry cell) runs outside the lock so
@@ -1724,13 +1807,13 @@ impl Tunnel {
                     drop(route);
                     continue;
                 }
-                self.inner
-                    .needs_ip_resolution
-                    .store(compiled.needs_ip_resolution(), Ordering::Relaxed);
                 let new_route = RouteTable {
                     compiled_rules: Arc::new(compiled),
                     ..route.inherit()
                 };
+                self.inner
+                    .needs_ip_resolution
+                    .store(new_route.needs_ip_resolution(), Ordering::Relaxed);
                 std::mem::replace(&mut *route, Arc::new(new_route))
             };
             // Same drop-outside-lock rule as `update_rules`.
@@ -1922,7 +2005,7 @@ impl Tunnel {
     }
 
     fn install_routing(&self, route: Arc<RouteTable>) -> Arc<RouteTable> {
-        let needs_ip = route.compiled_rules.needs_ip_resolution();
+        let needs_ip = route.needs_ip_resolution();
         // Publish inside the write hold so registry and route table swap
         // linearly — a concurrent installer can otherwise leave the registry
         // naming proxies the live route map already dropped (issue #489
@@ -3865,19 +3948,15 @@ mod tests {
         assert_eq!(named.process, "curl", "a supplied owner is kept");
         // Every skip is recorded on the flow's memo — unmarked, a later
         // process-demanding slot could rescan what this pass refused
-        // (issue #974). `proxied` is exempt: `special_proxy` resolves the
-        // flow before the lookup path entirely (upstream `resolveMetadata`
-        // returns early), so no rule scan can ever rescan it.
-        for md in [&internal, &named, &no_tuple, &no_port] {
+        // (issue #974). `proxied` marks it too: a forced route skips the
+        // lookup, but an unmarked memo would let the ledger treat the OS
+        // scan as unattempted and run it downstream.
+        for md in [&internal, &proxied, &named, &no_tuple, &no_port] {
             assert!(
                 md.flow_lookup.process_attempted(),
                 "the skip must be recorded"
             );
         }
-        assert!(
-            !proxied.flow_lookup.process_attempted(),
-            "special_proxy resolves before the lookup, leaving no memo"
-        );
     }
 
     /// `always`: a flow the pre-dispatch skip refused is marked attempted,

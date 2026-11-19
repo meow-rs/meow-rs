@@ -764,7 +764,9 @@ async fn strict_remote_provider_payload_degrades_at_boot() {
 /// A `listeners:` `type: tun` entry (spec §3) must validate green under
 /// `-t`: nothing in the flat named form touches a device, routes, or the
 /// network at load. The bad-stack leg proves the entry is actually
-/// checked rather than skipped.
+/// checked rather than skipped. Without `listener-tun` the build refuses
+/// the type outright at the feature gate, so the green leg cannot run.
+#[cfg(feature = "listener-tun")]
 #[tokio::test]
 async fn config_test_named_tun_validates_offline() {
     for (entry, ok) in [

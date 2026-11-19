@@ -162,9 +162,20 @@ impl PreinstalledBinding {
 /// (the registry's before/after comparison and the install must not
 /// interleave with a sibling mutation's).
 #[cfg(feature = "listener-tun")]
-pub fn preinstall_global_route_binding(raw: &RawConfig) -> PreinstalledBinding {
-    let Some(iface) = meow_config::global_route_outbound_interface(raw.tun.as_ref())
-        .or_else(|| meow_config::named_tun_global_route_interface(raw))
+pub fn preinstall_global_route_binding(
+    raw: &RawConfig,
+    named_tun_running: bool,
+) -> PreinstalledBinding {
+    let Some(iface) =
+        meow_config::global_route_outbound_interface(raw.tun.as_ref()).or_else(|| {
+            // A running named TUN owns its binding until restart — the
+            // candidate's staged `listeners: type: tun` entry only takes
+            // effect on the next boot, so installing its interface now
+            // would retarget live egress behind the running device's back.
+            (!named_tun_running)
+                .then(|| meow_config::named_tun_global_route_interface(raw))
+                .flatten()
+        })
     else {
         return PreinstalledBinding::default();
     };
@@ -187,7 +198,10 @@ pub fn preinstall_global_route_binding(raw: &RawConfig) -> PreinstalledBinding {
 /// Without the `listener-tun` feature no TUN can run, so there is never a
 /// global-route binding to install.
 #[cfg(not(feature = "listener-tun"))]
-pub fn preinstall_global_route_binding(_raw: &RawConfig) -> PreinstalledBinding {
+pub fn preinstall_global_route_binding(
+    _raw: &RawConfig,
+    _named_tun_running: bool,
+) -> PreinstalledBinding {
     PreinstalledBinding::default()
 }
 

@@ -761,7 +761,9 @@ type EarlyOutboundBinding = Option<std::convert::Infallible>;
 /// before, and until then no global route exists for a socket to loop on.
 #[cfg(feature = "listener-tun")]
 fn preinstall_global_route_binding(raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
-    meow_api::preinstall_global_route_binding(raw).into_binding()
+    // Startup: no TUN is running yet, so a named-TUN global route is
+    // free to install its own interface binding.
+    meow_api::preinstall_global_route_binding(raw, false).into_binding()
 }
 
 #[cfg(not(feature = "listener-tun"))]
@@ -1625,6 +1627,9 @@ async fn run(
         let rule_provider_refresh = Arc::clone(&rule_provider_refresh);
         let proxy_provider_refresh = Arc::clone(&proxy_provider_refresh);
         let provider_dialer_registry = config.provider_dialer_registry.clone();
+        // Refresh never rebinds listeners, so the startup snapshot is the
+        // right dependency set for the prospective-route sweep.
+        let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
             meow_app::subscription_refresh::run_loop(
                 raw_config,
@@ -1636,6 +1641,7 @@ async fn run(
                 provider_dialer_registry,
                 rule_provider_refresh,
                 proxy_provider_refresh,
+                running_listeners,
             )
             .await;
         });
@@ -1785,7 +1791,11 @@ async fn run(
                         .with_lan_acl(Arc::clone(&config.listeners.lan_acl))
                         .with_max_connections(nl.max_connections)
                         .with_tcp_keepalive(config.listeners.tcp_keepalive)
-                        .with_route_override(nl.route_override.clone());
+                        .with_route_override(nl.route_override.clone())
+                        // The SOCKS5 UDP-associate relay socket binds per
+                        // association inside the listener — its mark cannot
+                        // come from the listen socket's inheritance.
+                        .with_routing_mark(nl.routing_mark);
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on(socket).await {
                             error!("Listener error: {}", e);
@@ -1815,9 +1825,10 @@ async fn run(
                             continue;
                         }
                     };
-                    if !apply_listener_mark(&nl.name, &socket, nl.routing_mark) {
-                        continue;
-                    }
+                    // No `routing-mark` here: the parser already warns and
+                    // drops it on `type: tproxy` — marking the transparent
+                    // socket would mark the reply packets the policy rules
+                    // must route back.
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     let listener = TProxyListener::new(
@@ -1833,10 +1844,7 @@ async fn run(
                     .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout))
                     .with_tcp_keepalive(config.listeners.tcp_keepalive)
                     .with_transparent(*transparent)
-                    .with_route_override(nl.route_override.clone())
-                    // The UDP TPROXY socket binds inside `prepare`; the
-                    // TCP listen socket was marked above.
-                    .with_socket_mark(nl.routing_mark);
+                    .with_route_override(nl.route_override.clone());
                     // Firewall rules and the UDP TPROXY socket are fallible
                     // setup — run them eagerly so a failure can't drop the
                     // bound TCP socket inside a detached task (issue #641).
@@ -1900,7 +1908,11 @@ async fn run(
                         Ok(l) => l
                             .with_max_connections(nl.max_connections)
                             .with_tcp_keepalive(config.listeners.tcp_keepalive)
-                            .with_route_override(nl.route_override.clone()),
+                            .with_route_override(nl.route_override.clone())
+                            // The UDP relay socket binds inside the
+                            // listener — the TCP listen socket's mark
+                            // can't reach it.
+                            .with_routing_mark(nl.routing_mark),
                         Err(e) => {
                             listener_failed(&nl.name, &format!("invalid shadowsocks config: {e}"));
                             continue;
@@ -1945,11 +1957,10 @@ async fn run(
                             continue;
                         }
                     };
-                    // `listeners[].routing-mark` — ingress SO_MARK on the
-                    // responder's UDP socket; its datagrams carry it.
-                    if !apply_listener_mark(&nl.name, &socket, nl.routing_mark) {
-                        continue;
-                    }
+                    // No `routing-mark` here either — the parser warns and
+                    // drops it on `type: wireguard`; marking the responder
+                    // socket would mark handshake replies the policy rules
+                    // must route back.
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     // meow-listener takes plain ctor args, never a
@@ -2205,12 +2216,12 @@ fn publish_controller(
 
 /// A listener that did not start: logged, recorded in the logbook, and
 /// skipped — the rest of the engine runs without it.
-#[cfg(any(
-    feature = "listener-mixed",
-    feature = "listener-tproxy",
-    feature = "listener-shadowsocks",
-    feature = "listener-wireguard"
-))]
+#[allow(
+    dead_code,
+    reason = "needed whenever ANY listener feature or the linux mark \
+              path compiles — --no-default-features makes every call site \
+              cfg'd out"
+)]
 fn listener_failed(name: &str, message: &str) {
     error!("listener '{name}': {message}");
     meow_common::logbook::event(

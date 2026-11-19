@@ -177,16 +177,14 @@ impl NatAddrs {
 pub(super) struct Nat {
     pub(super) addrs: NatAddrs,
     nets: TunNets,
-    dns_hijack: bool,
     table: Mutex<Table>,
 }
 
 impl Nat {
-    pub(super) fn new(addrs: NatAddrs, nets: TunNets, dns_hijack: bool) -> Self {
+    pub(super) fn new(addrs: NatAddrs, nets: TunNets) -> Self {
         Self {
             addrs,
             nets,
-            dns_hijack,
             table: Mutex::new(Table::default()),
         }
     }
@@ -246,7 +244,7 @@ impl Nat {
             if src == a.b4 {
                 return Verdict::Drop;
             }
-            if super::tcp_loop_guard(SocketAddr::from((dst, dport)), self.dns_hijack, self.nets) {
+            if super::tcp_loop_guard(SocketAddr::from((dst, dport)), self.nets) {
                 return Verdict::Drop;
             }
             let client = SocketAddr::V4(SocketAddrV4::new(src, sport));
@@ -315,7 +313,7 @@ impl Nat {
             if src == b6 {
                 return Verdict::Drop;
             }
-            if super::tcp_loop_guard(SocketAddr::from((dst, dport)), self.dns_hijack, self.nets) {
+            if super::tcp_loop_guard(SocketAddr::from((dst, dport)), self.nets) {
                 return Verdict::Drop;
             }
             let client = SocketAddr::V6(SocketAddrV6::new(src, sport, 0, 0));
@@ -472,7 +470,6 @@ impl SystemStack {
         nets: TunNets,
         a4: Ipv4Addr,
         a6: Option<Ipv6Addr>,
-        dns_hijack: bool,
     ) -> io::Result<Self> {
         let b4 = nets.v4.hosts().find(|h| *h != a4).ok_or_else(|| {
             io::Error::other(format!(
@@ -515,7 +512,7 @@ impl SystemStack {
             v6: v6_addrs,
         };
         Ok(Self {
-            nat: Arc::new(Nat::new(addrs, nets, dns_hijack)),
+            nat: Arc::new(Nat::new(addrs, nets)),
             v4,
             v6,
         })
@@ -761,7 +758,6 @@ mod tests {
                 v6: Some("fdfe:dcba:9876::1/126".parse::<Ipv6Net>().unwrap()),
                 nat: None,
             },
-            false,
         )
     }
 
@@ -773,31 +769,21 @@ mod tests {
     }
 
     #[test]
-    fn dns_hijack_nat_admits_subnet_syn_only_when_enabled() {
-        for enabled in [false, true] {
-            for port in [53, 80] {
-                let mut nat = nat();
-                nat.dns_hijack = enabled;
-                let expected = if enabled && port == 53 {
-                    Verdict::Write
-                } else {
-                    Verdict::Drop
-                };
-                let mut v4 = v4_packet([192, 168, 1, 10], 51000, [172, 31, 0, 2], port, TCP_SYN);
-                assert_eq!(nat.translate(&mut v4, false), expected);
-                let mut v6 = v6_packet(
-                    "2001:db8::10".parse().unwrap(),
-                    51000,
-                    "fdfe:dcba:9876::2".parse().unwrap(),
-                    port,
-                    TCP_SYN,
-                );
-                assert_eq!(nat.translate(&mut v6, false), expected);
-                if expected == Verdict::Write {
-                    assert_eq!(read16(&v4, 36), tcp_check(&v4));
-                    assert_eq!(read16(&v6, 56), tcp_check(&v6));
-                }
-            }
+    fn nat_drops_subnet_syn_on_every_port() {
+        // `dns-hijack` is UDP-only — a TCP SYN at the device's own subnet
+        // address is a loop on :53 like on any other port and must drop.
+        let nat = nat();
+        for port in [53, 80] {
+            let mut v4 = v4_packet([192, 168, 1, 10], 51000, [172, 31, 0, 2], port, TCP_SYN);
+            assert_eq!(nat.translate(&mut v4, false), Verdict::Drop);
+            let mut v6 = v6_packet(
+                "2001:db8::10".parse().unwrap(),
+                51000,
+                "fdfe:dcba:9876::2".parse().unwrap(),
+                port,
+                TCP_SYN,
+            );
+            assert_eq!(nat.translate(&mut v6, false), Verdict::Drop);
         }
     }
 

@@ -921,9 +921,7 @@ impl TunListener {
         // Built before the pumps so the first SYN is already translated.
         let system = if cfg.stack == TunStack::System {
             if cfg!(target_os = "linux") {
-                match system::SystemStack::bind(tun_net, used_addr, used_addr6, cfg.dns_hijack)
-                    .await
-                {
+                match system::SystemStack::bind(tun_net, used_addr, used_addr6).await {
                     Ok(sys) => Some(sys),
                     Err(e) => {
                         warn!("tun.stack system unavailable ({e}); TCP stays on lwIP");
@@ -1048,8 +1046,6 @@ impl TunListener {
             None
         };
         let warned_saturated = Arc::new(AtomicBool::new(false));
-        // Bound upstream DNS work across all intercepted TCP streams.
-        let tcp_dns_budget = Arc::new(Semaphore::new(64));
         // System stack: kernel accept errors (ECONNABORTED, EMFILE under a
         // flow storm) back off and retry, as the other listeners do.
         // The accept future is pinned across `select!` iterations — the
@@ -1086,13 +1082,11 @@ impl TunListener {
                         Some(((stream, src, dst), permit)) => {
                             // Same loop guard as the UDP path: a dial to the
                             // TUN's own subnet routes back into the device.
-                            if tcp_loop_guard(dst, cfg.dns_hijack, tun_net) {
+                            if tcp_loop_guard(dst, tun_net) {
                                 debug!("tun TCP: dropping non-routable dst {dst} (from {src})");
                                 drop(stream);
                                 continue;
                             }
-                            let dns_hijack = cfg.dns_hijack;
-                            let dns_budget = Arc::clone(&tcp_dns_budget);
                             let tunnel = self.tunnel.clone();
                             let name = self.name.clone();
                             let sniffer = self.sniffer.clone();
@@ -1123,34 +1117,21 @@ impl TunListener {
                                         return;
                                     }
                                 };
-                                if dns_hijack && dst.port() == 53 {
-                                    let stream = TunTcpConn {
-                                        prefix,
-                                        pos: 0,
-                                        inner: std::sync::Mutex::new(stream),
-                                    };
-                                    if let Err(e) = meow_dns::server::serve_tcp_stream(
-                                        stream,
-                                        tunnel.resolver_slot(),
-                                        dns_budget,
-                                    )
-                                    .await
-                                    {
-                                        debug!("tun TCP DNS: {src} -> {dst}: {e}");
-                                    }
-                                } else {
-                                    handle_tcp_flow(
-                                        tunnel,
-                                        stream,
-                                        prefix,
-                                        src,
-                                        dst,
-                                        &name,
-                                        sniffer.as_deref(),
-                                        route_override.as_ref(),
-                                    )
-                                    .await;
-                                }
+                                // `dns-hijack` admits wildcard UDP :53
+                                // targets only (`tcp:`-schemed entries are
+                                // rejected at parse) — TCP :53 routes like
+                                // every other flow.
+                                handle_tcp_flow(
+                                    tunnel,
+                                    stream,
+                                    prefix,
+                                    src,
+                                    dst,
+                                    &name,
+                                    sniffer.as_deref(),
+                                    route_override.as_ref(),
+                                )
+                                .await;
                             });
                         }
                         None => break Err("netstack TCP listener or connection quota closed".into()),
@@ -1175,9 +1156,7 @@ impl TunListener {
                             dst,
                             guard,
                         } = accepted;
-                        if tcp_loop_guard(dst, cfg.dns_hijack, tun_net) { continue; }
-                        let dns_hijack = cfg.dns_hijack;
-                        let dns_budget = Arc::clone(&tcp_dns_budget);
+                        if tcp_loop_guard(dst, tun_net) { continue; }
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
                         let sniffer = self.sniffer.clone();
@@ -1204,18 +1183,6 @@ impl TunListener {
                                 Ok(Ok(_)) | Err(_) => {}
                             }
                             let _permit = permit;
-                            if dns_hijack && dst.port() == 53 {
-                                if let Err(e) = meow_dns::server::serve_tcp_stream(
-                                    stream,
-                                    tunnel.resolver_slot(),
-                                    dns_budget,
-                                )
-                                .await
-                                {
-                                    debug!("tun TCP DNS: {src} -> {dst}: {e}");
-                                }
-                                return;
-                            }
                             let mut metadata = Metadata {
                                 network: Network::Tcp,
                                 conn_type: ConnType::Tun,
@@ -1556,9 +1523,10 @@ fn pump_error(direction: &str, joined: Result<io::Result<()>, tokio::task::JoinE
     }
 }
 
-// Intercept DNS to the TUN address before rejecting subnet loopback traffic.
-fn tcp_loop_guard(dst: SocketAddr, dns_hijack: bool, nets: udp::TunNets) -> bool {
-    !(dns_hijack && dst.port() == 53) && udp::is_looping_dst(dst.ip(), nets)
+// `dns-hijack` covers UDP :53 only (the parser rejects `tcp:`-schemed
+// targets), so TCP :53 gets no exception from the subnet loopback drop.
+fn tcp_loop_guard(dst: SocketAddr, nets: udp::TunNets) -> bool {
+    udp::is_looping_dst(dst.ip(), nets)
 }
 
 #[allow(
@@ -1864,21 +1832,20 @@ mod tests {
     }
 
     #[test]
-    fn tcp_dns_hijack_precedes_subnet_loop_guard() {
+    fn tcp_subnet_dst_is_dropped_even_on_53() {
+        // `dns-hijack` is UDP-only: a TCP :53 dial at the device's own
+        // subnet address is a loop like any other port and must drop,
+        // not escape into the relay path.
         let nets = super::udp::TunNets {
             v4: "172.19.0.1/30".parse().unwrap(),
             v6: Some("fd00::1/126".parse().unwrap()),
             nat: None,
         };
         for ip in ["172.19.0.1", "fd00::1"] {
-            let dns = std::net::SocketAddr::new(ip.parse().unwrap(), 53);
-            assert!(!super::tcp_loop_guard(dns, true, nets));
-            assert!(super::tcp_loop_guard(dns, false, nets));
-            assert!(super::tcp_loop_guard(
-                std::net::SocketAddr::new(dns.ip(), 80),
-                true,
-                nets
-            ));
+            for port in [53u16, 80] {
+                let dst = std::net::SocketAddr::new(ip.parse().unwrap(), port);
+                assert!(super::tcp_loop_guard(dst, nets), "{dst}");
+            }
         }
     }
 

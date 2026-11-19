@@ -57,10 +57,6 @@ pub struct TProxyListener {
     /// `listeners[].proxy`/`rule` — the named-listener route override
     /// stamped onto every flow's `Metadata` (TCP and UDP TPROXY).
     route_override: Option<InboundRouteOverride>,
-    /// `listeners[].routing-mark` — ingress `SO_MARK` for the UDP TPROXY
-    /// socket bound inside [`Self::prepare`] (the TCP listen socket is
-    /// marked by the app right after `bind_tcp`). Linux only.
-    socket_mark: Option<u32>,
 }
 
 /// Fallible setup artifacts held on the listener between
@@ -122,7 +118,6 @@ impl TProxyListener {
             transparent: false,
             prepared: None,
             route_override: None,
-            socket_mark: None,
         }
     }
 
@@ -191,14 +186,6 @@ impl TProxyListener {
     /// UDP TPROXY path alike).
     pub fn with_route_override(mut self, ov: Option<InboundRouteOverride>) -> Self {
         self.route_override = ov;
-        self
-    }
-
-    /// `listeners[].routing-mark` for sockets this listener binds
-    /// internally (the UDP TPROXY socket in [`Self::prepare`]); the
-    /// caller marks the TCP listen socket itself. Linux only.
-    pub fn with_socket_mark(mut self, mark: Option<u32>) -> Self {
-        self.socket_mark = mark;
         self
     }
 
@@ -307,17 +294,6 @@ impl TProxyListener {
                     .into()
                 },
             )?;
-            // `listeners[].routing-mark` — ingress SO_MARK on the UDP
-            // TPROXY socket; failure is a startup failure like the bind.
-            if let Some(mark) = self.socket_mark {
-                use std::os::fd::AsRawFd;
-                meow_common::set_listener_socket_mark(sock.as_raw_fd(), mark).map_err(
-                    |e| -> Box<dyn std::error::Error + Send + Sync> {
-                        format!("tproxy `routing-mark` {mark}: {e} (SO_MARK needs CAP_NET_ADMIN)")
-                            .into()
-                    },
-                )?;
-            }
             Some(sock)
         } else {
             None

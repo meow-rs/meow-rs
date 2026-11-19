@@ -1330,7 +1330,13 @@ async fn update_configs(
             meow_common::dial::tcp_concurrent(),
             state.tunnel.process_lookup_mode(),
         );
-        let preinstalled = preinstall_global_route_binding(&candidate);
+        let preinstalled = preinstall_global_route_binding(
+            &candidate,
+            matches!(
+                state.tunnel.tun_owner(),
+                Some(meow_tunnel::TunOwner::Named(_))
+            ),
+        );
         // No routing publish runs here, so tracked TCP predating a
         // pre-installed global-route binding is still live.
         if let Err(e) = swap_config_and_reconcile_tun(
@@ -1924,6 +1930,17 @@ async fn apply_raw_to_tunnel(
             format!("proxy group '{missing}' failed validation"),
         ));
     }
+    // The prospective-route sweep: the candidate's own `listeners[]`
+    // references and the still-running listeners' `proxy:`/`rule`
+    // overrides must all keep resolving against this map — before the
+    // DNS rebuild dials or `update_routing` publishes anything.
+    listener_route_deps_guard(
+        &state.listeners,
+        &raw,
+        &proxies,
+        &sub_rules,
+        &proxy_providers,
+    )?;
     // Issue #514: a changed `dns:`/`hosts:`/`ipv6:`/`geodata:` section must
     // rebuild the resolver, not just land in the persisted config. Parse
     // against the freshly rebuilt proxy registry so circular
@@ -2051,7 +2068,13 @@ async fn commit_raw_candidate(
     if let Some(msg) = routing_mark_change_refused(&candidate) {
         return Err((StatusCode::BAD_REQUEST, msg));
     }
-    let preinstalled = preinstall_global_route_binding(&candidate);
+    let preinstalled = preinstall_global_route_binding(
+        &candidate,
+        matches!(
+            state.tunnel.tun_owner(),
+            Some(meow_tunnel::TunOwner::Named(_))
+        ),
+    );
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     // `apply_raw_to_tunnel` publishes through `update_routing`, which keeps
     // tracked TCP: a flush must cancel the flows that predate the binding.
@@ -2129,6 +2152,86 @@ fn named_tun_fake_ip_guard(
                      started with; restart meow to apply it"
                 ),
             ));
+        }
+    }
+    Ok(())
+}
+
+/// The prospective-route dependency sweep every publication must pass:
+///
+/// 1. The candidate's own `listeners[].proxy`/`rule` references must
+///    resolve in the rebuilt map — a committed dangling reference fails
+///    the next boot's `build_config` the same way `-t` already rejects
+///    it ([`meow_config::listener_proxy_target_err`], and `rule:` is
+///    rechecked against the PARSED block set, not just the raw keys).
+/// 2. The still-running listeners' `proxy:`/`rule:` overrides must keep
+///    resolving: PUT never rebinds running inbounds, so a route that
+///    drops their forced target or selected block strands them — the
+///    flow then fails closed at resolve time, which is exactly the
+///    silent break this rejects. `force` cannot push past either check.
+///
+/// `sub_rules` keys are `String` on the rebuild side
+/// ([`meow_config::RebuildResult`]) and `SmolStr` on the route-table
+/// side — names compare by `str`.
+pub fn listener_route_deps_guard(
+    running: &[meow_config::NamedListener],
+    raw: &RawConfig,
+    proxies: &std::collections::HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
+    sub_rules: &meow_config::sub_rules_parser::SubRuleBlocks,
+    proxy_providers: &std::collections::HashMap<String, Arc<ProxyProvider>>,
+) -> Result<(), (StatusCode, String)> {
+    for l in raw.listeners.as_deref().unwrap_or(&[]) {
+        if let Some(name) = l.proxy.as_deref().filter(|s| !s.is_empty()) {
+            if let Some(why) =
+                meow_config::listener_proxy_target_err(name, proxies, proxy_providers)
+            {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!("listeners[{}].proxy: {why}", l.name),
+                ));
+            }
+        }
+        if let Some(name) = l.rule.as_deref().filter(|s| !s.is_empty()) {
+            if !sub_rules.contains_key(name) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "listeners[{}].rule: '{name}' references undefined sub-rules block",
+                        l.name
+                    ),
+                ));
+            }
+        }
+    }
+    for l in running {
+        let Some(ov) = &l.route_override else {
+            continue;
+        };
+        if let Some(proxy) = &ov.proxy {
+            if !proxies.contains_key(proxy.as_str()) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "listener '{}' forces proxy '{proxy}', which this route removes — \
+                         the running listener still references it and cannot be re-pointed \
+                         without a restart",
+                        l.name
+                    ),
+                ));
+            }
+        }
+        if let Some(block) = &ov.rule {
+            if !sub_rules.contains_key(block.as_str()) {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "listener '{}' selects sub-rules block '{block}', which this route \
+                         removes — the running listener still references it and cannot be \
+                         re-pointed without a restart",
+                        l.name
+                    ),
+                ));
+            }
         }
     }
     Ok(())
@@ -3755,7 +3858,7 @@ async fn spawn_tun_from_raw(
     Ok(None)
 }
 
-fn tun_fake_ip_changed(prior: &meow_dns::Resolver, current: &meow_dns::Resolver) -> bool {
+pub fn tun_fake_ip_changed(prior: &meow_dns::Resolver, current: &meow_dns::Resolver) -> bool {
     prior.fake_ip_v4_net() != current.fake_ip_v4_net()
         || prior.fake_ip_v4_gateway() != current.fake_ip_v4_gateway()
         || prior.fake_ip_v6_net() != current.fake_ip_v6_net()
@@ -4263,7 +4366,47 @@ async fn put_configs(
     if let Some(msg) = named_tun_enable_blocked(&state, &raw_config) {
         return reload_rejected(StatusCode::BAD_REQUEST, &msg);
     }
-    let preinstalled = preinstall_global_route_binding(&raw_config);
+    // Document-shape admission, unbypassable by `?force` and placed
+    // BEFORE the rebuild's force early-return (which commits `raw_config`
+    // when nothing builds — a check after that arm could not gate the
+    // persisted document): the lan ACL and the `listeners:` shape —
+    // duplicate names/ports, `rule:` blocks, the one-TUN checks —
+    // are properties of the document itself, so they must never be
+    // committed malformed the way an environment failure may. The
+    // feature gate stays degradable later: whether THIS build serves a
+    // listener type is environment, not shape.
+    if let Err(e) = meow_config::resolve_lan_acl(&raw_config) {
+        return reload_rejected(
+            StatusCode::BAD_REQUEST,
+            &format!("lan ACL config error: {e}"),
+        );
+    }
+    let named_listeners = match meow_config::resolve_named_listeners(&raw_config) {
+        Ok(named) => named,
+        Err(e) => {
+            return reload_rejected(
+                StatusCode::BAD_REQUEST,
+                &format!("listeners config error: {e}"),
+            )
+        }
+    };
+    // A `listeners[].proxy` target the document itself never declares —
+    // not a `proxies:`/`proxy-groups:` name or a built-in — is a
+    // document-shape defect too: provider members are not registry keys,
+    // so the name can never resolve no matter how the build goes. Refused
+    // even when `force` would otherwise commit a candidate nothing builds
+    // (the map-level check inside the rebuild gates declared names that
+    // merely failed to build — that failure is environment, not shape).
+    if let Some(msg) = meow_config::listener_proxy_target_shape_err(&raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+    }
+    let preinstalled = preinstall_global_route_binding(
+        &raw_config,
+        matches!(
+            state.tunnel.tun_owner(),
+            Some(meow_tunnel::TunOwner::Named(_))
+        ),
+    );
     // Errors `force` pushed past, for the logbook.
     let mut forced: Vec<String> = Vec::new();
 
@@ -4561,29 +4704,13 @@ async fn put_configs(
         }
     }
 
-    // `lan-allowed-ips`/`lan-disallowed-ips` are hard admission errors even
-    // under `force`: persisting a malformed list or a `listeners:`-nested
-    // key would leave the next boot's guarded accept loops enforcing a
-    // policy different from what the operator wrote — or none at all. The
-    // ACL is a startup snapshot; this only gates persistence.
-    if let Err(e) = meow_config::resolve_lan_acl(&raw_config) {
-        return reload_rejected(
-            StatusCode::BAD_REQUEST,
-            &format!("lan ACL config error: {e}"),
-        );
-    }
-
-    // Same contract for `listeners:` — an entry the startup parser rejects
-    // (bad type, duplicate port, `udp: true` + managed firewall, IPv6 UDP
-    // bind, …) must not be committed into `raw_config`: the next
-    // `load_config` would hard-error on boot. So is an entry this build
-    // cannot serve (e.g. `type: shadowsocks` without the
-    // `listener-shadowsocks` feature) — startup now hard-errors on it too.
-    // Listeners are still a startup snapshot (no hot-reload), this only
-    // gates persistence.
-    if let Err(e) = meow_config::resolve_named_listeners(&raw_config)
-        .and_then(|named| crate::ensure_listeners_supported(&named, crate::listener_gate()))
-    {
+    // The listener *shape* was already gated unconditionally above; what
+    // remains is the feature gate — whether THIS build serves a declared
+    // type (e.g. `type: shadowsocks` without `listener-shadowsocks`), an
+    // environment property `force` degrades like the other rebuild
+    // failures. Listeners are still a startup snapshot (no hot-reload),
+    // this only gates persistence.
+    if let Err(e) = crate::ensure_listeners_supported(&named_listeners, crate::listener_gate()) {
         if force {
             tracing::error!("config reload forced despite listeners config error: {e}");
             forced.push(format!("listeners config error: {e}"));
@@ -4593,6 +4720,23 @@ async fn put_configs(
                 &format!("listeners config error: {e}"),
             );
         }
+    }
+
+    // The prospective-route dependency sweep — hard even under `force`:
+    // the candidate's own `listeners[].proxy`/`rule` references and every
+    // still-running listener's overrides must resolve against this map,
+    // or publishing would strand a live inbound (a PUT removing both the
+    // listener AND its dependency still has the running listener holding
+    // the reference). Before the DNS rebuild dials and before
+    // `reload_routing` publishes.
+    if let Err((status, msg)) = listener_route_deps_guard(
+        &state.listeners,
+        &raw_config,
+        &proxies,
+        &sub_rules,
+        &proxy_providers,
+    ) {
+        return reload_rejected(status, &msg);
     }
 
     // Issue #514: rebuild the DNS runtime too when its inputs changed —
@@ -6539,19 +6683,21 @@ mod global_route_binding_tests {
             // A missing interface: not fatal here, nothing installed.
             "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: no-such-iface-zz9\n",
         ] {
-            let p = preinstall_global_route_binding(&raw(yaml));
+            let p = preinstall_global_route_binding(&raw(yaml), false);
             assert!(!p.is_installed() && !p.interface_changed(), "{yaml}");
             assert_eq!(iface(), None, "{yaml}");
         }
         // None → Some(lo) is a change; a second owner of the same
         // interface is not; a non-global candidate leaves it alone.
-        let first = preinstall_global_route_binding(&raw(GLOBAL_LO));
+        let first = preinstall_global_route_binding(&raw(GLOBAL_LO), false);
         assert!(first.is_installed() && first.interface_changed());
         assert_eq!(iface().as_deref(), Some("lo"));
-        let second = preinstall_global_route_binding(&raw(GLOBAL_LO));
+        let second = preinstall_global_route_binding(&raw(GLOBAL_LO), false);
         assert!(second.is_installed() && !second.interface_changed());
-        let fake_ip =
-            preinstall_global_route_binding(&raw("tun:\n  enable: true\n  auto-route: fake-ip\n"));
+        let fake_ip = preinstall_global_route_binding(
+            &raw("tun:\n  enable: true\n  auto-route: fake-ip\n"),
+            false,
+        );
         assert!(!fake_ip.is_installed() && !fake_ip.interface_changed());
         drop(second);
         assert_eq!(iface().as_deref(), Some("lo"), "first owner restored");
@@ -6562,7 +6708,7 @@ mod global_route_binding_tests {
             "tun:\n  enable: true\n  outbound-interface: lo\n",
             "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: lo\n",
         ] {
-            let p = preinstall_global_route_binding(&raw(yaml));
+            let p = preinstall_global_route_binding(&raw(yaml), false);
             assert!(p.is_installed() && p.interface_changed(), "{yaml}");
             assert_eq!(iface().as_deref(), Some("lo"), "{yaml}");
             drop(p);
@@ -6661,5 +6807,75 @@ mod global_route_binding_tests {
         );
         assert!(!state.tunnel.has_tun());
         assert_eq!(iface(), None, "nothing runs, so nothing stays bound");
+    }
+}
+
+#[cfg(test)]
+mod listener_deps_tests {
+    use super::*;
+
+    fn ov(proxy: Option<&str>, rule: Option<&str>) -> NamedListener {
+        NamedListener {
+            name: "nl".into(),
+            spec: meow_config::ListenerSpec::Mixed,
+            port: 0,
+            listen: "127.0.0.1".into(),
+            max_connections: 0,
+            route_override: meow_common::InboundRouteOverride::new(proxy, rule),
+            routing_mark: None,
+        }
+    }
+
+    fn raw_with(yaml: &str) -> RawConfig {
+        meow_config::parse_raw_yaml(yaml).unwrap()
+    }
+
+    fn proxies() -> HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> {
+        HashMap::from([(
+            smol_str::SmolStr::from("DIRECT"),
+            Arc::new(meow_config::proxy_parser::WrappedProxy::new(Box::new(
+                meow_proxy::DirectAdapter::new(),
+            ))) as Arc<dyn meow_common::Proxy>,
+        )])
+    }
+
+    #[test]
+    fn candidate_listener_references_must_resolve() {
+        let empty = meow_config::sub_rules_parser::SubRuleBlocks::new();
+        let providers = HashMap::new();
+        // A dangling `proxy:` target fails the candidate itself.
+        let raw =
+            raw_with("listeners:\n  - name: a\n    type: mixed\n    port: 0\n    proxy: ghost\n");
+        let (_s, msg) =
+            listener_route_deps_guard(&[], &raw, &proxies(), &empty, &providers).unwrap_err();
+        assert!(msg.contains("ghost"), "{msg}");
+        // As does a dangling `rule:` block.
+        let raw =
+            raw_with("listeners:\n  - name: a\n    type: mixed\n    port: 0\n    rule: blk\n");
+        let (_s, msg) =
+            listener_route_deps_guard(&[], &raw, &proxies(), &empty, &providers).unwrap_err();
+        assert!(msg.contains("blk"), "{msg}");
+    }
+
+    #[test]
+    fn running_listener_deps_survive_candidate_removal() {
+        // The PUT removes BOTH the listener and its target — the running
+        // inbound still holds the reference, so the publish must refuse.
+        let running = vec![ov(Some("DIRECT"), Some("blk"))];
+        let raw = raw_with("rules:\n  - MATCH,DIRECT\n");
+        let mut blocks = meow_config::sub_rules_parser::SubRuleBlocks::new();
+        let (_s, msg) =
+            listener_route_deps_guard(&running, &raw, &HashMap::new(), &blocks, &HashMap::new())
+                .unwrap_err();
+        assert!(msg.contains("DIRECT"), "{msg}");
+        // Once the forced proxy resolves, the missing block still refuses.
+        let (_s, msg) =
+            listener_route_deps_guard(&running, &raw, &proxies(), &blocks, &HashMap::new())
+                .unwrap_err();
+        assert!(msg.contains("blk"), "{msg}");
+        // And with both dependencies present the sweep passes.
+        blocks.insert("blk".to_string(), std::sync::Arc::new(vec![]));
+        listener_route_deps_guard(&running, &raw, &proxies(), &blocks, &HashMap::new())
+            .expect("all dependencies resolve");
     }
 }

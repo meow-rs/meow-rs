@@ -8937,6 +8937,29 @@ async fn put_configs_tun_fake_ip_change_restarts_listener() {
         "stop_tun must have reaped the listener slot, not just the flag"
     );
     assert!(state.tunnel.resolver().fake_ip_v4_net().is_some());
+
+    // Restore a dns-free config so the process-global host-resolver hook
+    // installed above does not leak into other tests in this binary.
+    let restore =
+        base64::engine::general_purpose::STANDARD.encode("mode: rule\nrules:\n  - MATCH,DIRECT\n");
+    let restore_resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": restore}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restore_resp.status(),
+        StatusCode::NO_CONTENT,
+        "restore PUT must succeed so the host-resolver hook is cleared"
+    );
 }
 
 /// `PATCH /configs` with `body`, as a GUI's TUN switch sends it.
@@ -11008,4 +11031,124 @@ async fn get_listeners_named_tun_reports_no_socket() {
         items[0].get("port").is_none() && items[0].get("listen").is_none(),
         "a TUN owns no socket endpoint: {items}"
     );
+}
+
+/// A PUT that drops a still-running listener's forced proxy must be
+/// refused even though the candidate also removes the listener — the
+/// running inbound keeps its `proxy:` reference across the route swap
+/// and would strand on the missing name. `?force` cannot push past it.
+#[tokio::test]
+async fn put_configs_refuses_dropping_running_listener_dependency() {
+    use base64::Engine as _;
+    use meow_config::{ListenerSpec, NamedListener};
+
+    let raw: RawConfig = meow_config::parse_raw_yaml(concat!(
+        "listeners:\n",
+        "  - name: edge\n",
+        "    type: mixed\n",
+        "    port: 0\n",
+        "    proxy: sel\n",
+        "proxy-groups:\n",
+        "  - name: sel\n",
+        "    type: select\n",
+        "    proxies: [DIRECT]\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    ))
+    .unwrap();
+    let mut state = test_state(raw);
+    Arc::get_mut(&mut state).unwrap().listeners = vec![NamedListener {
+        name: "edge".into(),
+        spec: ListenerSpec::Mixed,
+        port: 0,
+        listen: "127.0.0.1".into(),
+        max_connections: 256,
+        route_override: meow_common::InboundRouteOverride::new(Some("sel"), None),
+        routing_mark: None,
+    }];
+
+    // The candidate removes the listener AND its forced group — the
+    // running inbound still holds `proxy: sel`.
+    let payload =
+        base64::engine::general_purpose::STANDARD.encode("mode: rule\nrules:\n  - MATCH,DIRECT\n");
+    for uri in ["/configs", "/configs?force=true"] {
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{uri} must refuse to strand the running listener's forced proxy"
+        );
+    }
+    // Nothing committed: the group and the listener stay in the document.
+    let committed = state.raw_config.read();
+    assert!(
+        committed
+            .proxy_groups
+            .as_deref()
+            .is_some_and(|g| g.iter().any(|g| g.name == "sel")),
+        "the refused PUT must not persist"
+    );
+    drop(committed);
+    assert!(state.tunnel.route_snapshot().proxies.contains_key("sel"));
+}
+
+/// A `listeners[].proxy` naming nothing the document declares — or a
+/// `proxy-providers:` key — is a document-shape defect: provider members
+/// are not registry keys, so the name can never resolve. `?force` cannot
+/// persist it the way it persists a declared name that merely failed to
+/// build (environment degradation).
+#[tokio::test]
+async fn put_configs_refuses_undeclared_listener_proxy_under_force() {
+    use base64::Engine as _;
+
+    for (decl, needle) in [("ghost", "no declared proxy"), ("feed", "proxy-provider")] {
+        let raw: RawConfig = meow_config::parse_raw_yaml("rules:\n  - MATCH,DIRECT\n").unwrap();
+        let state = test_state(raw);
+        let yaml = format!(
+            "proxy-providers:\n  feed:\n    type: file\n    path: p.yaml\nlisteners:\n  - name: edge\n    type: mixed\n    port: 0\n    proxy: {decl}\nrules:\n  - MATCH,DIRECT\n"
+        );
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        for uri in ["/configs", "/configs?force=true"] {
+            let resp = create_router(Arc::clone(&state))
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"payload": payload}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri} with proxy: {decl} must be refused"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                body["message"].as_str().is_some_and(|m| m.contains(needle)),
+                "{uri} with proxy: {decl} must explain the refusal: {body}"
+            );
+        }
+        assert!(
+            state.raw_config.read().listeners.is_none(),
+            "the refused PUT must not persist ({decl})"
+        );
+    }
 }

@@ -34,6 +34,7 @@ async fn associate(tunnel: meow_tunnel::Tunnel, authenticate: bool) -> (TcpStrea
             "socks",
             addr.port(),
             None,
+            None,
         )
         .await;
     });

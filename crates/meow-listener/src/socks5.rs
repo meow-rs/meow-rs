@@ -33,6 +33,7 @@ pub async fn handle_socks5(
     in_name: &str,
     in_port: u16,
     route_override: Option<&InboundRouteOverride>,
+    routing_mark: Option<u32>,
 ) {
     match handle_socks5_inner(
         tunnel,
@@ -75,6 +76,7 @@ pub async fn handle_socks5(
                     }
                     inbound
                 },
+                routing_mark,
             )
             .await
             {

@@ -79,6 +79,10 @@ pub struct ShadowsocksListener {
     /// `listeners[].proxy`/`rule` — the named-listener route override
     /// stamped onto every flow's `Metadata` (TCP and UDP).
     route_override: Option<meow_common::InboundRouteOverride>,
+    /// `listeners[].routing-mark` — `SO_MARK` for the separately bound
+    /// UDP relay socket (the TCP listen socket is marked by the caller;
+    /// its mark cannot reach this one). Linux only.
+    routing_mark: Option<u32>,
 }
 
 impl ShadowsocksListener {
@@ -114,6 +118,7 @@ impl ShadowsocksListener {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             tcp_keepalive: TcpKeepaliveConfig::default(),
             route_override: None,
+            routing_mark: None,
         })
     }
 
@@ -137,6 +142,14 @@ impl ShadowsocksListener {
     /// stamped onto every flow's `Metadata` before routing.
     pub fn with_route_override(mut self, ov: Option<meow_common::InboundRouteOverride>) -> Self {
         self.route_override = ov;
+        self
+    }
+
+    /// `listeners[].routing-mark` for the UDP relay socket — the only
+    /// socket this listener binds itself (the caller marks the TCP
+    /// listen socket). Linux only; `None` writes no sockopt.
+    pub fn with_routing_mark(mut self, mark: Option<u32>) -> Self {
+        self.routing_mark = mark;
         self
     }
 
@@ -165,9 +178,27 @@ impl ShadowsocksListener {
         }
         let udp_cfg = ServerConfig::new(bound, self.password.clone(), self.method)
             .map_err(|e| meow_common::MeowError::Config(format!("udp server config: {e}")))?;
-        let udp_sock = shadowsocks::ProxySocket::bind(Arc::clone(&self.ctx), &udp_cfg)
+        // Bind the socket ourselves: `ProxySocket::bind` keeps the fd
+        // inside `ShadowUdpSocket`, so the listener `routing-mark` could
+        // never reach it. `from_socket` is the server-side equivalent
+        // of `bind` with an already-bound socket.
+        let sock = tokio::net::UdpSocket::bind(bound)
             .await
             .map_err(|e| format!("udp bind failed: {e}"))?;
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        if let Some(mark) = self.routing_mark {
+            use std::os::fd::AsRawFd;
+            meow_common::set_listener_socket_mark(sock.as_raw_fd(), mark)
+                .map_err(|e| format!("routing-mark {mark}: {e} (SO_MARK needs CAP_NET_ADMIN)"))?;
+        }
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+        let _ = self.routing_mark;
+        let udp_sock = shadowsocks::ProxySocket::from_socket(
+            shadowsocks::relay::udprelay::proxy_socket::UdpSocketType::Server,
+            Arc::clone(&self.ctx),
+            &udp_cfg,
+            sock.into(),
+        );
         info!(
             "Shadowsocks listener '{}' UDP on {} (cipher={})",
             self.name, bound, self.method
