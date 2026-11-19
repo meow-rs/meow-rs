@@ -1471,12 +1471,19 @@ pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
     // below the 32-level budget (migration review F1). The join is a
     // synchronous block on paths that already parsed inline — startup and
     // reload — so nothing downstream changes. See `meow_common::yaml`.
-    meow_common::yaml::run_on_parse_stack(content, |doc| {
-        let root: yaml_tree::SpannedNode =
-            serde_saphyr::from_str_with_options(doc, yaml_options())?;
-        yaml_tree::deserialize_config(&root, doc).map_err(Into::into)
-    })
-    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))?
+    let raw = meow_common::yaml::run_on_parse_stack(
+        content,
+        |doc| -> Result<raw::RawConfig, anyhow::Error> {
+            let root: yaml_tree::SpannedNode =
+                serde_saphyr::from_str_with_options(doc, yaml_options())?;
+            yaml_tree::deserialize_config(&root, doc).map_err(Into::into)
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))??;
+    // Alias-conflict warnings are scoped to the document admission — this
+    // parse — not to the rebuild passes it later fans out to (issue #974).
+    validation::warn_store_fake_ip_alias(&raw);
+    Ok(raw)
 }
 
 /// Unique-per-call scratch sibling for atomic write-then-rename saves —

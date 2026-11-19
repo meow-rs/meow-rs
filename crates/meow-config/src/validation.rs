@@ -488,6 +488,26 @@ pub(crate) fn warn_extra<T>(context: &str, extra: &BTreeMap<String, T>) {
     emit_unknown_keys_warn(context, &extra.keys().cloned().collect::<Vec<_>>());
 }
 
+/// The `store-fake-ip` spelling conflict — `profile` wins when the two
+/// disagree. Emitted at the document-parse boundary (`parse_raw_yaml`)
+/// rather than inside [`validate_and_warn`], because the admission it is
+/// scoped to is the document itself: a startup runs two rebuild passes
+/// and a `PUT` up to two more over the same raw, and per-pass emission
+/// double-warned the operator (issue #974).
+pub(crate) fn warn_store_fake_ip_alias(raw: &crate::raw::RawConfig) {
+    if let (Some(pv), Some(dv)) = (
+        raw.profile.as_ref().and_then(|p| p.store_fake_ip),
+        raw.dns.as_ref().and_then(|d| d.store_fake_ip),
+    ) {
+        if pv != dv {
+            warn!(
+                "profile.store-fake-ip ({pv}) and dns.store-fake-ip ({dv}) disagree — \
+                 the profile value wins"
+            );
+        }
+    }
+}
+
 /// Warn on every key the typed schema dropped silently, across all
 /// surfaces [`crate::raw::RawConfig`] models — called once per rebuild
 /// pass so `-t` validation, startup, and `PUT`/`PATCH /configs` reloads
@@ -535,20 +555,6 @@ pub(crate) fn validate_and_warn(raw: &crate::raw::RawConfig) {
     }
     if let Some(profile) = &raw.profile {
         warn_extra("profile", &profile.extra);
-        // `store-fake-ip` has two spellings; `profile` wins when they
-        // disagree — say so once per admission rather than letting the
-        // losing alias look live (issue #974).
-        if let (Some(pv), Some(dv)) = (
-            profile.store_fake_ip,
-            raw.dns.as_ref().and_then(|d| d.store_fake_ip),
-        ) {
-            if pv != dv {
-                warn!(
-                    "profile.store-fake-ip ({pv}) and dns.store-fake-ip ({dv}) disagree — \
-                     the profile value wins"
-                );
-            }
-        }
     }
     if let Some(dns) = &raw.dns {
         warn_extra("dns", &dns.extra);
