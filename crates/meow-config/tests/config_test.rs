@@ -4676,4 +4676,48 @@ mod ntp_resolution {
         let c = resolve("ntp:\n  enable: true\n  write-to-system: true\n").unwrap();
         assert!(c.enable);
     }
+
+    /// An enabled `dialer-proxy` must name a transport: the
+    /// REJECT/REJECT-DROP/PASS/PASS-RULE built-ins sit in the proxy map
+    /// but are match-engine signals, so admission denies them by name.
+    /// DIRECT/COMPATIBLE dial direct and GLOBAL is a group — all valid.
+    #[test]
+    fn dialer_proxy_rejects_non_transport_builtins() {
+        for name in ["REJECT", "REJECT-DROP", "PASS", "PASS-RULE"] {
+            let raw = meow_config::parse_raw_yaml(&format!(
+                "ntp:\n  enable: true\n  dialer-proxy: {name}\n"
+            ))
+            .unwrap();
+            let e = meow_config::rebuild_from_raw(&raw)
+                .err()
+                .unwrap_or_else(|| panic!("{name} must fail admission"));
+            assert!(
+                e.to_string().contains("non-transport built-in"),
+                "{name}: unexpected error: {e}"
+            );
+        }
+        for name in ["DIRECT", "COMPATIBLE", "GLOBAL"] {
+            let raw = meow_config::parse_raw_yaml(&format!(
+                "ntp:\n  enable: true\n  dialer-proxy: {name}\n"
+            ))
+            .unwrap();
+            meow_config::rebuild_from_raw(&raw)
+                .unwrap_or_else(|e| panic!("{name} must pass admission: {e}"));
+        }
+        // A disabled section's dialer-proxy never reaches the gate.
+        let raw =
+            meow_config::parse_raw_yaml("ntp:\n  enable: false\n  dialer-proxy: REJECT\n").unwrap();
+        meow_config::rebuild_from_raw(&raw)
+            .expect("a disabled ntp section must not gate its dialer name");
+        // An undeclared name still fails the map check.
+        let raw =
+            meow_config::parse_raw_yaml("ntp:\n  enable: true\n  dialer-proxy: ghost\n").unwrap();
+        let e = meow_config::rebuild_from_raw(&raw)
+            .err()
+            .expect("ghost must fail");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
+    }
 }

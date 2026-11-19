@@ -5821,6 +5821,19 @@ pub(crate) fn check_ntp_dialer_target(
         return Ok(());
     }
     if let Some(name) = &cfg.dialer_proxy {
+        // REJECT/REJECT-DROP/PASS/PASS-RULE sit in the built map but are
+        // match-engine signals, not transports — they can never carry the
+        // exchange. DIRECT/COMPATIBLE dial directly and GLOBAL is a real
+        // group, so those stay valid targets (issue #974).
+        anyhow::ensure!(
+            !matches!(
+                name.as_str(),
+                "REJECT" | "REJECT-DROP" | "PASS" | "PASS-RULE"
+            ),
+            "ntp.dialer-proxy '{name}': non-transport built-ins cannot carry \
+             the exchange — name a built proxy/group, DIRECT, COMPATIBLE, \
+             or GLOBAL"
+        );
         anyhow::ensure!(
             name == "DIRECT" || proxies.contains_key(name.as_str()),
             "ntp.dialer-proxy '{name}': no such top-level proxy or group — \
