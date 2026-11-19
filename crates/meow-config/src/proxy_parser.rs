@@ -3327,7 +3327,27 @@ fn parse_mux_options(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<Option<meow_proxy::mux::MuxOptions>, String> {
-    let Some(mux_cfg) = mux_config_block(name, config)? else {
+    parse_mux_options_impl(name, config, false)
+}
+
+/// [`parse_mux_options`] with the advisory warnings silenced — used by
+/// the early shape gate (`check_mux_shape`) so they only emit once, from
+/// the real parse below.
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn parse_mux_options_impl(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+    quiet: bool,
+) -> std::result::Result<Option<meow_proxy::mux::MuxOptions>, String> {
+    let Some(mux_cfg) = mux_config_block(name, config, quiet)? else {
         return Ok(None);
     };
     let enabled = mux_bool_field(name, mux_cfg, "enabled", false)?;
@@ -3362,7 +3382,7 @@ fn parse_mux_options(
     // session is still reused, but one already carrying a stream is never
     // shared, so every *concurrent* stream dials its own carrier — almost
     // never what an operator wants, so say so.
-    if max_connections == 0 && min_streams == 0 && max_streams == 0 {
+    if !quiet && max_connections == 0 && min_streams == 0 && max_streams == 0 {
         tracing::warn!(
             proxy = %name,
             "mux: max-connections, min-streams and max-streams are all 0 — a carrier that \
@@ -3376,7 +3396,7 @@ fn parse_mux_options(
     // Validate the flag so a malformed value is a node defect like every
     // other mux bool, but warn rather than fail when set: the node still
     // works, just without carrier-level accounting.
-    if mux_bool_field(name, mux_cfg, "statistic", false)? {
+    if mux_bool_field(name, mux_cfg, "statistic", false)? && !quiet {
         tracing::warn!(
             proxy = %name,
             "mux option 'statistic' is not supported in meow-rs (carrier-level traffic \
@@ -3385,7 +3405,7 @@ fn parse_mux_options(
         );
     }
     // `brutal-opts` (TCP Brutal, Linux-only upstream) stays warn-ignore.
-    if mux_cfg.get("brutal-opts").is_some() {
+    if !quiet && mux_cfg.get("brutal-opts").is_some() {
         tracing::warn!(
             proxy = %name,
             "mux option 'brutal-opts' is not supported in meow-rs and will be ignored"
@@ -3429,12 +3449,31 @@ fn parse_mux_options(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<(), String> {
-    if let Some(mux_cfg) = mux_config_block(name, config)? {
+    parse_mux_options_impl(name, config, false)
+}
+
+/// [`parse_mux_options`] with the not-compiled warning silenced for the
+/// early shape gate (`check_mux_shape`).
+#[cfg(all(
+    not(feature = "mux"),
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn parse_mux_options_impl(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+    quiet: bool,
+) -> std::result::Result<(), String> {
+    if let Some(mux_cfg) = mux_config_block(name, config, quiet)? {
         let enabled = mux_cfg
             .get("enabled")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        if enabled {
+        if enabled && !quiet {
             tracing::warn!(
                 proxy = %name,
                 "mux is enabled in config but this build was compiled without the `mux` feature; the option is ignored"
@@ -3453,15 +3492,18 @@ fn parse_mux_options(
 fn mux_config_block<'a>(
     name: &str,
     config: &'a HashMap<String, serde_json::Value>,
+    quiet: bool,
 ) -> std::result::Result<Option<&'a serde_json::Value>, String> {
     let block = match (config.get("smux"), config.get("mux")) {
         (Some(_), Some(_)) => {
             // Migration-friendly: prefer the canonical key and say so,
             // instead of rejecting the node for a likely leftover.
-            tracing::warn!(
-                proxy = %name,
-                "both `smux` and legacy alias `mux` are configured; using the canonical `smux` key"
-            );
+            if !quiet {
+                tracing::warn!(
+                    proxy = %name,
+                    "both `smux` and legacy alias `mux` are configured; using the canonical `smux` key"
+                );
+            }
             config.get("smux")
         }
         (Some(config), None) | (None, Some(config)) => Some(config),
@@ -3528,6 +3570,59 @@ fn mux_usize_field(
         )),
     }
 }
+
+/// Cheap `smux:`/`mux:` shape gate over the static `proxies:` list, run
+/// before ECH pre-resolution so a malformed block rejects the document
+/// without the network fetches ever opening a socket (issue #974
+/// review — local shape/range checks precede candidate network work).
+/// Only the mux-capable leaf types are checked — the same arms that
+/// parse the block at build time. The gate runs quiet: advisory
+/// warnings belong to the real parse below, which re-runs the same
+/// validation.
+#[cfg(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "ss",
+    feature = "vmess"
+))]
+pub fn check_mux_shape(raw: &crate::raw::RawConfig) -> std::result::Result<(), String> {
+    let Some(proxies) = raw.proxies.as_deref() else {
+        return Ok(());
+    };
+    for node in proxies {
+        let Some(kind) = node.get("type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        // Exactly the types whose parse arms consume the block — other
+        // protocols never reach it, so their `smux:` key is not ours to
+        // reject here.
+        let capable = (kind == "ss" && cfg!(feature = "ss"))
+            || (kind == "trojan" && cfg!(feature = "trojan"))
+            || (kind == "vless" && cfg!(feature = "vless"))
+            || (kind == "vmess" && cfg!(feature = "vmess"));
+        if !capable {
+            continue;
+        }
+        let name = node
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        parse_mux_options_impl(name, node, true)?;
+    }
+    Ok(())
+}
+
+/// [`check_mux_shape`] when no mux-capable protocol is compiled in.
+#[cfg(not(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "ss",
+    feature = "vmess"
+)))]
+pub fn check_mux_shape(_raw: &crate::raw::RawConfig) -> std::result::Result<(), String> {
+    Ok(())
+}
+
 #[cfg(feature = "vless")]
 fn parse_vless_xhttp_config(
     config: &HashMap<String, serde_json::Value>,
