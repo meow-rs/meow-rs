@@ -6639,8 +6639,12 @@ async fn build_config_inner(
 
     // `smux:`/`mux:` blocks on the static leaves are the last local
     // shape check: a malformed one must reject here, before the ECH
-    // pre-resolution below opens sockets (issue #974 review).
-    proxy_parser::check_mux_shape(&raw).map_err(|e| anyhow::anyhow!("{e}"))?;
+    // pre-resolution below opens sockets (issue #974 review). The gate
+    // mirrors the parse's strictness — the rejection it orders ahead of
+    // the socket work is the strict one; lenient mode warn-drops the
+    // node in the real parse below instead.
+    proxy_parser::check_mux_shape(&raw, raw.strict.unwrap_or(false))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
     // sync `parse_proxy` path that follows can stay sync. Failures warn
     // and leave the map unchanged — except the `enable: true` with no

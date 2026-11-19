@@ -3579,13 +3579,25 @@ fn mux_usize_field(
 /// parse the block at build time. The gate runs quiet: advisory
 /// warnings belong to the real parse below, which re-runs the same
 /// validation.
+///
+/// `strict` mirrors the real parse's strictness: a malformed block is a
+/// *node-level* defect, which only `strict` promotes to a document
+/// error — the rejection this gate exists to order before ECH I/O.
+/// Lenient mode warn-drops the node in the real parse and the document
+/// succeeds, so the gate skips the scan entirely.
 #[cfg(any(
     feature = "trojan",
     feature = "vless",
     feature = "ss",
     feature = "vmess"
 ))]
-pub fn check_mux_shape(raw: &crate::raw::RawConfig) -> std::result::Result<(), String> {
+pub fn check_mux_shape(
+    raw: &crate::raw::RawConfig,
+    strict: bool,
+) -> std::result::Result<(), String> {
+    if !strict {
+        return Ok(());
+    }
     let Some(proxies) = raw.proxies.as_deref() else {
         return Ok(());
     };
@@ -3619,7 +3631,10 @@ pub fn check_mux_shape(raw: &crate::raw::RawConfig) -> std::result::Result<(), S
     feature = "ss",
     feature = "vmess"
 )))]
-pub fn check_mux_shape(_raw: &crate::raw::RawConfig) -> std::result::Result<(), String> {
+pub fn check_mux_shape(
+    _raw: &crate::raw::RawConfig,
+    _strict: bool,
+) -> std::result::Result<(), String> {
     Ok(())
 }
 

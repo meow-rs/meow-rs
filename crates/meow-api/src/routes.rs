@@ -4771,9 +4771,15 @@ async fn put_configs(
     // `smux:`/`mux:` blocks on the static leaves are the last local
     // shape check before candidate network work — a malformed one must
     // reject here, before the ECH pre-resolution opens sockets
-    // (issue #974 review). `force` cannot bypass it: like `parse_geodata`
-    // above, a committed poison would hard-fail the next boot.
-    if let Err(e) = meow_config::proxy_parser::check_mux_shape(&raw_config) {
+    // (issue #974 review). The gate mirrors the parse's strictness: a
+    // bad block is a node-level defect, so only `strict` rejects the
+    // document — and under `?force` it degrades leniently like every
+    // other strict defect class (the ECH retry just below): the lenient
+    // rebuild warn-drops the node and the PUT commits.
+    if let Err(e) = meow_config::proxy_parser::check_mux_shape(
+        &raw_config,
+        raw_config.strict.unwrap_or(false) && !force,
+    ) {
         return reload_rejected(StatusCode::BAD_REQUEST, &e);
     }
     // Pre-resolve any DNS-sourced ECH configs into inline base64. Under

@@ -1450,6 +1450,45 @@ proxies:
     assert!(!config.proxies.contains_key("trojan-scalar-mux"));
 }
 
+/// `strict: true` promotes the bad-`smux:` node defect to a document
+/// error — `check_mux_shape` gates it before the ECH pre-resolution
+/// opens sockets, so the load fails on the shape check itself.
+#[tokio::test]
+async fn test_proxy_parsing_strict_rejects_bad_mux_block() {
+    for yaml in [
+        r#"
+strict: true
+proxies:
+  - name: "trojan-bad-mux"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    smux:
+      enabled: "true"
+"#,
+        r#"
+strict: true
+proxies:
+  - name: "trojan-scalar-mux"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    smux: true
+"#,
+    ] {
+        let err = load_config_from_str(yaml)
+            .await
+            .err()
+            .expect("strict mode must reject a malformed smux block");
+        assert!(
+            err.to_string().contains("mux"),
+            "the error must name the mux defect, got: {err}"
+        );
+    }
+}
+
 #[cfg(feature = "mux")]
 #[tokio::test]
 async fn test_proxy_parsing_trojan_mux_h2mux_accepted() {

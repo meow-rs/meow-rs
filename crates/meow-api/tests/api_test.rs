@@ -2104,6 +2104,48 @@ async fn put_configs_local_gates_precede_ech_preresolve() {
     );
 }
 
+/// A malformed `smux:`/`mux:` block on a static leaf is a node-level
+/// defect, so the `check_mux_shape` admission gate mirrors the parse's
+/// strictness: `strict` rejects the PUT before the ECH preresolve opens
+/// sockets, while `?force=true` degrades it like every other strict
+/// defect class — the lenient rebuild warn-drops the node and the
+/// document commits.
+#[tokio::test]
+async fn put_configs_strict_bad_mux_gate_force_drops_node() {
+    let state = test_state(test_raw_config());
+    let yaml = "strict: true\nmode: rule\n\
+        proxies:\n  - {name: badmux, type: vless, server: vless.test, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, smux: true}\n\
+        rules: ['MATCH,DIRECT']\n";
+
+    let status = put_config_yaml(&state, yaml, false).await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a strict smux shape defect must reject the candidate"
+    );
+    assert!(
+        state.tunnel.proxy("badmux").is_none(),
+        "the route map must be untouched"
+    );
+    assert!(
+        state.raw_config.read().strict.is_none(),
+        "the live raw config must be untouched"
+    );
+
+    // `?force=true` retries the same candidate leniently: the malformed
+    // node is warn-dropped and the document commits.
+    let status = put_config_yaml(&state, yaml, true).await;
+    assert_eq!(
+        status,
+        StatusCode::NO_CONTENT,
+        "force retains the lenient escape"
+    );
+    assert!(
+        state.tunnel.proxy("badmux").is_none(),
+        "the lenient rebuild warn-drops the node"
+    );
+}
+
 /// Issue #974: under `force`, a `dns:` section that fails its rebuild
 /// keeps the previous resolver — but a candidate whose EFFECTIVE
 /// store-fake-ip flag (profile > dns > false) differs from the committed
