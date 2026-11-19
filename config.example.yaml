@@ -29,6 +29,18 @@ mixed-port: 7890
 
 allow-lan: false
 bind-address: "127.0.0.1"
+
+# CIDR admission control on the TCP accept loops of the mixed/HTTP/SOCKS
+# listeners (tproxy, TUN, shadowsocks and wireguard are exempt — their
+# traffic arrives already authorized). Entries must be CIDRs; host bits
+# are truncated. Omitted `lan-allowed-ips` admits every source; an
+# explicit `lan-allowed-ips: []` admits none. `lan-disallowed-ips` wins
+# over the allow list. Rejected peers are dropped silently at accept —
+# before auth, sniffing or any protocol bytes. Startup-only: PUT /configs
+# validates and stores them for the next boot; nothing rebinds live.
+# lan-allowed-ips: [10.0.0.0/8, 192.168.0.0/16, fd00::/8]
+# lan-disallowed-ips: [192.168.3.0/24]
+
 mode: rule
 log-level: info
 ipv6: false
@@ -182,6 +194,36 @@ rules:
 
   # Final fallback
   - MATCH,Proxy
+
+# Named rule blocks a `listeners:` entry can select with `rule:`. The
+# block replaces the top-level `rules:` scan for that inbound's flows;
+# exhausting it (or an empty block) goes DIRECT — the top-level list is
+# never consulted. Top-level `SUB-RULE,<name>` rules keep their existing
+# meaning (enter the block, then continue the main scan).
+# sub-rules:
+#   guest:
+#     - DOMAIN-SUFFIX,ads.example,REJECT
+#     - MATCH,DIRECT
+
+# Additional named listeners. `proxy:` pins every flow of the inbound to
+# a proxy/group resolved live at dial time (a name missing from the table
+# rejects; there is no fallback to the rules). `rule:` selects a
+# `sub-rules:` block by name — it must exist in this document (hard parse
+# error otherwise) and replaces the top-level rules for the inbound's
+# rule-mode scans. `routing-mark` sets SO_MARK on the listener's own
+# socket (Linux only; it is an ingress mark and has nothing to do with the
+# top-level `routing-mark` outbound key). `lan-*` ACL keys belong at the
+# top level only and are rejected here.
+# listeners:
+#   - name: guests
+#     type: mixed
+#     port: 7894
+#     proxy: Proxy        # every flow leaves through `Proxy` (or a group)
+#   - name: isolated
+#     type: socks5
+#     port: 7895
+#     rule: guest         # scans the `sub-rules.guest` block only
+#     routing-mark: 255   # SO_MARK on the listen socket (Linux)
 
 # Subscriptions (remote Clash configs merged in as a tracked contribution).
 # A refresh merges the fetched document's proxies/proxy-groups by name
