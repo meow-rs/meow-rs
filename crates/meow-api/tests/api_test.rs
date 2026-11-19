@@ -2013,6 +2013,58 @@ async fn put_configs_force_broken_dns_gates_store_fake_ip() {
     );
 }
 
+/// Issue #974: at the API boundary every non-transport built-in
+/// (`REJECT`/`REJECT-DROP`/`PASS`/`PASS-RULE`) is rejected as an
+/// `ntp.dialer-proxy` target — they sit in the proxy map but cannot
+/// carry the exchange — while `DIRECT` stays a valid dialer.
+#[tokio::test]
+async fn put_configs_rejects_ntp_dialer_proxy_builtin_policies() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let put = |document: String| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+
+    for name in ["REJECT", "REJECT-DROP", "PASS", "PASS-RULE"] {
+        let resp = put(format!(
+            "ntp:\n  enable: true\n  dialer-proxy: {name}\nrules:\n  - MATCH,DIRECT\n"
+        ))
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{name}: a non-transport built-in must not dial ntp"
+        );
+        assert!(
+            state.raw_config.read().ntp.is_none(),
+            "{name}: a rejected candidate must not touch the committed document"
+        );
+    }
+    let resp =
+        put("ntp:\n  enable: true\n  dialer-proxy: DIRECT\nrules:\n  - MATCH,DIRECT\n".to_string())
+            .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "DIRECT remains a valid ntp dialer"
+    );
+}
+
 #[tokio::test]
 async fn get_traffic() {
     let state = test_state_default();
