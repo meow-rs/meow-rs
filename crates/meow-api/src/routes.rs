@@ -2121,6 +2121,17 @@ async fn apply_raw_to_tunnel(
         named_tun_fake_ip_guard(state, &prior_resolver, dns)?;
         install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
     }
+    // Selection-persistence commit BEFORE the route swap exposes the
+    // candidate's groups (issue #974 review): every fallible gate has
+    // passed, and the epoch flip must land before any live `select` can
+    // reach the new writers — an off→on select admitted in the gap would
+    // be acknowledged but fenced (in-memory only, lost on restart), and
+    // an on→off stale writer could still flush to the file. The pending
+    // store's adoption rides the same call.
+    state
+        .tunnel
+        .selection_backing()
+        .commit(meow_config::resolve_profile(&raw).store_selected);
     state
         .tunnel
         .update_routing(proxies, rules, sub_rules, dialer_registry);
@@ -4234,16 +4245,12 @@ async fn swap_config_and_reconcile_tun(
             Ok(ka) => meow_common::set_outbound_tcp_keepalive(ka),
             Err(e) => warn!("outbound keepalive resolution failed at commit: {e}"),
         }
-        // `profile.store-selected` on the same lane: the transition bumps
-        // the backing's enable epoch, fencing writers held by the
-        // outgoing generation's group Arcs — checked under the store's
-        // write lock, so a stale `select` can never flush through after
-        // this commit (issue #974). An unchanged flag is a no-op;
-        // ordinary enabled rebuilds keep store and epoch.
-        state
-            .tunnel
-            .selection_backing()
-            .commit(meow_config::resolve_profile(&candidate).store_selected);
+        // `profile.store-selected` commits EARLIER on this lane — at the
+        // route-publish sites in `apply_raw_to_tunnel` / the PUT cold
+        // path — so the epoch flip lands before the candidate's group
+        // writers go live (issue #974 review). Lanes that reach here
+        // without a publish (the verbatim fallback, a knobs-only PATCH)
+        // never carry a flag diff, so nothing remains to retire.
         // `ntp:` on the same lane, resolved here but reconciled once the
         // route/DNS/dial-globals/TUN commit below settles (issue #974 —
         // the worker must never dial through a half-published commit).
@@ -5158,6 +5165,13 @@ async fn put_configs(
         }
         install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
     }
+    // Same selection-persistence ordering as `apply_raw_to_tunnel`
+    // (issue #974 review): the epoch flip commits before the new route
+    // table — and its group writers — go live.
+    state
+        .tunnel
+        .selection_backing()
+        .commit(meow_config::resolve_profile(&raw_config).store_selected);
     let dropped = state
         .tunnel
         .reload_routing(proxies, rules, sub_rules, mode, dialer_registry);
