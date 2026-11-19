@@ -369,7 +369,11 @@ pub async fn parse_dns(
     // silently fall back to the upstream resolver, which is a user-surprising
     // privacy regression.
     if mode == DnsMode::FakeIp {
-        install_fakeip(&mut resolver, dns, cache_dir, prior, strict).await?;
+        // `profile.store-fake-ip` > `dns.store-fake-ip` > false — resolved
+        // once for both family pools so a spelling flip can't leave v4/v6
+        // disagreeing about persistence (issue #974).
+        let persist = crate::resolve_profile(raw).store_fake_ip;
+        install_fakeip(&mut resolver, dns, cache_dir, prior, strict, persist).await?;
         if let Some(range) = &dns.fake_ip_range6 {
             let prefix: ipnet::Ipv6Net = range.parse().map_err(|e| {
                 anyhow::anyhow!("dns.fake-ip-range6 '{range}' is not a valid IPv6 CIDR: {e}")
@@ -382,7 +386,7 @@ pub async fn parse_dns(
             }
             let mut v6 = dns.clone();
             v6.fake_ip_range = Some(prefix.to_string());
-            install_fakeip(&mut resolver, &v6, cache_dir, prior, strict).await?;
+            install_fakeip(&mut resolver, &v6, cache_dir, prior, strict, persist).await?;
         }
     } else {
         // Dead-key observability for the fake-IP ranges: a user who pairs
@@ -425,6 +429,9 @@ async fn install_fakeip(
     cache_dir: Option<&std::path::Path>,
     prior: Option<&Resolver>,
     strict: bool,
+    // The profile-resolved persistence flag — `profile.store-fake-ip`
+    // already folded over `dns.store-fake-ip` by the caller (issue #974).
+    persist: bool,
 ) -> Result<(), anyhow::Error> {
     let range_str = dns
         .fake_ip_range
@@ -433,8 +440,6 @@ async fn install_fakeip(
     let prefix: ipnet::IpNet = range_str
         .parse()
         .map_err(|e| anyhow::anyhow!("dns.fake-ip-range '{range_str}' is not a valid CIDR: {e}"))?;
-
-    let persist = dns.store_fake_ip.unwrap_or(false);
 
     // The file this generation would bind to, when persisting. Computed
     // before the reuse check so the check can compare store identity, not

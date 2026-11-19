@@ -118,6 +118,11 @@ pub struct Config {
     /// Hand it to `Tunnel::update_routing` so the route table retains it —
     /// chained adapters resolve through it weakly (issue #533).
     pub dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    /// The config-scoped `profile.store-selected` persistence owner —
+    /// install it on the `Tunnel` (`set_selection_backing`) so every
+    /// runtime rebuild lane shares this build's store and epoch
+    /// (issue #974).
+    pub selection: std::sync::Arc<meow_proxy::SelectionBacking>,
     pub listeners: ListenerConfig,
     pub tun: TunConfig,
     pub api: ApiConfig,
@@ -1851,13 +1856,21 @@ pub fn rebuild_from_raw_with_resolver(
     cache_dir: Option<&Path>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     shared_rule_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
+    // The running config's selection-persistence owner — pass
+    // `Tunnel::selection_backing()` for committed-state republishes so
+    // rebuilt groups keep the user's persisted pick (issue #974);
+    // SelectionBacking::unpersisted() otherwise.
+    selection: &meow_proxy::SelectionBacking,
 ) -> Result<RebuildResult, anyhow::Error> {
+    let store_selected = resolve_profile(raw).store_selected;
+    selection.prepare_sync(store_selected);
+    let writer = selection.attach(store_selected);
     rebuild_from_raw_impl(
         raw,
         cache_dir,
         resolver,
         providers,
-        None,
+        writer.as_ref(),
         None,
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
@@ -1887,22 +1900,24 @@ pub fn rebuild_from_raw_runtime(
     // or their `dialer-proxy` chains never resolve (issue #489). Pass
     // `Config::provider_dialer_registry`.
     provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    // The running config's selection-persistence owner — the same
+    // SelectionBacking startup built, so a rebuilt group keeps the user's
+    // persisted pick and the PUT commit's epoch bump fences these groups'
+    // writers correctly (issue #974). Pass
+    // SelectionBacking::unpersisted() for embedders without a backing file.
+    selection: &meow_proxy::SelectionBacking,
 ) -> Result<RebuildResult, anyhow::Error> {
-    let store = meow_proxy::SelectorStore::global();
-    if store.is_none() {
-        // First-`open`-wins binds the global at startup; embedders that
-        // never call `SelectorStore::open` (e.g. `load_config_from_str`)
-        // get the unpersisted behavior — selections reset on rebuild.
-        debug!(
-            "rebuild_from_raw_runtime: no global SelectorStore; group selections will not persist"
-        );
-    }
+    // This lane always runs on a blocking thread (spawn_blocking in the
+    // API/subscription callers), so the lazy store open is safe inline.
+    let store_selected = resolve_profile(raw).store_selected;
+    selection.prepare_sync(store_selected);
+    let writer = selection.attach(store_selected);
     rebuild_from_raw_impl(
         raw,
         cache_dir,
         resolver,
         providers,
-        store.as_ref(),
+        writer.as_ref(),
         None,
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
@@ -2995,7 +3010,7 @@ fn build_proxy_layer(
     raw: &raw::RawConfig,
     resolver: Option<&meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
     registry: &meow_proxy::dialer::ProxyRegistry,
     strict: bool,
 ) -> Result<HashMap<SmolStr, Arc<dyn Proxy>>, anyhow::Error> {
@@ -3216,7 +3231,7 @@ fn build_proxy_layer(
                 &proxies,
                 &include_all_proxies,
                 providers,
-                selector_store,
+                selection,
             ) {
                 Ok(group) => {
                     let name = SmolStr::from(group.name());
@@ -3258,7 +3273,7 @@ fn build_proxy_layer(
                     &proxies,
                     &include_all_proxies,
                     providers,
-                    selector_store,
+                    selection,
                 ) {
                     details.push(format!("'{}': {e}", raw_group.name));
                 }
@@ -3289,7 +3304,7 @@ fn build_proxy_layer(
                 &proxies,
                 &include_all_proxies,
                 providers,
-                selector_store,
+                selection,
             ) {
                 Ok(group) => {
                     let name = SmolStr::from(group.name());
@@ -3315,7 +3330,7 @@ fn build_proxy_layer(
                     &proxies,
                     &include_all_proxies,
                     providers,
-                    selector_store,
+                    selection,
                 ) {
                     Ok(group) => {
                         let name = SmolStr::from(group.name());
@@ -3390,7 +3405,7 @@ fn build_proxy_layer(
             &proxies,
             &[],
             providers,
-            selector_store,
+            selection,
         ) {
             Ok(group) => {
                 proxies.insert(SmolStr::new_static("GLOBAL"), group);
@@ -3481,7 +3496,7 @@ struct PrefetchProxies {
 fn prefetch_proxy_map(
     raw: &raw::RawConfig,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
 ) -> Result<Option<PrefetchProxies>, anyhow::Error> {
     // No `proxies:` entries means nothing to tunnel through — named `proxy:`
     // lookups and the default proxy all come back empty either way. Such a
@@ -3499,7 +3514,7 @@ fn prefetch_proxy_map(
         raw,
         None,
         providers,
-        selector_store,
+        selection,
         &registry,
         raw.strict.unwrap_or(false),
     )?;
@@ -3512,20 +3527,20 @@ fn prefetch_proxy_map(
 
 /// Build the prefetch proxy layer on a blocking thread — adapter and group
 /// construction can spawn plugin subprocesses and read TLS material, so it
-/// must not run inline on the async executor. `selector_store` is threaded
+/// must not run inline on the async executor. `selection` is threaded
 /// in so a `select` group's persisted choice resolves to the same member
 /// the runtime build would pick. A rejected layer or a failed build task
 /// surfaces as `Err` — the same failure pass 1 of the real build reports.
 async fn prefetch_proxy_layer_async(
     raw: &raw::RawConfig,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
 ) -> Result<Option<Arc<PrefetchProxies>>, anyhow::Error> {
     let raw = raw.clone();
     let providers = providers.clone();
-    let selector_store = selector_store.cloned();
+    let selection = selection.cloned();
     spawn_blocking_with_current_dispatcher(move || {
-        prefetch_proxy_map(&raw, &providers, selector_store.as_ref())
+        prefetch_proxy_map(&raw, &providers, selection.as_ref())
     })
     .await
     .map_err(|e| anyhow::anyhow!("prefetch proxy-layer build task failed: {e}"))?
@@ -3542,7 +3557,7 @@ fn rebuild_from_raw_impl(
     cache_dir: Option<&Path>,
     resolver: Option<&meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
     shared_ctx: Option<&meow_rules::ParserContext>,
     prefetched_payloads: Option<Arc<rule_provider::PrefetchedPayloads>>,
     // `dialer-proxy` front hops are resolved by name against this registry on
@@ -3637,7 +3652,7 @@ fn rebuild_from_raw_impl(
         raw,
         resolver,
         &candidate_providers,
-        selector_store,
+        selection,
         registry,
         strict,
     )?;
@@ -3803,14 +3818,6 @@ fn rebuild_from_raw_impl(
     })
 }
 
-async fn open_selector_store_async(
-    path: PathBuf,
-) -> Result<Arc<meow_proxy::SelectorStore>, anyhow::Error> {
-    spawn_blocking_with_current_dispatcher(move || meow_proxy::SelectorStore::open(path))
-        .await
-        .map_err(|e| anyhow::anyhow!("selector store open task failed: {e}"))
-}
-
 async fn build_parser_context_with_geo_async(
     raw: raw::RawConfig,
     geo: GeoDataConfig,
@@ -3880,7 +3887,7 @@ async fn rebuild_from_raw_impl_async(
     cache_dir: Option<PathBuf>,
     resolver: Option<meow_dns::ResolverSlot>,
     providers: HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<Arc<meow_proxy::SelectorStore>>,
+    selection: Option<meow_proxy::SelectorWriter>,
     ctx: meow_rules::ParserContext,
     provider_payloads: Arc<rule_provider::PrefetchedPayloads>,
     // Caller's registry cell — shared across a multi-pass build so pass-1
@@ -3901,7 +3908,7 @@ async fn rebuild_from_raw_impl_async(
             cache_dir.as_deref(),
             resolver.as_ref(),
             &providers,
-            selector_store.as_ref(),
+            selection.as_ref(),
             Some(&ctx),
             Some(provider_payloads),
             &registry,
@@ -5686,6 +5693,35 @@ pub fn resolve_tcp_keepalive(
     Ok(config)
 }
 
+/// The effective `profile:` flags — what the running config and
+/// `GET /configs` report (issue #974).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedProfile {
+    /// `profile.store-selected` — selection persistence for `select`
+    /// groups and url-test/fallback `fix` pins. Upstream default `true`.
+    pub store_selected: bool,
+    /// `profile.store-fake-ip` resolved over `dns.store-fake-ip` —
+    /// explicit `profile` wins over explicit `dns`, which wins over the
+    /// `false` default (`false` is still an explicit value; `null`
+    /// falls through, matching upstream's absent-handling).
+    pub store_fake_ip: bool,
+}
+
+/// Resolve `profile:` — `store-selected` defaults to upstream's `true`;
+/// `store-fake-ip` follows `profile` > `dns` > `false`. When both
+/// explicit spellings disagree, `profile` wins and the caller warns once
+/// per admission ([`validation::validate_and_warn`]).
+pub fn resolve_profile(raw: &raw::RawConfig) -> ResolvedProfile {
+    let profile = raw.profile.as_ref();
+    ResolvedProfile {
+        store_selected: profile.and_then(|p| p.store_selected).unwrap_or(true),
+        store_fake_ip: profile
+            .and_then(|p| p.store_fake_ip)
+            .or_else(|| raw.dns.as_ref().and_then(|d| d.store_fake_ip))
+            .unwrap_or(false),
+    }
+}
+
 /// Resolve `keep-alive-idle`/`keep-alive-interval`/`disable-keep-alive`
 /// — mihomo's keepalive knobs, scoped here to *outbound* dials (the
 /// inbound side stays with `tcp-keepalive*` / [`resolve_tcp_keepalive`],
@@ -6483,17 +6519,29 @@ async fn build_config_inner(
     // Open the persistent selector store (one JSON file in cache_dir).
     // Missing/unreadable files yield an empty store — no fatal errors.
     let cache_dir_buf = cache_dir.map(Path::to_path_buf);
-    let selector_store = match cache_dir_buf.as_ref() {
-        Some(d) => Some(open_selector_store_async(d.join("selector-cache.json")).await?),
-        None => None,
-    };
+    // The config-scoped selection-persistence owner: the file-backed
+    // store opens lazily for an enabled `profile.store-selected` only —
+    // a disabled profile never touches disk, and `-t` validation never
+    // reaches this point's fs work at all (issue #974).
+    let selection_backing = std::sync::Arc::new(meow_proxy::SelectionBacking::new(
+        cache_dir_buf
+            .as_ref()
+            .map(|d| d.join("selector-cache.json")),
+    ));
+    let resolved_profile = resolve_profile(&raw);
+    if !is_offline_validate() {
+        selection_backing
+            .prepare(resolved_profile.store_selected)
+            .await;
+    }
+    let selector_writer = selection_backing.attach(resolved_profile.store_selected);
 
     // One shared pre-registry proxy layer for the two startup fetches that
     // can ride a proxy (rule-provider prefetch + geodata download). Built
     // only when at least one of them could need it — a full layer costs an
     // adapter construction per `proxies:` entry (issue #533).
     let prefetch_proxies = if prefetch_proxy_layer_needed(&raw, &geodata) {
-        prefetch_proxy_layer_async(&raw, &proxy_providers, selector_store.as_ref()).await?
+        prefetch_proxy_layer_async(&raw, &proxy_providers, selector_writer.as_ref()).await?
     } else {
         None
     };
@@ -6544,7 +6592,7 @@ async fn build_config_inner(
             cache_dir_buf.clone(),
             None,
             proxy_providers.clone(),
-            selector_store.clone(),
+            selector_writer.clone(),
             ctx.clone(),
             Arc::clone(&provider_payloads),
             dialer_registry.clone(),
@@ -6602,7 +6650,7 @@ async fn build_config_inner(
             cache_dir_buf.clone(),
             Some(Arc::clone(&dns_config.resolver_slot)),
             proxy_providers.clone(),
-            selector_store.clone(),
+            selector_writer.clone(),
             ctx.clone(),
             Arc::clone(&provider_payloads),
             dialer_registry.clone(),
@@ -6704,6 +6752,12 @@ async fn build_config_inner(
         rules.len()
     );
 
+    // Startup's route commit for the selection epoch: writers this build
+    // attached priced the pending enable transition, so publishing the
+    // resolved flag here is what un-fences them. A `-t` validation runs
+    // the same no-op on a throwaway backing — memory only, no fs.
+    selection_backing.commit(resolved_profile.store_selected);
+
     Ok(Config {
         general,
         dns: dns_config,
@@ -6715,6 +6769,7 @@ async fn build_config_inner(
         rule_providers,
         dropped_providers,
         dialer_registry,
+        selection: selection_backing,
         listeners,
         tun,
         api,
@@ -7328,7 +7383,8 @@ mod dialer_proxy_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = meow_proxy::SelectorStore::open(dir.path().join("sel.json"));
         store.set("G", "B2");
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&store))
+        let writer = meow_proxy::SelectorWriter::standalone(store);
+        let layer = prefetch_proxy_map(&raw, &providers, Some(&writer))
             .expect("layer builds")
             .expect("proxies configured");
         let geo = geodata::parse_geodata(&raw).unwrap();
@@ -7354,7 +7410,8 @@ mod dialer_proxy_tests {
         // A fresh store → the group falls back to its first member.
         let empty_dir = tempfile::tempdir().unwrap();
         let empty_store = meow_proxy::SelectorStore::open(empty_dir.path().join("sel.json"));
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_store))
+        let empty_writer = meow_proxy::SelectorWriter::standalone(empty_store);
+        let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_writer))
             .expect("layer builds")
             .expect("proxies configured");
         let geo = geodata::parse_geodata(&raw).unwrap();
@@ -8536,8 +8593,15 @@ rules:
              \x20 - name: front\n    type: direct\n",
         )
         .unwrap();
-        let result = rebuild_from_raw_with_resolver(&raw, Some(&slot), None, &HashMap::new(), None)
-            .expect("direct chain builds");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            Some(&slot),
+            None,
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("direct chain builds");
 
         let metadata = meow_common::Metadata {
             network: meow_common::Network::Tcp,
@@ -9189,6 +9253,7 @@ mod geoip_context_tests {
                 &HashMap::new(),
                 None,
                 &meow_proxy::dialer::ProxyRegistry::default(),
+                &meow_proxy::SelectionBacking::unpersisted(),
             )
         })
         .await
@@ -9932,11 +9997,15 @@ rules:
 
         // `rebuild_from_raw_with_resolver` — used by geodata_fetch's
         // rules-only rebuilds.
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect(
-                    "trusted rebuild with the real cache dir must not hard-fail on a file provider",
-                );
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("trusted rebuild with the real cache dir must not hard-fail on a file provider");
         assert_eq!(result.rules.len(), 2);
 
         // `rebuild_from_raw_runtime` — used by meow-api's `PUT /configs`
@@ -9947,6 +10016,7 @@ rules:
             &HashMap::new(),
             Some(dir.path()),
             &Default::default(),
+            &meow_proxy::SelectionBacking::unpersisted(),
         )
         .expect(
             "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
@@ -9987,9 +10057,15 @@ rules:
             parking_lot::RwLock::new(HashMap::new());
 
         // Commit path: swap the returned set in after validation succeeds.
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("rebuild ok");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("rebuild ok");
         *live.write() = result.rule_providers;
         assert!(live.read().contains_key("ads"));
 
@@ -10002,6 +10078,7 @@ rules:
             Some(dir.path()),
             &HashMap::new(),
             None,
+            &meow_proxy::SelectionBacking::unpersisted(),
         )
         .expect("rebuild ok");
         *live.write() = result.rule_providers;
@@ -10013,9 +10090,15 @@ rules:
             "rule-providers:\n  ads:\n    type: file\n    behavior: domain\n    format: yaml\n    path: ads.yaml\nrules:\n  - RULE-SET,ads,REJECT\n  - \"MATCH,DIRECT\"\n",
         )
         .unwrap();
-        let result =
-            rebuild_from_raw_with_resolver(&raw_ok, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("rebuild ok");
+        let result = rebuild_from_raw_with_resolver(
+            &raw_ok,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("rebuild ok");
         *live.write() = result.rule_providers;
         let raw_bad: raw::RawConfig =
             serde_saphyr::from_str("rules:\n  - SUB-RULE,(MATCH,DIRECT),missing\n").unwrap();
@@ -10024,7 +10107,8 @@ rules:
             None,
             Some(dir.path()),
             &HashMap::new(),
-            None
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
         )
         .is_err());
         assert!(
@@ -10646,9 +10730,15 @@ rules:
 "#;
         let raw = raw_config(yaml);
         // Empty live map — the declaration itself must authorize `use:`.
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("strict must accept use: of a candidate-declared provider");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("strict must accept use: of a candidate-declared provider");
         assert!(result.proxies.contains_key("g"));
         assert!(result.proxy_providers.contains_key("airport"));
     }
@@ -10676,15 +10766,29 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let Err(err) = rebuild_from_raw_with_resolver(&raw, None, None, &live, None) else {
+        let Err(err) = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            None,
+            &live,
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        ) else {
             panic!("use: of a removed provider must fail strict");
         };
         assert!(err.to_string().contains("airport"), "unexpected: {err}");
 
         // Lenient keeps the group — the zombie Arc is not consulted.
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
-        let result = rebuild_from_raw_with_resolver(&raw, None, None, &live, None)
-            .expect("lenient mode must tolerate the removal");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            None,
+            &live,
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("lenient mode must tolerate the removal");
         assert!(result.proxies.contains_key("g"));
         assert!(
             result.proxy_providers.is_empty(),
@@ -10734,8 +10838,15 @@ rules:
 "#
             );
             let raw = raw_config(&yaml);
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .unwrap_or_else(|e| panic!("strict must ignore inert use: under {flag}: {e}"));
+            rebuild_from_raw_with_resolver(
+                &raw,
+                None,
+                Some(dir.path()),
+                &HashMap::new(),
+                None,
+                &meow_proxy::SelectionBacking::unpersisted(),
+            )
+            .unwrap_or_else(|e| panic!("strict must ignore inert use: under {flag}: {e}"));
         }
     }
 
@@ -10777,9 +10888,15 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("strict must keep an unreadable provider as a known-empty set");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("strict must keep an unreadable provider as a known-empty set");
         assert!(result.rule_providers.contains_key("remote"));
         assert_eq!(
             result.rules.len(),
@@ -10808,9 +10925,14 @@ rule-providers:
     url: 'not a url'
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let Err(err) =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-        else {
+        let Err(err) = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        ) else {
             panic!("strict must reject an unparseable provider url");
         };
         assert!(err.to_string().contains("url"), "unexpected: {err}");
@@ -10818,8 +10940,15 @@ rule-providers:
         // Lenient keeps the acquisition-failure contract: the bad URL is a
         // fetch-time error → empty registered provider.
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
-        rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-            .expect("lenient registers an empty provider on bad url");
+        rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("lenient registers an empty provider on bad url");
     }
 
     /// A bad `format:` is a DEFECT in the definition, not an acquisition
@@ -10840,9 +10969,14 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let Err(err) =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-        else {
+        let Err(err) = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        ) else {
             panic!("a bogus format: is a defect — strict must reject");
         };
         assert!(err.to_string().contains("bad"), "unexpected: {err}");
@@ -10873,16 +11007,29 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        if rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-            .is_ok()
+        if rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .is_ok()
         {
             panic!("strict must reject a non-string payload item");
         }
 
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("lenient drops the non-string item and keeps the provider");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("lenient drops the non-string item and keeps the provider");
         assert!(result.rule_providers.contains_key("mixed"));
     }
 
@@ -11590,9 +11737,15 @@ mod dns_provider_sharing_tests {
             rule_provider::test_provider("p", rule_provider::ProviderType::Http, 0),
         );
 
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, None, &HashMap::new(), Some(shared))
-                .expect("a shared rebuild must not need the network");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            Some(shared),
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("a shared rebuild must not need the network");
         // Any would-be fetch attempt gets a beat to reach the listener.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(

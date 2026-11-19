@@ -666,10 +666,34 @@ pub struct RawConfig {
     /// `disable-keep-alive` — `true` clears `SO_KEEPALIVE` on outbound
     /// dials instead of applying the timing knobs above.
     pub disable_keep_alive: Option<bool>,
+    /// `profile:` — mihomo's selection/fake-IP persistence switches
+    /// ([`RawProfile`]).
+    pub profile: Option<RawProfile>,
     /// Keys no field above models land here — `validation::validate_and_warn`
     /// warns on them by name (forward-compat, ADR-0002) instead of serde
     /// dropping them silently (issue #974). `BTreeMap` so the save path
     /// writes them back in sorted order.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
+/// The `profile:` section — mihomo's two persistence switches (issue
+/// #974). Both are optional so an explicit value always wins over the
+/// fallback chain [`crate::resolve_profile`] applies; unmodeled children
+/// (`selected`, `tracing`, …) land in `extra` and get a scoped
+/// warn-and-ignore like every other section.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct RawProfile {
+    /// `store-selected` — persist `select`/url-test/fallback pins to the
+    /// config's selector cache and restore them into newly built groups.
+    /// Absent resolves `true` (upstream's default); `false` builds groups
+    /// with no persistence handle at all — in-memory selection still
+    /// works, nothing reads or writes the file.
+    pub store_selected: Option<bool>,
+    /// `store-fake-ip` — persist fake-IP forward/reverse mappings to a
+    /// JSON file. Resolution is `profile` > `dns.store-fake-ip` > `false`.
+    pub store_fake_ip: Option<bool>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, UnknownYamlValue>,
 }

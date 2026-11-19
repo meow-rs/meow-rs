@@ -239,22 +239,24 @@ pub async fn run_loop(
                             .iter()
                             .map(|e| (e.key().clone(), Arc::clone(e.value())))
                             .collect();
+                        let selection = tunnel.selection_backing();
                         move || {
-                            // The runtime variant wires
-                            // `SelectorStore::global()` so a `select` group
-                            // in the fetched config keeps the user's
-                            // persisted choice — the plain resolver variant
-                            // would reset every selector to its first
-                            // member on each refresh (issue #543). The
-                            // candidate's provider set still loads fresh
-                            // and is swapped into the live registry only
-                            // once validated (issue #533).
+                            // The runtime variant attaches the tunnel's
+                            // selection backing so a `select` group in the
+                            // fetched config keeps the user's persisted
+                            // choice — the plain resolver variant would
+                            // reset every selector to its first member on
+                            // each refresh (issue #543). The candidate's
+                            // provider set still loads fresh and is swapped
+                            // into the live registry only once validated
+                            // (issue #533).
                             meow_config::rebuild_from_raw_runtime(
                                 &candidate,
                                 Some(&resolver),
                                 &proxy_providers,
                                 cache_dir.as_deref(),
                                 &provider_dialer_registry,
+                                &selection,
                             )
                         }
                     })

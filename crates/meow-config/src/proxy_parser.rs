@@ -4241,7 +4241,7 @@ pub fn parse_proxy_group_with_store(
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
     include_all_proxies: &[Arc<dyn Proxy>],
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
-    store: Option<&Arc<meow_proxy::SelectorStore>>,
+    store: Option<&meow_proxy::SelectorWriter>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     parse_proxy_group_inner(
         config,
@@ -4283,7 +4283,7 @@ pub fn parse_proxy_group_lenient_with_store(
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
     include_all_proxies: &[Arc<dyn Proxy>],
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
-    store: Option<&Arc<meow_proxy::SelectorStore>>,
+    store: Option<&meow_proxy::SelectorWriter>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     parse_proxy_group_inner(
         config,
@@ -4301,7 +4301,7 @@ fn parse_proxy_group_inner(
     include_all_proxies: &[Arc<dyn Proxy>],
     strict: bool,
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selector_store: Option<&meow_proxy::SelectorWriter>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let mut proxies: Vec<Arc<dyn Proxy>> = Vec::new();
 
@@ -4403,7 +4403,7 @@ fn parse_proxy_group_inner(
             let mut group = SelectorGroup::new_with_providers(&config.name, proxies, slots)
                 .with_display(group_display(config));
             if let Some(store) = selector_store {
-                group = group.with_store(Arc::clone(store));
+                group = group.with_store(store.clone());
             }
             Ok(Arc::new(group))
         }

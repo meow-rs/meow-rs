@@ -658,9 +658,7 @@ fn run_application_inner(
         // per dial, so it must be installed before the build's first
         // provider/geodata fetch opens a socket. `-t` never reaches here;
         // PUT/PATCH re-assert at their commit points.
-        meow_common::set_outbound_tcp_keepalive(meow_config::resolve_outbound_tcp_keepalive(
-            &raw,
-        )?);
+        meow_common::set_outbound_tcp_keepalive(meow_config::resolve_outbound_tcp_keepalive(&raw)?);
 
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);
@@ -1526,6 +1524,10 @@ async fn run(
     // Share the DNS config's resolver slot so runtime `set_resolver` swaps
     // reach the map's DIRECT adapters built from this slot (issue #514).
     let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
+    // The config-scoped `profile.store-selected` persistence owner — every
+    // rebuild lane (API PUT, subscription/geodata republish) attaches
+    // through it so groups share the startup store and enable epoch.
+    tunnel.set_selection_backing(Arc::clone(&config.selection));
     meow_tunnel::nftset::install(
         &tunnel,
         config

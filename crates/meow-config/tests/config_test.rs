@@ -3650,10 +3650,7 @@ fn test_outbound_keepalive_defaults() {
     let ka = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
     assert_eq!(ka, meow_common::OutboundTcpKeepalive::default());
 
-    let raw = meow_config::parse_raw_yaml(
-        "keep-alive-idle: 0\nkeep-alive-interval: 0\n",
-    )
-    .unwrap();
+    let raw = meow_config::parse_raw_yaml("keep-alive-idle: 0\nkeep-alive-interval: 0\n").unwrap();
     let ka = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
     assert_eq!(ka, meow_common::OutboundTcpKeepalive::default());
 }
@@ -3675,12 +3672,10 @@ fn test_outbound_keepalive_bounds() {
 
     // Disabled keeps the timing bounds — a disabled-but-invalid knob is
     // still rejected rather than committed.
-    let err = meow_config::parse_raw_yaml(
-        "disable-keep-alive: true\nkeep-alive-idle: 40000\n",
-    )
-    .ok()
-    .and_then(|raw| meow_config::resolve_outbound_tcp_keepalive(&raw).err())
-    .expect("an out-of-range idle must fail even when disabled");
+    let err = meow_config::parse_raw_yaml("disable-keep-alive: true\nkeep-alive-idle: 40000\n")
+        .ok()
+        .and_then(|raw| meow_config::resolve_outbound_tcp_keepalive(&raw).err())
+        .expect("an out-of-range idle must fail even when disabled");
     assert!(err.to_string().contains("keep-alive-idle"), "{err}");
 
     let raw = meow_config::parse_raw_yaml("disable-keep-alive: true\n").unwrap();
@@ -4540,4 +4535,74 @@ proxies:
             .expect_err("a null mapping key must still fail");
         assert!(err.to_string().contains("null"), "got: {err}");
     }
+}
+
+/// `resolve_profile` — `profile.store-fake-ip` outranks
+/// `dns.store-fake-ip`, which outranks the `false` default; plus
+/// upstream's `store-selected: true` default and the typed-shape
+/// contract (`profile:` must be a mapping, flags booleans when
+/// non-null) — issue #974.
+#[test]
+fn test_resolve_profile_matrix() {
+    // Omitted everything → upstream defaults.
+    let raw = meow_config::parse_raw_yaml("mode: rule\n").unwrap();
+    let p = meow_config::resolve_profile(&raw);
+    assert!(p.store_selected);
+    assert!(!p.store_fake_ip);
+
+    // Explicit profile values win over dns and defaults.
+    let raw = meow_config::parse_raw_yaml(
+        "profile:\n  store-selected: false\n  store-fake-ip: true\ndns:\n  store-fake-ip: false\n",
+    )
+    .unwrap();
+    let p = meow_config::resolve_profile(&raw);
+    assert!(!p.store_selected);
+    assert!(p.store_fake_ip, "profile.store-fake-ip outranks dns'");
+
+    // The alias carries over when profile omits the key — including an
+    // explicit `store-fake-ip: false` in dns (false is a value, not a
+    // fallthrough).
+    let raw = meow_config::parse_raw_yaml(
+        "profile:\n  store-selected: true\ndns:\n  store-fake-ip: true\n",
+    )
+    .unwrap();
+    assert!(meow_config::resolve_profile(&raw).store_fake_ip);
+    let raw = meow_config::parse_raw_yaml("dns:\n  store-fake-ip: false\n").unwrap();
+    assert!(!meow_config::resolve_profile(&raw).store_fake_ip);
+
+    // `null` falls through to the next source; a `null` profile section
+    // resolves like an absent one.
+    let raw =
+        meow_config::parse_raw_yaml("profile:\n  store-fake-ip: ~\ndns:\n  store-fake-ip: true\n")
+            .unwrap();
+    assert!(
+        meow_config::resolve_profile(&raw).store_fake_ip,
+        "null falls through to the dns spelling"
+    );
+    let raw = meow_config::parse_raw_yaml("profile: ~\n").unwrap();
+    let p = meow_config::resolve_profile(&raw);
+    assert!(p.store_selected && !p.store_fake_ip);
+
+    // Typed shape: non-bool flags and a non-mapping section are hard
+    // failures, not warn-and-ignore.
+    for doc in [
+        "profile: {store-selected: 5}\n",
+        "profile: {store-fake-ip: yes-but-no}\n",
+        "profile: 3\n",
+    ] {
+        assert!(
+            meow_config::parse_raw_yaml(doc).is_err(),
+            "must fail raw parse: {doc:?}"
+        );
+    }
+
+    // Unmodeled children survive into `extra` for the scoped warning —
+    // `selected`/`tracing` must NOT be silently accepted as config.
+    let raw = meow_config::parse_raw_yaml(
+        "profile:\n  store-selected: false\n  selected: {G: X}\n  tracing: true\n",
+    )
+    .unwrap();
+    let profile = raw.profile.as_ref().unwrap();
+    assert!(profile.extra.contains_key("selected"));
+    assert!(profile.extra.contains_key("tracing"));
 }

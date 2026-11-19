@@ -1,4 +1,4 @@
-use super::selector_store::SelectorStore;
+use super::selector_store::SelectorWriter;
 use super::{DialFailureTracker, UsageTracker};
 use async_trait::async_trait;
 use meow_common::{
@@ -18,7 +18,7 @@ pub struct UrlTestGroup {
     /// User-fixed member. This is independent from `fastest`, which remains
     /// the automatic URL-test incumbent.
     fixed: RwLock<Option<SmolStr>>,
-    store: Option<Arc<SelectorStore>>,
+    store: Option<SelectorWriter>,
     test_url: String,
     expected_status: String,
     /// Name of the currently selected proxy; `None` means "not yet picked,
@@ -81,7 +81,7 @@ impl UrlTestGroup {
         mut self,
         test_url: String,
         expected_status: String,
-        store: Option<Arc<SelectorStore>>,
+        store: Option<SelectorWriter>,
     ) -> Self {
         self.test_url = test_url;
         self.expected_status = expected_status;

@@ -8,10 +8,9 @@
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::warn;
-
-static GLOBAL_STORE: std::sync::OnceLock<Arc<SelectorStore>> = std::sync::OnceLock::new();
 
 /// Map of `{group_name → selected_proxy_name}` persisted to a JSON file.
 pub struct SelectorStore {
@@ -50,26 +49,12 @@ impl SelectorStore {
                 HashMap::new()
             }
         };
-        let store = Arc::new(Self {
+        Arc::new(Self {
             path,
             map: Mutex::new(map),
             write_lock: Mutex::new(()),
-            dirty: std::sync::atomic::AtomicBool::new(false),
-        });
-        let _ = GLOBAL_STORE.set(Arc::clone(&store));
-        store
-    }
-
-    /// Process-wide store used by runtime config rebuilds so rebuilt groups
-    /// retain the same persistence side-channel as startup-created groups.
-    ///
-    /// Returns `None` until the first call to [`Self::open`]. The first
-    /// `open()` call wins the process-global slot; subsequent calls still
-    /// return their own `Arc<Self>` but do **not** replace the global.
-    /// Tests or library users that create multiple stores should be aware
-    /// that only the first store is reachable via `global()`.
-    pub fn global() -> Option<Arc<Self>> {
-        GLOBAL_STORE.get().cloned()
+            dirty: AtomicBool::new(false),
+        })
     }
 
     pub fn get(&self, group: &str) -> Option<String> {
@@ -80,7 +65,16 @@ impl SelectorStore {
     /// errors only warn — losing the persistence side-channel must never
     /// fail the user's selection.
     pub fn set(&self, group: &str, selected: &str) {
-        use std::sync::atomic::Ordering::Relaxed;
+        let _write = self.write_lock.lock();
+        self.set_locked(group, selected);
+    }
+
+    /// The body of [`Self::set`] with the write serialization already held —
+    /// [`SelectorWriter::set`] takes the same lock to check its epoch, so a
+    /// fenced writer's check and the flush it gates share one critical
+    /// section.
+    fn set_locked(&self, group: &str, selected: &str) {
+        use Ordering::Relaxed;
         {
             let mut g = self.map.lock();
             if g.get(group).is_some_and(|v| v == selected) && !self.dirty.load(Relaxed) {
@@ -94,7 +88,6 @@ impl SelectorStore {
         // committed map — without this, a slow writer holding an older
         // snapshot could publish it after a newer writer, leaving the
         // persisted choice behind the last in-memory one (issue #621).
-        let _write = self.write_lock.lock();
         let snapshot = self.map.lock().clone();
         match write_atomic(&self.path, &snapshot) {
             Ok(()) => self.dirty.store(false, Relaxed),
@@ -109,6 +102,163 @@ impl SelectorStore {
                 warn!(path = %self.path.display(), error = %e,
                     "selector store: persist failed");
             }
+        }
+    }
+}
+
+/// The epoch-fenced persistence handle a group holds — `profile.
+/// store-selected`'s writer half. `get` reads the shared map (priming a
+/// group's saved pick is safe under any epoch); `set` rechecks its
+/// captured epoch under the store's write lock, so a stale group Arc from
+/// an earlier generation can never flush through after a disable or a
+/// disable→re-enable cycle — the two sides of the fence are serialized by
+/// the same lock the atomic rename already required (issue #974).
+#[derive(Clone)]
+pub struct SelectorWriter {
+    store: Arc<SelectorStore>,
+    epoch: u64,
+    epochs: Arc<AtomicU64>,
+}
+
+impl SelectorWriter {
+    /// An unfenced writer over a bare store — tests and embedders that
+    /// own persistence directly rather than through [`SelectionBacking`]'s
+    /// config-scoped lifecycle. Its private epoch cell never moves, so
+    /// every `set` passes the fence check.
+    pub fn standalone(store: Arc<SelectorStore>) -> Self {
+        Self {
+            store,
+            epoch: 0,
+            epochs: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn get(&self, group: &str) -> Option<String> {
+        self.store.get(group)
+    }
+
+    pub fn set(&self, group: &str, selected: &str) {
+        let _write = self.store.write_lock.lock();
+        if self.epochs.load(Ordering::Acquire) != self.epoch {
+            return;
+        }
+        self.store.set_locked(group, selected);
+    }
+}
+
+/// The config-scoped owner of the `profile.store-selected` channel —
+/// replaces the former first-`open`-wins process global (issue #974).
+/// Created by the config build, carried by the running `Config`/`Tunnel`,
+/// and consulted on every rebuild lane (startup, PUT/PATCH commit,
+/// subscription/geodata republish):
+///
+/// - `prepare` opens the JSON store lazily, only for an enabled
+///   generation — a disabled profile never touches the file, and a
+///   `None` path (`--config-string`, `load_config_from_str`) means no
+///   persistence is possible at all.
+/// - `attach` hands a group its writer — `None` while disabled, matching
+///   upstream's "no `StoreSelected` gate ⇒ no restore and no write".
+/// - `commit` is run by the publication lane with the *committed*
+///   generation's resolved flag: an enable/disable transition bumps the
+///   epoch, instantly fencing every writer an older group Arc still
+///   holds; an unchanged flag is a no-op, so ordinary enabled rebuilds
+///   keep sharing store and epoch. Rejected candidates never reach
+///   `commit` — their attached writers die fenced with them.
+pub struct SelectionBacking {
+    /// `None` disables persistence structurally (no backing file).
+    path: Option<PathBuf>,
+    /// Lazily opened — `prepare` fills it on the first enabled build and
+    /// it stays open across a disable so re-enable reuses one store.
+    store: Mutex<Option<Arc<SelectorStore>>>,
+    epoch: Arc<AtomicU64>,
+    /// The last *committed* resolved flag — `attach` prices a not-yet-
+    /// committed generation's epoch from it.
+    enabled: AtomicBool,
+}
+
+impl SelectionBacking {
+    pub fn new(path: Option<PathBuf>) -> Self {
+        Self {
+            path,
+            store: Mutex::new(None),
+            epoch: Arc::new(AtomicU64::new(0)),
+            enabled: AtomicBool::new(false),
+        }
+    }
+
+    /// A backing that can never persist — tests and `--config-string`.
+    pub fn unpersisted() -> Self {
+        Self::new(None)
+    }
+
+    /// Open the store if `enabled` and a path exists. Runs the fs work on
+    /// a blocking thread for async callers; `prepare_sync` is the same
+    /// step for callers already on a blocking thread. Idempotent — an
+    /// already-open store is reused across disable/re-enable cycles.
+    pub async fn prepare(&self, enabled: bool) {
+        if !enabled || self.store.lock().is_some() {
+            return;
+        }
+        let Some(path) = self.path.clone() else {
+            return;
+        };
+        let store = tokio::task::spawn_blocking(move || SelectorStore::open(path)).await;
+        if let Ok(store) = store {
+            let mut guard = self.store.lock();
+            if guard.is_none() {
+                *guard = Some(store);
+            }
+        }
+    }
+
+    /// [`Self::prepare`] for callers already on a blocking thread.
+    pub fn prepare_sync(&self, enabled: bool) {
+        if !enabled {
+            return;
+        }
+        let mut guard = self.store.lock();
+        if guard.is_none() {
+            if let Some(path) = &self.path {
+                *guard = Some(SelectorStore::open(path.clone()));
+            }
+        }
+    }
+
+    /// Attach a writer for a group built under `enabled` — `None` when
+    /// disabled or persistence is impossible. While the committed flag is
+    /// still `false` the pending generation's writers price their epoch at
+    /// `epoch + 1`: exactly the value [`Self::commit`] will publish for
+    /// the disable→enable transition, so a rejected candidate's writers
+    /// stay fenced without a wasted bump.
+    pub fn attach(&self, enabled: bool) -> Option<SelectorWriter> {
+        if !enabled {
+            return None;
+        }
+        let epoch =
+            self.epoch.load(Ordering::Acquire) + u64::from(!self.enabled.load(Ordering::Acquire));
+        self.store.lock().as_ref().map(|store| SelectorWriter {
+            store: Arc::clone(store),
+            epoch,
+            epochs: Arc::clone(&self.epoch),
+        })
+    }
+
+    /// Called at the route commit with the candidate's resolved flag:
+    /// bumps the epoch on any transition — under the store's write lock,
+    /// so it serializes against a stale writer's epoch check the same way
+    /// two writers already serialize their renames. Writers attached for
+    /// the pending generation captured `epoch + 1` at [`Self::attach`],
+    /// so an enable transition publishes exactly the epoch they fence on.
+    pub fn commit(&self, enabled: bool) {
+        if self.enabled.swap(enabled, Ordering::AcqRel) == enabled {
+            return;
+        }
+        let guard = self.store.lock();
+        if let Some(store) = guard.as_ref() {
+            let _write = store.write_lock.lock();
+            self.epoch.fetch_add(1, Ordering::AcqRel);
+        } else {
+            self.epoch.fetch_add(1, Ordering::AcqRel);
         }
     }
 }
@@ -205,6 +355,78 @@ mod tests {
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         let in_memory = s.map.lock().clone();
         assert_eq!(on_disk, in_memory);
+    }
+
+    #[test]
+    fn backing_fences_writers_across_disable_and_reenable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sel.json");
+        let backing = SelectionBacking::new(Some(path.clone()));
+
+        // Disabled: no writer attaches and the file is never opened.
+        assert!(backing.attach(false).is_none());
+        assert!(!path.exists(), "disabled profile must not touch disk");
+
+        // First enabled generation: the pending writer is fenced until
+        // the commit publishes its epoch.
+        backing.prepare_sync(true);
+        let gen1 = backing.attach(true).expect("enabled attaches a writer");
+        gen1.set("g", "a");
+        assert!(
+            backing.store.lock().as_ref().unwrap().get("g").is_none(),
+            "a not-yet-committed generation must not reach the map"
+        );
+        backing.commit(true);
+        gen1.set("g", "a");
+        assert_eq!(
+            backing.store.lock().as_ref().unwrap().get("g").as_deref(),
+            Some("a")
+        );
+
+        // An ordinary enabled rebuild shares store and epoch.
+        let gen2 = backing.attach(true).unwrap();
+        backing.commit(true); // unchanged flag — no-op
+        gen2.set("g2", "x");
+        assert_eq!(
+            backing.store.lock().as_ref().unwrap().get("g2").as_deref(),
+            Some("x")
+        );
+
+        // Disable commit: every writer from earlier generations dies.
+        backing.commit(false);
+        gen1.set("g", "stale1");
+        gen2.set("g", "stale2");
+        assert_eq!(
+            backing.store.lock().as_ref().unwrap().get("g").as_deref(),
+            Some("a"),
+            "stale group Arcs must never write after disable"
+        );
+
+        // Re-enable: the new generation's pending writer stays fenced
+        // until its own commit; old writers stay dead forever.
+        let gen3 = backing.attach(true).unwrap();
+        gen3.set("g", "early");
+        backing.commit(true);
+        gen3.set("g", "d");
+        gen1.set("g", "zombie1");
+        gen2.set("g", "zombie2");
+        assert_eq!(
+            backing.store.lock().as_ref().unwrap().get("g").as_deref(),
+            Some("d")
+        );
+
+        // Round-trip through disk like a restart.
+        drop(backing);
+        let reopened = SelectorStore::open(path);
+        assert_eq!(reopened.get("g").as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn unpersisted_backing_never_attaches() {
+        let backing = SelectionBacking::unpersisted();
+        backing.prepare_sync(true);
+        backing.commit(true);
+        assert!(backing.attach(true).is_none());
     }
 
     #[test]

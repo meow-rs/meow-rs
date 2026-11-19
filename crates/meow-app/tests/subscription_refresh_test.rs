@@ -789,6 +789,7 @@ async fn refreshed_trusttunnel_provider_commits_with_a_dead_placeholder() {
         &live,
         Some(fx.dir.path()),
         &fx.provider_dialer_registry,
+        &fx.tunnel.selection_backing(),
     )
     .unwrap();
     fx.tunnel

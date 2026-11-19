@@ -1,4 +1,4 @@
-use super::selector_store::SelectorStore;
+use super::selector_store::SelectorWriter;
 use super::{DialFailureTracker, UsageTracker};
 use async_trait::async_trait;
 use meow_common::{
@@ -15,7 +15,7 @@ pub struct FallbackGroup {
     static_proxies: Vec<Arc<dyn Proxy>>,
     provider_slots: Vec<ProviderSlot>,
     fixed: RwLock<Option<SmolStr>>,
-    store: Option<Arc<SelectorStore>>,
+    store: Option<SelectorWriter>,
     test_url: String,
     expected_status: String,
     health: ProxyHealth,
@@ -69,7 +69,7 @@ impl FallbackGroup {
         mut self,
         test_url: String,
         expected_status: String,
-        store: Option<Arc<SelectorStore>>,
+        store: Option<SelectorWriter>,
     ) -> Self {
         self.test_url = test_url;
         self.expected_status = expected_status;

@@ -1,4 +1,4 @@
-use super::selector_store::SelectorStore;
+use super::selector_store::SelectorWriter;
 use async_trait::async_trait;
 use meow_common::{
     AdapterType, DelayHistory, GroupDisplay, MeowError, Metadata, ProviderSlot, Proxy,
@@ -18,7 +18,7 @@ pub struct SelectorGroup {
     /// DIRECT either way, so the divergence is cosmetic.)
     selected: RwLock<Option<SmolStr>>,
     /// Optional write-through persistence; primed at construction.
-    store: Option<Arc<SelectorStore>>,
+    store: Option<SelectorWriter>,
     health: ProxyHealth,
     display: GroupDisplay,
 }
@@ -52,11 +52,12 @@ impl SelectorGroup {
         }
     }
 
-    /// Attach a persistent store. The previously-saved choice (if any) is
-    /// loaded into `selected` immediately so the group dials it on first use.
-    /// Subsequent successful `select()` calls flush back through the store.
+    /// Attach the epoch-fenced persistence writer. The saved choice (if
+    /// any) is loaded into `selected` immediately so the group dials it on
+    /// first use; subsequent `select()`s flush through while the writer's
+    /// generation still owns the persistence epoch.
     #[must_use]
-    pub fn with_store(mut self, store: Arc<SelectorStore>) -> Self {
+    pub fn with_store(mut self, store: SelectorWriter) -> Self {
         if let Some(prev) = store.get(&self.name) {
             *self.selected.write() = Some(SmolStr::from(prev));
         }
@@ -389,7 +390,9 @@ mod tests {
 
         let a = MockProxy::new("a");
         let b = MockProxy::new("b");
-        let g = SelectorGroup::new("sel", vec![a, b]).with_store(Arc::clone(&store));
+        let g = SelectorGroup::new("sel", vec![a, b]).with_store(
+            crate::group::selector_store::SelectorWriter::standalone(Arc::clone(&store)),
+        );
         assert_eq!(
             g.selected_proxy().unwrap().name(),
             "b",

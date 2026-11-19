@@ -17,7 +17,6 @@ const UNSUPPORTED_KEYS: &[(&str, Option<u32>, &str)] = &[
     ("brutal-delay", None, "experimental, no spec"),
     ("brutal-opts", None, "experimental, no spec"),
     ("ntp", Some(974), "NTP time sync not implemented"),
-    ("profile", None, "not a routing concern"),
     (
         "geox-update-interval",
         None,
@@ -525,6 +524,23 @@ pub(crate) fn validate_and_warn(raw: &crate::raw::RawConfig) {
         }
     }
 
+    if let Some(profile) = &raw.profile {
+        warn_extra("profile", &profile.extra);
+        // `store-fake-ip` has two spellings; `profile` wins when they
+        // disagree — say so once per admission rather than letting the
+        // losing alias look live (issue #974).
+        if let (Some(pv), Some(dv)) = (
+            profile.store_fake_ip,
+            raw.dns.as_ref().and_then(|d| d.store_fake_ip),
+        ) {
+            if pv != dv {
+                warn!(
+                    "profile.store-fake-ip ({pv}) and dns.store-fake-ip ({dv}) disagree — \
+                     the profile value wins"
+                );
+            }
+        }
+    }
     if let Some(dns) = &raw.dns {
         warn_extra("dns", &dns.extra);
         if let Some(ff) = &dns.fallback_filter {

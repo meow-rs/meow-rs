@@ -992,6 +992,14 @@ struct ConfigResponse {
     keep_alive_interval: u64,
     #[serde(rename = "disable-keep-alive")]
     disable_keep_alive: bool,
+    /// The effective `profile:` flags — resolved over the committed
+    /// document (`profile.store-fake-ip` > `dns.store-fake-ip` > false),
+    /// matching how mihomo reports them flat on `GET /configs`
+    /// (issue #974).
+    #[serde(rename = "store-selected")]
+    store_selected: bool,
+    #[serde(rename = "store-fake-ip")]
+    store_fake_ip: bool,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -1070,10 +1078,13 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
         // The live outbound keepalive posture — same live-vs-document
         // reporting as `tcp-concurrent` (issue #974).
         keep_alive_idle: meow_common::outbound_tcp_keepalive().idle.as_secs(),
-        keep_alive_interval: meow_common::outbound_tcp_keepalive()
-            .interval
-            .as_secs(),
+        keep_alive_interval: meow_common::outbound_tcp_keepalive().interval.as_secs(),
         disable_keep_alive: !meow_common::outbound_tcp_keepalive().enabled,
+        // Effective profile flags — the resolved pair, so `GET` reports
+        // what selection/fake-IP persistence actually does, not the
+        // spelling the operator happened to use.
+        store_selected: meow_config::resolve_profile(&raw).store_selected,
+        store_fake_ip: meow_config::resolve_profile(&raw).store_fake_ip,
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
@@ -1988,6 +1999,7 @@ async fn apply_raw_to_tunnel(
         providers,
         cache_dir,
         state.provider_dialer_registry.clone(),
+        state.tunnel.selection_backing(),
     )
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -2587,11 +2599,25 @@ fn dns_inputs_equal(a: &RawConfig, b: &RawConfig) -> bool {
             _ => false,
         }
     };
+    // `store-fake-ip` compares on its resolved value — `profile` and
+    // `dns` spellings fold to one effective flag (`profile` wins), so an
+    // alias move with an equal verdict is not a pool change; a changed
+    // effective flag is (issue #974). Normalized out of the section
+    // compare so the raw spelling can't trigger a spurious rebuild.
+    let dns_sections_equal = {
+        let (mut da, mut db) = (a.dns.clone(), b.dns.clone());
+        for d in [&mut da, &mut db].into_iter().flatten() {
+            d.store_fake_ip = None;
+        }
+        da == db
+            && meow_config::resolve_profile(a).store_fake_ip
+                == meow_config::resolve_profile(b).store_fake_ip
+    };
     // `geox-url` is the top-level alias for `geodata.url.*` — it feeds the
     // same `parse_geodata` result, so it joins the DNS-input comparison.
     let base = hosts_equal
         && nsp_equal
-        && a.dns == b.dns
+        && dns_sections_equal
         && a.ipv6 == b.ipv6
         && a.geodata == b.geodata
         && a.geox_url == b.geox_url;
@@ -2851,6 +2877,11 @@ async fn rebuild_from_raw_runtime_async(
     providers: HashMap<String, Arc<ProxyProvider>>,
     cache_dir: Option<std::path::PathBuf>,
     provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    // The running config's `profile.store-selected` owner — the same
+    // backing startup installed on the tunnel, so rebuilt groups keep
+    // persisted picks and the commit's epoch bump fences correctly
+    // (issue #974).
+    selection: Arc<meow_proxy::SelectionBacking>,
 ) -> Result<meow_config::RebuildResult, String> {
     // Carry the caller's tracing dispatcher into the rebuild thread — the
     // same propagation `spawn_blocking_with_current_dispatcher` applies
@@ -2865,6 +2896,7 @@ async fn rebuild_from_raw_runtime_async(
                 &providers,
                 cache_dir.as_deref(),
                 &provider_dialer_registry,
+                &selection,
             )
         })
     })
@@ -4140,6 +4172,16 @@ async fn swap_config_and_reconcile_tun(
             Ok(ka) => meow_common::set_outbound_tcp_keepalive(ka),
             Err(e) => warn!("outbound keepalive resolution failed at commit: {e}"),
         }
+        // `profile.store-selected` on the same lane: the transition bumps
+        // the backing's enable epoch, fencing writers held by the
+        // outgoing generation's group Arcs — checked under the store's
+        // write lock, so a stale `select` can never flush through after
+        // this commit (issue #974). An unchanged flag is a no-op;
+        // ordinary enabled rebuilds keep store and epoch.
+        state
+            .tunnel
+            .selection_backing()
+            .commit(meow_config::resolve_profile(&candidate).store_selected);
         let ledger = candidate.traffic_ledger.as_ref();
         let ledger = (
             meow_config::raw::RawTrafficLedger::enabled(ledger),
@@ -4678,6 +4720,7 @@ async fn put_configs(
         providers.clone(),
         cache_dir.clone(),
         state.provider_dialer_registry.clone(),
+        state.tunnel.selection_backing(),
     )
     .await
     {
@@ -4702,6 +4745,7 @@ async fn put_configs(
                     providers,
                     cache_dir,
                     state.provider_dialer_registry.clone(),
+                    state.tunnel.selection_backing(),
                 )
                 .await
                 {
@@ -4728,9 +4772,32 @@ async fn put_configs(
     let Some(result) = result else {
         // The force contract accepts the config even when nothing in it
         // builds — persist the raw config but keep the previous routing,
-        // resolver, and provider registries untouched. Refresh tasks
-        // intentionally follow the *retained* registry (its providers
-        // still back the live route table), so no reconcile runs here.
+        // resolver, and provider registries untouched. One limit (issue
+        // #974): the verbatim commit installs live policy from the
+        // candidate, so a fallback that would *change* an effective
+        // profile/NTP/outbound-keepalive knob claims a switch it never
+        // earned — reject rather than publish.
+        {
+            let committed = state.raw_config.read();
+            let profile_changed = meow_config::resolve_profile(&committed)
+                != meow_config::resolve_profile(&raw_config);
+            let keepalive_changed = match (
+                meow_config::resolve_outbound_tcp_keepalive(&committed),
+                meow_config::resolve_outbound_tcp_keepalive(&raw_config),
+            ) {
+                (Ok(old), Ok(new)) => old != new,
+                _ => true,
+            };
+            if profile_changed || keepalive_changed {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    "config validation failed under force, and the candidate \
+                     changes an effective profile/outbound-keepalive policy — \
+                     the fallback would claim a switch it cannot apply; \
+                     fix the defect and retry",
+                );
+            }
+        }
         let prior_resolver = state.tunnel.resolver();
         // No `reload_routing` ran, so tracked TCP predating the binding
         // is still live. A TUN that fails to come up is rolled back and
