@@ -605,12 +605,13 @@ impl MuxClient {
                 } else if options.max_connections > 0 {
                     sessions.len() >= options.max_connections || load < options.min_streams
                 } else {
-                    // max-connections=0: honor min-streams first (sing-mux
-                    // checks minStreams before maxStreams in this branch),
-                    // then fall back to max-streams.  All three at zero
-                    // still reuses an idle session (the load == 0 arm
-                    // above) — only a carrier already holding streams is
-                    // never shared, so concurrent streams each dial.
+                    // max-connections=0: meow honors min-streams first,
+                    // then falls back to max-streams (upstream sing-mux
+                    // does not consult minStreams in this branch at all).
+                    // All three at zero still reuses an idle session (the
+                    // load == 0 arm above) — only a carrier already
+                    // holding streams is never shared, so concurrent
+                    // streams each dial.
                     load < options.min_streams
                         || (options.max_streams > 0 && load < options.max_streams)
                 };
