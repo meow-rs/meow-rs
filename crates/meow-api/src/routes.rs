@@ -982,6 +982,16 @@ struct ConfigResponse {
     /// (`always`/`strict`/`off`), not the document's (issue #974).
     #[serde(rename = "find-process-mode")]
     find_process_mode: String,
+    /// mihomo's `keep-alive-idle`/`keep-alive-interval`/`disable-keep-alive`
+    /// — the effective outbound-dial keepalive policy (seconds), like the
+    /// other live globals above: what the next `connect_tcp` applies, not
+    /// necessarily the committed document's spellings (`0`/absent → 15 s).
+    #[serde(rename = "keep-alive-idle")]
+    keep_alive_idle: u64,
+    #[serde(rename = "keep-alive-interval")]
+    keep_alive_interval: u64,
+    #[serde(rename = "disable-keep-alive")]
+    disable_keep_alive: bool,
     /// Whether the TUN listener is currently running (issue #326).
     /// Mirrors `tun.enable` from the raw config and reflects actual
     /// runtime state so nyanpasu can correctly render its toggle.
@@ -1057,6 +1067,13 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
         // The live policy on the tunnel — a PATCH can change it without a
         // committed-document round-trip, like `tcp-concurrent` above.
         find_process_mode: state.tunnel.process_lookup_mode().to_string(),
+        // The live outbound keepalive posture — same live-vs-document
+        // reporting as `tcp-concurrent` (issue #974).
+        keep_alive_idle: meow_common::outbound_tcp_keepalive().idle.as_secs(),
+        keep_alive_interval: meow_common::outbound_tcp_keepalive()
+            .interval
+            .as_secs(),
+        disable_keep_alive: !meow_common::outbound_tcp_keepalive().enabled,
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
     })
@@ -1185,6 +1202,15 @@ struct UpdateConfigRequest {
     /// is applied (issue #974).
     #[serde(rename = "find-process-mode")]
     find_process_mode: Option<meow_common::ProcessLookupMode>,
+    /// mihomo's `keep-alive-*` outbound-dial knobs — merged over the
+    /// committed document like every field here; absent/null keeps the
+    /// committed value (issue #974).
+    #[serde(rename = "keep-alive-idle")]
+    keep_alive_idle: Option<u64>,
+    #[serde(rename = "keep-alive-interval")]
+    keep_alive_interval: Option<u64>,
+    #[serde(rename = "disable-keep-alive")]
+    disable_keep_alive: Option<bool>,
     tun: Option<TunFields>,
 }
 
@@ -1229,6 +1255,37 @@ async fn update_configs(
                 .into_response();
         }
     }
+    // `keep-alive-*` patch: merge the supplied fields over the committed
+    // document and validate the COMPLETE result before anything below is
+    // applied — a bad merged posture rejects the whole PATCH, like the
+    // `global-ua` gate above (issue #974).
+    let keepalive_supplied = body.keep_alive_idle.is_some()
+        || body.keep_alive_interval.is_some()
+        || body.disable_keep_alive.is_some();
+    let keepalive = if keepalive_supplied {
+        let mut candidate = state.raw_config.read().clone();
+        if let Some(v) = body.keep_alive_idle {
+            candidate.keep_alive_idle = Some(v);
+        }
+        if let Some(v) = body.keep_alive_interval {
+            candidate.keep_alive_interval = Some(v);
+        }
+        if let Some(v) = body.disable_keep_alive {
+            candidate.disable_keep_alive = Some(v);
+        }
+        match meow_config::resolve_outbound_tcp_keepalive(&candidate) {
+            Ok(ka) => Some((candidate, ka)),
+            Err(e) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "message": e.to_string() })),
+                )
+                    .into_response()
+            }
+        }
+    } else {
+        None
+    };
     // The patched `tun:` section, checked like a `PUT /configs` one before
     // anything is applied; `None` when the patch leaves it as it is.
     let tun = match body.tun {
@@ -1320,6 +1377,13 @@ async fn update_configs(
         if body.find_process_mode.is_some() {
             candidate.find_process_mode = body.find_process_mode;
         }
+        // The keepalive patch rides the same commit — the swap installs
+        // the merged posture with the rest of the process-globals.
+        if let Some((ref merged, _)) = keepalive {
+            candidate.keep_alive_idle = merged.keep_alive_idle;
+            candidate.keep_alive_interval = merged.keep_alive_interval;
+            candidate.disable_keep_alive = merged.disable_keep_alive;
+        }
         // The swap commits the riding live globals and the raw before its
         // fallible TUN reconcile — snapshot both so a failed spawn leaves
         // the PATCH as it found them (`tun.enable`'s own rollback below
@@ -1331,6 +1395,7 @@ async fn update_configs(
             meow_common::global_ua(),
             meow_common::dial::tcp_concurrent(),
             state.tunnel.process_lookup_mode(),
+            meow_common::outbound_tcp_keepalive(),
         );
         let preinstalled = preinstall_global_route_binding(
             &candidate,
@@ -1359,6 +1424,7 @@ async fn update_configs(
             meow_common::set_global_ua(live.3.as_deref());
             meow_common::dial::set_tcp_concurrent(live.4);
             state.tunnel.set_process_lookup_mode(live.5);
+            meow_common::set_outbound_tcp_keepalive(live.6);
             let mut raw = state.raw_config.write();
             let tun_left = raw.tun.take();
             *raw = prior;
@@ -1430,6 +1496,16 @@ async fn update_configs(
         state.tunnel.set_process_lookup_mode(mode);
         info!("find-process-mode changed to {mode}");
         raw.find_process_mode = Some(mode);
+    }
+    if let Some((merged, ka)) = keepalive {
+        // Commit point after every fallible step above: install the
+        // merged policy and echo the merged fields into the document —
+        // an omitted key keeps its committed value. Idempotent when a
+        // `tun:` patch already installed the same posture via the swap.
+        meow_common::set_outbound_tcp_keepalive(ka);
+        raw.keep_alive_idle = merged.keep_alive_idle;
+        raw.keep_alive_interval = merged.keep_alive_interval;
+        raw.disable_keep_alive = merged.disable_keep_alive;
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -4053,6 +4129,17 @@ async fn swap_config_and_reconcile_tun(
         state
             .tunnel
             .set_process_lookup_mode(candidate.find_process_mode.unwrap_or_default());
+        // `keep-alive-*` outbound policy on the same lane: the accepted
+        // candidate's posture — omission resets to the 15 s/9-probe
+        // defaults; sockets already dialed keep the posture they were
+        // built with (issue #974). Candidates were validated before this
+        // point, so a failure here means a caller skipped its gate —
+        // log loudly and keep the live posture rather than silently
+        // installing a fallback.
+        match meow_config::resolve_outbound_tcp_keepalive(&candidate) {
+            Ok(ka) => meow_common::set_outbound_tcp_keepalive(ka),
+            Err(e) => warn!("outbound keepalive resolution failed at commit: {e}"),
+        }
         let ledger = candidate.traffic_ledger.as_ref();
         let ledger = (
             meow_config::raw::RawTrafficLedger::enabled(ledger),
@@ -4521,6 +4608,15 @@ async fn put_configs(
         } else {
             return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
         }
+    }
+
+    // `keep-alive-*` semantic admission — unbypassable by `?force` like
+    // the document-shape gates: the outbound socket policy is installed
+    // at commit, so a candidate that cannot resolve it must never
+    // persist. `keep-alive-idle`/`-interval` hold 0–32767 s even under
+    // `disable-keep-alive` (negative values already failed raw parse).
+    if let Err(e) = meow_config::resolve_outbound_tcp_keepalive(&raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
     }
 
     // Same admission contract for `global-ua`: it is validated inside

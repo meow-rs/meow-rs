@@ -3608,33 +3608,84 @@ async fn test_tcp_keepalive_disabled_still_rejects_invalid() {
     }
 }
 
-/// Upstream mihomo's `keep-alive-*` keys (which tune inbound listeners
-/// AND outbound dials there) are captured and warned (never honored),
-/// not silently dropped: they must land in the `RawConfig` capture
-/// fields AND not fail the load.
+/// Upstream mihomo's `keep-alive-*` keys tune the OUTBOUND side here
+/// (`tcp-keepalive*` keeps the inbound side) — typed fields resolving
+/// into the `OutboundTcpKeepalive` snapshot, never silently dropped.
 #[tokio::test]
-async fn test_upstream_keepalive_keys_warn_but_parse() {
+async fn test_upstream_keepalive_keys_resolve_outbound() {
     let yaml = r#"
 keep-alive-idle: 15
 keep-alive-interval: 30
 disable-keep-alive: false
 mixed-port: 7890
 "#;
-    // The keys must be captured, not dropped as unknown fields — a
-    // misnamed serde field would leave `keep-alive-idle` silently
-    // ignored while this test's load assertions still pass.
+    // The keys must be captured as typed fields — a misnamed serde field
+    // would leave `keep-alive-idle` silently ignored while the load
+    // assertions below still pass.
     let raw = meow_config::parse_raw_yaml(yaml).unwrap();
-    assert!(raw.keep_alive_idle.is_some());
-    assert!(raw.keep_alive_interval.is_some());
-    assert!(raw.disable_keep_alive.is_some());
+    assert_eq!(raw.keep_alive_idle, Some(15));
+    assert_eq!(raw.keep_alive_interval, Some(30));
+    assert_eq!(raw.disable_keep_alive, Some(false));
+
+    let outbound = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert!(outbound.enabled);
+    assert_eq!(outbound.idle, std::time::Duration::from_secs(15));
+    assert_eq!(outbound.interval, std::time::Duration::from_secs(30));
+    assert_eq!(outbound.probes, 9);
 
     let config = load_config_from_str(yaml).await.unwrap();
-    // Ignored upstream keys never reach the resolved inbound posture.
+    // The independent inbound posture is untouched by outbound knobs.
     let ka = config.listeners.tcp_keepalive;
     assert!(ka.enabled);
     assert_eq!(ka.idle, std::time::Duration::from_secs(300));
     assert_eq!(ka.interval, std::time::Duration::from_secs(30));
     assert_eq!(ka.probes, 5);
+}
+
+/// Omitted and explicit-0 keepalive timings resolve to the 15 s upstream
+/// default; `disable-keep-alive` defaults to enabled policy.
+#[test]
+fn test_outbound_keepalive_defaults() {
+    let raw = meow_config::parse_raw_yaml("mixed-port: 7890\n").unwrap();
+    let ka = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert_eq!(ka, meow_common::OutboundTcpKeepalive::default());
+
+    let raw = meow_config::parse_raw_yaml(
+        "keep-alive-idle: 0\nkeep-alive-interval: 0\n",
+    )
+    .unwrap();
+    let ka = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert_eq!(ka, meow_common::OutboundTcpKeepalive::default());
+}
+
+/// Timing bounds hold at 0–32767 s even while disabled; a negative value
+/// fails the typed field's serde before resolution.
+#[test]
+fn test_outbound_keepalive_bounds() {
+    let err = meow_config::parse_raw_yaml("keep-alive-idle: 32768\n")
+        .ok()
+        .and_then(|raw| meow_config::resolve_outbound_tcp_keepalive(&raw).err())
+        .expect("32768 must fail the 32767 s ceiling");
+    assert!(err.to_string().contains("keep-alive-idle"), "{err}");
+
+    assert!(
+        meow_config::parse_raw_yaml("keep-alive-interval: -5\n").is_err(),
+        "a negative interval must fail the typed field's serde"
+    );
+
+    // Disabled keeps the timing bounds — a disabled-but-invalid knob is
+    // still rejected rather than committed.
+    let err = meow_config::parse_raw_yaml(
+        "disable-keep-alive: true\nkeep-alive-idle: 40000\n",
+    )
+    .ok()
+    .and_then(|raw| meow_config::resolve_outbound_tcp_keepalive(&raw).err())
+    .expect("an out-of-range idle must fail even when disabled");
+    assert!(err.to_string().contains("keep-alive-idle"), "{err}");
+
+    let raw = meow_config::parse_raw_yaml("disable-keep-alive: true\n").unwrap();
+    let ka = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert!(!ka.enabled);
 }
 
 /// `redir-port` is mihomo's REDIRECT inbound — meow's tproxy

@@ -101,7 +101,9 @@ pub use socket_protect::{
     set_global_ua, set_routing_mark, DialerOpts, GlobalDialerOpts, IpVersion, RoutingMarkPin,
     DEFAULT_USER_AGENT,
 };
-pub use tcp_opts::TcpKeepaliveConfig;
+pub use tcp_opts::{
+    outbound_tcp_keepalive, set_outbound_tcp_keepalive, OutboundTcpKeepalive, TcpKeepaliveConfig,
+};
 // Host-resolver hook is cross-platform (iOS installs it without a protector).
 pub use socket_protect::{clear_host_resolver, host_resolver, set_host_resolver, HostResolver};
 // Socket protector is Android / OpenHarmony only (raw-fd `protect(fd)`).

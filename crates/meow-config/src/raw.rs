@@ -649,13 +649,23 @@ pub struct RawConfig {
     /// tproxy entry; `udp-timeout` on `listeners:`/`tun:`, issue #564).
     pub udp: Option<serde_json::Value>,
     pub udp_timeout: Option<serde_json::Value>,
-    /// Upstream mihomo's `keep-alive-*` keys tune BOTH inbound listeners
-    /// and outbound dials — captured only to warn on the plausible
-    /// migration mistake (`tcp-keepalive*` above covers the inbound
-    /// side; the outbound-dialer tuning is not honored).
-    pub keep_alive_idle: Option<serde_json::Value>,
-    pub keep_alive_interval: Option<serde_json::Value>,
-    pub disable_keep_alive: Option<serde_json::Value>,
+    /// `keep-alive-idle` — seconds of outbound-socket silence before the
+    /// first keepalive probe (`TCP_KEEPIDLE` / `TCP_KEEPALIVE` /
+    /// `SIO_KEEPALIVE_VALS.keepalivetime`). Upstream mihomo applies the
+    /// `keep-alive-*` keys to BOTH inbound listeners and outbound dials;
+    /// here they cover the outbound side only (`tcp-keepalive*` above
+    /// covers inbound). Omitted or `0` resolves to
+    /// [`meow_common::tcp_opts::DEFAULT_OUTBOUND_KEEPALIVE_SECS`]; max
+    /// [`meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS`] (Linux's
+    /// `TCP_KEEPIDLE` ceiling — larger would EINVAL at setsockopt).
+    pub keep_alive_idle: Option<u64>,
+    /// `keep-alive-interval` — seconds between outbound keepalive probes
+    /// (`TCP_KEEPINTVL`); same 0→default resolution and 32767 ceiling as
+    /// `keep-alive-idle`.
+    pub keep_alive_interval: Option<u64>,
+    /// `disable-keep-alive` — `true` clears `SO_KEEPALIVE` on outbound
+    /// dials instead of applying the timing knobs above.
+    pub disable_keep_alive: Option<bool>,
     /// Keys no field above models land here — `validation::validate_and_warn`
     /// warns on them by name (forward-compat, ADR-0002) instead of serde
     /// dropping them silently (issue #974). `BTreeMap` so the save path

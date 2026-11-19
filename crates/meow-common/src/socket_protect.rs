@@ -723,6 +723,21 @@ pub fn routing_mark_pinned() -> bool {
 /// silent regressions back into the system resolver; see the module docs
 /// for the loop-routing failure mode.
 pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
+    // Snapshot the outbound keepalive policy before the socket is built —
+    // one read per dial, then one application on the connected stream so
+    // every terminal path below (Android/OHOS protected, socket2 with
+    // mark/iface/TFO/MPTCP, and the plain-Tokio fast path) gets the same
+    // posture exactly once. TLS/mux/logical hops wrap this stream and
+    // never re-apply it; reused connections keep what they dialled with.
+    let keepalive = crate::tcp_opts::outbound_tcp_keepalive();
+    let stream = connect_tcp_dial(addr).await?;
+    keepalive.apply(&stream);
+    Ok(stream)
+}
+
+/// [`connect_tcp`]'s dispatch across the platform dial paths; the wrapper
+/// owns the keepalive snapshot + application around it.
+async fn connect_tcp_dial(addr: SocketAddr) -> io::Result<TcpStream> {
     // Platforms without the socket2 dial path — OpenHarmony included:
     // an `interface-name` cannot be honored — fail closed rather than
     // dial unbound, ahead of the protector early-return so even an
@@ -1955,6 +1970,85 @@ mod tests {
         let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
         let _stream = connect_tcp_host("127.0.0.1", port).await.expect("connect");
         let _ = accept.await.unwrap();
+    }
+
+    // ─── outbound keepalive policy (issue #974) ────────────────────────
+
+    /// The installed `OutboundTcpKeepalive` lands on the dialed stream —
+    /// SO_KEEPALIVE plus the configured timing — and the disabled posture
+    /// clears it instead. Serialized under LOCK: the policy is a
+    /// process-global.
+    #[cfg(any(unix, windows))]
+    #[tokio::test]
+    async fn connect_tcp_applies_installed_keepalive_policy() {
+        use crate::tcp_opts::{
+            outbound_tcp_keepalive, set_outbound_tcp_keepalive, OutboundTcpKeepalive,
+        };
+
+        let _g = LOCK.lock().await;
+        clear_socket_protector();
+        clear_host_resolver();
+        let prior = outbound_tcp_keepalive();
+
+        let listener =
+            Arc::new(tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap());
+        let port = listener.local_addr().unwrap().port();
+
+        let enabled_policy = OutboundTcpKeepalive {
+            enabled: true,
+            idle: std::time::Duration::from_secs(60),
+            interval: std::time::Duration::from_secs(5),
+            probes: 9,
+        };
+        set_outbound_tcp_keepalive(enabled_policy);
+        let accept = tokio::spawn({
+            let listener = Arc::clone(&listener);
+            async move { listener.accept().await.unwrap() }
+        });
+        let stream = connect_tcp(format!("127.0.0.1:{port}").parse().unwrap())
+            .await
+            .expect("connect");
+        let _ = accept.await.unwrap();
+        let sock = socket2::SockRef::from(&stream);
+        assert!(
+            sock.keepalive().unwrap(),
+            "enabled policy must set SO_KEEPALIVE"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(
+                sock.keepalive_time().unwrap(),
+                std::time::Duration::from_secs(60)
+            );
+            assert_eq!(
+                sock.keepalive_interval().unwrap(),
+                std::time::Duration::from_secs(5)
+            );
+            assert_eq!(sock.keepalive_retries().unwrap(), 9);
+        }
+        drop(stream);
+
+        // The disabled posture clears SO_KEEPALIVE rather than leaving
+        // the kernel default.
+        set_outbound_tcp_keepalive(OutboundTcpKeepalive {
+            enabled: false,
+            ..enabled_policy
+        });
+        let accept = tokio::spawn({
+            let listener = Arc::clone(&listener);
+            async move { listener.accept().await.unwrap() }
+        });
+        let stream = connect_tcp(format!("127.0.0.1:{port}").parse().unwrap())
+            .await
+            .expect("connect");
+        let _ = accept.await.unwrap();
+        assert!(
+            !socket2::SockRef::from(&stream).keepalive().unwrap(),
+            "disabled policy must clear SO_KEEPALIVE"
+        );
+        drop(stream);
+
+        set_outbound_tcp_keepalive(prior);
     }
 
     // ─── bind_udp ────────────────────────────────────────────────────────────

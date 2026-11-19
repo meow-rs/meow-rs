@@ -653,6 +653,14 @@ fn run_application_inner(
         meow_common::dial::set_tcp_concurrent(meow_config::effective_tcp_concurrent(
             raw.tcp_concurrent,
         ));
+        // `keep-alive-*` — the outbound-dial keepalive policy, same
+        // lane and same ordering rationale: `connect_tcp` snapshots it
+        // per dial, so it must be installed before the build's first
+        // provider/geodata fetch opens a socket. `-t` never reaches here;
+        // PUT/PATCH re-assert at their commit points.
+        meow_common::set_outbound_tcp_keepalive(meow_config::resolve_outbound_tcp_keepalive(
+            &raw,
+        )?);
 
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);

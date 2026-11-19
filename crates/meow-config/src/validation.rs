@@ -87,6 +87,18 @@ const MISPLACED_KEYS: &[(&str, &str)] = &[
     ),
     ("global-ua", "the top-level config"),
     (
+        "keep-alive-idle",
+        "the top-level config (outbound-dial keepalive)",
+    ),
+    (
+        "keep-alive-interval",
+        "the top-level config (outbound-dial keepalive)",
+    ),
+    (
+        "disable-keep-alive",
+        "the top-level config (outbound-dial keepalive)",
+    ),
+    (
         "statistic",
         "a proxies: entry's smux: block (and is ignored there: \
          carrier-level traffic accounting is not modeled)",

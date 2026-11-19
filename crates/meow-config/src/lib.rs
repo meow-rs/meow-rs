@@ -5683,39 +5683,47 @@ pub fn resolve_tcp_keepalive(
             }
         }
     }
-    // Upstream mihomo applies `keep-alive-*` to BOTH inbound listeners
-    // (`net.ListenConfig.KeepAliveConfig` on accepted sockets) and
-    // outbound dials; `tcp-keepalive*` here covers the inbound side only
-    // — outbound dials carry no configurable keepalive (the residual
-    // gap). Captured only to warn on the plausible migration mistake —
-    // without this the keys are silently ignored by serde.
-    for (key, present, inbound_equivalent) in [
-        (
-            "keep-alive-idle",
-            raw.keep_alive_idle.is_some(),
-            "`tcp-keepalive-idle`",
-        ),
-        (
-            "keep-alive-interval",
-            raw.keep_alive_interval.is_some(),
-            "`tcp-keepalive-interval`",
-        ),
-        (
-            "disable-keep-alive",
-            raw.disable_keep_alive.is_some(),
-            "`tcp-keepalive: false`",
-        ),
-    ] {
-        if present {
-            warn!(
-                "{key}: tunes inbound AND outbound sockets upstream and is \
-                 ignored; the inbound-socket equivalent here is \
-                 {inbound_equivalent} (outbound dials keep no keepalive \
-                 tuning)"
-            );
-        }
-    }
     Ok(config)
+}
+
+/// Resolve `keep-alive-idle`/`keep-alive-interval`/`disable-keep-alive`
+/// — mihomo's keepalive knobs, scoped here to *outbound* dials (the
+/// inbound side stays with `tcp-keepalive*` / [`resolve_tcp_keepalive`],
+/// an independence upstream's shared keys did not have) — into the
+/// [`meow_common::OutboundTcpKeepalive`] `connect_tcp` snapshots once per
+/// dial. Omitted or `0` timings resolve to the 15 s upstream default;
+/// `disable-keep-alive` defaults to `false`. Timing bounds hold at
+/// 0–32767 s even when disabled, like `tcp-keepalive*` — Linux EINVALs
+/// `TCP_KEEPIDLE`/`TCP_KEEPINTVL` above it. Negative values never reach
+/// here: the `u64` raw fields already failed serde.
+///
+/// `PUT`/`PATCH /configs` gate persistence on this resolver so a
+/// committed document cannot fail the next boot's `build_config`; the
+/// install itself happens at the caller's commit point, not here.
+pub fn resolve_outbound_tcp_keepalive(
+    raw: &raw::RawConfig,
+) -> Result<meow_common::OutboundTcpKeepalive, anyhow::Error> {
+    let bound = |key: &str, value: Option<u64>| -> Result<u64, anyhow::Error> {
+        match value {
+            None | Some(0) => Ok(meow_common::tcp_opts::DEFAULT_OUTBOUND_KEEPALIVE_SECS),
+            Some(secs) if secs > meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS => {
+                anyhow::bail!(
+                    "{key}: {secs}s exceeds the {}s ceiling",
+                    meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS
+                )
+            }
+            Some(secs) => Ok(secs),
+        }
+    };
+    Ok(meow_common::OutboundTcpKeepalive {
+        enabled: !raw.disable_keep_alive.unwrap_or(false),
+        idle: std::time::Duration::from_secs(bound("keep-alive-idle", raw.keep_alive_idle)?),
+        interval: std::time::Duration::from_secs(bound(
+            "keep-alive-interval",
+            raw.keep_alive_interval,
+        )?),
+        probes: meow_common::tcp_opts::OUTBOUND_KEEPALIVE_PROBES,
+    })
 }
 
 /// `lan-allowed-ips`/`lan-disallowed-ips` nested under a `listeners:`
@@ -6619,6 +6627,12 @@ async fn build_config_inner(
     // [`resolve_tcp_keepalive`], which `PUT /configs` also gates
     // persistence on so a committed document cannot fail this boot path.
     let tcp_keepalive = resolve_tcp_keepalive(&raw)?;
+
+    // `keep-alive-*` — the keepalive posture `connect_tcp` applies to
+    // outbound dials. Validated here (and on `-t`) so a bad value fails
+    // admission; the process-global install belongs to the launcher's
+    // commit point — a candidate build must never mutate live policy.
+    let _ = resolve_outbound_tcp_keepalive(&raw)?;
 
     // `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound TCP ACL.
     // Startup-only like `listeners:` (upstream live-patches the prefix

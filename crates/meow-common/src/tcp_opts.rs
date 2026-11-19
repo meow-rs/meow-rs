@@ -73,3 +73,132 @@ impl Default for TcpKeepaliveConfig {
         }
     }
 }
+
+/// mihomo's default for `keep-alive-idle`/`keep-alive-interval`, in
+/// seconds — an omitted *or zero* knob resolves to it (upstream treats 0
+/// as "leave the default", never as an actual zero).
+pub const DEFAULT_OUTBOUND_KEEPALIVE_SECS: u64 = 15;
+
+/// Unanswered probes before the kernel drops the connection for outbound
+/// dials — mihomo's fixed 9; `keep-alive-*` has no probe-count knob.
+/// Not settable on Windows (`SIO_KEEPALIVE_VALS` has no count field; the
+/// OS default applies there), like [`DEFAULT_TCP_KEEPALIVE_PROBES`].
+pub const OUTBOUND_KEEPALIVE_PROBES: u32 = 9;
+
+/// Resolved keepalive posture applied to every *outbound* TCP socket
+/// [`crate::socket_protect::connect_tcp`] dials — mihomo's
+/// `keep-alive-idle`/`keep-alive-interval`/`disable-keep-alive`, scoped
+/// to outbound only: upstream's same keys also cover accepted sockets,
+/// but meow models the inbound side separately (`tcp-keepalive*` →
+/// [`TcpKeepaliveConfig`]). Kept independent of `TcpKeepaliveConfig` so
+/// the two policies can never alias each other's knobs or defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutboundTcpKeepalive {
+    /// `false` when `disable-keep-alive: true` — clears `SO_KEEPALIVE`
+    /// explicitly rather than inheriting the OS default.
+    pub enabled: bool,
+    /// `keep-alive-idle` — silence before the first probe.
+    pub idle: Duration,
+    /// `keep-alive-interval` — spacing between probes.
+    pub interval: Duration,
+    /// [`OUTBOUND_KEEPALIVE_PROBES`] — not configurable in this batch.
+    pub probes: u32,
+}
+
+impl Default for OutboundTcpKeepalive {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            idle: Duration::from_secs(DEFAULT_OUTBOUND_KEEPALIVE_SECS),
+            interval: Duration::from_secs(DEFAULT_OUTBOUND_KEEPALIVE_SECS),
+            probes: OUTBOUND_KEEPALIVE_PROBES,
+        }
+    }
+}
+
+impl OutboundTcpKeepalive {
+    /// Apply this posture to a just-dialed outbound stream. Best-effort:
+    /// an unsupported sub-option or a failed `setsockopt` degrades to
+    /// "different keepalive timing" and logs at debug — a lost keepalive
+    /// must never break connectivity.
+    #[cfg(any(unix, windows))]
+    pub fn apply(&self, stream: &tokio::net::TcpStream) {
+        let sock = socket2::SockRef::from(stream);
+        if let Err(e) = sock.set_keepalive(self.enabled) {
+            tracing::debug!("outbound TCP keepalive setsockopt failed: {e}");
+        }
+        if !self.enabled {
+            return;
+        }
+        let ka = socket2::TcpKeepalive::new().with_time(self.idle);
+        // Same platform gates as the inbound apply (`meow-listener`'s
+        // keepalive.rs): `with_interval`/`with_retries` exist only on
+        // these socket2 cfg sets; the remaining targets engage keepalive
+        // with OS-default timing.
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "windows",
+            target_os = "cygwin",
+        ))]
+        let ka = ka.with_interval(self.interval);
+        #[cfg(any(
+            target_os = "android",
+            target_os = "dragonfly",
+            target_os = "freebsd",
+            target_os = "fuchsia",
+            target_os = "illumos",
+            target_os = "ios",
+            target_os = "visionos",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "netbsd",
+            target_os = "tvos",
+            target_os = "watchos",
+            target_os = "cygwin",
+        ))]
+        let ka = ka.with_retries(self.probes);
+        if let Err(e) = sock.set_tcp_keepalive(&ka) {
+            tracing::debug!("outbound TCP keepalive setsockopt failed: {e}");
+        }
+    }
+
+    /// Non-unix/windows stub: exotic targets degrade to no keepalive
+    /// setsockopts — the relay idle timeout still bounds the connection.
+    #[cfg(not(any(unix, windows)))]
+    pub fn apply(&self, _stream: &tokio::net::TcpStream) {}
+}
+
+/// The installed outbound keepalive policy — process-global like
+/// `set_routing_mark`/`set_global_ua`, snapshot once per `connect_tcp`
+/// dial and applied to the connected stream. Installed at startup and on
+/// every committed `PUT`/`PATCH /configs`; the default (enabled, 15 s /
+/// 15 s / 9 probes) matches mihomo's when the config never says a word.
+static OUTBOUND_TCP_KEEPALIVE: parking_lot::RwLock<OutboundTcpKeepalive> =
+    parking_lot::RwLock::new(OutboundTcpKeepalive {
+        enabled: true,
+        idle: Duration::from_secs(DEFAULT_OUTBOUND_KEEPALIVE_SECS),
+        interval: Duration::from_secs(DEFAULT_OUTBOUND_KEEPALIVE_SECS),
+        probes: OUTBOUND_KEEPALIVE_PROBES,
+    });
+
+/// Snapshot of the live outbound keepalive policy.
+pub fn outbound_tcp_keepalive() -> OutboundTcpKeepalive {
+    *OUTBOUND_TCP_KEEPALIVE.read()
+}
+
+/// Install the outbound keepalive policy every later `connect_tcp` dial
+/// applies. Sockets already dialed keep the posture they were built with.
+pub fn set_outbound_tcp_keepalive(policy: OutboundTcpKeepalive) {
+    *OUTBOUND_TCP_KEEPALIVE.write() = policy;
+}

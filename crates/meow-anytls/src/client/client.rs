@@ -4,8 +4,7 @@ use crate::client::{SessionPool, SessionPoolConfig};
 use crate::padding::{PaddingFactory, SharedPaddingFactory};
 use crate::session::{Session, SessionHeartbeatConfig};
 use crate::util::{
-    AnyTlsError, Result, TlsConnect, TransportDialer, configure_tcp_stream, hash_password,
-    send_authentication,
+    AnyTlsError, Result, TlsConnect, TransportDialer, hash_password, send_authentication,
 };
 use bytes::Bytes;
 use std::net::{Ipv4Addr, Ipv6Addr};
@@ -392,8 +391,10 @@ impl Client {
                         return Err(AnyTlsError::Io(e));
                     }
                 };
-                configure_tcp_stream(&tcp_stream, &self.server_addr);
-
+                // `connect_tcp_addr` already tuned the stream at the
+                // dispatch: bridge-owned dials keep the host's keepalive
+                // posture plus NODELAY; the standalone fallback got this
+                // crate's defaults.
                 tracing::debug!(
                     "[Client] TCP connection established to {}",
                     self.server_addr
