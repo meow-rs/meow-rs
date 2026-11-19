@@ -2209,12 +2209,19 @@ async fn run(
     // the TUN wait, and a PUT committed in that window already swapped
     // `raw_config` and fired its own reconcile — firing the stale boot
     // target now would resurrect a worker the operator just disabled
-    // (issue #974 review). A committed document always resolves (PUT
-    // admission gates `resolve_ntp`); on a defect leave the worker
-    // stopped and say so.
-    match meow_config::resolve_ntp(&raw_config.read()) {
-        Ok(ntp) => ntp_supervisor.reconcile(ntp),
-        Err(e) => warn!("startup ntp resolution failed; worker left stopped: {e}"),
+    // (issue #974 review). The resolve+reconcile pair runs inside the
+    // `CONFIG_MUTATION` lane so it cannot split a PUT's commit (publish
+    // seen, its reconcile still pending) — either this fires before the
+    // PUT's own reconcile or it already sees the fully committed
+    // document. A committed document always resolves (PUT admission
+    // gates `resolve_ntp`); on a defect leave the worker stopped and
+    // say so.
+    {
+        let _mutation = meow_api::routes::CONFIG_MUTATION.lock().await;
+        match meow_config::resolve_ntp(&raw_config.read()) {
+            Ok(ntp) => ntp_supervisor.reconcile(ntp),
+            Err(e) => warn!("startup ntp resolution failed; worker left stopped: {e}"),
+        }
     }
 
     // Only now: a signal before `shutdown.wait()` installs its handler
