@@ -482,10 +482,12 @@ impl MuxClient {
     ) -> Result<Box<dyn ProxyPacketConn>> {
         let (stream, session) = self.open_stream_flags(host, port, true).await?;
         // The conn is bound to the stream request's destination; reads
-        // report it as the datagram source.  Non-IP hosts (domains) get a
-        // placeholder — same convention as the plain VLESS UDP path.
+        // report it as the datagram source.  Non-IP hosts (domains) carry
+        // no locally-known IP — report the port on the unspecified
+        // address, the only half a name-bound demux can check (`UdpTarget
+        // ::src_matches`; same convention as VMess/plain VLESS, #974).
         let destination = host.parse::<std::net::IpAddr>().ok().map_or_else(
-            || "0.0.0.0:0".parse().expect("static placeholder"),
+            || SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), port),
             |ip| SocketAddr::new(ip, port),
         );
         match stream.kind {
