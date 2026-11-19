@@ -6622,10 +6622,22 @@ mod global_route_binding_tests {
         )
     }
 
-    /// Rejected after the rebuild (and so after its fetch) by the
-    /// `listeners:` admission check.
-    const BAD_LISTENERS: &str =
-        "listeners:\n  - name: tp\n    type: tproxy\n    port: 7895\n    udp: true\n";
+    /// Rejected after the rebuild (and so after its fetch) by a
+    /// `listeners:` admission check — but not the document-shape one:
+    /// `resolve_named_listeners` now runs before the global-route
+    /// preinstall, so a malformed entry (the old `udp: true` + managed
+    /// firewall) is refused before the binding ever installs and this
+    /// test could no longer observe it. `proxy: ghost` is document-shape
+    /// *valid* — `ghost` is declared in `proxies:` — yet the leaf fails
+    /// to build (`type: bogus` parses in no feature build, and `strict:
+    /// false` pins the lenient warn-drop a strict default would turn
+    /// into a pre-fetch bail), so `validate_listener_proxy_targets`
+    /// inside the rebuild refuses it after the rule-provider prefetch.
+    /// The only later listeners gate, `ensure_listeners_supported`, is
+    /// unreachable here: tests get the permissive `listener_gate`.
+    const BAD_LISTENERS: &str = "strict: false\n\
+         proxies:\n  - name: ghost\n    type: bogus\n\
+         listeners:\n  - name: tp\n    type: mixed\n    port: 7895\n    proxy: ghost\n";
 
     const GLOBAL_LO: &str =
         "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: lo\n";
@@ -6739,7 +6751,10 @@ mod global_route_binding_tests {
         let listener_flow = state.tunnel.inner().udp_flush_watch();
         let (status, body) = put(&state, &candidate(GLOBAL_LO, &origin, BAD_LISTENERS)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-        assert!(body.contains("listeners config error"), "{body}");
+        // The dangling `listeners[].proxy` target is what refuses the
+        // candidate — the same admission family as the old shape gate,
+        // reached inside the rebuild after the fetch.
+        assert!(body.contains("listeners[tp].proxy: 'ghost'"), "{body}");
         assert_eq!(origin.take_seen(), vec![Some("lo".to_string())]);
         assert_eq!(iface(), None, "a rejected PUT must not leave a binding");
         assert!(state.tunnel.inner().nat_table.contains_key(&nat_key));

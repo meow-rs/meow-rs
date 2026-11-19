@@ -592,6 +592,15 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
          the port (Windows per-protocol exclusions can partition it)",
     ),
     (
+        "crates/meow-listener/src/shadowsocks.rs",
+        "UdpSocket::bind(",
+        1,
+        "inbound Shadowsocks UDP relay socket facing the client — bound raw \
+         so `bind_udp` can stamp the listener `routing-mark` on the fd before \
+         `ProxySocket::from_socket` takes it (`ProxySocket::bind` would keep \
+         the fd unreachable)",
+    ),
+    (
         "crates/meow-listener/src/socks5_udp.rs",
         "UdpSocket::bind(",
         1,
