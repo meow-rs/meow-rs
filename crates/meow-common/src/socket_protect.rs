@@ -2003,8 +2003,17 @@ mod tests {
     /// The installed `OutboundTcpKeepalive` lands on the dialed stream —
     /// SO_KEEPALIVE plus the configured timing — and the disabled posture
     /// clears it instead. Serialized under LOCK: the policy is a
-    /// process-global.
-    #[cfg(any(unix, windows))]
+    /// process-global. Gated to the targets `OutboundTcpKeepalive::apply`
+    /// performs setsockopts on (the BSD stub would leave SO_KEEPALIVE
+    /// unset and fail the assertion).
+    #[cfg(any(
+        target_os = "android",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "tvos",
+        target_os = "windows"
+    ))]
     #[tokio::test]
     async fn connect_tcp_applies_installed_keepalive_policy() {
         use crate::tcp_opts::{

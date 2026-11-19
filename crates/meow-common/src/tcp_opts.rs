@@ -123,8 +123,8 @@ impl OutboundTcpKeepalive {
     /// must never break connectivity.
     ///
     /// Gated to the targets `Cargo.toml` gives the socket2 dep
-    /// (Android/Linux/macOS/Windows) — iOS/tvOS and the BSDs take the
-    /// stub below rather than fail to resolve `socket2`.
+    /// (Android/Linux/macOS/Windows) — iOS/tvOS take the libc path below
+    /// and the remaining BSDs the stub.
     #[cfg(any(
         target_os = "android",
         target_os = "linux",
@@ -182,12 +182,61 @@ impl OutboundTcpKeepalive {
         }
     }
 
-    /// No-socket2 stub: the remaining targets degrade to no keepalive
-    /// setsockopts — the relay idle timeout still bounds the connection.
+    /// libc path for the Darwin targets the `socket2` dep does not cover
+    /// — iOS/tvOS are Darwin, so `TCP_KEEPALIVE`/`TCP_KEEPINTVL`/
+    /// `TCP_KEEPCNT` exist and the upstream contract (keepalive applied
+    /// where supported) holds through raw `setsockopt`.
+    #[cfg(any(target_os = "ios", target_os = "tvos"))]
+    pub fn apply(&self, stream: &tokio::net::TcpStream) {
+        use std::os::fd::AsRawFd;
+        let fd = stream.as_raw_fd();
+        let set = |level: libc::c_int, name: libc::c_int, value: libc::c_int| {
+            // SAFETY: `fd` is a live socket for the call's duration;
+            // `value` is a plain int the kernel copies in.
+            let rc = unsafe {
+                libc::setsockopt(
+                    fd,
+                    level,
+                    name,
+                    (&raw const value).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+            if rc != 0 {
+                tracing::debug!(
+                    "outbound TCP keepalive setsockopt({name}) failed: {}",
+                    std::io::Error::last_os_error()
+                );
+            }
+        };
+        set(
+            libc::SOL_SOCKET,
+            libc::SO_KEEPALIVE,
+            libc::c_int::from(self.enabled),
+        );
+        if !self.enabled {
+            return;
+        }
+        let secs =
+            |d: Duration| libc::c_int::try_from(d.as_secs().max(1)).unwrap_or(libc::c_int::MAX);
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPALIVE, secs(self.idle));
+        set(libc::IPPROTO_TCP, libc::TCP_KEEPINTVL, secs(self.interval));
+        set(
+            libc::IPPROTO_TCP,
+            libc::TCP_KEEPCNT,
+            libc::c_int::try_from(self.probes).unwrap_or(libc::c_int::MAX),
+        );
+    }
+
+    /// Stub for the remaining targets (the BSDs without the socket2 dep):
+    /// degrade to no keepalive setsockopts — the relay idle timeout still
+    /// bounds the connection.
     #[cfg(not(any(
         target_os = "android",
+        target_os = "ios",
         target_os = "linux",
         target_os = "macos",
+        target_os = "tvos",
         target_os = "windows"
     )))]
     pub fn apply(&self, _stream: &tokio::net::TcpStream) {}
