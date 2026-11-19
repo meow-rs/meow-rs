@@ -36,10 +36,28 @@ use tracing::{debug, info, warn};
 /// `rules` and `domain_index` are themselves `Arc`-wrapped so a partial
 /// update (e.g. `update_proxies` keeping the rules) is a refcount bump
 /// rather than a deep clone — `Box<dyn Rule>` is not `Clone`.
+/// One named `sub-rules:` block as a scannable table — the shared rule
+/// vector plus the compiled matcher built for it through the same engine
+/// as the top-level rules (the per-block `DomainIndex` rides inside
+/// `compiled` like the main set's). There is deliberately no per-index
+/// disable state: blocks have no `/rules` surface of their own, so a
+/// block-local index must never alias a top-level counter or switch.
+pub struct SubRuleRoute {
+    /// The block's rules — the same `Arc` `SUB-RULE` rule objects and the
+    /// config parser's `SubRuleBlocks` map hold.
+    pub rules: Arc<Vec<Box<dyn Rule>>>,
+    /// The compiled matcher for `rules`.
+    pub compiled: CompiledRuleSet,
+}
+
 pub struct RouteTable {
     pub rules: Arc<Vec<Box<dyn Rule>>>,
     pub domain_index: Arc<DomainIndex>,
     pub compiled_rules: Arc<CompiledRuleSet>,
+    /// `sub-rules:` blocks a named listener's `rule:` override selects by
+    /// name. Published inside the same snapshot as `rules`/`proxies` so a
+    /// flow never observes a block and a route that disagree.
+    pub sub_rules: Arc<HashMap<SmolStr, SubRuleRoute>>,
     /// Shared so routing installs can republish the map into the
     /// provider-node dialer registry (`publish_dialer_registry`) with an
     /// Arc bump instead of a full map clone (issue #489 review).
@@ -62,6 +80,7 @@ impl RouteTable {
     fn new(
         proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
         rules: Vec<Box<dyn Rule>>,
+        sub_rules: HashMap<String, meow_rules::sub_rule::SubRuleBlock>,
         dialer_registry: meow_proxy::dialer::ProxyRegistry,
         prior: Option<&RouteTable>,
     ) -> Self {
@@ -71,11 +90,24 @@ impl RouteTable {
         );
         let domain_index = DomainIndex::build(&rules);
         let compiled_rules = CompiledRuleSet::build_masked(&rules, |i| rule_stats.is_disabled(i));
+        let sub_rules = sub_rules
+            .into_iter()
+            .map(|(name, block)| {
+                (
+                    SmolStr::from(name),
+                    SubRuleRoute {
+                        compiled: CompiledRuleSet::build(&block),
+                        rules: block,
+                    },
+                )
+            })
+            .collect();
         Self {
             rule_stats: Arc::new(rule_stats),
             rules: Arc::new(rules),
             domain_index: Arc::new(domain_index),
             compiled_rules: Arc::new(compiled_rules),
+            sub_rules: Arc::new(sub_rules),
             proxies: Arc::new(proxies),
             dialer_registry,
         }
@@ -86,6 +118,7 @@ impl RouteTable {
             rules: Arc::new(Vec::new()),
             domain_index: Arc::new(DomainIndex::empty()),
             compiled_rules: Arc::new(CompiledRuleSet::empty()),
+            sub_rules: Arc::new(HashMap::new()),
             proxies: Arc::new(HashMap::new()),
             dialer_registry: meow_proxy::dialer::ProxyRegistry::default(),
             rule_stats: Arc::default(),
@@ -101,6 +134,7 @@ impl RouteTable {
             rules: Arc::clone(&self.rules),
             domain_index: Arc::clone(&self.domain_index),
             compiled_rules: Arc::clone(&self.compiled_rules),
+            sub_rules: Arc::clone(&self.sub_rules),
             proxies: Arc::clone(&self.proxies),
             dialer_registry: self.dialer_registry.clone(),
             rule_stats: Arc::clone(&self.rule_stats),
@@ -615,6 +649,99 @@ impl TunnelInner {
     /// never dial). The probe also skips `always` mode's unconditional
     /// lookup: it only spends a scan when a reached rule predicate actually
     /// needs one, sharing the flow's lookup memo either way.
+    /// The listener `proxy:` override (upstream `SpecialProxy` →
+    /// `proxies[NAME]`): resolved per flow against the LIVE proxy map —
+    /// a group name keeps resolving its current membership and selection
+    /// across route swaps, never a startup-cached adapter. `DIRECT` is
+    /// unconditional like the main dispatch; a name absent from the
+    /// table fails closed ("proxy NAME not found" upstream) rather than
+    /// slide to DIRECT. A UDP flow whose forced target cannot relay UDP
+    /// fails the same way — it must not fall back to the main rules.
+    fn resolve_listener_proxy(&self, metadata: &Metadata, record_hit: bool) -> ResolvedTarget {
+        let route = self.route();
+        let name = metadata.special_proxy.as_str();
+        let (adapter, action) = if name == "DIRECT" {
+            (Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>, "DIRECT")
+        } else {
+            match route.proxies.get(name) {
+                Some(p) if metadata.network == Network::Udp && !p.support_udp() => {
+                    warn!("listener '{name}': forced proxy does not support UDP; rejecting flow");
+                    (Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>, "REJECT")
+                }
+                Some(p) => (
+                    Arc::clone(p) as Arc<dyn ProxyAdapter>,
+                    proxy_action(p.adapter_type()),
+                ),
+                None => {
+                    warn!(
+                        "listener forced proxy '{name}' is not in the route table; \
+                         rejecting flow (upstream: proxy {name} not found)"
+                    );
+                    (Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>, "REJECT")
+                }
+            }
+        };
+        if record_hit {
+            self.stats.rule_match.increment("ListenerProxy", action);
+        }
+        ResolvedTarget {
+            adapter,
+            rule_name: SmolStr::new_static("ListenerProxy"),
+            rule_payload: SmolStr::from(name),
+            route,
+        }
+    }
+
+    /// Listener `rule:` override when the named `sub-rules:` block is not
+    /// in the route table. Deliberate divergence from upstream (which
+    /// falls back to the top-level list): a configured override that
+    /// vanished must not silently change egress policy — reject.
+    fn missing_block_reject(
+        &self,
+        route: &Arc<RouteTable>,
+        metadata: &Metadata,
+        record_hit: bool,
+    ) -> ResolvedTarget {
+        let name = metadata.special_rules.as_str();
+        warn!("listener sub-rules block '{name}' is not in the route table; rejecting flow");
+        if record_hit {
+            self.stats.rule_match.increment("ListenerProxy", "REJECT");
+        }
+        ResolvedTarget {
+            adapter: Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>,
+            rule_name: SmolStr::new_static("ListenerProxy"),
+            rule_payload: SmolStr::from(name),
+            route: Arc::clone(route),
+        }
+    }
+
+    /// The `(rules, compiled, stats)` a rule-mode scan runs over for
+    /// `metadata` — the named `sub-rules` block `special_rules` selects,
+    /// or the top-level set when unset. `Err(())` = the named block is
+    /// missing from the table: the caller fails the flow closed.
+    fn rule_scan<'a>(route: &'a RouteTable, metadata: &Metadata) -> Result<RuleScan<'a>, ()> {
+        let name = metadata.special_rules.as_str();
+        if name.is_empty() {
+            return Ok(RuleScan {
+                rules: route.rules.as_slice(),
+                compiled: &route.compiled_rules,
+                stats: Some(&route.rule_stats),
+            });
+        }
+        route
+            .sub_rules
+            .get(name)
+            .map(|block| RuleScan {
+                rules: block.rules.as_slice(),
+                compiled: &block.compiled,
+                // A block's rules have no /rules surface — they are never
+                // disabled, and a block-local index must not alias the
+                // top-level stats.
+                stats: None,
+            })
+            .ok_or(())
+    }
+
     async fn resolve_proxy_inner(
         &self,
         metadata: &mut Metadata,
@@ -624,6 +751,13 @@ impl TunnelInner {
         // resolution — a PATCH lands on the next flow, not mid-scan
         // (issue #974).
         let process_mode = self.process_policy.get();
+        // Upstream `resolveMetadata`: a nonempty `special_proxy` resolves
+        // in the current proxy map BEFORE process lookup and before
+        // direct/global/rule dispatch — it overrides every mode,
+        // including when `rule:` is also set.
+        if !metadata.special_proxy.is_empty() {
+            return Some(self.resolve_listener_proxy(metadata, record_hit));
+        }
         if record_hit {
             self.maybe_lookup_flow_process(metadata, process_mode).await;
         }
@@ -663,13 +797,21 @@ impl TunnelInner {
                 // One route-table snapshot — rules + index + proxies all read
                 // from a consistent table. Replaces three RwLock acquisitions.
                 let route = self.route();
+                // The listener `rule:` override selects its sub-rules block
+                // for this scan; a present block replaces the top-level
+                // list, and exhausting it falls to DIRECT (no main-list
+                // consult) — a MISSING block rejects instead of upstream's
+                // top-level fallback.
+                let Ok(scan) = Self::rule_scan(&route, metadata) else {
+                    return Some(self.missing_block_reject(&route, metadata, record_hit));
+                };
                 // Eager callers own destination resolution (the UDP NAT key
                 // is built from `resolve_udp_dst` output), so IP demand may
                 // not stop this scan — only process demand may.
                 let result = self
-                    .match_rule_route(&route, metadata, false, process_mode)
+                    .match_rule_route(&route, scan, metadata, false, process_mode)
                     .await;
-                Some(self.materialize_rule_match(&route, result, record_hit))
+                Some(self.materialize_rule_match(&route, result, record_hit, scan.stats))
             }
         }
     }
@@ -686,16 +828,23 @@ impl TunnelInner {
     /// requires a resolved `dst_ip` regardless of what the rules demand.
     pub async fn resolve_proxy_lazy(&self, metadata: &mut Metadata) -> Option<ResolvedTarget> {
         let mode = *self.mode.read();
-        if mode != TunnelMode::Rule {
+        // A forced `proxy:` overrides every mode upstream — it must win
+        // before this early-out; the special-proxy flow then resolves
+        // inside `resolve_proxy_inner` and never reaches lazy scanning.
+        if mode != TunnelMode::Rule || !metadata.special_proxy.is_empty() {
             return self.resolve_proxy_flow(metadata).await;
         }
         let process_mode = self.process_policy.get();
         self.maybe_lookup_flow_process(metadata, process_mode).await;
         let route = self.route();
+        // Same `rule:` block selection the eager path makes.
+        let Ok(scan) = Self::rule_scan(&route, metadata) else {
+            return Some(self.missing_block_reject(&route, metadata, true));
+        };
         let result = self
-            .match_rule_route(&route, metadata, true, process_mode)
+            .match_rule_route(&route, scan, metadata, true, process_mode)
             .await;
-        Some(self.materialize_rule_match(&route, result, true))
+        Some(self.materialize_rule_match(&route, result, true, scan.stats))
     }
 
     /// The rule-table scan both dispatch paths share: a demand-stop pass,
@@ -715,6 +864,7 @@ impl TunnelInner {
     async fn match_rule_route<'a>(
         &self,
         route: &'a Arc<RouteTable>,
+        scan: RuleScan<'a>,
         metadata: &mut Metadata,
         allow_ip: bool,
         process_mode: ProcessLookupMode,
@@ -731,10 +881,10 @@ impl TunnelInner {
                 process: process_mode != ProcessLookupMode::Off
                     && !input.flow_lookup.process_attempted(),
             };
-            match route.compiled_rules.match_rules_lazy(
+            match scan.compiled.match_rules_lazy(
                 input,
-                route.rules.as_ref(),
-                &Self::target_probe(route, input),
+                scan.rules,
+                &Self::target_probe(route, input, scan.stats),
                 gate,
             ) {
                 LazyMatchOutcome::Matched(m) => return Some(m),
@@ -744,7 +894,7 @@ impl TunnelInner {
                     needs_process,
                     blocked_rule,
                 } => {
-                    if let Some(rule) = route.rules.get(blocked_rule) {
+                    if let Some(rule) = scan.rules.get(blocked_rule) {
                         let needs = match (needs_ip, needs_process) {
                             (true, true) => "the destination IP and the owning process",
                             (true, false) => "the destination IP",
@@ -879,9 +1029,19 @@ impl TunnelInner {
     /// `proxies[ada]` membership, the `Unwrap` walk for the `PASS`
     /// built-in (`continue GetRules`), and the UDP `SupportUDP` continue
     /// (issue #513). `DIRECT` is hard-coded as always usable: the tunnel
-    /// owns that adapter unconditionally.
-    fn target_probe<'a>(route: &'a RouteTable, metadata: &'a Metadata) -> RouteTargetProbe<'a> {
-        RouteTargetProbe { route, metadata }
+    /// owns that adapter unconditionally. `stats` is the scanned vector's
+    /// own disable table — `None` for a `sub-rules` block, whose rules
+    /// are never disabled.
+    fn target_probe<'a>(
+        route: &'a RouteTable,
+        metadata: &'a Metadata,
+        stats: Option<&'a crate::rule_stats::RuleStats>,
+    ) -> RouteTargetProbe<'a> {
+        RouteTargetProbe {
+            route,
+            metadata,
+            stats,
+        }
     }
 
     /// Map a rule-match result to a [`ResolvedTarget`], recording match
@@ -890,12 +1050,16 @@ impl TunnelInner {
     /// caller's dial (see [`Self::resolve_proxy`]). `record_hit` is false
     /// for `resolve_udp_dst`'s internal probe — only a resolution the
     /// caller keeps counts toward `hitCount`/`rule_match` (issue #882
-    /// review).
+    /// review). `hit_stats` is the scanned vector's own per-index hit
+    /// counter — `None` for a `sub-rules` block match, which counts the
+    /// aggregate `rule_match` metric but must not stamp a block-local
+    /// index onto the top-level `/rules` counters.
     fn materialize_rule_match(
         &self,
         route: &Arc<RouteTable>,
         result: Option<CompiledMatchResult<'_>>,
         record_hit: bool,
+        hit_stats: Option<&crate::rule_stats::RuleStats>,
     ) -> ResolvedTarget {
         match result {
             Some(m) => {
@@ -941,7 +1105,13 @@ impl TunnelInner {
                     }
                 };
                 if record_hit {
-                    route.rule_stats.record_hit(m.rule_index);
+                    // A `sub-rules` block match carries no stats — never
+                    // stamp a block-local index onto the top-level /rules
+                    // counters or switches (the spec's "no fictitious rule
+                    // hit"). The aggregate metric still counts it.
+                    if let Some(stats) = hit_stats {
+                        stats.record_hit(m.rule_index);
+                    }
                     self.stats
                         .rule_match
                         .increment(m.rule_type.as_str(), action);
@@ -1142,10 +1312,38 @@ pub enum PreHandleVerdict {
     Drop,
 }
 
+/// The `(rules, compiled, stats)` a rule-mode scan runs over for `metadata`
+/// — the named `sub-rules` block `special_rules` selects, or the top-level
+/// set when unset. `Err(())` = the named block is missing from the table:
+/// the caller fails the flow closed.
+#[derive(Clone, Copy)]
+struct RuleScan<'a> {
+    rules: &'a [Box<dyn Rule>],
+    compiled: &'a CompiledRuleSet,
+    /// The scanned vector's own disable table — `None` for a `sub-rules`
+    /// block, whose rules are never disabled and never hit-counted.
+    stats: Option<&'a crate::rule_stats::RuleStats>,
+}
+
+/// The rule_match metric bucket for an adapter kind — the `action` half of
+/// the counters keyed by `(rule_type, action)`. Shared between the
+/// forced-proxy and rule-match paths so a `ListenerProxy` line buckets
+/// identically to the rule it bypassed.
+fn proxy_action(t: AdapterType) -> &'static str {
+    match t {
+        AdapterType::Direct | AdapterType::Compatible => "DIRECT",
+        AdapterType::Reject | AdapterType::RejectDrop | AdapterType::PassRule => "REJECT",
+        _ => "PROXY",
+    }
+}
+
 /// Route-table-backed [`TargetProbe`] for the match engines.
 struct RouteTargetProbe<'a> {
     route: &'a RouteTable,
     metadata: &'a Metadata,
+    /// The scanned vector's own disable table — `None` for a `sub-rules`
+    /// block, whose rules have no /rules surface and are never disabled.
+    stats: Option<&'a crate::rule_stats::RuleStats>,
 }
 
 /// `true` when `adapter` dials through a DIRECT/COMPATIBLE hop for
@@ -1200,7 +1398,10 @@ impl RouteTargetProbe<'_> {
 
 impl TargetProbe for RouteTargetProbe<'_> {
     fn rule_enabled(&self, rule_index: usize) -> bool {
-        self.route.rule_stats.is_enabled(rule_index)
+        // A `sub-rules` block carries no disable table — every block rule
+        // scans enabled (spec: blocks never inherit the top-level
+        // /rules switches, and no block-local index may alias them).
+        self.stats.is_none_or(|s| s.is_enabled(rule_index))
     }
 
     fn check(&self, name: &str) -> TargetCheck {
@@ -1566,16 +1767,21 @@ impl Tunnel {
     ///
     /// `dialer_registry` is the registry the rebuild published `proxies`
     /// into; the route table owns it so the map's `dialer-proxy` chains keep
-    /// resolving while this generation lives (issue #533).
+    /// resolving while this generation lives (issue #533). `sub_rules` is
+    /// the config's `sub-rules:` map — published in the same snapshot so a
+    /// listener `rule:` override never observes a block and a route that
+    /// disagree.
     pub fn update_routing(
         &self,
         proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
         rules: Vec<Box<dyn Rule>>,
+        sub_rules: HashMap<String, meow_rules::sub_rule::SubRuleBlock>,
         dialer_registry: meow_proxy::dialer::ProxyRegistry,
     ) {
         let route = RouteTable::new(
             proxies,
             rules,
+            sub_rules,
             dialer_registry,
             Some(&self.route_snapshot()),
         );
@@ -1595,16 +1801,19 @@ impl Tunnel {
     /// `dialer_registry` is the registry generation the build published
     /// `proxies` into; the new route table owns it so the map's `dialer-proxy`
     /// chains keep resolving while this generation lives (issue #533).
+    /// `sub_rules` joins the snapshot like `update_routing`.
     pub fn reload_routing(
         &self,
         proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
         rules: Vec<Box<dyn Rule>>,
+        sub_rules: HashMap<String, meow_rules::sub_rule::SubRuleBlock>,
         mode: Option<TunnelMode>,
         dialer_registry: meow_proxy::dialer::ProxyRegistry,
     ) -> usize {
         let route = Arc::new(RouteTable::new(
             proxies,
             rules,
+            sub_rules,
             dialer_registry,
             Some(&self.route_snapshot()),
         ));
@@ -1939,6 +2148,7 @@ mod tests {
                 HashMap::from([("OLD".into(), Arc::clone(&proxy))]),
                 vec![Box::new(meow_rules::final_rule::FinalRule::new("OLD"))],
                 Default::default(),
+                Default::default(),
             );
             let stats = tunnel.statistics();
             let id = stats.track_connection(
@@ -1958,11 +2168,22 @@ mod tests {
                     let proxies = HashMap::from([("NEW".into(), proxy)]);
                     if cold {
                         assert_eq!(
-                            tunnel.reload_routing(proxies, candidate, None, Default::default()),
+                            tunnel.reload_routing(
+                                proxies,
+                                candidate,
+                                Default::default(),
+                                None,
+                                Default::default()
+                            ),
                             1
                         );
                     } else {
-                        tunnel.update_routing(proxies, candidate, Default::default());
+                        tunnel.update_routing(
+                            proxies,
+                            candidate,
+                            Default::default(),
+                            Default::default(),
+                        );
                     }
                 });
                 entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -2005,7 +2226,7 @@ mod tests {
         // Stand-in for the weak edge every chained adapter holds.
         let target = DialerTarget::new("FRONT", &registry);
         registry.publish(Arc::new(proxies.clone()));
-        tunnel.update_routing(proxies, vec![], registry);
+        tunnel.update_routing(proxies, vec![], Default::default(), registry);
         assert!(
             target.resolve().is_some(),
             "the route table retains its registry generation"
@@ -2023,7 +2244,12 @@ mod tests {
         // A held route snapshot keeps the generation alive across a later
         // swap; the new generation's (empty) registry replaces it.
         let gen1 = tunnel.route_snapshot();
-        tunnel.update_routing(HashMap::new(), vec![], ProxyRegistry::default());
+        tunnel.update_routing(
+            HashMap::new(),
+            vec![],
+            Default::default(),
+            ProxyRegistry::default(),
+        );
         assert!(
             target.resolve().is_some(),
             "a held snapshot still retains the old generation"
@@ -2304,6 +2530,7 @@ mod tests {
         tunnel.update_routing(
             HashMap::from([("DIRECT".into(), Arc::clone(&direct))]),
             vec![],
+            Default::default(),
             build_registry.clone(),
         );
         assert!(
@@ -2347,6 +2574,7 @@ mod tests {
         tunnel.reload_routing(
             HashMap::from([("RELOADED".into(), Arc::clone(&direct))]),
             vec![],
+            Default::default(),
             None,
             build_registry,
         );
@@ -2369,7 +2597,12 @@ mod tests {
         let provider_registry = ProxyRegistry::default();
         tunnel.set_dialer_registry(provider_registry.clone());
         let build_registry = ProxyRegistry::default();
-        tunnel.update_routing(HashMap::new(), vec![], build_registry.clone());
+        tunnel.update_routing(
+            HashMap::new(),
+            vec![],
+            Default::default(),
+            build_registry.clone(),
+        );
 
         for registry in [&build_registry, &provider_registry] {
             let traffic = DialerTarget::new("fast", registry)
@@ -2414,6 +2647,7 @@ mod tests {
                 Box::new(DomainSuffixRule::new("example.com", "PASS")),
                 Box::new(FinalRule::new("REJECT")),
             ],
+            Default::default(),
             Default::default(),
         );
         let meta = Metadata {
@@ -2465,6 +2699,7 @@ mod tests {
                 Box::new(FinalRule::new("DIRECT")),
             ],
             Default::default(),
+            Default::default(),
         );
         let meta = Metadata {
             host: "x.example.com".into(),
@@ -2511,6 +2746,7 @@ mod tests {
                 Box::new(FinalRule::new("DIRECT")),
             ],
             Default::default(),
+            Default::default(),
         );
         let meta = Metadata {
             host: "x.example.com".into(),
@@ -2552,6 +2788,7 @@ mod tests {
                 Box::new(FinalRule::new("DIRECT")),
             ],
             Default::default(),
+            Default::default(),
         );
         let meta = Metadata {
             host: "x.example.com".into(),
@@ -2584,6 +2821,7 @@ mod tests {
                 Box::new(FinalRule::new("DIRECT")),
             ],
             Default::default(),
+            Default::default(),
         );
         let meta = Metadata {
             host: "x.example.com".into(),
@@ -2614,6 +2852,7 @@ mod tests {
                 Box::new(DomainSuffixRule::new("example.com", "COMPATIBLE")),
                 Box::new(FinalRule::new("REJECT")),
             ],
+            Default::default(),
             Default::default(),
         );
         let meta = Metadata {
@@ -2672,6 +2911,7 @@ mod tests {
                 Box::new(FinalRule::new("REJECT")),
             ],
             Default::default(),
+            Default::default(),
         );
 
         let udp = |host: &str| Metadata {
@@ -2728,6 +2968,7 @@ mod tests {
                 Box::new(DomainSuffixRule::new("direct.test", "DIRECT")),
                 Box::new(FinalRule::new("REJECT")),
             ],
+            Default::default(),
             Default::default(),
         );
 
@@ -2867,6 +3108,7 @@ mod tests {
             ]),
             vec![Box::new(meow_rules::final_rule::FinalRule::new("g"))],
             Default::default(),
+            Default::default(),
         );
 
         let meta = Metadata {
@@ -2923,6 +3165,7 @@ mod tests {
                 )) as Box<dyn Rule>,
                 Box::new(meow_rules::final_rule::FinalRule::new("DIRECT")),
             ],
+            Default::default(),
             res.dialer_registry,
         );
 
@@ -3060,7 +3303,7 @@ mod tests {
         let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
         proxies.insert("GROUP".into(), Arc::clone(&group) as Arc<dyn Proxy>);
         proxies.insert("SHARED".into(), Arc::clone(&shared) as Arc<dyn Proxy>);
-        tunnel.update_routing(proxies, vec![], Default::default());
+        tunnel.update_routing(proxies, vec![], Default::default(), Default::default());
 
         let first = tracked_tcp(&tunnel);
         let second = tracked_tcp(&tunnel);
@@ -3474,7 +3717,7 @@ mod tests {
         let tunnel = test_tunnel();
         let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
         tunnel.set_mode(TunnelMode::Rule);
-        tunnel.update_routing(res.proxies, rules, res.dialer_registry);
+        tunnel.update_routing(res.proxies, rules, Default::default(), res.dialer_registry);
         tunnel
     }
 
@@ -3507,7 +3750,7 @@ mod tests {
         for mode in [TunnelMode::Direct, TunnelMode::Global] {
             let tunnel = test_tunnel();
             let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
-            tunnel.update_routing(res.proxies, vec![], res.dialer_registry);
+            tunnel.update_routing(res.proxies, vec![], Default::default(), res.dialer_registry);
             tunnel.set_mode(mode);
             tunnel.set_process_lookup_mode(ProcessLookupMode::Always);
             let calls = counting_hook(&tunnel, Some(owner()));

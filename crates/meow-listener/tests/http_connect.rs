@@ -44,6 +44,7 @@ async fn http_connect_proxies_bytes_to_echo_server() {
             None, // no auth
             "test",
             0,
+            None,
         )
         .await;
     });

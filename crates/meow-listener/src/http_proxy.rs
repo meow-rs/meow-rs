@@ -1,6 +1,8 @@
 use crate::sniffer::SnifferRuntime;
 use base64::Engine;
-use meow_common::{with_dial_timeout, AuthConfig, ConnType, Metadata, Network};
+use meow_common::{
+    with_dial_timeout, AuthConfig, ConnType, InboundRouteOverride, Metadata, Network,
+};
 use meow_tunnel::{
     copy_bidirectional_buf_tracked_idle, route_inbound_tcp, MatchedRule, ResolvedTarget, Tunnel,
     UsingProxy, RELAY_BUF_SIZE,
@@ -15,6 +17,11 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tracing::{debug, info, warn};
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent inbound-scoped value the \
+              handler forwards; bundling them only renames the list"
+)]
 pub async fn handle_http(
     tunnel: &Tunnel,
     mut stream: TcpStream,
@@ -23,6 +30,7 @@ pub async fn handle_http(
     auth: Option<&AuthConfig>,
     in_name: &str,
     in_port: u16,
+    route_override: Option<&InboundRouteOverride>,
 ) {
     if let Err(e) = handle_http_inner(
         tunnel,
@@ -32,6 +40,7 @@ pub async fn handle_http(
         auth,
         in_name,
         in_port,
+        route_override,
     )
     .await
     {
@@ -39,6 +48,11 @@ pub async fn handle_http(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent inbound-scoped value the \
+              handler forwards; bundling them only renames the list"
+)]
 async fn handle_http_inner(
     tunnel: &Tunnel,
     stream: &mut TcpStream,
@@ -47,6 +61,7 @@ async fn handle_http_inner(
     auth: Option<&AuthConfig>,
     in_name: &str,
     in_port: u16,
+    route_override: Option<&InboundRouteOverride>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Read the HTTP request line and headers in chunks until we find
     // \r\n\r\n. Reading one byte at a time costs ~100 syscalls per CONNECT;
@@ -191,6 +206,11 @@ async fn handle_http_inner(
             in_user: in_user.as_deref().map(Into::into),
             ..Default::default()
         };
+        // The named listener's `proxy:`/`rule:` override stamps before the
+        // sniff and the route scan (upstream Additions order).
+        if let Some(ov) = route_override {
+            ov.apply(&mut metadata);
+        }
 
         debug!("HTTP CONNECT to {}:{}", host, port);
 
@@ -271,6 +291,11 @@ async fn handle_http_inner(
             in_user: in_user.as_deref().map(Into::into),
             ..Default::default()
         };
+        // The named listener's `proxy:`/`rule:` override stamps before the
+        // sniff and the route scan (upstream Additions order).
+        if let Some(ov) = route_override {
+            ov.apply(&mut metadata);
+        }
 
         // For plain HTTP, sniff_http on the already-read buffer so IP-literal
         // destinations still benefit from Host-header routing.

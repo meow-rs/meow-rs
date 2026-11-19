@@ -66,8 +66,17 @@ async fn spawn_proxy_handler(server_stream: TcpStream) -> tokio::task::JoinHandl
     let tunnel = direct_tunnel();
     let src: SocketAddr = "127.0.0.1:1".parse().unwrap();
     tokio::spawn(async move {
-        meow_listener::http_proxy::handle_http(&tunnel, server_stream, src, None, None, "test", 0)
-            .await;
+        meow_listener::http_proxy::handle_http(
+            &tunnel,
+            server_stream,
+            src,
+            None,
+            None,
+            "test",
+            0,
+            None,
+        )
+        .await;
     })
 }
 

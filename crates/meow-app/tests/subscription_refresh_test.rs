@@ -791,8 +791,12 @@ async fn refreshed_trusttunnel_provider_commits_with_a_dead_placeholder() {
     .unwrap();
     fx.tunnel
         .set_dialer_registry(fx.provider_dialer_registry.clone());
-    fx.tunnel
-        .update_routing(initial.proxies, initial.rules, initial.dialer_registry);
+    fx.tunnel.update_routing(
+        initial.proxies,
+        initial.rules,
+        initial.sub_rules,
+        initial.dialer_registry,
+    );
     // Stage a redefined provider while its live slot still holds the
     // last-good generation. The new front only exists in the fetched
     // subscription, so the acquisition must use the published route map.

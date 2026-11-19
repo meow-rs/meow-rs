@@ -847,6 +847,7 @@ mod tests {
         tunnel.update_routing(
             committed.proxies,
             committed.rules,
+            committed.sub_rules,
             committed.dialer_registry,
         );
 

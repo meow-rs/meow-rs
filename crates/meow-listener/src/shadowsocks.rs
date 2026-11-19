@@ -76,6 +76,9 @@ pub struct ShadowsocksListener {
     /// Keepalive posture applied to every accepted socket (see
     /// [`crate::keepalive`]); `enabled: false` writes no sockopts.
     tcp_keepalive: TcpKeepaliveConfig,
+    /// `listeners[].proxy`/`rule` — the named-listener route override
+    /// stamped onto every flow's `Metadata` (TCP and UDP).
+    route_override: Option<meow_common::InboundRouteOverride>,
 }
 
 impl ShadowsocksListener {
@@ -110,6 +113,7 @@ impl ShadowsocksListener {
             obfs,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             tcp_keepalive: TcpKeepaliveConfig::default(),
+            route_override: None,
         })
     }
 
@@ -126,6 +130,13 @@ impl ShadowsocksListener {
     /// no keepalive `setsockopt` at all.
     pub fn with_tcp_keepalive(mut self, cfg: TcpKeepaliveConfig) -> Self {
         self.tcp_keepalive = cfg;
+        self
+    }
+
+    /// Install the named listener's `proxy:`/`rule:` route override —
+    /// stamped onto every flow's `Metadata` before routing.
+    pub fn with_route_override(mut self, ov: Option<meow_common::InboundRouteOverride>) -> Self {
+        self.route_override = ov;
         self
     }
 
@@ -219,8 +230,18 @@ impl ShadowsocksListener {
             // session ID per relay session, so the relay draws from the
             // cipher context's CSPRNG instead of a plain counter.
             let session_ids = ServerSessionIds::new(Arc::clone(&self.ctx), self.method);
+            let route_override = self.route_override.clone();
             tokio::spawn(async move {
-                run_udp_relay(tunnel, udp_sock, session_ids, name, in_port, max_flows).await;
+                run_udp_relay(
+                    tunnel,
+                    udp_sock,
+                    session_ids,
+                    name,
+                    in_port,
+                    max_flows,
+                    route_override,
+                )
+                .await;
             });
         }
 
@@ -341,8 +362,9 @@ impl ShadowsocksListener {
 
             let tunnel = self.tunnel.clone();
             let name = self.name.clone();
+            let route_override = self.route_override.clone();
             tokio::spawn(async move {
-                handle_ss_conn(ss, peer, tunnel, name, in_port).await;
+                handle_ss_conn(ss, peer, tunnel, name, in_port, route_override).await;
                 drop(permit);
             });
         }
@@ -358,6 +380,7 @@ async fn handle_ss_conn<S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'stati
     tunnel: Tunnel,
     in_name: String,
     in_port: u16,
+    route_override: Option<meow_common::InboundRouteOverride>,
 ) {
     // ProxyServerStream::handshake decrypts the SS header and returns the
     // SOCKS target address. Bound the wait so a silent peer can't hold a
@@ -383,7 +406,7 @@ async fn handle_ss_conn<S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'stati
         }
     }
 
-    let metadata = build_metadata(peer, &target, &in_name, in_port);
+    let metadata = build_metadata(peer, &target, &in_name, in_port, route_override.as_ref());
     debug!("ss listener {} -> {}", peer, metadata.remote_address());
 
     let inner = tunnel.inner();
@@ -391,7 +414,13 @@ async fn handle_ss_conn<S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'stati
 }
 
 /// Map an SS target `Address` + peer into a `Metadata` for the tunnel.
-fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u16) -> Metadata {
+fn build_metadata(
+    peer: SocketAddr,
+    target: &Address,
+    in_name: &str,
+    in_port: u16,
+    route_override: Option<&meow_common::InboundRouteOverride>,
+) -> Metadata {
     let (host, dst_ip, dst_port) = match target {
         // Lowercase only when needed — `SmolStr::from` on an
         // already-lowercase name is inline (≤22 B) with no String
@@ -407,7 +436,7 @@ fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u1
         ),
         Address::SocketAddress(sa) => (SmolStr::default(), Some(sa.ip()), sa.port()),
     };
-    Metadata {
+    let mut metadata = Metadata {
         network: Network::Tcp,
         conn_type: ConnType::Shadowsocks,
         src_ip: Some(peer.ip()),
@@ -418,7 +447,13 @@ fn build_metadata(peer: SocketAddr, target: &Address, in_name: &str, in_port: u1
         in_name: in_name.into(),
         in_port,
         ..Default::default()
+    };
+    // The named listener's `proxy:`/`rule:` override stamps before the
+    // route scan (upstream Additions order).
+    if let Some(ov) = route_override {
+        ov.apply(&mut metadata);
     }
+    metadata
 }
 
 // ──────────────────────────────── UDP relay ────────────────────────────────
@@ -693,6 +728,7 @@ async fn run_udp_relay<S>(
     in_name: String,
     in_port: u16,
     max_flows: usize,
+    route_override: Option<meow_common::InboundRouteOverride>,
 ) where
     S: DatagramSend + DatagramReceive + Send + Sync + 'static,
 {
@@ -757,6 +793,7 @@ async fn run_udp_relay<S>(
                     &in_name,
                     in_port,
                     max_flows,
+                    route_override.as_ref(),
                 ) {
                     Ok(true) => {}
                     Ok(false) => {
@@ -904,6 +941,7 @@ fn handle_ss_udp_datagram<S>(
     in_name: &str,
     in_port: u16,
     max_flows: usize,
+    route_override: Option<&meow_common::InboundRouteOverride>,
 ) -> Result<bool, String>
 where
     S: DatagramSend + DatagramReceive + Send + Sync + 'static,
@@ -1016,6 +1054,11 @@ where
         in_port,
         ..Default::default()
     };
+    // The named listener's `proxy:`/`rule:` override stamps before the
+    // fake-IP guard and the route scan (upstream Additions order).
+    if let Some(ov) = route_override {
+        ov.apply(&mut metadata);
+    }
 
     // Drop an unmapped fake-IP destination before it spawns a flow — a
     // stale-datagram flood would otherwise churn a spawn+evict per packet
@@ -1449,6 +1492,7 @@ mod tests {
                 "ss",
                 8388,
                 8,
+                None,
             )
             .unwrap());
             assert!(
@@ -1479,6 +1523,7 @@ mod tests {
                 "ss",
                 8388,
                 8,
+                None,
             )
             .expect_err(host);
             assert!(err.contains("not a hostname"), "{host:?}: {err}");
@@ -1496,6 +1541,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap());
         assert_eq!(state.flows.len(), 1);
@@ -1584,6 +1630,7 @@ mod tests {
                 "ss",
                 8388,
                 8,
+                None,
             )
             .unwrap());
             // Wait for the flow's reply pump to come up — it is what holds
@@ -1646,6 +1693,7 @@ mod tests {
             "ss",
             8388,
             1,
+            None,
         );
         assert!(
             matches!(verdict, Ok(false)),
@@ -1669,6 +1717,7 @@ mod tests {
             "ss",
             8388,
             1,
+            None,
         )
         .unwrap());
         assert_eq!(state.flows.len(), 1);
@@ -1741,6 +1790,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap());
         let old_conn = flow_conn(&state, &key).await;
@@ -1762,6 +1812,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap());
 
@@ -1802,6 +1853,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("replay"), "A's window must persist: {err}");
@@ -1819,6 +1871,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap());
         assert_eq!(state.flows[&key].client_session_id, old_csid);
@@ -1851,6 +1904,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap());
 
@@ -1867,6 +1921,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap_err();
         assert!(err.contains("replay"), "unexpected drop reason: {err}");
@@ -1886,6 +1941,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap());
 
@@ -1903,6 +1959,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap());
         assert_eq!(state.flows.len(), 1, "the replay never touched the table");
@@ -1935,6 +1992,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap());
         let dead_flow_conn = flow_conn(&state, &key).await;
@@ -1968,6 +2026,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap());
         let redialed = flow_conn(&state, &key).await;
@@ -2010,6 +2069,7 @@ mod tests {
                 "ss",
                 8388,
                 8,
+                None,
             )
             .unwrap());
         }
@@ -2034,6 +2094,7 @@ mod tests {
             "ss",
             8388,
             8,
+            None,
         )
         .unwrap());
         assert_eq!(state.flows.len(), 2);

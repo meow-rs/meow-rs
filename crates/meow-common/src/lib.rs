@@ -34,6 +34,7 @@ pub mod dns_mode;
 pub mod error;
 pub mod fs_util;
 pub mod home_dir;
+pub mod inbound;
 pub mod logbook;
 pub mod metadata;
 pub mod network;
@@ -71,6 +72,7 @@ pub use dns_mode::DnsMode;
 pub use error::{MeowError, Result};
 pub use fs_util::{sweep_scratch_siblings, sweep_scratch_siblings_excluding, SCRATCH_STALE_AGE};
 pub use home_dir::{meow_home_dir, resolved_home_dir, set_home_dir, xdg_home_dir};
+pub use inbound::InboundRouteOverride;
 pub use metadata::{is_valid_host, metadata_ip_literal, AddrDisplay, Metadata};
 pub use network::Network;
 #[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
@@ -88,6 +90,8 @@ pub use process_lookup::{
 pub use replay_window::ReplayWindow;
 pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};
 pub use sniffer::SnifferConfig;
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+pub use socket_protect::set_listener_socket_mark;
 pub use socket_protect::{
     apply_ip_version_filter, bind_udp, bind_udp_for_peer, canonical_socket_addr, connect_tcp,
     connect_tcp_candidates, connect_tcp_host, dialer_opts, dialer_opts_scope, effective_user_agent,

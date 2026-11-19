@@ -31,8 +31,8 @@ fn acl(allowed: &[&str], denied: &[&str]) -> Arc<LanAcl> {
 async fn start_acl_listener(acl: Arc<LanAcl>, auth: Option<AuthConfig>) -> std::net::SocketAddr {
     let socket = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bound = socket.local_addr().unwrap();
-    let mut listener = MixedListener::new(direct_tunnel(), bound, "acl-test".to_string())
-        .with_lan_acl(acl);
+    let mut listener =
+        MixedListener::new(direct_tunnel(), bound, "acl-test".to_string()).with_lan_acl(acl);
     if let Some(auth) = auth {
         listener = listener.with_auth(Arc::new(auth));
     }

@@ -261,6 +261,7 @@ pub async fn run_loop(
                             let meow_config::RebuildResult {
                                 proxies: new_proxies,
                                 rules: new_rules,
+                                sub_rules: new_sub_rules,
                                 dialer_registry: new_registry,
                                 rule_providers: new_rule_providers,
                                 proxy_providers: new_proxy_providers,
@@ -357,7 +358,12 @@ pub async fn run_loop(
                                     dns,
                                 );
                             }
-                            tunnel.update_routing(new_proxies, new_rules, new_registry);
+                            tunnel.update_routing(
+                                new_proxies,
+                                new_rules,
+                                new_sub_rules,
+                                new_registry,
+                            );
                             // Commit point: the candidate's provider sets —
                             // already referenced by the rules and DNS
                             // `rule-set:` matchers — become the live

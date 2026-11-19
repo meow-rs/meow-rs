@@ -66,6 +66,13 @@ pub struct Metadata {
     pub in_user: Option<SmolStr>,
     #[serde(rename = "specialProxy")]
     pub special_proxy: SmolStr,
+    /// `listeners[].rule` — the `sub-rules:` block name this flow scans
+    /// instead of the top-level rule list (upstream `SpecialRules`, set
+    /// by `WithSpecialRules` in `BaseOption.Additions`). Internal-only:
+    /// a routing carrier like `internal`, not a conn attribute — never
+    /// serialized and dropped by [`Self::pure`].
+    #[serde(skip)]
+    pub special_rules: SmolStr,
     /// Marks housekeeping traffic that is not a user connection: health
     /// probes, provider/geodata/subscription fetches, and DNS-via-proxy
     /// exchanges.
@@ -174,6 +181,7 @@ impl Default for Metadata {
             in_port: 0,
             in_user: None,
             special_proxy: SmolStr::default(),
+            special_rules: SmolStr::default(),
             internal: false,
             flow_lookup: std::sync::Arc::default(),
         }
@@ -311,6 +319,7 @@ impl Metadata {
             in_port: 0,
             in_user: None,
             special_proxy: SmolStr::default(),
+            special_rules: SmolStr::default(),
             internal: self.internal,
             // The tracked copy shares the flow's lookup memo: the ledger
             // reuses an `always` scan (miss included) instead of rescanning.

@@ -48,11 +48,9 @@ async fn explicit_empty_allow_list_admits_nobody() {
 
 #[tokio::test]
 async fn allow_list_scopes_admission() {
-    let cfg = load_config_from_str(
-        "mixed-port: 7890\nlan-allowed-ips: [10.0.0.0/8, fd00::/8]\n",
-    )
-    .await
-    .expect("config must load");
+    let cfg = load_config_from_str("mixed-port: 7890\nlan-allowed-ips: [10.0.0.0/8, fd00::/8]\n")
+        .await
+        .expect("config must load");
     assert!(allows(&cfg, "10.9.9.9"));
     assert!(allows(&cfg, "fd00::42"));
     assert!(!allows(&cfg, "127.0.0.1"), "no implicit loopback exception");
@@ -106,7 +104,13 @@ async fn bare_ip_is_rejected() {
 
 #[tokio::test]
 async fn malformed_prefix_is_rejected() {
-    for bad in ["10.0.0.0/33", "10.0.0.0/-1", "not-a-cidr/24", "10.0.0.0/abc", "::1/129"] {
+    for bad in [
+        "10.0.0.0/33",
+        "10.0.0.0/-1",
+        "not-a-cidr/24",
+        "10.0.0.0/abc",
+        "::1/129",
+    ] {
         let err = expect_load_err(&format!("lan-disallowed-ips: ['{bad}']\n")).await;
         assert!(
             err.contains("lan-disallowed-ips[0]"),
@@ -117,8 +121,7 @@ async fn malformed_prefix_is_rejected() {
 
 #[tokio::test]
 async fn element_index_in_error() {
-    let err =
-        expect_load_err("lan-allowed-ips: [10.0.0.0/8, bogus, 172.16.0.0/12]\n").await;
+    let err = expect_load_err("lan-allowed-ips: [10.0.0.0/8, bogus, 172.16.0.0/12]\n").await;
     assert!(err.contains("lan-allowed-ips[1]"), "{err}");
 }
 
@@ -135,7 +138,10 @@ async fn explicit_null_is_rejected() {
 
 #[tokio::test]
 async fn non_list_value_is_rejected() {
-    for bad in ["lan-allowed-ips: 10.0.0.0/8\n", "lan-allowed-ips: {net: 10.0.0.0/8}\n"] {
+    for bad in [
+        "lan-allowed-ips: 10.0.0.0/8\n",
+        "lan-allowed-ips: {net: 10.0.0.0/8}\n",
+    ] {
         let err = expect_load_err(bad).await;
         assert!(!err.is_empty(), "{bad}");
     }
@@ -157,7 +163,8 @@ async fn nested_under_listener_is_hard_error() {
 
 #[tokio::test]
 async fn nested_deny_key_also_errors() {
-    let yaml = "listeners:\n  - name: lan\n    type: mixed\n    port: 8081\n    lan-disallowed-ips: []\n";
+    let yaml =
+        "listeners:\n  - name: lan\n    type: mixed\n    port: 8081\n    lan-disallowed-ips: []\n";
     let err = expect_load_err(yaml).await;
     assert!(err.contains("lan-disallowed-ips"), "{err}");
 }

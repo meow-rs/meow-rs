@@ -1880,6 +1880,7 @@ async fn apply_raw_to_tunnel(
     let meow_config::RebuildResult {
         proxies,
         rules,
+        sub_rules,
         dialer_registry,
         rule_providers,
         proxy_providers,
@@ -1924,7 +1925,9 @@ async fn apply_raw_to_tunnel(
     if let Some(dns) = &dns {
         install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
     }
-    state.tunnel.update_routing(proxies, rules, dialer_registry);
+    state
+        .tunnel
+        .update_routing(proxies, rules, sub_rules, dialer_registry);
     state.tunnel.set_connection_notes(connection_notes);
     meow_tunnel::nftset::install(
         &state.tunnel,
@@ -4404,6 +4407,7 @@ async fn put_configs(
     let meow_config::RebuildResult {
         proxies,
         rules,
+        sub_rules,
         dialer_registry,
         rule_providers,
         proxy_providers,
@@ -4564,7 +4568,7 @@ async fn put_configs(
     }
     let dropped = state
         .tunnel
-        .reload_routing(proxies, rules, mode, dialer_registry);
+        .reload_routing(proxies, rules, sub_rules, mode, dialer_registry);
     state
         .tunnel
         .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
@@ -6102,10 +6106,11 @@ mod outbound_flush_tests {
         let meow_config::RebuildResult {
             proxies,
             rules,
+            sub_rules,
             dialer_registry,
             ..
         } = meow_config::rebuild_from_raw(&raw).unwrap();
-        tunnel.update_routing(proxies, rules, dialer_registry);
+        tunnel.update_routing(proxies, rules, sub_rules, dialer_registry);
         Arc::new(AppState {
             tunnel,
             secret: None,

@@ -20,8 +20,17 @@ async fn assert_bad_request(request: &[u8]) {
     let tunnel = direct_tunnel();
     let src: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let handle = tokio::spawn(async move {
-        meow_listener::http_proxy::handle_http(&tunnel, server_stream, src, None, None, "test", 0)
-            .await;
+        meow_listener::http_proxy::handle_http(
+            &tunnel,
+            server_stream,
+            src,
+            None,
+            None,
+            "test",
+            0,
+            None,
+        )
+        .await;
     });
 
     client_stream.write_all(request).await.unwrap();
@@ -92,8 +101,17 @@ async fn bare_lf_is_rejected_when_the_head_arrives_one_byte_per_write() {
     let tunnel = direct_tunnel();
     let src: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let handle = tokio::spawn(async move {
-        meow_listener::http_proxy::handle_http(&tunnel, server_stream, src, None, None, "test", 0)
-            .await;
+        meow_listener::http_proxy::handle_http(
+            &tunnel,
+            server_stream,
+            src,
+            None,
+            None,
+            "test",
+            0,
+            None,
+        )
+        .await;
     });
 
     let request = b"GET http://127.0.0.1:9/ HTTP/1.1\r\nX-A: 1\nContent-Length: 0\r\n\r\n";
@@ -156,8 +174,17 @@ async fn body_line_feeds_in_a_later_read_are_not_header_errors() {
     let tunnel = direct_tunnel();
     let src: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let handle = tokio::spawn(async move {
-        meow_listener::http_proxy::handle_http(&tunnel, server_stream, src, None, None, "test", 0)
-            .await;
+        meow_listener::http_proxy::handle_http(
+            &tunnel,
+            server_stream,
+            src,
+            None,
+            None,
+            "test",
+            0,
+            None,
+        )
+        .await;
     });
 
     let head = format!(
@@ -214,8 +241,17 @@ async fn valid_obs_text_is_preserved_and_body_line_feeds_are_not_header_errors()
     let tunnel = direct_tunnel();
     let src: SocketAddr = "127.0.0.1:1".parse().unwrap();
     let handle = tokio::spawn(async move {
-        meow_listener::http_proxy::handle_http(&tunnel, server_stream, src, None, None, "test", 0)
-            .await;
+        meow_listener::http_proxy::handle_http(
+            &tunnel,
+            server_stream,
+            src,
+            None,
+            None,
+            "test",
+            0,
+            None,
+        )
+        .await;
     });
 
     let mut request =

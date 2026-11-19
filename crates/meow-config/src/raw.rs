@@ -105,10 +105,7 @@ where
             self.visit_none()
         }
 
-        fn visit_some<D2: serde::Deserializer<'de>>(
-            self,
-            d: D2,
-        ) -> Result<Self::Value, D2::Error> {
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
             Vec::<String>::deserialize(d).map(Some)
         }
     }
@@ -818,6 +815,23 @@ pub struct RawListener {
     /// Per-listener override of the global `max-connections` cap. `0`
     /// disables the cap for this listener.
     pub max_connections: Option<usize>,
+
+    // ── named-routing overrides (upstream `BaseOption` Additions) ──
+    /// `proxy:` — force every flow through this proxy/group name,
+    /// bypassing mode dispatch and rule matching entirely. Resolved per
+    /// flow against the live route table (a group keeps its current
+    /// membership); a missing target fails closed.
+    pub proxy: Option<String>,
+    /// `rule:` — the name of a `sub-rules:` block scanned *instead of*
+    /// the top-level rule list for this listener's flows (upstream
+    /// `SpecialRules`). NOT a rule-provider and not an `IN-NAME` rule —
+    /// the block is selected by name.
+    pub rule: Option<String>,
+    /// `routing-mark:` — `SO_MARK` stamped on this listener's socket at
+    /// bind (ingress; Linux only — warned about and ignored elsewhere).
+    /// Distinct from the top-level `routing-mark`, which marks outbound
+    /// dials and feeds the tproxy firewall exemption.
+    pub routing_mark: Option<u32>,
 
     // ── shadowsocks-listener fields (only meaningful when `type: shadowsocks`) ──
     pub cipher: Option<String>,

@@ -37,8 +37,7 @@ impl LanAcl {
     /// `Unmap` in `IsRemoteAddrDisAllowed`.
     pub fn allows(&self, src_ip: IpAddr) -> bool {
         let ip = src_ip.to_canonical();
-        self.allowed.iter().any(|n| n.contains(&ip))
-            && !self.denied.iter().any(|n| n.contains(&ip))
+        self.allowed.iter().any(|n| n.contains(&ip)) && !self.denied.iter().any(|n| n.contains(&ip))
     }
 }
 

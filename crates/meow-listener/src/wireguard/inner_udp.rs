@@ -77,6 +77,8 @@ pub(super) struct FlowArgs {
     pub inner_mtu: usize,
     /// Actor-bound reply queue: `(slot, wire-ready inner IP packet)`.
     pub inject_tx: mpsc::Sender<(usize, Bytes)>,
+    /// The named listener's `proxy:`/`rule:` route override (shared Arc).
+    pub route_override: Option<Arc<meow_common::InboundRouteOverride>>,
 }
 
 /// Per-flow pump: resolve → `dial_udp` → relay both directions until
@@ -95,6 +97,7 @@ pub(super) async fn run_flow(args: FlowArgs, mut rx: mpsc::Receiver<Bytes>) -> R
         udp_timeout,
         inner_mtu,
         inject_tx,
+        route_override,
     } = args;
 
     // The flow key and metadata dst are the ORIGINAL inner destination
@@ -111,6 +114,11 @@ pub(super) async fn run_flow(args: FlowArgs, mut rx: mpsc::Receiver<Bytes>) -> R
         in_port,
         ..Default::default()
     };
+    // The named listener's `proxy:`/`rule:` override stamps before the
+    // fake-IP guard and the route scan (upstream Additions order).
+    if let Some(ov) = &route_override {
+        ov.apply(&mut metadata);
+    }
 
     if matches!(
         inner.pre_handle_metadata(&mut metadata),

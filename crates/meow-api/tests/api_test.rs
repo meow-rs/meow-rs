@@ -212,6 +212,8 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             port: 7894,
             listen: "127.0.0.1".into(),
             max_connections: 256,
+            route_override: None,
+            routing_mark: None,
         },
         NamedListener {
             name: "mixed".into(),
@@ -219,6 +221,8 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             port: 7890,
             listen: "127.0.0.1".into(),
             max_connections: 256,
+            route_override: None,
+            routing_mark: None,
         },
     ];
 
@@ -5403,9 +5407,12 @@ async fn get_connection_by_id_returns_notes_live_and_after_close() {
     let state = test_state_default();
     let rule =
         meow_rules::parse_rule("MATCH,DIRECT", &meow_rules::ParserContext::default()).unwrap();
-    state
-        .tunnel
-        .update_routing(HashMap::new(), vec![rule], Default::default());
+    state.tunnel.update_routing(
+        HashMap::new(),
+        vec![rule],
+        HashMap::new(),
+        Default::default(),
+    );
     state.tunnel.set_connection_notes(true);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -8063,7 +8070,7 @@ async fn put_configs_lan_acl_rejected_before_commit() {
     let state = test_state(test_raw_config());
 
     for (yaml, force) in [
-        ("lan-allowed-ips: [10.0.0.1]\n", ""),     // bare IP, not a CIDR
+        ("lan-allowed-ips: [10.0.0.1]\n", ""), // bare IP, not a CIDR
         ("lan-allowed-ips: [10.0.0.1]\n", "?force=true"),
         ("lan-disallowed-ips: bogus\n", "?force=true"),
         (
@@ -8121,16 +8128,17 @@ async fn put_configs_lan_acl_rejected_before_commit() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let raw = state.raw_config.read();
-    assert_eq!(
-        raw.lan_allowed_ips.as_deref(),
-        Some(&["10.0.0.0/8".to_string(), "fd00::/8".to_string()][..])
-    );
-    assert_eq!(
-        raw.lan_disallowed_ips.as_deref(),
-        Some(&["10.9.0.0/16".to_string()][..])
-    );
-    drop(raw);
+    {
+        let raw = state.raw_config.read();
+        assert_eq!(
+            raw.lan_allowed_ips.as_deref(),
+            Some(&["10.0.0.0/8".to_string(), "fd00::/8".to_string()][..])
+        );
+        assert_eq!(
+            raw.lan_disallowed_ips.as_deref(),
+            Some(&["10.9.0.0/16".to_string()][..])
+        );
+    }
 
     // PATCH is not an ACL surface (the ACL is a startup snapshot): the
     // keys are simply not modeled by the patch schema, so this is a
@@ -8149,12 +8157,14 @@ async fn put_configs_lan_acl_rejected_before_commit() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NO_CONTENT);
-    let raw = state.raw_config.read();
-    assert_eq!(
-        raw.lan_allowed_ips.as_deref(),
-        Some(&["10.0.0.0/8".to_string(), "fd00::/8".to_string()][..]),
-        "PATCH must not touch the committed ACL"
-    );
+    {
+        let raw = state.raw_config.read();
+        assert_eq!(
+            raw.lan_allowed_ips.as_deref(),
+            Some(&["10.0.0.0/8".to_string(), "fd00::/8".to_string()][..]),
+            "PATCH must not touch the committed ACL"
+        );
+    }
 }
 
 /// mihomo spells the named SOCKS inbound `type: socks` — a full PUT must

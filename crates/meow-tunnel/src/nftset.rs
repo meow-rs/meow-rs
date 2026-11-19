@@ -491,6 +491,7 @@ mod tests {
             compiled_rules: Arc::new(CompiledRuleSet::empty()),
             proxies: Arc::new(proxies),
             dialer_registry: meow_proxy::dialer::ProxyRegistry::default(),
+            sub_rules: Default::default(),
             rule_stats: Arc::new(rule_stats),
         }
     }

@@ -266,6 +266,11 @@ fn handle_client_datagram(
         in_name: inbound.in_name.clone(),
         in_port: inbound.in_port,
         in_user: inbound.in_user.clone(),
+        // The named listener's `proxy:`/`rule:` override — stamped onto
+        // the handshake's inbound tag by the caller, carried here so the
+        // association's flows route through it too.
+        special_proxy: inbound.special_proxy.clone(),
+        special_rules: inbound.special_rules.clone(),
         ..Default::default()
     };
 
@@ -1159,6 +1164,7 @@ mod tests {
                     None,
                     "socks",
                     addr.port(),
+                    None,
                 )
                 .await;
             });

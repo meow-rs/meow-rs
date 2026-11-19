@@ -105,6 +105,11 @@ pub struct Config {
     /// resolve the *current* name map.
     pub provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
     pub rules: Vec<Box<dyn Rule>>,
+    /// The `sub-rules:` blocks `listeners[].rule` selects by name —
+    /// published into the route table in the same snapshot as `rules` so
+    /// a listener's named scan never observes a block and a route that
+    /// disagree.
+    pub sub_rules: sub_rules_parser::SubRuleBlocks,
     pub rule_providers: HashMap<String, Arc<rule_provider::RuleProvider>>,
     /// Providers the load left out leniently. The embedder records them once
     /// it runs this config ([`DroppedProviders::record`]).
@@ -428,6 +433,16 @@ pub struct NamedListener {
     /// `max-connections` field, falling back to the global `max-connections`.
     #[serde(default)]
     pub max_connections: usize,
+    /// `listeners[].proxy`/`listeners[].rule` — the named-listener route
+    /// override stamped onto every flow's `Metadata` (upstream's
+    /// `BaseOption` Additions). `None` on the port shorthands and on
+    /// entries that declare neither key.
+    #[serde(default)]
+    pub route_override: Option<meow_common::InboundRouteOverride>,
+    /// `listeners[].routing-mark` — `SO_MARK` on the listener socket at
+    /// bind; Linux only (warned and ignored elsewhere).
+    #[serde(default)]
+    pub routing_mark: Option<u32>,
 }
 
 /// Parsed + validated `tun:` section (issue #326). Consumed by the app
@@ -1463,6 +1478,10 @@ mod save_scratch_tests {
 pub struct RebuildResult {
     pub proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
     pub rules: Vec<Box<dyn Rule>>,
+    /// The `sub-rules:` blocks this build parsed — passed through to
+    /// `Tunnel::update_routing`/`reload_routing` so a listener's `rule:`
+    /// override publishes in the same route snapshot as `rules`.
+    pub sub_rules: sub_rules_parser::SubRuleBlocks,
     pub dialer_registry: meow_proxy::dialer::ProxyRegistry,
     /// The rule-provider set parsed for this generation — shared by the
     /// rules, any DNS `rule-set:` policy matchers, and (once the caller
@@ -3508,6 +3527,7 @@ fn rebuild_from_raw_impl(
     Ok(RebuildResult {
         proxies,
         rules,
+        sub_rules,
         dialer_registry: registry.clone(),
         rule_providers,
         proxy_providers: candidate_providers,
@@ -5388,16 +5408,15 @@ pub fn resolve_lan_acl(raw: &raw::RawConfig) -> Result<meow_common::LanAcl, anyh
     for l in raw.listeners.iter().flatten() {
         check_listener_acl_placement(l)?;
     }
-    let parse_list = |key: &str,
-                      entries: Option<&[String]>|
-     -> Result<Vec<ipnet::IpNet>, anyhow::Error> {
-        entries
-            .unwrap_or(&[])
-            .iter()
-            .enumerate()
-            .map(|(i, s)| parse_lan_cidr(s).map_err(|e| anyhow::anyhow!("{key}[{i}]: {e}")))
-            .collect()
-    };
+    let parse_list =
+        |key: &str, entries: Option<&[String]>| -> Result<Vec<ipnet::IpNet>, anyhow::Error> {
+            entries
+                .unwrap_or(&[])
+                .iter()
+                .enumerate()
+                .map(|(i, s)| parse_lan_cidr(s).map_err(|e| anyhow::anyhow!("{key}[{i}]: {e}")))
+                .collect()
+        };
     let allowed = match raw.lan_allowed_ips.as_deref() {
         None => vec![
             "0.0.0.0/0".parse().expect("static CIDR"),
@@ -5458,7 +5477,9 @@ fn build_named_listeners(
                    spec: ListenerSpec,
                    port: u16,
                    listen: &str,
-                   max_connections: usize|
+                   max_connections: usize,
+                   route_override: Option<meow_common::InboundRouteOverride>,
+                   routing_mark: Option<u32>|
      -> Result<(), anyhow::Error> {
         validate_connection_limit(max_connections)
             .map_err(|e| anyhow::anyhow!("listener '{name}': {e}"))?;
@@ -5483,6 +5504,8 @@ fn build_named_listeners(
             port,
             listen: listen.to_string(),
             max_connections,
+            route_override,
+            routing_mark,
         });
         Ok(())
     };
@@ -5498,6 +5521,8 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
         )?;
     }
     if let Some(port) = raw.socks_port.filter(|p| *p != 0) {
@@ -5507,6 +5532,8 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
         )?;
     }
     if let Some(port) = raw.port.filter(|p| *p != 0) {
@@ -5516,6 +5543,8 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
         )?;
     }
     if raw.firewall.is_some() {
@@ -5553,6 +5582,8 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
         )?;
     }
     if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
@@ -5573,6 +5604,8 @@ fn build_named_listeners(
             port,
             "127.0.0.1",
             global_max_conns,
+            None,
+            None,
         )?;
     }
 
@@ -5724,8 +5757,45 @@ fn build_named_listeners(
                 );
             }
         }
+        // `listeners[].rule` selects a `sub-rules:` block BY NAME — not a
+        // rule-provider and not an `IN-NAME` rule (upstream
+        // `WithSpecialRules`). Requiring the block in this same document
+        // is the `SUB-RULE,…` hard-error contract (Class A per ADR-0002);
+        // a block a later PUT removes fails closed in the resolver.
+        if let Some(name) = raw_l.rule.as_deref().filter(|s| !s.is_empty()) {
+            let defined = raw.sub_rules.as_ref().is_some_and(|m| m.contains_key(name));
+            if !defined {
+                anyhow::bail!(
+                    "listeners[{}].rule: '{name}' references undefined sub-rules block",
+                    raw_l.name
+                );
+            }
+        }
+        let route_override =
+            meow_common::InboundRouteOverride::new(raw_l.proxy.as_deref(), raw_l.rule.as_deref());
+        // `listeners[].routing-mark` marks the LISTENER socket at bind
+        // (ingress SO_MARK, upstream `InboundOption.RoutingMark`) —
+        // Linux-only; the top-level `routing-mark` outbound key is a
+        // different consumer and is not altered.
+        let routing_mark = raw_l.routing_mark;
+        #[cfg(not(target_os = "linux"))]
+        if routing_mark.is_some() {
+            warn!(
+                "listeners[{}].routing-mark: SO_MARK is Linux-only — ignored \
+                 on this platform; remove it to suppress this warning",
+                raw_l.name
+            );
+        }
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
-        add(&raw_l.name, spec, port, &listen, max_connections)?;
+        add(
+            &raw_l.name,
+            spec,
+            port,
+            &listen,
+            max_connections,
+            route_override,
+            routing_mark,
+        )?;
     }
 
     Ok(result)
@@ -5992,7 +6062,7 @@ async fn build_config_inner(
     )
     .await?;
 
-    let (proxies, rules, _) = {
+    let (proxies, rules, sub_rules, _) = {
         let res = rebuild_from_raw_impl_async(
             raw.clone(),
             cache_dir_buf.clone(),
@@ -6009,7 +6079,7 @@ async fn build_config_inner(
             Some(rule_providers.clone()),
         )
         .await?;
-        (res.proxies, res.rules, res.dialer_registry)
+        (res.proxies, res.rules, res.sub_rules, res.dialer_registry)
     };
 
     // Listener config
@@ -6101,6 +6171,7 @@ async fn build_config_inner(
         proxy_providers,
         provider_dialer_registry,
         rules,
+        sub_rules,
         rule_providers,
         dropped_providers,
         dialer_registry,

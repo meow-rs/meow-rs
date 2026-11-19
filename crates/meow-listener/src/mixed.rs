@@ -1,7 +1,7 @@
 use crate::http_proxy;
 use crate::sniffer::SnifferRuntime;
 use crate::socks5;
-use meow_common::{AuthConfig, LanAcl, TcpKeepaliveConfig};
+use meow_common::{AuthConfig, InboundRouteOverride, LanAcl, TcpKeepaliveConfig};
 use meow_tunnel::Tunnel;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -32,6 +32,10 @@ pub struct MixedListener {
     /// `ipfilter` gate). `None` = no ACL configured (e.g. tests that
     /// build the listener directly).
     lan_acl: Option<Arc<LanAcl>>,
+    /// `listeners[].proxy`/`rule` — the named-listener route override
+    /// stamped onto every flow's `Metadata` (upstream `BaseOption`
+    /// Additions). `None` = plain routing.
+    route_override: Option<InboundRouteOverride>,
 }
 
 impl MixedListener {
@@ -45,6 +49,7 @@ impl MixedListener {
             max_connections: DEFAULT_MAX_CONNECTIONS,
             tcp_keepalive: TcpKeepaliveConfig::default(),
             lan_acl: None,
+            route_override: None,
         }
     }
 
@@ -83,6 +88,13 @@ impl MixedListener {
     /// credential store holds any credentials.
     pub fn with_lan_acl(mut self, acl: Arc<LanAcl>) -> Self {
         self.lan_acl = Some(acl);
+        self
+    }
+
+    /// Install the named listener's `proxy:`/`rule:` route override —
+    /// stamped onto every accepted flow's `Metadata` before routing.
+    pub fn with_route_override(mut self, ov: Option<InboundRouteOverride>) -> Self {
+        self.route_override = ov;
         self
     }
 
@@ -196,14 +208,30 @@ impl MixedListener {
             let name = self.name.clone();
             let port = bound_addr.port();
             let auth = self.auth.clone();
+            let route_override = self.route_override.clone();
             tokio::spawn(async move {
-                handle_connection(tunnel, stream, src_addr, sniffer, name, port, auth).await;
+                handle_connection(
+                    tunnel,
+                    stream,
+                    src_addr,
+                    sniffer,
+                    name,
+                    port,
+                    auth,
+                    route_override,
+                )
+                .await;
                 drop(permit);
             });
         }
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent inbound-scoped value the \
+              handler forwards; bundling them only renames the list"
+)]
 async fn handle_connection(
     tunnel: Tunnel,
     stream: tokio::net::TcpStream,
@@ -212,6 +240,7 @@ async fn handle_connection(
     name: String,
     port: u16,
     auth: Option<Arc<AuthConfig>>,
+    route_override: Option<InboundRouteOverride>,
 ) {
     // Peek the first byte to determine protocol
     let mut peek = [0u8; 1];
@@ -238,6 +267,7 @@ async fn handle_connection(
             auth.as_deref(),
             &name,
             port,
+            route_override.as_ref(),
         )
         .await;
     } else {
@@ -250,6 +280,7 @@ async fn handle_connection(
             auth.as_deref(),
             &name,
             port,
+            route_override.as_ref(),
         )
         .await;
     }

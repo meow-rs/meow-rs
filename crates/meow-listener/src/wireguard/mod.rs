@@ -110,6 +110,9 @@ pub struct WireGuardListener {
     name: String,
     max_connections: usize,
     sniffer: Option<Arc<SnifferRuntime>>,
+    /// `listeners[].proxy`/`rule` — the named-listener route override
+    /// stamped onto every inner flow's `Metadata`.
+    pub(super) route_override: Option<Arc<meow_common::InboundRouteOverride>>,
 }
 
 /// Owning handle for a running WG listener. `shutdown()` (or drop)
@@ -130,6 +133,7 @@ impl WireGuardListener {
             name,
             max_connections: 0,
             sniffer: None,
+            route_override: None,
         }
     }
 
@@ -145,6 +149,13 @@ impl WireGuardListener {
     /// flow before rule matching, same as the TUN inbound's TCP tail.
     pub fn with_sniffer(mut self, rt: Arc<SnifferRuntime>) -> Self {
         self.sniffer = Some(rt);
+        self
+    }
+
+    /// Install the named listener's `proxy:`/`rule:` route override —
+    /// stamped onto every inner TCP/UDP flow's `Metadata`.
+    pub fn with_route_override(mut self, ov: Option<meow_common::InboundRouteOverride>) -> Self {
+        self.route_override = ov.map(Arc::new);
         self
     }
 

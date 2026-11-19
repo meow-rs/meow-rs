@@ -83,6 +83,7 @@ async fn socks5_connect_proxies_bytes_to_echo_server() {
             None, // no auth
             "test",
             0,
+            None,
         )
         .await;
     });
@@ -128,6 +129,7 @@ async fn socks5_rejects_no_auth_when_client_does_not_offer_it() {
             None,
             "test",
             0,
+            None,
         )
         .await;
     });
@@ -158,6 +160,7 @@ async fn socks5_rejects_invalid_utf8_domain_name() {
             None,
             "test",
             0,
+            None,
         )
         .await;
     });
@@ -203,6 +206,7 @@ async fn socks5_rejects_invalid_utf8_auth_credentials() {
             Some(&auth),
             "test",
             0,
+            None,
         )
         .await;
     });

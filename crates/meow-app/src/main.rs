@@ -1541,7 +1541,12 @@ async fn run(
     // shared with the traffic ledger's app lookup (issue #974). `-t`
     // validation never reaches here; PUT/PATCH re-assert at commit.
     tunnel.set_process_lookup_mode(config.general.find_process_mode);
-    tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
+    tunnel.update_routing(
+        config.proxies,
+        config.rules,
+        config.sub_rules,
+        config.dialer_registry,
+    );
     tunnel.spawn_background_tasks();
 
     // Spawn periodic health checks for fallback / url-test proxy groups.
@@ -1727,6 +1732,11 @@ async fn run(
                             continue;
                         }
                     };
+                    // `listeners[].routing-mark` — ingress SO_MARK on the
+                    // listen socket; accepted sockets inherit it.
+                    if !apply_listener_mark(&nl.name, &socket, nl.routing_mark) {
+                        continue;
+                    }
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     let listener = MixedListener::new(tunnel.clone(), bound, nl.name.clone())
@@ -1734,7 +1744,8 @@ async fn run(
                         .with_auth(Arc::clone(&auth))
                         .with_lan_acl(Arc::clone(&config.listeners.lan_acl))
                         .with_max_connections(nl.max_connections)
-                        .with_tcp_keepalive(config.listeners.tcp_keepalive);
+                        .with_tcp_keepalive(config.listeners.tcp_keepalive)
+                        .with_route_override(nl.route_override.clone());
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on(socket).await {
                             error!("Listener error: {}", e);
@@ -1764,6 +1775,9 @@ async fn run(
                             continue;
                         }
                     };
+                    if !apply_listener_mark(&nl.name, &socket, nl.routing_mark) {
+                        continue;
+                    }
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     let listener = TProxyListener::new(
@@ -1778,7 +1792,11 @@ async fn run(
                     .with_firewall(*firewall)
                     .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout))
                     .with_tcp_keepalive(config.listeners.tcp_keepalive)
-                    .with_transparent(*transparent);
+                    .with_transparent(*transparent)
+                    .with_route_override(nl.route_override.clone())
+                    // The UDP TPROXY socket binds inside `prepare`; the
+                    // TCP listen socket was marked above.
+                    .with_socket_mark(nl.routing_mark);
                     // Firewall rules and the UDP TPROXY socket are fallible
                     // setup — run them eagerly so a failure can't drop the
                     // bound TCP socket inside a detached task (issue #641).
@@ -1821,6 +1839,9 @@ async fn run(
                             continue;
                         }
                     };
+                    if !apply_listener_mark(&nl.name, &socket, nl.routing_mark) {
+                        continue;
+                    }
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     let obfs = cfg.simple_obfs.as_ref().map(|o| match o.mode {
@@ -1838,7 +1859,8 @@ async fn run(
                     ) {
                         Ok(l) => l
                             .with_max_connections(nl.max_connections)
-                            .with_tcp_keepalive(config.listeners.tcp_keepalive),
+                            .with_tcp_keepalive(config.listeners.tcp_keepalive)
+                            .with_route_override(nl.route_override.clone()),
                         Err(e) => {
                             listener_failed(&nl.name, &format!("invalid shadowsocks config: {e}"));
                             continue;
@@ -1883,6 +1905,11 @@ async fn run(
                             continue;
                         }
                     };
+                    // `listeners[].routing-mark` — ingress SO_MARK on the
+                    // responder's UDP socket; its datagrams carry it.
+                    if !apply_listener_mark(&nl.name, &socket, nl.routing_mark) {
+                        continue;
+                    }
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     // meow-listener takes plain ctor args, never a
@@ -1907,7 +1934,8 @@ async fn run(
                     };
                     let listener = WireGuardListener::new(tunnel.clone(), spec, nl.name.clone())
                         .with_max_connections(nl.max_connections)
-                        .with_sniffer(Arc::clone(&sniffer_runtime));
+                        .with_sniffer(Arc::clone(&sniffer_runtime))
+                        .with_route_override(nl.route_override.clone());
                     match listener.spawn(socket) {
                         Ok(guard) => {
                             tokio::spawn(async move {
@@ -2148,6 +2176,38 @@ fn listener_failed(name: &str, message: &str) {
     )
     .subject(name)
     .record();
+}
+
+/// `listeners[].routing-mark` — `SO_MARK` on the listener's own socket
+/// (ingress; upstream `InboundOption.RoutingMark`). Linux only — the
+/// config layer already warned and ignored the key elsewhere, so the
+/// non-Linux arm is a silent no-op. A failed `setsockopt` (missing
+/// `CAP_NET_ADMIN`) is a listener startup failure like a bind error: a
+/// silently unmarked socket would evade the policy routing the mark was
+/// declared for. Returns `false` when the listener must be skipped.
+#[cfg(unix)]
+fn apply_listener_mark<F: std::os::fd::AsRawFd>(name: &str, sock: &F, mark: Option<u32>) -> bool {
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    if let Some(mark) = mark {
+        if let Err(e) = meow_common::set_listener_socket_mark(sock.as_raw_fd(), mark) {
+            listener_failed(
+                name,
+                &format!("routing-mark {mark}: {e} (SO_MARK needs CAP_NET_ADMIN)"),
+            );
+            return false;
+        }
+    }
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    let _ = (name, sock, mark);
+    true
+}
+
+/// Windows has no `AsRawFd` (its socket handle type differs); the
+/// `routing-mark` key is Linux-only anyway and already warned off at
+/// parse time.
+#[cfg(not(unix))]
+fn apply_listener_mark<F>(_name: &str, _sock: &F, _mark: Option<u32>) -> bool {
+    true
 }
 
 /// #625: roll the committed `tun.enable` back to false after an initial
@@ -2669,6 +2729,8 @@ mod tests {
             port: 23300,
             listen: "0.0.0.0".into(),
             max_connections: 256,
+            route_override: None,
+            routing_mark: None,
         }];
         let err = meow_api::ensure_listeners_supported(&named, without_shadowsocks)
             .expect_err("ss listener must fail on a feature-less build");

@@ -25,6 +25,7 @@ async fn close_stalled_plain_http_response_terminates_sockets() {
                 None,
                 "http",
                 inbound_addr.port(),
+                None,
             )
             .await;
         });
@@ -112,6 +113,7 @@ async fn cold_reload_rejects_plain_http_setup_before_registration() {
                 None,
                 "http",
                 inbound_addr.port(),
+                None,
             )
             .await;
         });
@@ -134,7 +136,10 @@ async fn cold_reload_rejects_plain_http_setup_before_registration() {
             dialer_registry: registry,
             ..
         } = meow_config::rebuild_from_raw(&raw).unwrap();
-        assert_eq!(tunnel.reload_routing(proxies, rules, None, registry), 0);
+        assert_eq!(
+            tunnel.reload_routing(proxies, rules, Default::default(), None, registry),
+            0
+        );
         resume_tx.send(()).unwrap();
         tokio::select! {
             biased;

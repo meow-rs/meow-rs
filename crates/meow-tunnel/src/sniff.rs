@@ -670,7 +670,12 @@ mod tests {
             .map(|line| meow_rules::parse_rule(line, &meow_rules::ParserContext::default()))
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        tunnel.update_routing(Default::default(), rules, Default::default());
+        tunnel.update_routing(
+            Default::default(),
+            rules,
+            Default::default(),
+            Default::default(),
+        );
         tunnel.set_connection_notes(true);
 
         let (mut client, server) = stream_pair().await;
