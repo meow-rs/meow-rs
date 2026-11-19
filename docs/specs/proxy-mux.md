@@ -286,11 +286,22 @@ crates/meow-proxy/src/mux/
   bounds; all protocol differences are contained in the SessionKind arms
   and the with_mux dial closure — zero branching in the adapter layer.
 - **Pool defaults**: meow defaults to `max-connections=4, min-streams=4,
-  max-streams=4`. mihomo's `smux:` block defaults to `0/0/0`, which makes
-  sing-mux apply `minStreams = 8` upstream. A user copying a mihomo config
-  with explicit zeros gets one physical connection per stream (mihomo
-  semantics); a user relying on implicit defaults gets meow's 4/4/4 pooling
-  rather than mihomo's 0/0/0.
+  max-streams=4` (a single source — `MuxOptions::default` — feeds both the
+  runtime and the config parser's omitted-field fallbacks). mihomo's
+  `smux:` block defaults to `0/0/0`, which makes sing-mux apply
+  `minStreams = 8` upstream; a user relying on implicit defaults gets
+  meow's 4/4/4 pooling rather than mihomo's 0/0/0.
+- **Reuse predicate** (`MuxClient::offer`): an idle eligible session always
+  takes the next stream first. For a busy session, with positive
+  `max-connections` it is reused when its load is under `min-streams` or
+  once the pool already holds `max-connections` carriers; with zero
+  `max-connections` it is reused when load is under `min-streams`, else
+  under a positive `max-streams`. All three at `0` therefore still reuses
+  idle carriers but never shares a busy one — every *concurrent* stream
+  dials its own connection. Note the shipped defaults are not a hard
+  concurrency cap either: the fifth overlapping stream opens a second
+  carrier, and once four carriers exist `max-streams: 4` no longer limits
+  how many streams pack onto them (only the pool size does).
 
 ## Test Plan
 

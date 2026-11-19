@@ -41,7 +41,7 @@ pub type DialFn =
     Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<Box<dyn ProxyConn>>> + Send>> + Send + Sync>;
 
 /// Mux options, defaults aligned with mihomo's documented values.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MuxOptions {
     pub protocol: Protocol,
     /// sing-mux session padding (smux/yamux/h2mux only; Mux.Cool has none).
@@ -607,9 +607,10 @@ impl MuxClient {
                 } else {
                     // max-connections=0: honor min-streams first (sing-mux
                     // checks minStreams before maxStreams in this branch),
-                    // then fall back to max-streams.  max-streams=0 with
-                    // min-streams=0 keeps the mihomo semantics: one physical
-                    // connection per stream.
+                    // then fall back to max-streams.  All three at zero
+                    // still reuses an idle session (the load == 0 arm
+                    // above) — only a carrier already holding streams is
+                    // never shared, so concurrent streams each dial.
                     load < options.min_streams
                         || (options.max_streams > 0 && load < options.max_streams)
                 };
@@ -826,8 +827,8 @@ mod tests {
         assert_eq!(dials.load(Ordering::SeqCst), 2);
     }
 
-    /// max-connections=0 with max-streams=0 and min-streams=0 keeps the
-    /// mihomo semantics: every stream dials its own physical connection.
+    /// max-connections=0 with max-streams=0 and min-streams=0 never shares
+    /// a busy carrier: every *concurrent* stream dials its own connection.
     #[tokio::test]
     async fn zero_bounds_dial_one_connection_per_stream() {
         let dials = Arc::new(AtomicUsize::new(0));
@@ -846,7 +847,7 @@ mod tests {
         assert_eq!(
             dials.load(Ordering::SeqCst),
             3,
-            "max-connections=0 + max-streams=0 must dial one connection per stream"
+            "0/0/0 must not share a busy carrier: each concurrent stream dials"
         );
         drop(streams);
     }

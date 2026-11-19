@@ -3351,16 +3351,23 @@ fn parse_mux_options(
             "{name}: unknown mux protocol '{protocol_str}'; valid values: smux, yamux, h2mux, muxcool"
         ));
     };
-    // max-connections=0 AND max-streams=0 means one physical connection
-    // per stream (mirrors mihomo/sing-mux exactly) — almost never what an
-    // operator wants, so say so.
-    let max_connections = mux_usize_field(name, mux_cfg, "max-connections", 4)?;
-    let max_streams = mux_usize_field(name, mux_cfg, "max-streams", 4)?;
-    if max_connections == 0 && max_streams == 0 {
+    // The shipped 4/4/4 defaults live on `MuxOptions::default` — the parse
+    // fallbacks read it so the two sources can never drift apart.
+    let defaults = meow_proxy::mux::MuxOptions::default();
+    let max_connections =
+        mux_usize_field(name, mux_cfg, "max-connections", defaults.max_connections)?;
+    let min_streams = mux_usize_field(name, mux_cfg, "min-streams", defaults.min_streams)?;
+    let max_streams = mux_usize_field(name, mux_cfg, "max-streams", defaults.max_streams)?;
+    // All three at 0 turns off pooling across busy carriers: an idle
+    // session is still reused, but one already carrying a stream is never
+    // shared, so every *concurrent* stream dials its own carrier — almost
+    // never what an operator wants, so say so.
+    if max_connections == 0 && min_streams == 0 && max_streams == 0 {
         tracing::warn!(
             proxy = %name,
-            "mux: max-connections and max-streams are both 0 — every stream dials its own \
-             physical connection (mirrors mihomo); consider the 4/4/4 defaults"
+            "mux: max-connections, min-streams and max-streams are all 0 — a carrier that \
+             already holds a stream is never shared, so concurrent streams each dial their \
+             own connection; consider the 4/4/4 defaults"
         );
     }
     // Parsed but unsupported upstream fields: `statistic` (per-connection
@@ -3390,7 +3397,7 @@ fn parse_mux_options(
         protocol,
         padding,
         max_connections,
-        min_streams: mux_usize_field(name, mux_cfg, "min-streams", 4)?,
+        min_streams,
         max_streams,
         only_tcp: mux_bool_field(name, mux_cfg, "only-tcp", false)?,
     }))
@@ -4611,6 +4618,73 @@ mod tests {
 
     fn proxy_config(yaml: &str) -> HashMap<String, serde_json::Value> {
         serde_saphyr::from_str(yaml).unwrap()
+    }
+
+    /// Omitted `smux:` pool fields resolve to `MuxOptions::default` — the
+    /// parser must not carry a second copy of the 4/4/4 constants that can
+    /// drift from the runtime source of truth.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_omitted_pool_fields_use_muxoptions_default() {
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n",
+        );
+        let opts = parse_mux_options("n", &node).unwrap().unwrap();
+        assert_eq!(opts, meow_proxy::mux::MuxOptions::default());
+    }
+
+    /// A single explicit field overrides only that field; the rest still
+    /// come from `MuxOptions::default`.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_partial_override_keeps_other_defaults() {
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n  max-streams: 2\n",
+        );
+        let opts = parse_mux_options("n", &node).unwrap().unwrap();
+        let expected = meow_proxy::mux::MuxOptions {
+            max_streams: 2,
+            ..Default::default()
+        };
+        assert_eq!(opts, expected);
+    }
+
+    /// The legacy `mux:` alias feeds the same parse; `smux:` wins when both
+    /// are present.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_key_takes_precedence_over_mux_alias() {
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\n\
+             smux:\n  enabled: true\n  max-streams: 2\n\
+             mux:\n  enabled: true\n  max-streams: 9\n",
+        );
+        let opts = parse_mux_options("n", &node).unwrap().unwrap();
+        assert_eq!(opts.max_streams, 2);
     }
 
     #[cfg(feature = "vless")]
