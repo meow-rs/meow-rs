@@ -789,6 +789,7 @@ fn listener_feature_gate(spec: &meow_config::ListenerSpec) -> Option<&'static st
             (!cfg!(feature = "listener-shadowsocks")).then_some("listener-shadowsocks")
         }
         S::WireGuard(_) => (!cfg!(feature = "listener-wireguard")).then_some("listener-wireguard"),
+        S::Tun(_) => (!cfg!(feature = "listener-tun")).then_some("listener-tun"),
     }
 }
 
@@ -1707,6 +1708,10 @@ async fn run(
     // Suppress unused-variable warnings: sniffer_runtime and auth are
     // consumed only inside feature-gated listener blocks below.
     let _ = (&sniffer_runtime, &auth);
+    // `take()`d by the TUN spawn paths below, which exist only under
+    // `listener-tun`; the not-feature build moves it once at the end.
+    #[cfg(feature = "listener-tun")]
+    let mut early_binding = early_binding;
 
     // Start listeners. Bind before spawning the accept loops so a `port: 0`
     // (ephemeral) listener resolves to its OS-assigned port up front; the
@@ -1716,6 +1721,41 @@ async fn run(
 
     let mut named_listeners = config.listeners.named.clone();
     for nl in &mut named_listeners {
+        // A named `type: tun` owns no socket — skip the bind entirely
+        // (`""` is not a bindable address). It spawns here like every
+        // named inbound, but its startup failures are fatal: the sole
+        // effective TUN cannot be left half-started behind a "running"
+        // banner, and no PUT-path rollback exists for it.
+        if let ListenerSpec::Tun(cfg) = &nl.spec {
+            #[cfg(feature = "listener-tun")]
+            {
+                if let Err(msg) = spawn_named_tun(
+                    &tunnel,
+                    cfg,
+                    &nl.name,
+                    nl.route_override.clone(),
+                    Arc::clone(&sniffer_runtime),
+                    early_binding.take(),
+                )
+                .await
+                {
+                    listener_failed(&nl.name, &format!("TUN failed to start: {msg}"));
+                    return Err(anyhow::anyhow!(
+                        "listener '{}': TUN failed to start: {msg}",
+                        nl.name
+                    ));
+                }
+            }
+            #[cfg(not(feature = "listener-tun"))]
+            {
+                let _ = cfg;
+                tracing::warn!(
+                    "listener '{}': type tun requires feature 'listener-tun'",
+                    nl.name
+                );
+            }
+            continue;
+        }
         let addr = bind_socket_addr(&nl.listen, nl.port)
             .map_err(|e| anyhow::anyhow!("listener '{}': {e}", nl.name))?;
         // Suppress unused-variable warning: addr is consumed only inside
@@ -1958,6 +1998,9 @@ async fn run(
                     );
                 }
             }
+            // Spawned above the bind (a TUN owns no socket) — this arm
+            // is unreachable, kept only for exhaustiveness.
+            ListenerSpec::Tun(_) => {}
         }
     }
 
@@ -2049,7 +2092,7 @@ async fn run(
             // The global-route binding installed before the config build
             // moves into the listener, which clears it with its routes —
             // or right away if startup fails (issue #695).
-            if let Some(binding) = early_binding {
+            if let Some(binding) = early_binding.take() {
                 listener = listener.with_outbound_binding(binding);
             }
 
@@ -2074,6 +2117,7 @@ async fn run(
                         &startup_tun,
                         meow_tunnel::TunHandle {
                             task: handle,
+                            owner: meow_tunnel::TunOwner::TopLevel,
                             core_done: Some(core_done),
                             udp_flows,
                         },
@@ -2186,6 +2230,11 @@ fn listener_failed(name: &str, message: &str) {
 /// silently unmarked socket would evade the policy routing the mark was
 /// declared for. Returns `false` when the listener must be skipped.
 #[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "every call site sits inside a `listener-*`-gated arm — \
+              --no-default-features compiles them all out"
+)]
 fn apply_listener_mark<F: std::os::fd::AsRawFd>(name: &str, sock: &F, mark: Option<u32>) -> bool {
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     if let Some(mark) = mark {
@@ -2206,6 +2255,11 @@ fn apply_listener_mark<F: std::os::fd::AsRawFd>(name: &str, sock: &F, mark: Opti
 /// `routing-mark` key is Linux-only anyway and already warned off at
 /// parse time.
 #[cfg(not(unix))]
+#[allow(
+    dead_code,
+    reason = "every call site sits inside a `listener-*`-gated arm — \
+              --no-default-features compiles them all out"
+)]
 fn apply_listener_mark<F>(_name: &str, _sock: &F, _mark: Option<u32>) -> bool {
     true
 }
@@ -2293,6 +2347,85 @@ async fn publish_tun_if_committed(
         return;
     }
     tunnel.set_tun_handle(tun_handle).await;
+}
+
+/// Spawn a named `listeners: type: tun` device and publish it as the
+/// effective TUN ([`meow_tunnel::TunOwner::Named`]). Unlike the top-level
+/// section's spawn there is no committed-config re-validation and no
+/// `tun.enable` rollback — a named device is a startup-snapshot object no
+/// PUT can restart or roll back, so any failure here is returned to the
+/// caller, which fails startup instead of logging-and-continuing.
+/// `binding` is the early global-route binding installed before the
+/// config build ([`preinstall_global_route_binding`], issue #695) —
+/// adopted by this listener or given up with it on failure.
+#[cfg(feature = "listener-tun")]
+async fn spawn_named_tun(
+    tunnel: &Tunnel,
+    cfg: &meow_config::TunConfig,
+    name: &str,
+    route_override: Option<meow_common::InboundRouteOverride>,
+    sniffer: Arc<SnifferRuntime>,
+    binding: Option<meow_listener::OutboundBinding>,
+) -> Result<(), String> {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let mut listener = TunListener::new(
+        tunnel.clone(),
+        tun_config_to_listener_config(cfg),
+        name.to_string(),
+    )
+    .with_readiness_signal(ready_tx)
+    .with_sniffer(sniffer)
+    .with_route_override(route_override);
+    if let Some(binding) = binding {
+        listener = listener.with_outbound_binding(binding);
+    }
+    let task_name = name.to_string();
+    let handle = tokio::spawn(async move {
+        if let Err(e) = listener.run().await {
+            error!("TUN listener '{task_name}' error: {e}");
+        }
+    });
+
+    let (core_done, udp_flows) =
+        match tokio::time::timeout(meow_api::TUN_STARTUP_TIMEOUT, ready_rx).await {
+            Ok(Ok(meow_listener::TunReady::Ready {
+                core_done,
+                udp_flows,
+            })) => (core_done, udp_flows),
+            Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
+                handle.abort();
+                let _ = handle.await;
+                return Err(msg);
+            }
+            Ok(Err(_)) => {
+                handle.abort();
+                let _ = handle.await;
+                return Err("TUN readiness signal dropped unexpectedly".into());
+            }
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                return Err(format!(
+                    "TUN startup timed out after {} s",
+                    meow_api::TUN_STARTUP_TIMEOUT.as_secs()
+                ));
+            }
+        };
+
+    let tun_handle = meow_tunnel::TunHandle {
+        task: handle,
+        owner: meow_tunnel::TunOwner::Named(name.to_string()),
+        core_done: Some(core_done),
+        udp_flows,
+    };
+    if tun_handle.task.is_finished() {
+        // Reported ready, then exited before the handle could publish —
+        // the same dead-handle refusal the top-level publish applies.
+        tunnel.teardown_tun_handle(tun_handle).await;
+        return Err("TUN listener exited after reporting ready".into());
+    }
+    tunnel.set_tun_handle(tun_handle).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2849,6 +2982,7 @@ mod tests {
                     let _tx = tx;
                     std::future::pending::<()>().await;
                 }),
+                owner: meow_tunnel::TunOwner::TopLevel,
                 core_done: None,
                 udp_flows: Arc::new(AtomicUsize::new(0)),
             };
@@ -2983,6 +3117,7 @@ mod tests {
         fn finished_handle() -> TunHandle {
             TunHandle {
                 task: tokio::spawn(async {}),
+                owner: meow_tunnel::TunOwner::TopLevel,
                 core_done: None,
                 udp_flows: Arc::new(AtomicUsize::new(0)),
             }

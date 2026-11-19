@@ -15,7 +15,7 @@ use std::net::IpAddr;
 /// Immutable allow/deny CIDR pair resolved at config load.
 ///
 /// `None`-equivalent defaults are produced by the config resolver
-/// ([`meow_config::resolve_lan_acl`]): an omitted allow list becomes
+/// (`meow_config::resolve_lan_acl`): an omitted allow list becomes
 /// `0.0.0.0/0` + `::/0`, so an *explicit* `lan-allowed-ips: []` stays
 /// distinguishable and admits nobody.
 #[derive(Debug, Clone, Default)]

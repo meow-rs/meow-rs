@@ -48,7 +48,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `external-controller` | ✓ | REST API on same port. |
 | `secret` (Bearer auth) | ✓ | Enforced (security fix vs upstream). |
 | `authentication` + `skip-auth-prefixes` | ✓ | Inbound proxy auth (M1.F-3). |
-| `listeners:` named listeners | ✓ | Named listener array (M1.F-1). `type: socks` is accepted as an alias of `type: socks5` (canonical name stays `socks5`); the named-listener `udp` SOCKS option is not ported. Per-listener `proxy:`/`rule:` route overrides and `routing-mark` are supported (see below). |
+| `listeners:` named listeners | ✓ | Named listener array (M1.F-1). `type: socks` is accepted as an alias of `type: socks5` (canonical name stays `socks5`); the named-listener `udp` SOCKS option is not ported. Per-listener `proxy:`/`rule:` route overrides and `routing-mark` are supported (see below). `type: tun` declares a flat-form TUN device (`listeners:`-tuned defaults: `mtu` 9000, `udp-timeout` 300, `auto-route` off; presence is the enabled state — `enable`/nested `tun:`/`port`/`listen` are hard errors; one effective TUN — a named entry plus `tun.enable: true`, or two named entries, fails to parse). Starts at boot only and a failed spawn is fatal; `PUT`/`PATCH` `tun.enable` is refused while a named device runs. Same `listener-tun` feature; see [tun.md](tun.md#named-listeners-type-tun-entries). |
 | `lan-allowed-ips`, `lan-disallowed-ips` | ✓ | CIDR admission on the mixed/HTTP/SOCKS TCP accept loops only — rejected peers drop silently at `accept` before auth or sniffing. Omitted allow list admits all; explicit `[]` admits none. Top-level keys only; nested under `listeners:` they are a hard parse error. Startup-only like the listeners themselves: `PUT /configs` validates and stores for the next boot. |
 | `proxies:` — Shadowsocks | ✓ | Including AEAD 2022 ciphers. |
 | `proxies:` — Trojan | ✓ | TLS + WebSocket transport. |
@@ -717,7 +717,7 @@ using them will produce a clear error at startup.
 | Feature | Reason | Alternative |
 |---------|--------|-------------|
 | TUIC, SSH protocols | Protocol scope and dependency budget | Revisit in M2+ if users need them |
-| TUN inbound | L3-device transparent proxy (issue #326) | `tun:` section with the `listener-tun` Cargo feature |
+| TUN inbound | L3-device transparent proxy (issue #326) | `tun:` section or a named `listeners:` `type: tun` entry (flat form, one effective TUN), with the `listener-tun` Cargo feature |
 
 ---
 

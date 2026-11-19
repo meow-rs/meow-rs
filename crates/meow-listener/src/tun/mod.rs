@@ -385,6 +385,10 @@ pub struct TunListener {
     /// The top-level `sniffer:` (TLS SNI / HTTP Host), as mihomo applies it
     /// to TUN flows too.
     sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
+    /// `proxy`/`rule` override a `listeners: type: tun` entry declares —
+    /// stamped onto every flow's metadata before routing (upstream's
+    /// `Additions` shape). `None` on the top-level `tun:` device.
+    route_override: Option<meow_common::InboundRouteOverride>,
 }
 
 impl TunListener {
@@ -396,7 +400,15 @@ impl TunListener {
             ready: None,
             outbound_binding: None,
             sniffer: None,
+            route_override: None,
         }
+    }
+
+    /// Stamp the named entry's `proxy`/`rule` override onto each flow
+    /// (`InboundRouteOverride::apply`), as every socket listener does.
+    pub fn with_route_override(mut self, ov: Option<meow_common::InboundRouteOverride>) -> Self {
+        self.route_override = ov;
+        self
     }
 
     /// Name TCP flows with the configured sniffer (ignored when disabled).
@@ -982,6 +994,7 @@ impl TunListener {
             tun_net,
             std::sync::Arc::clone(&udp_flows),
             self.sniffer.clone(),
+            self.route_override.clone(),
         ));
         if let Some(socket) = lwip_udp {
             tasks.spawn(udp::run_udp(
@@ -993,6 +1006,7 @@ impl TunListener {
                 tun_net,
                 std::sync::Arc::clone(&udp_flows),
                 self.sniffer.clone(),
+                self.route_override.clone(),
             ));
         }
 
@@ -1082,6 +1096,7 @@ impl TunListener {
                             let tunnel = self.tunnel.clone();
                             let name = self.name.clone();
                             let sniffer = self.sniffer.clone();
+                            let route_override = self.route_override.clone();
                             tasks.spawn(async move {
                                 let _permit = permit;
                                 // lwIP only delivers this stream after the
@@ -1132,6 +1147,7 @@ impl TunListener {
                                         dst,
                                         &name,
                                         sniffer.as_deref(),
+                                        route_override.as_ref(),
                                     )
                                     .await;
                                 }
@@ -1165,6 +1181,7 @@ impl TunListener {
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
                         let sniffer = self.sniffer.clone();
+                        let route_override = self.route_override.clone();
                         tasks.spawn(async move {
                             let _guard = guard;
                             // The same post-handshake window as the lwIP
@@ -1209,6 +1226,9 @@ impl TunListener {
                                 in_name: name.as_str().into(),
                                 ..Default::default()
                             };
+                            if let Some(ov) = route_override {
+                                ov.apply(&mut metadata);
+                            }
                             if let Some(rt) = sniffer.as_deref() {
                                 crate::sniffer::prefill_host(
                                     &tunnel.inner().resolver(),
@@ -1541,6 +1561,10 @@ fn tcp_loop_guard(dst: SocketAddr, dns_hijack: bool, nets: udp::TunNets) -> bool
     !(dns_hijack && dst.port() == 53) && udp::is_looping_dst(dst.ip(), nets)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the listener's TCP knobs, passed once per accepted flow"
+)]
 async fn handle_tcp_flow(
     tunnel: Tunnel,
     tcp: lwip::TcpStream,
@@ -1549,6 +1573,7 @@ async fn handle_tcp_flow(
     dst: SocketAddr, // original destination
     in_name: &str,
     sniffer: Option<&crate::sniffer::SnifferRuntime>,
+    route_override: Option<&meow_common::InboundRouteOverride>,
 ) {
     let mut metadata = Metadata {
         network: Network::Tcp,
@@ -1560,6 +1585,11 @@ async fn handle_tcp_flow(
         in_name: in_name.into(),
         ..Default::default()
     };
+    // The named entry's `proxy`/`rule` override stamps before sniffing
+    // and routing, as on every socket listener (upstream's `Additions`).
+    if let Some(ov) = route_override {
+        ov.apply(&mut metadata);
+    }
     let mut tcp = tcp;
     let mut prefix = prefix;
     if let Some(rt) = sniffer {

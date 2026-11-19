@@ -224,6 +224,13 @@ rules:
 #     port: 7895
 #     rule: guest         # scans the `sub-rules.guest` block only
 #     routing-mark: 255   # SO_MARK on the listen socket (Linux)
+#   - name: edge
+#     type: tun           # TUN device, fields flat on the entry (no port/
+#                         # listen/enable; its presence is the on switch;
+#                         # only one effective TUN — not with `tun.enable`)
+#     mtu: 9000           # named defaults differ from `tun:` — see tun.md
+#     auto-route: global
+#     dns-hijack: [any:53]
 
 # Subscriptions (remote Clash configs merged in as a tracked contribution).
 # A refresh merges the fetched document's proxies/proxy-groups by name

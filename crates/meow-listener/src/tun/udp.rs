@@ -225,6 +225,7 @@ pub(super) async fn run_udp(
     tun_net: TunNets,
     live_flows: Arc<AtomicUsize>,
     sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
+    route_override: Option<meow_common::InboundRouteOverride>,
 ) {
     // One owner for the loop's cancellable async work: flows, DNS queries
     // and the lwIP reply pump. Blocking nftset hooks are handled separately.
@@ -471,6 +472,7 @@ pub(super) async fn run_udp(
                 in_name: in_name.clone(),
                 last_activity,
                 sniffer: sniffer.clone(),
+                route_override: route_override.clone(),
             },
         ));
         let task_id = task.id();
@@ -504,6 +506,9 @@ struct FlowSpec {
     /// The configured sniffer; its QUIC ports name a flow from the
     /// client's Initials before it is routed.
     sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
+    /// A named `type: tun` entry's `proxy`/`rule` override — stamped on
+    /// the metadata before routing (upstream's `Additions` shape).
+    route_override: Option<meow_common::InboundRouteOverride>,
 }
 
 /// Count a dropped hijack response and warn on a power-of-two cadence so
@@ -586,6 +591,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         in_name,
         last_activity,
         sniffer,
+        route_override,
     } = spec;
     // Capture the generation before any await, including sniffing and DNS.
     // A refresh must cancel establishment, not just a connected relay.
@@ -600,6 +606,11 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         in_name: in_name.into(),
         ..Default::default()
     };
+    // A named entry's `proxy`/`rule` override stamps before sniffing and
+    // routing, as on every socket listener (upstream's `Additions`).
+    if let Some(ov) = &route_override {
+        ov.apply(&mut metadata);
+    }
 
     // QUIC sniff: hold the first datagrams until their Initials yield the
     // server name, at most `sniffer.timeout` and a few packets; they are
@@ -1014,6 +1025,7 @@ mod tests {
                 net(),
                 Arc::clone(&gauge),
                 None,
+                None,
             ));
             (tx, task)
         };
@@ -1097,6 +1109,7 @@ mod tests {
             net,
             Arc::clone(&gauge),
             None,
+            None,
         ));
 
         let pkt = |src: SocketAddr| (b"x".to_vec(), src, SocketAddr::from(([8, 8, 8, 8], 1234)));
@@ -1151,6 +1164,7 @@ mod tests {
                     in_name: "tun".to_string(),
                     last_activity: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
                     sniffer: None,
+                    route_override: None,
                 },
             )
             .await;
@@ -1352,6 +1366,7 @@ mod cleanup_tests {
             in_name: "tun".into(),
             last_activity: Arc::new(AtomicU64::new(0)),
             sniffer: None,
+            route_override: None,
         };
         (tunnel, spec, tx, probe)
     }
@@ -1426,6 +1441,7 @@ mod cleanup_tests {
             },
             Arc::clone(&gauge),
             None,
+            None,
         ));
         tx.send((vec![1], spec.key.0, spec.key.1)).await.unwrap();
         tokio::time::timeout(Duration::from_secs(2), probe.reading.notified())
@@ -1474,6 +1490,7 @@ mod cleanup_tests {
                 nat: None,
             },
             Arc::new(AtomicUsize::new(0)),
+            None,
             None,
         ));
         // Standard recursive TXT question for example.com, with no local answer.
@@ -1628,6 +1645,7 @@ mod cleanup_tests {
                 nat: None,
             },
             Arc::clone(&gauge),
+            None,
             None,
         ));
         incoming_tx

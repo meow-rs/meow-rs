@@ -7540,6 +7540,15 @@ async fn put_configs_fetches_rule_provider_payload_once() {
 /// so post-state alone can't distinguish a no-op from a working
 /// restart under a privileged listener-tun build).
 fn fake_tun_handle() -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBool>) {
+    let (handle, flag) = fake_tun_handle_owned(meow_tunnel::TunOwner::TopLevel);
+    (handle, flag)
+}
+
+/// [`fake_tun_handle`] with an explicit [`TunOwner`] — named-owner
+/// variants pin the top-level reconcile off the slot (spec §3).
+fn fake_tun_handle_owned(
+    owner: meow_tunnel::TunOwner,
+) -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBool>) {
     struct Flag(Arc<std::sync::atomic::AtomicBool>);
     impl Drop for Flag {
         fn drop(&mut self) {
@@ -7555,6 +7564,7 @@ fn fake_tun_handle() -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBo
                 std::future::pending::<()>().await;
             }
         }),
+        owner,
         core_done: None,
         udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
@@ -10703,5 +10713,299 @@ fn put_configs_warns_on_unknown_keys() {
     assert!(
         logs.contains("unknown keys in top-level config: api-bogus-key"),
         "PUT rebuild must re-emit the unknown-key warn: {logs}"
+    );
+}
+
+// ─── Named `type: tun` listeners (spec §3) ─────────────────────────────
+
+/// PUT a base64 YAML payload into `/configs`; `query` carries `?force`
+/// & friends.
+async fn put_configs_payload(
+    state: &Arc<AppState>,
+    yaml: &str,
+    query: &str,
+) -> axum::response::Response {
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    create_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/configs{query}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Store a stand-in *named* `type: tun` device in the slot — the owner
+/// the startup path publishes (`spec §3`); the pending task is what
+/// owner-aware paths must not reap.
+async fn install_named_tun(
+    state: &Arc<AppState>,
+    name: &str,
+) -> Arc<std::sync::atomic::AtomicBool> {
+    let (handle, stopped) = fake_tun_handle_owned(meow_tunnel::TunOwner::Named(name.to_string()));
+    state.tunnel.set_tun_handle(handle).await;
+    stopped
+}
+
+/// A `tun.enable` candidate must never pass admission while a named
+/// `type: tun` device holds the slot — and the named device stays up.
+#[tokio::test]
+async fn put_configs_tun_enable_while_named_tun_owns_slot_rejected() {
+    let state = test_state(test_raw_config());
+    let stopped = install_named_tun(&state, "edge-tun").await;
+    // The request even *removes* the listeners section — the slot stays
+    // owned until a restart, so the enable still rejects.
+    for query in ["", "?force=true"] {
+        let resp = put_configs_payload(
+            &state,
+            "tun:\n  enable: true\nrules:\n  - MATCH,DIRECT\n",
+            query,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {query}");
+        assert!(
+            body_json(resp).await["message"]
+                .as_str()
+                .unwrap()
+                .contains("edge-tun"),
+            "the error must name the owning listener, query {query}"
+        );
+    }
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the named device must keep running"
+    );
+    assert!(state.tunnel.has_tun());
+    assert!(
+        !state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.enable),
+        "nothing may persist"
+    );
+}
+
+/// Same contract when the enable arrives inside a doc that *declares* a
+/// named TUN: refused before binding/mutation/persist, `force` included
+/// (the listeners-gate bail alone would be force-degradable).
+#[tokio::test]
+async fn put_configs_tun_enable_with_named_tun_entry_rejected() {
+    let state = test_state(test_raw_config());
+    for query in ["", "?force=true"] {
+        let resp = put_configs_payload(
+            &state,
+            "tun:\n  enable: true\nlisteners:\n  - name: n-tun\n    type: tun\nrules:\n  - MATCH,DIRECT\n",
+            query,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {query}");
+        assert!(
+            body_json(resp).await["message"]
+                .as_str()
+                .unwrap()
+                .contains("tun.enable"),
+            "the error must explain the one-effective-TUN rule, query {query}"
+        );
+    }
+    assert!(
+        !state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.enable),
+        "nothing may persist"
+    );
+}
+
+/// PATCHing `tun.enable` on is refused while a named device owns the
+/// slot or the committed document still stages a named entry — a PATCH
+/// cannot drop `listeners:`.
+#[tokio::test]
+async fn patch_configs_tun_enable_while_named_tun_rejected() {
+    // (a) slot owned by a live named device
+    let state = test_state(test_raw_config());
+    let stopped = install_named_tun(&state, "edge-tun").await;
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"enable": true}})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(!stopped.load(Ordering::SeqCst));
+
+    // (b) no live device, but the committed document stages a named TUN
+    let mut raw = test_raw_config();
+    raw.listeners = Some(vec![
+        serde_saphyr::from_str("name: n-tun\ntype: tun").unwrap()
+    ]);
+    let state = test_state(raw);
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"enable": true}})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.enable),
+        "nothing may persist"
+    );
+}
+
+/// The allowed shape: a PUT that disables the running top-level TUN and
+/// stages a named `type: tun` entry — the former may stop, the named
+/// device starts only at next boot.
+#[tokio::test]
+async fn put_configs_tun_disable_plus_named_tun_staged_ok() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let resp = put_configs_payload(
+        &state,
+        "tun:\n  enable: false\nlisteners:\n  - name: n-tun\n    type: tun\nrules:\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the running top-level device may stop"
+    );
+    assert!(
+        !state.tunnel.has_tun(),
+        "the staged named TUN must not start — next boot only"
+    );
+    let committed = state.raw_config.read().clone();
+    assert!(
+        committed
+            .listeners
+            .as_deref()
+            .unwrap()
+            .iter()
+            .any(|l| l.listener_type == "tun"),
+        "the named entry persists for next boot"
+    );
+}
+
+/// `GET /configs` `tun-enable` reports the top-level section's device
+/// only — a live named device does not read as `tun.enable`.
+#[tokio::test]
+async fn get_configs_tun_enable_ignores_named_tun() {
+    let state = test_state(test_raw_config());
+    install_named_tun(&state, "edge-tun").await;
+    let json = get_configs_json(&state).await;
+    assert_eq!(json["tun-enable"], serde_json::json!(false));
+    assert_eq!(json["tun"]["enable"], serde_json::json!(false));
+}
+
+/// A resolver rebuild that would move the fake-IP pool while a named
+/// `type: tun` device runs is refused wholesale; an unrelated resolver
+/// change keeps the device alive.
+#[tokio::test]
+async fn put_configs_fake_ip_move_while_named_tun_runs_rejected() {
+    let mut raw = test_raw_config();
+    raw.dns = Some(
+        serde_saphyr::from_str(
+            "enable: true\nenhanced-mode: fake-ip\nfake-ip-range: 198.18.0.0/16\nnameserver: [1.1.1.1]",
+        )
+        .unwrap(),
+    );
+    let state = test_state(raw);
+    let stopped = install_named_tun(&state, "edge-tun").await;
+    // Give the tunnel a resolver generation carrying the committed
+    // fake-IP pool (the startup would have built it the same way).
+    {
+        let committed = state.raw_config.read().clone();
+        let dns = meow_config::parse_dns_from_raw(
+            &committed,
+            None,
+            &Default::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dns builds");
+        state.tunnel.set_resolver(Arc::clone(&dns.resolver));
+    }
+    let pool_before = state.tunnel.resolver().fake_ip_v4_net();
+    assert!(pool_before.is_some(), "the pin needs a live pool");
+
+    // Moving `fake-ip-range` → refused, device untouched.
+    let resp = put_configs_payload(
+        &state,
+        "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 28.0.0.0/8\n  nameserver: [1.1.1.1]\nrules:\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the named device must keep running"
+    );
+    assert_eq!(
+        state.tunnel.resolver().fake_ip_v4_net(),
+        pool_before,
+        "the rejected pool must never publish"
+    );
+
+    // An unrelated resolver change (nameserver swap, same pool) → the
+    // device is not pinned against it.
+    let resp = put_configs_payload(
+        &state,
+        "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.0/16\n  nameserver: [9.9.9.9]\nrules:\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(state.tunnel.resolver().fake_ip_v4_net(), pool_before);
+    assert!(!stopped.load(Ordering::SeqCst));
+}
+
+/// `GET /listeners` reports a `type: tun` entry's name and type without
+/// port/listen — it owns no socket.
+#[tokio::test]
+async fn get_listeners_named_tun_reports_no_socket() {
+    use meow_config::{ListenerSpec, NamedListener};
+    let mut state = test_state(test_raw_config());
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .listeners
+        .push(NamedListener {
+            name: "edge-tun".into(),
+            spec: ListenerSpec::Tun(meow_config::TunConfig::default()),
+            port: 0,
+            listen: String::new(),
+            max_connections: 256,
+            route_override: None,
+            routing_mark: None,
+        });
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/listeners")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let items = body_json(resp).await;
+    assert_eq!(items[0]["name"], serde_json::json!("edge-tun"));
+    assert_eq!(items[0]["type"], serde_json::json!("tun"));
+    assert!(
+        items[0].get("port").is_none() && items[0].get("listen").is_none(),
+        "a TUN owns no socket endpoint: {items}"
     );
 }

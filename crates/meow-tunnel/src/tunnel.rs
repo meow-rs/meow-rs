@@ -232,6 +232,21 @@ pub struct TunnelInner {
     tcp_idle_timeout: AtomicU64,
 }
 
+/// Which configuration surface owns a stored [`TunHandle`]: the
+/// top-level `tun:` section's live reconcile (PUT/PATCH start, stop and
+/// restart) or a `listeners:` `type: tun` entry — a startup-snapshot
+/// object the top-level paths must never stop, replace, or report as
+/// `tun.enable` (spec: one effective TUN).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TunOwner {
+    /// Spawned from the top-level `tun:` section — the config-mutation
+    /// reconcile owns its lifecycle.
+    TopLevel,
+    /// Spawned from the named `listeners:` entry of this name; its
+    /// lifecycle belongs to process startup only.
+    Named(String),
+}
+
 /// A running TUN listener: the task plus the signal resolving once its
 /// lwIP core has fully torn down.
 ///
@@ -244,6 +259,9 @@ pub struct TunnelInner {
 pub struct TunHandle {
     /// The listener task — abort + await it to stop.
     pub task: tokio::task::JoinHandle<()>,
+    /// Which surface spawned this listener — gates which lifecycle paths
+    /// may act on the stored slot ([`TunOwner`]).
+    pub owner: TunOwner,
     /// Flips `true` once this generation's lwIP core finished teardown.
     /// `None` for non-lwIP/test handles that have no core to await.
     pub core_done: Option<tokio::sync::watch::Receiver<bool>>,
@@ -2017,11 +2035,21 @@ impl Tunnel {
         info!("discarded a stale TUN listener");
     }
 
-    /// Abort the running TUN listener, if any, and wait for teardown —
-    /// including the lwIP core's `core_done`, so a successor
-    /// `NetStack::new` can never overlap this generation (issue #514).
+    /// Abort the running top-level `tun:` listener, if that is what the
+    /// slot holds, and wait for teardown — including the lwIP core's
+    /// `core_done`, so a successor `NetStack::new` can never overlap this
+    /// generation (issue #514). A [`TunOwner::Named`] handle is left
+    /// running: named listeners are a startup snapshot no config mutation
+    /// may stop (the PUT/PATCH admission gates keep a top-level enable
+    /// from ever targeting the named owner's slot).
     pub async fn stop_tun(&self) {
-        let handle = self.inner.tun_handle.write().take();
+        let handle = {
+            let mut slot = self.inner.tun_handle.write();
+            match slot.as_ref() {
+                Some(h) if h.owner == TunOwner::TopLevel => slot.take(),
+                _ => None,
+            }
+        };
         // parking_lot RwLock write guard is dropped here — safe to .await
         if let Some(handle) = handle {
             teardown_tun(handle).await;
@@ -2039,6 +2067,20 @@ impl Tunnel {
             .read()
             .as_ref()
             .is_some_and(|h| !h.task.is_finished())
+    }
+
+    /// The owner of the stored TUN listener while it runs — `None` when
+    /// the slot is empty or its task already exited (a dead handle claims
+    /// no ownership: `set_tun_handle` may replace it). Consumers use this
+    /// to keep top-level `tun:` reconcile/status off a
+    /// [`TunOwner::Named`] device.
+    pub fn tun_owner(&self) -> Option<TunOwner> {
+        self.inner
+            .tun_handle
+            .read()
+            .as_ref()
+            .filter(|h| !h.task.is_finished())
+            .map(|h| h.owner.clone())
     }
 
     /// Live TUN UDP flow-table occupancy (issue #515). Zero when no TUN
@@ -2277,6 +2319,7 @@ mod tests {
     fn task_handle(task: tokio::task::JoinHandle<()>) -> TunHandle {
         TunHandle {
             task,
+            owner: TunOwner::TopLevel,
             core_done: None,
             udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
@@ -2376,6 +2419,7 @@ mod tests {
         tunnel
             .set_tun_handle(TunHandle {
                 task,
+                owner: TunOwner::TopLevel,
                 core_done: Some(done_rx),
                 udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })
@@ -2398,6 +2442,28 @@ mod tests {
             .expect("stop_tun must return once core_done fires")
             .unwrap();
         assert!(!tunnel.has_tun());
+    }
+
+    /// Named-TUN ownership (spec §3): the top-level `stop_tun` reconcile
+    /// path must never reap a `listeners: type: tun` device — it reports
+    /// through `tun_owner` and stays running.
+    #[tokio::test]
+    async fn stop_tun_never_touches_a_named_owner() {
+        let tunnel = test_tunnel();
+        let mut handle = task_handle(tokio::spawn(std::future::pending::<()>()));
+        handle.owner = TunOwner::Named("edge-tun".into());
+        tunnel.set_tun_handle(handle).await;
+
+        assert_eq!(tunnel.tun_owner(), Some(TunOwner::Named("edge-tun".into())));
+        tunnel.stop_tun().await;
+        assert!(
+            tunnel.has_tun(),
+            "stop_tun must not reap a named TUN's slot"
+        );
+        assert_eq!(tunnel.tun_owner(), Some(TunOwner::Named("edge-tun".into())));
+        // Reap the stored pending task so the test leaves no stray task.
+        let stored = tunnel.inner.tun_handle.write().take().unwrap();
+        tunnel.teardown_tun_handle(stored).await;
     }
 
     #[tokio::test]
@@ -2453,6 +2519,7 @@ mod tests {
                 let _guard = DropSignal(Some(drop_tx));
                 let _ = exit_rx.await;
             }),
+            owner: TunOwner::TopLevel,
             core_done: Some(done_rx),
             udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         };

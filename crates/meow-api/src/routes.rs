@@ -992,7 +992,13 @@ struct ConfigResponse {
 }
 
 async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
-    let tun_running = state.tunnel.has_tun();
+    // `tun-enable`/`tun.enable` report the top-level section's device
+    // only — a running named `type: tun` listener is not `tun.enable`
+    // (its lifecycle belongs to startup, not this toggle).
+    let tun_running = matches!(
+        state.tunnel.tun_owner(),
+        Some(meow_tunnel::TunOwner::TopLevel)
+    );
     let raw = state.raw_config.read();
     Json(ConfigResponse {
         mode: state.tunnel.mode().to_string(),
@@ -1235,6 +1241,28 @@ async fn update_configs(
                 return (
                     StatusCode::BAD_REQUEST,
                     Json(serde_json::json!({ "message": format!("tun config error: {e}") })),
+                )
+                    .into_response();
+            }
+            // A merged `enable: true` runs the same one-effective-TUN
+            // rule `PUT /configs` enforces: refused while a named
+            // `type: tun` device holds the slot or the committed
+            // document still stages one (a PATCH cannot drop
+            // `listeners:`, so the doc check is against `raw` itself).
+            if tun.enable
+                && (matches!(
+                    state.tunnel.tun_owner(),
+                    Some(meow_tunnel::TunOwner::Named(_))
+                ) || raw
+                    .listeners
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .any(|l| l.listener_type.eq_ignore_ascii_case("tun")))
+            {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "message": "tun.enable cannot be set while a named `type: tun` listener is declared — meow-rs runs one effective TUN" })),
                 )
                     .into_response();
             }
@@ -1922,7 +1950,10 @@ async fn apply_raw_to_tunnel(
     // through the standalone DNS server's or host hook's OLD resolver
     // would fail closed in the gap until `publish_dns` runs (issue #533
     // review). Idempotent — `publish_dns` installs the same Arc again.
+    // The named-TUN fake-IP pin gates first so a rejected candidate never
+    // publishes the moving pool.
     if let Some(dns) = &dns {
+        named_tun_fake_ip_guard(state, &prior_resolver, dns)?;
         install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
     }
     state
@@ -2014,6 +2045,9 @@ async fn commit_raw_candidate(
             )
         })?;
     }
+    if let Some(msg) = named_tun_enable_blocked(state, &candidate) {
+        return Err((StatusCode::BAD_REQUEST, msg));
+    }
     if let Some(msg) = routing_mark_change_refused(&candidate) {
         return Err((StatusCode::BAD_REQUEST, msg));
     }
@@ -2034,6 +2068,68 @@ async fn commit_raw_candidate(
     .await;
     if let Some(change) = change.into() {
         change.record();
+    }
+    Ok(())
+}
+
+/// A candidate that enables the top-level `tun:` section collides with a
+/// named `listeners: type: tun` — meow runs one effective TUN. Refused
+/// while the named device owns the slot (it keeps it until a restart
+/// publishes the request's `listeners:` — removing the entry in the same
+/// PUT does not free the slot) and whenever the next-boot document itself
+/// declares a named TUN. Hard admission, unbypassable by `?force`, and
+/// checked before the pre-installed binding so a rejected candidate never
+/// disturbs the running device's outbound-interface binding.
+fn named_tun_enable_blocked(state: &AppState, candidate: &RawConfig) -> Option<String> {
+    if !candidate.tun.as_ref().is_some_and(|t| t.enable) {
+        return None;
+    }
+    if let Some(meow_tunnel::TunOwner::Named(name)) = state.tunnel.tun_owner() {
+        return Some(format!(
+            "tun.enable: named `type: tun` listener '{name}' holds the TUN slot — \
+             meow-rs runs one effective TUN; restart on a config without it before \
+             enabling the top-level section"
+        ));
+    }
+    candidate
+        .listeners
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .find(|l| l.listener_type.eq_ignore_ascii_case("tun"))
+        .map(|l| {
+            format!(
+                "tun.enable: cannot coexist with named `type: tun` listener '{}' — \
+                 meow-rs runs one effective TUN; drop one of them",
+                l.name
+            )
+        })
+}
+
+/// The named-TUN fake-IP pin: a `listeners: type: tun` device snapshots
+/// the fake-IP pool it was started with — its default device address,
+/// fake-IP routes and DNS-hijack target all derive from it — and has no
+/// restart path, so a resolver generation that would move the pinned
+/// pool (either family net or the v4 gateway, [`tun_fake_ip_changed`])
+/// is refused wholesale. Unrelated resolver changes keep the device
+/// alive. Runs before the candidate's `install_resolver_everywhere` so a
+/// rejected mutation never publishes the moving pool.
+fn named_tun_fake_ip_guard(
+    state: &AppState,
+    prior: &meow_dns::Resolver,
+    dns: &meow_config::DnsConfig,
+) -> Result<(), (StatusCode, String)> {
+    if let Some(meow_tunnel::TunOwner::Named(name)) = state.tunnel.tun_owner() {
+        if tun_fake_ip_changed(prior, &dns.resolver) {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "resolver change moves the fake-IP pool while named `type: tun` \
+                     listener '{name}' is running — the device pins the pool it \
+                     started with; restart meow to apply it"
+                ),
+            ));
+        }
     }
     Ok(())
 }
@@ -3638,6 +3734,7 @@ async fn spawn_tun_from_raw(
 
     Ok(Some(meow_tunnel::TunHandle {
         task: handle,
+        owner: meow_tunnel::TunOwner::TopLevel,
         core_done: Some(core_done),
         udp_flows,
     }))
@@ -4159,6 +4256,13 @@ async fn put_configs(
     if let Some(msg) = routing_mark_change_refused(&raw_config) {
         return reload_rejected(StatusCode::BAD_REQUEST, &msg);
     }
+    // One effective TUN, unbypassable by `force` like the lan-ACL gate:
+    // a candidate enabling `tun:` while a named `type: tun` device holds
+    // the slot — or whose own document stages one — must not bind,
+    // mutate, or persist.
+    if let Some(msg) = named_tun_enable_blocked(&state, &raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+    }
     let preinstalled = preinstall_global_route_binding(&raw_config);
     // Errors `force` pushed past, for the logbook.
     let mut forced: Vec<String> = Vec::new();
@@ -4562,8 +4666,13 @@ async fn put_configs(
     // Same early-install as the warm path: `reload_routing` drops the old
     // route table — and its registry cell — before `publish_dns` runs
     // below, so every resolver consumer (tunnel, host hook, live
-    // `dns.listen` server) must be on the new generation first.
+    // `dns.listen` server) must be on the new generation first. The
+    // named-TUN fake-IP pin gates first — unbypassable by `force`, like
+    // the enable check above.
     if let Some(dns) = &dns {
+        if let Err((status, msg)) = named_tun_fake_ip_guard(&state, &prior_resolver, dns) {
+            return reload_rejected(status, &msg);
+        }
         install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
     }
     let dropped = state
@@ -5395,12 +5504,17 @@ async fn get_listeners(State(state): State<Arc<AppState>>) -> Json<serde_json::V
         .listeners
         .iter()
         .map(|l| {
+            // A `type: tun` entry owns no socket — report name and type
+            // only; `port`/`listen` would claim an endpoint that does not
+            // exist.
             let mut item = serde_json::json!({
                 "name": l.name,
                 "type": l.spec.type_name(),
-                "port": l.port,
-                "listen": l.listen,
             });
+            if !matches!(l.spec, meow_config::ListenerSpec::Tun(_)) {
+                item["port"] = serde_json::json!(l.port);
+                item["listen"] = serde_json::json!(l.listen);
+            }
             // TProxy listeners disclose who owns the redirect rules — a
             // deployer checking whether the table/anchor they installed is
             // supposed to coexist with a meow-managed one reads this field
@@ -6521,6 +6635,7 @@ mod global_route_binding_tests {
                     let _old = old;
                     std::future::pending::<()>().await;
                 }),
+                owner: meow_tunnel::TunOwner::TopLevel,
                 core_done: None,
                 udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             })

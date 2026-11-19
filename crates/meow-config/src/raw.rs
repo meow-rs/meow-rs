@@ -552,7 +552,7 @@ pub struct RawConfig {
     /// mihomo's top-level `lan-allowed-ips`: CIDRs the mixed/HTTP/SOCKS
     /// TCP accept loops admit remote addresses from. `None` = omitted →
     /// the allow-all default; `Some([])` admits nobody. Explicit `null`
-    /// or a non-list value is a parse error — see [`deserialize_lan_acl`].
+    /// or a non-list value is a parse error — see `deserialize_lan_acl`.
     /// `skip_serializing_if` keeps a PUT-saved document free of
     /// `lan-allowed-ips: null`, which would not re-parse.
     #[serde(
@@ -805,8 +805,10 @@ pub struct RawListener {
     /// an external system — no nft/pfctl invocation, no bypass-IP
     /// collection, no cleanup on exit (issue #563).
     pub firewall: Option<bool>,
-    /// `tproxy`/`wireguard` listeners: UDP flow idle timeout in seconds
-    /// (default 60, issue #564). `0` is a config error. The companion `udp`
+    /// `tproxy`/`wireguard`/`tun` listeners: UDP flow idle timeout in
+    /// seconds (default 60 on tproxy/wireguard, 300 on `type: tun`,
+    /// issue #564). `0` is a config error on tproxy/wireguard but means
+    /// "default" on the named-TUN path. The companion `udp`
     /// key itself lives in the shadowsocks field block below — one raw key,
     /// two consumers: for tproxy `udp` defaults to `false` and requires
     /// `firewall: false` (meow does not manage UDP gateway rules); for
@@ -848,10 +850,55 @@ pub struct RawListener {
     /// Listener static private key, base64 decoding to exactly 32 bytes
     /// (required for `type: wireguard`).
     pub private_key: Option<String>,
-    /// Outer (wire) MTU; default 1420, accepted range `640..=9000`.
+    /// `wireguard`: outer (wire) MTU, default 1420, range `640..=9000`.
+    /// `type: tun` shares the field: device MTU, named default 9000,
+    /// `0` meaning "default".
     pub mtu: Option<u16>,
     /// Static peer table; required and non-empty for `type: wireguard`.
     pub peers: Option<Vec<RawWgPeer>>,
+
+    // ── named-TUN fields (only meaningful when `type: tun`) ──
+    // Upstream decodes these FLAT on the listener entry (`TunOption`
+    // embedding `BaseOption`) — there is no nested `tun:` map and no
+    // `enable` (the entry's presence is its enabled state). `mtu`,
+    // `udp-timeout` and `max-connections` above are shared with the
+    // wireguard/tproxy consumers; everything TUN-only lives here.
+    /// Device name; absent = platform-chosen (like `tun.device`).
+    pub device: Option<String>,
+    /// Stack selector — free-form like `RawTun::stack`: `system`/`mixed`
+    /// pick the kernel TCP path, `lwip` (meow extension) and the upstream
+    /// `mips`/`gvisor` spellings stay on lwIP (the latter two warn);
+    /// any other value is a hard error on the named path.
+    pub stack: Option<serde_json::Value>,
+    /// DNS-hijack targets; `[]` turns hijacking off, a `:53` target
+    /// (`any:53`, `0.0.0.0:53`) keeps it on, other entries warn+ignore.
+    pub dns_hijack: Option<Vec<String>>,
+    /// `auto-route` — the named default is OFF, unlike the top-level
+    /// `tun:` section; same bool-or-mode-string shape as `RawAutoRoute`.
+    pub auto_route: Option<RawAutoRoute>,
+    /// Physical-interface binding under `auto-route: global`
+    /// (loop avoidance); ignored elsewhere.
+    pub outbound_interface: Option<String>,
+    /// Device IPv4/IPv6 addresses — a string or mihomo's list form
+    /// (first entry used); the IPv4 default derives from
+    /// `dns.fake-ip-range` like the top-level section.
+    pub inet4_address: Option<serde_json::Value>,
+    pub inet6_address: Option<serde_json::Value>,
+    // Recognized-but-unsupported named-TUN keys — modeled so their
+    // presence produces a specific warn (ADR-0002) instead of landing in
+    // `extra` as unknown.
+    pub dns_mode: Option<serde_json::Value>,
+    pub strict_route: Option<serde_json::Value>,
+    pub auto_detect_interface: Option<serde_json::Value>,
+    pub auto_redirect: Option<serde_json::Value>,
+    pub endpoint_independent_nat: Option<serde_json::Value>,
+    pub mtu_v6: Option<serde_json::Value>,
+    pub route_address: Option<serde_json::Value>,
+    pub route_exclude_address: Option<serde_json::Value>,
+    pub include_uid: Option<serde_json::Value>,
+    pub exclude_uid: Option<serde_json::Value>,
+    pub gso: Option<serde_json::Value>,
+    pub file_descriptor: Option<serde_json::Value>,
 
     // ── upstream sub-options not yet supported by meow-rs ──
     // Captured as opaque `Value`s so their mere presence can be warned about

@@ -152,7 +152,10 @@ impl PreinstalledBinding {
 ///
 /// A no-op (default value) unless `raw` selects an enabled TUN in global
 /// route scope (`auto-route` unset, `true` or `global`) — TUN-off,
-/// fake-IP-scope and `auto-route: false` configs are untouched. An install failure is not fatal here: the
+/// fake-IP-scope and `auto-route: false` configs are untouched. A named
+/// `listeners: type: tun` entry is consulted the same way
+/// ([`meow_config::named_tun_global_route_interface`]) — it is the same
+/// sole effective TUN. An install failure is not fatal here: the
 /// listener retries before it touches any route and fails closed with the
 /// same error, exactly as before, and until then no global route exists for
 /// a socket to loop on. API callers must hold the `CONFIG_MUTATION` lane
@@ -160,7 +163,9 @@ impl PreinstalledBinding {
 /// interleave with a sibling mutation's).
 #[cfg(feature = "listener-tun")]
 pub fn preinstall_global_route_binding(raw: &RawConfig) -> PreinstalledBinding {
-    let Some(iface) = meow_config::global_route_outbound_interface(raw.tun.as_ref()) else {
+    let Some(iface) = meow_config::global_route_outbound_interface(raw.tun.as_ref())
+        .or_else(|| meow_config::named_tun_global_route_interface(raw))
+    else {
         return PreinstalledBinding::default();
     };
     let previous = meow_common::outbound_interface();
