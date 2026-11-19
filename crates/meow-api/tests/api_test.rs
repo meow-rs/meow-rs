@@ -1700,6 +1700,319 @@ async fn put_configs_force_invalid_global_ua_commits_live_value() {
     meow_common::set_global_ua(None);
 }
 
+/// Issue #974: `PUT /configs` commits the `keep-alive-*`, `profile`, and
+/// `ntp` top-level knobs; `GET /configs` reports the resolved values —
+/// `ntp.write-to-system` always `false` — and `PATCH` applies only the
+/// keep-alive keys while leaving the PUT-only sections untouched.
+#[tokio::test]
+async fn put_configs_roundtrips_top_level_knobs() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    // The PUT installs a non-default keepalive posture on the process
+    // global — restore it on every exit so later tests never inherit it.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            meow_common::set_outbound_tcp_keepalive(meow_common::OutboundTcpKeepalive::default());
+        }
+    }
+    let _reset = Reset;
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    let get = || {
+        let app = create_router(Arc::clone(&state));
+        async move {
+            body_json(
+                app.oneshot(
+                    Request::get("/configs")
+                        .body(axum::body::Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap(),
+            )
+            .await
+        }
+    };
+
+    // GET reports keep-alive from the live process global — a racing
+    // sibling PUT can reset it between this PUT and the read. The whole
+    // assert block therefore runs under the mutation lane, and the PUT
+    // sits INSIDE the retry loop so each pass re-publishes our posture
+    // before the lane freezes writers (the global-ua test above uses
+    // the same pattern).
+    let mut attempts = 0;
+    loop {
+        let resp = put(
+            "mode: rule\n\
+             keep-alive-idle: 45\n\
+             keep-alive-interval: 5\n\
+             disable-keep-alive: true\n\
+             profile:\n  store-selected: false\n  store-fake-ip: true\n\
+             ntp:\n  enable: true\n  server: ntp.test\n  port: 1123\n  interval: 60\n  dialer-proxy: DIRECT\n  write-to-system: true\n\
+             rules:\n  - MATCH,DIRECT\n",
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+        let live = meow_common::outbound_tcp_keepalive();
+        if live.enabled || live.idle.as_secs() != 45 || live.interval.as_secs() != 5 {
+            drop(_lane);
+            attempts += 1;
+            assert!(attempts < 20, "siblings kept resetting outbound keepalive");
+            continue;
+        }
+
+        let json = get().await;
+        assert_eq!(json["keep-alive-idle"], 45);
+        assert_eq!(json["keep-alive-interval"], 5);
+        assert_eq!(json["disable-keep-alive"], true);
+        assert_eq!(json["store-selected"], false);
+        assert_eq!(json["store-fake-ip"], true);
+        break;
+    }
+    let json = get().await;
+    assert_eq!(
+        json["ntp"],
+        serde_json::json!({
+            "enable": true,
+            "server": "ntp.test",
+            "port": 1123,
+            "interval": 60,
+            "dialer-proxy": "DIRECT",
+            "write-to-system": false,
+        }),
+        "GET reports the resolved ntp section; write-to-system is never claimed"
+    );
+    assert_eq!(
+        state
+            .raw_config
+            .read()
+            .ntp
+            .as_ref()
+            .and_then(|n| n.write_to_system),
+        Some(true),
+        "the raw spelling persists verbatim; only the resolved view drops it"
+    );
+
+    // PATCH: keep-alive keys apply (merged over the committed document);
+    // `ntp`/`profile` body keys are not PATCH fields — unknown keys are
+    // ignored and must leave both the document and GET report alone.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "keep-alive-idle": 30,
+                        "ntp": { "enable": false },
+                        "profile": { "store-selected": true },
+                        "store-selected": true,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let json = get().await;
+    assert_eq!(json["ntp"]["enable"], true, "PATCH must not touch ntp:");
+    assert_eq!(
+        json["store-selected"], false,
+        "PATCH must not touch profile"
+    );
+    {
+        let raw = state.raw_config.read();
+        assert!(
+            raw.ntp.is_some() && raw.profile.is_some(),
+            "PATCH must not merge PUT-only sections into the document"
+        );
+    }
+
+    // Ordered cleanup under the lane: a racing reader between here and
+    // the `Reset` guard's drop never observes this test's stale posture.
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    meow_common::set_outbound_tcp_keepalive(meow_common::OutboundTcpKeepalive::default());
+}
+
+/// Issue #974: the forced verbatim-commit fallback — strict AND lenient
+/// rebuilds both fail — must not claim a changed effective profile, ntp,
+/// or outbound-keepalive posture: each diff alone rejects the PUT, and a
+/// knob-free document still commits verbatim.
+#[tokio::test]
+async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
+    use base64::Engine as _;
+    // The reconcile spy proves a rejected PUT never feeds the candidate's
+    // resolved ntp config to the supervisor.
+    let seen = Arc::new(std::sync::Mutex::new(Vec::<meow_config::NtpConfig>::new()));
+    let mut state = test_state(test_raw_config());
+    Arc::get_mut(&mut state).unwrap().ntp_reconcile = Some({
+        let seen = Arc::clone(&seen);
+        Arc::new(move |cfg| seen.lock().unwrap().push(cfg)) as meow_api::routes::NtpReconcile
+    });
+    let put = |uri: &'static str, document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // Duplicate group names fail strict AND lenient — the unbuildable
+    // document the verbatim fallback would otherwise commit as written.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+
+    // Each effective-knob diff rejects before the fallback commits.
+    for (label, knob) in [
+        ("profile", "profile:\n  store-selected: false\n"),
+        ("ntp", "ntp:\n  enable: true\n  server: ntp.test\n"),
+        ("keepalive", "keep-alive-idle: 60\n"),
+    ] {
+        let before = seen.lock().unwrap().len();
+        let resp = put(
+            "/configs?force=true",
+            &format!("mode: rule\n{knob}{UNBUILDABLE}"),
+        )
+        .await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{label} diff must be rejected under the verbatim fallback"
+        );
+        assert_eq!(
+            seen.lock().unwrap().len(),
+            before,
+            "{label}: a rejected PUT must not reach the ntp supervisor"
+        );
+        // The committed document keeps its original knob-free sections.
+        {
+            let raw = state.raw_config.read();
+            assert!(
+                raw.ntp.is_none() && raw.profile.is_none() && raw.keep_alive_idle.is_none(),
+                "{label}: a rejected PUT must not touch the committed document"
+            );
+        }
+    }
+
+    // The knob-free unbuildable document still commits verbatim — the
+    // fallback's force leniency itself is unchanged.
+    let resp = put("/configs?force=true", &format!("mode: rule\n{UNBUILDABLE}")).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    {
+        let raw = state.raw_config.read();
+        assert!(
+            raw.proxy_groups.as_deref().is_some_and(|groups| groups
+                .iter()
+                .filter(|g| g.name == "dup")
+                .count()
+                == 2),
+            "the unbuildable document must commit verbatim"
+        );
+    }
+    // ...and the verbatim commit's ntp section still reaches the
+    // supervisor (resolved disabled — a no-op for it).
+    assert_eq!(
+        seen.lock().unwrap().len(),
+        1,
+        "the committed document's ntp section must reconcile"
+    );
+}
+
+/// Issue #974: under `force`, a `dns:` section that fails its rebuild
+/// keeps the previous resolver — but a candidate whose EFFECTIVE
+/// store-fake-ip flag (profile > dns > false) differs from the committed
+/// document's must not claim a posture the kept pool never implements.
+/// A flag-unchanged candidate still degrades to 204 as before.
+#[tokio::test]
+async fn put_configs_force_broken_dns_gates_store_fake_ip() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let put = |uri: &'static str, document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // `fake-ip-range` fails inside `reconcile_dns_config` — after the
+    // routing rebuild succeeded — landing in the force keep-resolver arm.
+    const BROKEN_DNS: &str =
+        "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: not-a-cidr\n";
+
+    // A changed effective flag (committed has none → false) rejects.
+    let resp = put(
+        "/configs?force=true",
+        &format!(
+            "mode: rule\nprofile:\n  store-fake-ip: true\n{BROKEN_DNS}rules:\n  - MATCH,DIRECT\n"
+        ),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a store-fake-ip change must not commit through the kept resolver"
+    );
+    assert!(
+        state.raw_config.read().profile.is_none(),
+        "the rejected document must not persist"
+    );
+
+    // Flag unchanged (both sides resolve false) keeps the force degrade.
+    let resp = put(
+        "/configs?force=true",
+        &format!("mode: rule\n{BROKEN_DNS}rules:\n  - MATCH,DIRECT\n"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "unchanged effective flag commits through the keep-resolver arm"
+    );
+}
+
 #[tokio::test]
 async fn get_traffic() {
     let state = test_state_default();

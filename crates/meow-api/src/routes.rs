@@ -4097,6 +4097,7 @@ async fn swap_config_and_reconcile_tun(
         new_log_level,
         (logbook_enable, ledger),
         geo_schedule_changed,
+        ntp_resolved,
     ) = {
         let mut guard = state.raw_config.write();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
@@ -4238,17 +4239,12 @@ async fn swap_config_and_reconcile_tun(
             .tunnel
             .selection_backing()
             .commit(meow_config::resolve_profile(&candidate).store_selected);
-        // `ntp:` on the same lane: the supervisor sees every committed
-        // document's resolved service config and restarts only on a real
-        // change; a disabled/unchanged section never re-schedules
-        // (issue #974). The candidate already resolved inside the
-        // rebuild — an error here means a caller skipped its gate.
-        if let Some(reconcile) = &state.ntp_reconcile {
-            match meow_config::resolve_ntp(&candidate) {
-                Ok(cfg) => reconcile(cfg),
-                Err(e) => warn!("ntp resolution failed at commit: {e}"),
-            }
-        }
+        // `ntp:` on the same lane, resolved here but reconciled once the
+        // route/DNS/dial-globals/TUN commit below settles (issue #974 —
+        // the worker must never dial through a half-published commit).
+        // The candidate already resolved inside the rebuild — an error
+        // here means a caller skipped its gate.
+        let ntp_resolved = meow_config::resolve_ntp(&candidate);
         let ledger = candidate.traffic_ledger.as_ref();
         let ledger = (
             meow_config::raw::RawTrafficLedger::enabled(ledger),
@@ -4263,6 +4259,7 @@ async fn swap_config_and_reconcile_tun(
             new_log_level,
             (logbook_enable, ledger),
             geo_schedule_changed,
+            ntp_resolved,
         )
     };
     if geo_schedule_changed {
@@ -4316,7 +4313,10 @@ async fn swap_config_and_reconcile_tun(
     let fake_ip_changed =
         dns_rebuilt && tun_fake_ip_changed(&prior_resolver, &state.tunnel.resolver());
 
-    if old_enable == new_enable {
+    // The TUN transition as a value so the `ntp:` reconcile below runs on
+    // every exit — a rolled-back spawn still committed the document, so
+    // the supervisor must see its `ntp:` section either way (issue #974).
+    let tun_result = if old_enable == new_enable {
         // on → on with changed fake-IP inputs or any real `tun:` parameter
         // change: restart the listener so the running stack matches the
         // committed raw (issue #543). No `has_tun()` gate — a dead
@@ -4343,6 +4343,7 @@ async fn swap_config_and_reconcile_tun(
                             tracked_tcp,
                         );
                     }
+                    Ok(())
                 }
                 // Unreachable like the off→on arm — `enable` is still true
                 // in the committed raw. Roll back the same way rather than
@@ -4352,7 +4353,7 @@ async fn swap_config_and_reconcile_tun(
                     if let Some(ref mut tun) = state.raw_config.write().tun {
                         tun.enable = false;
                     }
-                    return Err("TUN did not restart and was turned off".into());
+                    Err("TUN did not restart and was turned off".into())
                 }
                 Err(e) => {
                     warn!("TUN listener failed to restart: {e} (config rolled back)");
@@ -4361,13 +4362,13 @@ async fn swap_config_and_reconcile_tun(
                     if let Some(ref mut tun) = state.raw_config.write().tun {
                         tun.enable = false;
                     }
-                    return Err(message);
+                    Err(message)
                 }
             }
+        } else {
+            Ok(())
         }
-        return Ok(());
-    }
-    if let Some(snapshot) = snapshot {
+    } else if let Some(snapshot) = snapshot {
         // off → on. Defensive: if a handle somehow outlives a raw config
         // that already says `enable: false`, stop it first — the new
         // listener must never build a second lwIP core over a live one
@@ -4383,6 +4384,7 @@ async fn swap_config_and_reconcile_tun(
                 if adopted {
                     outbound_binding_adopted(state, preinstalled.interface_changed(), tracked_tcp);
                 }
+                Ok(())
             }
             Ok(None) => {
                 // Unreachable today — `spawn_tun_from_raw` only yields
@@ -4393,7 +4395,7 @@ async fn swap_config_and_reconcile_tun(
                 if let Some(ref mut tun) = state.raw_config.write().tun {
                     tun.enable = false;
                 }
-                return Err("TUN did not start and was turned off".into());
+                Err("TUN did not start and was turned off".into())
             }
             Err(e) => {
                 // TUN failed to start — roll back tun.enable to false so
@@ -4405,15 +4407,29 @@ async fn swap_config_and_reconcile_tun(
                 if let Some(ref mut tun) = state.raw_config.write().tun {
                     tun.enable = false;
                 }
-                return Err(message);
+                Err(message)
             }
         }
     } else {
         // on → off
         state.tunnel.stop_tun().await;
         info!("TUN listener stopped via config reload");
+        Ok(())
+    };
+
+    // `ntp:` reconciles last — after the route publish, DNS install,
+    // dial globals, and the TUN transition (or its rollback) settle, so
+    // the worker never dials a half-published commit (issue #974). The
+    // supervisor sees every committed document's resolved service config
+    // and restarts only on a real change; a disabled/unchanged section
+    // never re-schedules.
+    if let Some(reconcile) = &state.ntp_reconcile {
+        match ntp_resolved {
+            Ok(cfg) => reconcile(cfg),
+            Err(e) => warn!("ntp resolution failed at commit: {e}"),
+        }
     }
-    Ok(())
+    tun_result
 }
 
 /// Record a TUN listener that did not (re)start, at startup or on a config
@@ -4866,11 +4882,21 @@ async fn put_configs(
                 (Ok(old), Ok(new)) => old != new,
                 _ => true,
             };
-            if profile_changed || keepalive_changed {
+            // `ntp:` on the same footing — compared on its effective
+            // service config (`enable` gates the rest), the shape the
+            // supervisor's reconcile actually sees.
+            let ntp_changed = match (
+                meow_config::resolve_ntp(&committed),
+                meow_config::resolve_ntp(&raw_config),
+            ) {
+                (Ok(old), Ok(new)) => old.enable.then_some(old) != new.enable.then_some(new),
+                _ => true,
+            };
+            if profile_changed || keepalive_changed || ntp_changed {
                 return reload_rejected(
                     StatusCode::BAD_REQUEST,
                     "config validation failed under force, and the candidate \
-                     changes an effective profile/outbound-keepalive policy — \
+                     changes an effective profile/ntp/outbound-keepalive policy — \
                      the fallback would claim a switch it cannot apply; \
                      fix the defect and retry",
                 );
@@ -5016,7 +5042,7 @@ async fn put_configs(
                 // route swap below. In that case fall back to a dns-less
                 // candidate: a default resolver beats a dead one under the
                 // force contract (issue #533 review).
-                if dns_uses_runtime_refs(&state.raw_config.read()) {
+                let kept = if dns_uses_runtime_refs(&state.raw_config.read()) {
                     let mut stripped = dns_raw.clone().unwrap_or_else(|| raw_config.clone());
                     stripped.dns = None;
                     stripped.strict = Some(false);
@@ -5040,7 +5066,28 @@ async fn put_configs(
                     })
                 } else {
                     None
+                };
+                // A `None` keeps the previous resolver — whose fake-IP pool
+                // implements the COMMITTED document's persistence flag. When
+                // the candidate changed the effective flag
+                // (`profile.store-fake-ip` > `dns.store-fake-ip` > false),
+                // committing would claim a posture the kept pool never
+                // implements — reject instead (issue #974). A `Some` carries
+                // the dns-less build above: no fake-IP pool, nothing to
+                // diverge.
+                if kept.is_none()
+                    && meow_config::resolve_profile(&state.raw_config.read()).store_fake_ip
+                        != meow_config::resolve_profile(&raw_config).store_fake_ip
+                {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        "config validation failed under force, and the candidate \
+                         changes the effective store-fake-ip flag while the \
+                         kept resolver still implements the old one — \
+                         fix the defect and retry",
+                    );
                 }
+                kept
             } else {
                 return reload_rejected(status, &msg);
             }
