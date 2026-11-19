@@ -1796,10 +1796,10 @@ async fn put_configs_roundtrips_top_level_knobs() {
             "server": "ntp.test",
             "port": 1123,
             "interval": 60,
-            "dialer-proxy": "DIRECT",
             "write-to-system": false,
         }),
-        "GET reports the resolved ntp section; write-to-system is never claimed"
+        "GET reports the resolved ntp section: DIRECT normalizes to the \
+         omitted spelling and write-to-system is never claimed"
     );
     assert_eq!(
         state

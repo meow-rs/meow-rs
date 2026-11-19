@@ -5768,15 +5768,18 @@ pub fn resolve_ntp(raw: &raw::RawConfig) -> Result<NtpConfig, anyhow::Error> {
     let server = {
         let s = server_raw.trim();
         anyhow::ensure!(!s.is_empty(), "ntp.server must not be empty");
-        // Bracketed IPv6 (`[::1]`) unwraps to the literal; a bare
-        // `host:port` or URI fails the IpAddr parse and the colon test.
+        // Bracketed IPv6 (`[::1]`) unwraps to the literal; anything else
+        // must be a hostname — `is_valid_host` is the same byte contract
+        // ingress applies, so whitespace, control bytes and every
+        // authority-shaped spelling (`host:port`, `scheme://`, `a@b`,
+        // `x/y`) fail here.
         let inner = s
             .strip_prefix('[')
             .and_then(|r| r.strip_suffix(']'))
             .unwrap_or(s);
         if inner.parse::<std::net::IpAddr>().is_err() {
             anyhow::ensure!(
-                !inner.contains(':') && !inner.contains('/'),
+                meow_common::is_valid_host(inner),
                 "ntp.server '{server_raw}': expected a host or IP literal, not a host:port or URI"
             );
         }
@@ -5791,10 +5794,15 @@ pub fn resolve_ntp(raw: &raw::RawConfig) -> Result<NtpConfig, anyhow::Error> {
     );
     let interval_minutes = u32::try_from(interval)
         .map_err(|_| anyhow::anyhow!("ntp.interval {interval} is out of range"))?;
+    // `dialer-proxy` matches names verbatim — no trimming: `' DIRECT '`
+    // is not the DIRECT built-in (issue #974). Empty means direct like
+    // an absent key, and `DIRECT` normalizes to the same direct path so
+    // the two spellings compare equal at reconcile and never restart an
+    // unchanged worker.
     let dialer_proxy = ntp
         .and_then(|n| n.dialer_proxy.as_deref())
-        .map(str::trim)
         .filter(|s| !s.is_empty())
+        .filter(|s| *s != "DIRECT")
         .map(str::to_string);
     Ok(NtpConfig {
         enable: ntp.and_then(|n| n.enable).unwrap_or(false),

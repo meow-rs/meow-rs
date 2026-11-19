@@ -4639,7 +4639,32 @@ mod ntp_resolution {
         assert_eq!(c.server, "pool.ntp.org");
         assert_eq!(c.port, 1123);
         assert_eq!(c.interval_minutes, 60);
-        assert_eq!(c.dialer_proxy.as_deref(), Some("DIRECT"));
+        // `dialer-proxy: DIRECT` normalizes to the absent spelling — both
+        // resolve to the direct dial path, so the two spellings must
+        // compare equal or reconcile would restart an unchanged worker.
+        assert_eq!(c.dialer_proxy, None);
+        assert_eq!(
+            c,
+            resolve("ntp:\n  enable: true\n  server: pool.ntp.org\n  port: 1123\n  interval: 60\n")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn dialer_proxy_matches_names_verbatim() {
+        // No trimming: `' DIRECT '` is not the DIRECT built-in — enabled,
+        // it must fail the named-target gate like any undeclared name.
+        let raw = meow_config::parse_raw_yaml("ntp:\n  enable: true\n  dialer-proxy: ' DIRECT '\n")
+            .unwrap();
+        let c = meow_config::resolve_ntp(&raw).unwrap();
+        assert_eq!(c.dialer_proxy.as_deref(), Some(" DIRECT "));
+        let e = meow_config::rebuild_from_raw(&raw)
+            .err()
+            .expect("a whitespace-padded name must not resolve to DIRECT");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
     }
 
     #[test]
@@ -4651,10 +4676,13 @@ mod ntp_resolution {
         }
         for bad in [
             "",
+            "bad host",
             "host:123",
             "udp://host",
             "host/path",
+            "user@host",
             "ntp://pool.ntp.org:123",
+            "ho\tst",
         ] {
             let y = format!("ntp:\n  server: '{bad}'\n");
             assert!(resolve(&y).is_err(), "{bad} must fail");

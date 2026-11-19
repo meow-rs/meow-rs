@@ -140,9 +140,11 @@ async fn run_worker(
 ) {
     let mut ticker =
         tokio::time::interval(Duration::from_secs(u64::from(cfg.interval_minutes) * 60));
-    // Skip missed ticks rather than bursting after a pause — same policy
-    // the provider refresh supervisors use.
-    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Upstream's `time.Ticker` anchors to the start time and drops ticks
+    // a stalled poll missed — `Skip` keeps that original cadence (a stall
+    // does not permanently shift the phase; `Delay` would, `Burst` would
+    // queue catch-ups upstream never runs).
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // `interval` ticks once immediately — the immediate first exchange.
     loop {
         ticker.tick().await;
@@ -297,20 +299,12 @@ fn validate_reply(
     if reply.len() < 48 {
         return Err(format!("short NTP reply ({} bytes)", reply.len()));
     }
-    // Wrong peer: literal targets pin IP+port; name-bound conns may
-    // report the bound remote or an unspecified source — only a
-    // specified source that mismatches the port is evidence.
-    match target {
-        UdpTarget::Addr(addr) => {
-            if from != *addr {
-                return Err(format!("reply from wrong peer {from}"));
-            }
-        }
-        UdpTarget::Name { port, .. } => {
-            if !from.ip().is_unspecified() && from.port() != *port {
-                return Err(format!("reply from wrong peer {from}"));
-            }
-        }
+    // Wrong peer — `src_matches` applies the same contract every UDP
+    // demux uses: literal targets pin the canonical IP+port (a v4-mapped
+    // reply source folds to plain v4); name-bound conns can only check
+    // the dialed port, which they check unconditionally.
+    if !target.src_matches(from) {
+        return Err(format!("reply from wrong peer {from}"));
     }
     if reply[24..32] != transmit_ts[..] {
         return Err("originate timestamp does not match request".into());
@@ -326,14 +320,20 @@ fn validate_reply(
         let kod = String::from_utf8_lossy(&reply[12..16]);
         return Err(format!("kiss-of-death reply (ref '{kod}')"));
     }
-    if !(4..=5).contains(&mode) || vn == 0 || vn > 4 || stratum > 15 {
+    // Mode 4 (server) only — a broadcast-mode (5) packet is not an
+    // answer to our client request.
+    if mode != 4 || vn == 0 || vn > 4 || stratum > 15 {
         return Err(format!(
             "invalid server mode {mode}/version {vn}/stratum {stratum}"
         ));
     }
     let t2_secs = u32::from_be_bytes(reply[32..36].try_into().unwrap());
+    let t2_frac = u32::from_be_bytes(reply[36..40].try_into().unwrap());
     let t3_secs = u32::from_be_bytes(reply[40..44].try_into().unwrap());
-    if t2_secs == 0 || t3_secs == 0 {
+    let t3_frac = u32::from_be_bytes(reply[44..48].try_into().unwrap());
+    // Only the all-zero timestamp is the unsynchronized marker — zero
+    // seconds with a nonzero fraction is a real (era-boundary) instant.
+    if (t2_secs == 0 && t2_frac == 0) || (t3_secs == 0 && t3_frac == 0) {
         return Err("server returned a zero timestamp".into());
     }
     let t1 = t1_wall
@@ -342,16 +342,15 @@ fn validate_reply(
     let t4d = t4.duration_since(UNIX_EPOCH).map_err(|e| e.to_string())?;
     let t1_ns = t1.as_nanos() as i128;
     let t4_ns = t4d.as_nanos() as i128;
-    let t2_ns = ntp_secs_to_unix_nanos(
-        t2_secs,
-        u32::from_be_bytes(reply[36..40].try_into().unwrap()),
-        &t1_wall,
-    );
-    let t3_ns = ntp_secs_to_unix_nanos(
-        t3_secs,
-        u32::from_be_bytes(reply[44..48].try_into().unwrap()),
-        &t1_wall,
-    );
+    let t2_ns = ntp_secs_to_unix_nanos(t2_secs, t2_frac, &t1_wall);
+    let t3_ns = ntp_secs_to_unix_nanos(t3_secs, t3_frac, &t1_wall);
+    // The server's own ordering must hold: it received before it sent,
+    // so t3 >= t2. An inverted pair is not a plausible clock reading —
+    // it is a forged or corrupted reply, and folding it into the offset
+    // would let it pass at half magnitude.
+    if t3_ns < t2_ns {
+        return Err("server timestamps out of order (t3 < t2)".into());
+    }
     let offset = ((t2_ns - t1_ns) + (t3_ns - t4_ns)) / 2;
     if offset.abs() > MAX_OFFSET_NS {
         return Err("offset beyond the ±24 h cap".into());
@@ -512,6 +511,116 @@ mod tests {
         assert!(validate_reply(&ok, &tx, t1, t1, &target, wrong).is_err());
     }
 
+    /// A syntactically valid mode-4 reply scaffolding for the validator
+    /// tests below: originate echoing `tx`, stratum 1, caller-chosen
+    /// server receive/transmit timestamps.
+    fn reply_with(tx: &[u8; 8], t2: [u8; 8], t3: [u8; 8]) -> Vec<u8> {
+        let mut r = vec![0u8; 48];
+        r[0] = 0x24; // LI=0, VN=4, Mode=4
+        r[1] = 1;
+        r[24..32].copy_from_slice(tx);
+        r[32..40].copy_from_slice(&t2);
+        r[40..48].copy_from_slice(&t3);
+        r
+    }
+
+    /// Server timestamps that run backwards (t3 < t2) are forged or
+    /// corrupted — the reply is rejected rather than letting the pair
+    /// fold into the offset at half magnitude.
+    #[test]
+    fn reply_validation_rejects_inverted_server_timestamps() {
+        let t1 = SystemTime::now();
+        let tx = ntp_timestamp(t1);
+        let reply = reply_with(
+            &tx,
+            ntp_timestamp(t1 + Duration::from_secs(60)),
+            ntp_timestamp(t1 + Duration::from_secs(30)),
+        );
+        let target = UdpTarget::named("ntp.test", 123);
+        let from: SocketAddr = "0.0.0.0:123".parse().unwrap();
+        let e = validate_reply(&reply, &tx, t1, t1, &target, from).unwrap_err();
+        assert!(e.contains("out of order"), "{e}");
+    }
+
+    /// Mode 5 (broadcast) is not an answer to a client request — only
+    /// mode 4 is a server reply.
+    #[test]
+    fn reply_validation_rejects_broadcast_mode() {
+        let t1 = SystemTime::now();
+        let tx = ntp_timestamp(t1);
+        let ts = ntp_timestamp(t1);
+        let mut reply = reply_with(&tx, ts, ts);
+        reply[0] = 0x25; // LI=0, VN=4, Mode=5 (broadcast)
+        let target = UdpTarget::named("ntp.test", 123);
+        let from: SocketAddr = "0.0.0.0:123".parse().unwrap();
+        let e = validate_reply(&reply, &tx, t1, t1, &target, from).unwrap_err();
+        assert!(e.contains("mode"), "{e}");
+    }
+
+    /// A name-bound conn whose read reports an unspecified source IP
+    /// still has its port to check — the dialed port is the only locally
+    /// known half of the wire identity.
+    #[test]
+    fn reply_validation_checks_source_port_when_ip_unspecified() {
+        let t1 = SystemTime::now();
+        let tx = ntp_timestamp(t1);
+        let ts = ntp_timestamp(t1);
+        let reply = reply_with(&tx, ts, ts);
+        let target = UdpTarget::named("ntp.test", 123);
+
+        let wrong_port: SocketAddr = "0.0.0.0:999".parse().unwrap();
+        assert!(
+            validate_reply(&reply, &tx, t1, t1, &target, wrong_port).is_err(),
+            "unspecified ip + wrong port must not slip the peer check"
+        );
+        let no_port: SocketAddr = "0.0.0.0:0".parse().unwrap();
+        assert!(validate_reply(&reply, &tx, t1, t1, &target, no_port).is_err());
+        let right_port: SocketAddr = "0.0.0.0:123".parse().unwrap();
+        assert!(validate_reply(&reply, &tx, t1, t1, &target, right_port).is_ok());
+    }
+
+    /// Only the all-zero timestamp marks "unsynchronized" — zero seconds
+    /// with a nonzero fraction is a real (era-boundary) instant and must
+    /// not trip the zero check.
+    #[test]
+    fn reply_validation_zero_check_requires_all_zero_bits() {
+        let t1 = SystemTime::now();
+        let tx = ntp_timestamp(t1);
+        let target = UdpTarget::named("ntp.test", 123);
+        let from: SocketAddr = "0.0.0.0:123".parse().unwrap();
+
+        let mut half = [0u8; 8];
+        half[4..8].copy_from_slice(&0x8000_0000u32.to_be_bytes());
+        let reply = reply_with(&tx, half, half);
+        let e = validate_reply(&reply, &tx, t1, t1, &target, from).unwrap_err();
+        assert!(
+            !e.contains("zero timestamp"),
+            "sec=0/frac≠0 must not be the zero rejection: {e}"
+        );
+
+        let reply = reply_with(&tx, [0; 8], [0; 8]);
+        assert!(validate_reply(&reply, &tx, t1, t1, &target, from)
+            .unwrap_err()
+            .contains("zero timestamp"));
+    }
+
+    /// `DirectDialer` canonicalizes `[::ffff:127.0.0.1]` to `127.0.0.1`
+    /// before connecting — the socket reports the plain v4 source, and
+    /// the peer check must fold both sides the same way.
+    #[test]
+    fn reply_validation_accepts_canonical_peer_equivalent() {
+        let t1 = SystemTime::now();
+        let tx = ntp_timestamp(t1);
+        let ts = ntp_timestamp(t1);
+        let reply = reply_with(&tx, ts, ts);
+        let target = UdpTarget::Addr("[::ffff:127.0.0.1]:123".parse().unwrap());
+        let from: SocketAddr = "127.0.0.1:123".parse().unwrap();
+        assert!(
+            validate_reply(&reply, &tx, t1, t1, &target, from).is_ok(),
+            "v4-mapped target vs plain v4 reply source must compare canonically"
+        );
+    }
+
     /// Era unfold: a seconds value near `now` lands in the same era.
     #[test]
     fn era_unfold_picks_nearest() {
@@ -565,6 +674,40 @@ mod tests {
         meow_common::protocol_now()
             .duration_since(SystemTime::now())
             .map_or_else(|e| -(e.duration().as_secs() as i64), |d| d.as_secs() as i64)
+    }
+
+    /// `dialer-proxy: DIRECT` and an omitted key resolve to the same
+    /// effective config — reconcile sees no diff and keeps the running
+    /// worker generation (issue #974 normalization).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_treats_direct_spelling_as_omitted() {
+        let _gate = offset_gate();
+        let sup = supervisor();
+        let explicit = meow_config::resolve_ntp(
+            &meow_config::parse_raw_yaml(
+                "ntp:\n  enable: true\n  server: 127.0.0.1\n  port: 9\n  interval: 525600\n  dialer-proxy: DIRECT\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let omitted = meow_config::resolve_ntp(
+            &meow_config::parse_raw_yaml(
+                "ntp:\n  enable: true\n  server: 127.0.0.1\n  port: 9\n  interval: 525600\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(explicit, omitted);
+        sup.reconcile(explicit);
+        let gen = sup.generation.load(Ordering::Acquire);
+        sup.reconcile(omitted);
+        assert_eq!(
+            sup.generation.load(Ordering::Acquire),
+            gen,
+            "an equal effective config must not bump the worker generation"
+        );
+        drop(_gate);
+        sup.shutdown().await;
     }
 
     /// Reconcile clears the published offset on ANY config change — not
