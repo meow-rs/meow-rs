@@ -121,7 +121,16 @@ impl OutboundTcpKeepalive {
     /// an unsupported sub-option or a failed `setsockopt` degrades to
     /// "different keepalive timing" and logs at debug — a lost keepalive
     /// must never break connectivity.
-    #[cfg(any(unix, windows))]
+    ///
+    /// Gated to the targets `Cargo.toml` gives the socket2 dep
+    /// (Android/Linux/macOS/Windows) — iOS/tvOS and the BSDs take the
+    /// stub below rather than fail to resolve `socket2`.
+    #[cfg(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    ))]
     pub fn apply(&self, stream: &tokio::net::TcpStream) {
         let sock = socket2::SockRef::from(stream);
         if let Err(e) = sock.set_keepalive(self.enabled) {
@@ -173,9 +182,14 @@ impl OutboundTcpKeepalive {
         }
     }
 
-    /// Non-unix/windows stub: exotic targets degrade to no keepalive
+    /// No-socket2 stub: the remaining targets degrade to no keepalive
     /// setsockopts — the relay idle timeout still bounds the connection.
-    #[cfg(not(any(unix, windows)))]
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "windows"
+    )))]
     pub fn apply(&self, _stream: &tokio::net::TcpStream) {}
 }
 

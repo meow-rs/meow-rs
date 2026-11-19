@@ -88,6 +88,10 @@ struct Owner {
     iface: Arc<str>,
     /// OS interface index, resolved when the owner installed. What the
     /// index-keyed platforms bind to; Linux binds by name.
+    #[cfg_attr(
+        not(any(target_os = "linux", target_os = "macos", target_os = "windows")),
+        allow(dead_code, reason = "read only by the linux/macos/windows bind paths")
+    )]
     index: u32,
     /// Its configuration runs ([`OutboundIfaceGuard::commit`]).
     committed: bool,

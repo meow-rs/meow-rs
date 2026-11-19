@@ -1504,6 +1504,12 @@ pub fn canonical_socket_addr(mut addr: SocketAddr) -> SocketAddr {
 /// Linux) overflows whenever a reader falls a few milliseconds behind a
 /// fast download, and each dropped datagram is a loss the sender must
 /// detect and resend.
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+))]
 const UDP_RECV_BUFFER_BYTES: usize = 7 << 20;
 
 /// Grow a UDP socket's receive buffer, best effort — for QUIC endpoint
@@ -1516,6 +1522,16 @@ const UDP_RECV_BUFFER_BYTES: usize = 7 << 20;
 /// request halves until one is taken. The send buffer keeps the OS
 /// default: the driver does not pace, and a full send buffer is what holds
 /// its bursts back from the interface queue.
+///
+/// Gated to the targets `Cargo.toml` gives the socket2 dep
+/// (Android/Linux/macOS/Windows) — iOS/tvOS and the BSDs keep the OS
+/// default buffer via the stub below.
+#[cfg(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+))]
 pub fn enlarge_udp_recv_buffer(socket: &UdpSocket) {
     let sock = socket2::SockRef::from(socket);
     let mut size = UDP_RECV_BUFFER_BYTES;
@@ -1532,6 +1548,16 @@ pub fn enlarge_udp_recv_buffer(socket: &UdpSocket) {
     }
     tracing::debug!(size = ?sock.recv_buffer_size(), "udp socket receive buffer");
 }
+
+/// No-socket2 stub for the remaining targets — the enlargement is
+/// best-effort headroom, never correctness.
+#[cfg(not(any(
+    target_os = "android",
+    target_os = "linux",
+    target_os = "macos",
+    target_os = "windows"
+)))]
+pub fn enlarge_udp_recv_buffer(_socket: &UdpSocket) {}
 
 /// `SO_RCVBUFFORCE` needs `CAP_NET_ADMIN`, so it fails harmlessly (EPERM)
 /// for an unprivileged meow.
