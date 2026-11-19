@@ -38,8 +38,6 @@ const UNSUPPORTED_KEYS: &[(&str, Option<u32>, &str)] = &[
         Some(974),
         "named pipe API not implemented",
     ),
-    ("lan-allowed-ips", None, "ACL not in proxy kernel scope"),
-    ("lan-disallowed-ips", None, "ACL not in proxy kernel scope"),
     ("tunnels", Some(974), "inbound tunnels not implemented"),
     ("udp-over-tcp", None, "UDP-over-TCP not implemented"),
     ("udp-over-tcp-version", None, "UDP-over-TCP not implemented"),

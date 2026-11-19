@@ -4453,6 +4453,18 @@ async fn put_configs(
         }
     }
 
+    // `lan-allowed-ips`/`lan-disallowed-ips` are hard admission errors even
+    // under `force`: persisting a malformed list or a `listeners:`-nested
+    // key would leave the next boot's guarded accept loops enforcing a
+    // policy different from what the operator wrote — or none at all. The
+    // ACL is a startup snapshot; this only gates persistence.
+    if let Err(e) = meow_config::resolve_lan_acl(&raw_config) {
+        return reload_rejected(
+            StatusCode::BAD_REQUEST,
+            &format!("lan ACL config error: {e}"),
+        );
+    }
+
     // Same contract for `listeners:` — an entry the startup parser rejects
     // (bad type, duplicate port, `udp: true` + managed firewall, IPv6 UDP
     // bind, …) must not be committed into `raw_config`: the next

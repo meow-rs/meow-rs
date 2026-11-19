@@ -73,6 +73,49 @@ where
     deserializer.deserialize_any(StringOrSeq)
 }
 
+/// `lan-allowed-ips`/`lan-disallowed-ips`: a list of CIDR strings, and
+/// nothing else. Absence (`#[serde(default)]` → `None`) is the
+/// allow-all/empty-deny default; explicit `null` or a non-list value is
+/// a hard parse error — silently mapping a malformed allow policy to
+/// the allow-all default would widen the ACL beyond what the operator
+/// wrote, while `Some([])` must stay distinguishable ("admit nobody").
+fn deserialize_lan_acl<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct LanAclList;
+
+    impl<'de> Visitor<'de> for LanAclList {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a list of CIDR strings")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "lan-*-ips must be a list of CIDRs, not null; remove the key or supply []",
+            ))
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            self.visit_none()
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            d: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            Vec::<String>::deserialize(d).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(LanAclList)
+}
+
 /// `expected-status` accepts either a bare integer (`204`) or a string
 /// (`"204"`, `"200-299"`, `"200,204"`). The docs and upstream mihomo both
 /// allow the unquoted integer form; normalize it to the string form the
@@ -509,6 +552,26 @@ pub struct RawConfig {
     pub listeners: Option<Vec<RawListener>>,
     pub authentication: Option<Vec<String>>,
     pub skip_auth_prefixes: Option<Vec<String>>,
+    /// mihomo's top-level `lan-allowed-ips`: CIDRs the mixed/HTTP/SOCKS
+    /// TCP accept loops admit remote addresses from. `None` = omitted →
+    /// the allow-all default; `Some([])` admits nobody. Explicit `null`
+    /// or a non-list value is a parse error — see [`deserialize_lan_acl`].
+    /// `skip_serializing_if` keeps a PUT-saved document free of
+    /// `lan-allowed-ips: null`, which would not re-parse.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lan_acl",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lan_allowed_ips: Option<Vec<String>>,
+    /// mihomo's top-level `lan-disallowed-ips`: deny CIDRs checked before
+    /// the allow list. Same presence/null contract as `lan_allowed_ips`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lan_acl",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lan_disallowed_ips: Option<Vec<String>>,
     pub geodata: Option<RawGeoDataConfig>,
     /// Top-level `geox-url:` — mihomo's flat download-URL alias. Merged
     /// into [`GeoDataConfig`](crate::GeoDataConfig) by

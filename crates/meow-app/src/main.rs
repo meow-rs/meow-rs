@@ -1732,6 +1732,7 @@ async fn run(
                     let listener = MixedListener::new(tunnel.clone(), bound, nl.name.clone())
                         .with_sniffer(Arc::clone(&sniffer_runtime))
                         .with_auth(Arc::clone(&auth))
+                        .with_lan_acl(Arc::clone(&config.listeners.lan_acl))
                         .with_max_connections(nl.max_connections)
                         .with_tcp_keepalive(config.listeners.tcp_keepalive);
                     tokio::spawn(async move {

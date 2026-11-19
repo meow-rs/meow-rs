@@ -1,7 +1,7 @@
 use crate::http_proxy;
 use crate::sniffer::SnifferRuntime;
 use crate::socks5;
-use meow_common::{AuthConfig, TcpKeepaliveConfig};
+use meow_common::{AuthConfig, LanAcl, TcpKeepaliveConfig};
 use meow_tunnel::Tunnel;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,6 +27,11 @@ pub struct MixedListener {
     /// Keepalive posture applied to every accepted socket (see
     /// [`crate::keepalive`]); `enabled: false` writes no sockopts.
     tcp_keepalive: TcpKeepaliveConfig,
+    /// `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound ACL
+    /// checked against the remote IP right after `accept` (upstream's
+    /// `ipfilter` gate). `None` = no ACL configured (e.g. tests that
+    /// build the listener directly).
+    lan_acl: Option<Arc<LanAcl>>,
 }
 
 impl MixedListener {
@@ -39,6 +44,7 @@ impl MixedListener {
             auth: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             tcp_keepalive: TcpKeepaliveConfig::default(),
+            lan_acl: None,
         }
     }
 
@@ -68,6 +74,15 @@ impl MixedListener {
         if !auth.credentials.is_empty() {
             self.auth = Some(auth);
         }
+        self
+    }
+
+    /// Install the shared LAN CIDR ACL (top-level
+    /// `lan-allowed-ips`/`lan-disallowed-ips`). Deliberately independent
+    /// of [`Self::with_auth`]: the check runs whether or not the global
+    /// credential store holds any credentials.
+    pub fn with_lan_acl(mut self, acl: Arc<LanAcl>) -> Self {
+        self.lan_acl = Some(acl);
         self
     }
 
@@ -154,6 +169,22 @@ impl MixedListener {
                     continue;
                 }
             };
+
+            // `lan-allowed-ips`/`lan-disallowed-ips` (upstream
+            // `IsRemoteAddrDisAllowed`): the ACL runs inside the accept
+            // loop — before keepalive, sniffing, auth, protocol peek and
+            // the spawn — and only against the real remote IP. A denied
+            // peer gets no protocol response; the socket and permit drop
+            // with the iteration.
+            if let Some(acl) = &self.lan_acl {
+                if !acl.allows(src_addr.ip()) {
+                    debug!(
+                        "Mixed listener '{}' dropped {src_addr}: outside lan-allowed-ips",
+                        self.name
+                    );
+                    continue;
+                }
+            }
 
             // Earliest point in the accepted socket's life: keepalive must
             // be set before protocol peek/handshake/relay so a dead peer is

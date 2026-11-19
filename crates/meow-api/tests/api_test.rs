@@ -8051,6 +8051,112 @@ async fn put_configs_invalid_listeners_rejected_before_commit() {
     );
 }
 
+/// `lan-allowed-ips`/`lan-disallowed-ips` are hard admission errors even
+/// under `?force=true`: a malformed CIDR or a `listeners:`-nested key is
+/// a 400 that commits nothing, since persisting a broken access policy
+/// would leave the next boot's guarded listeners enforcing the wrong
+/// (or no) ACL. A valid PUT commits the raw fields for the next boot
+/// without hot-applying anything.
+#[tokio::test]
+async fn put_configs_lan_acl_rejected_before_commit() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    for (yaml, force) in [
+        ("lan-allowed-ips: [10.0.0.1]\n", ""),     // bare IP, not a CIDR
+        ("lan-allowed-ips: [10.0.0.1]\n", "?force=true"),
+        ("lan-disallowed-ips: bogus\n", "?force=true"),
+        (
+            concat!(
+                "lan-allowed-ips: [10.0.0.0/8]\n",
+                "listeners:\n",
+                "  - name: lan\n",
+                "    type: http\n",
+                "    port: 8081\n",
+                "    lan-disallowed-ips: [10.9.0.0/16]\n", // misplaced
+            ),
+            "?force=true",
+        ),
+    ] {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/configs{force}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{yaml} (force={force}) must be rejected"
+        );
+        assert!(
+            state.raw_config.read().lan_allowed_ips.is_none(),
+            "the rejected ACL must not have been committed"
+        );
+    }
+
+    // A valid ACL commits verbatim — for the next boot only; nothing
+    // about the running listeners changes.
+    let yaml = "lan-allowed-ips: [10.0.0.0/8, fd00::/8]\nlan-disallowed-ips: [10.9.0.0/16]\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let raw = state.raw_config.read();
+    assert_eq!(
+        raw.lan_allowed_ips.as_deref(),
+        Some(&["10.0.0.0/8".to_string(), "fd00::/8".to_string()][..])
+    );
+    assert_eq!(
+        raw.lan_disallowed_ips.as_deref(),
+        Some(&["10.9.0.0/16".to_string()][..])
+    );
+    drop(raw);
+
+    // PATCH is not an ACL surface (the ACL is a startup snapshot): the
+    // keys are simply not modeled by the patch schema, so this is a
+    // no-op that leaves the committed document alone.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"lan-allowed-ips": ["1.2.3.0/24"]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let raw = state.raw_config.read();
+    assert_eq!(
+        raw.lan_allowed_ips.as_deref(),
+        Some(&["10.0.0.0/8".to_string(), "fd00::/8".to_string()][..]),
+        "PATCH must not touch the committed ACL"
+    );
+}
+
 /// mihomo spells the named SOCKS inbound `type: socks` — a full PUT must
 /// admit it through the same `resolve_named_listeners` gate, store the
 /// spelling verbatim, and not rebind anything (listeners stay a startup

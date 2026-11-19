@@ -19,6 +19,7 @@ pub const MAX_DURATION_SECS: u64 = 10 * 365 * 24 * 60 * 60;
 /// (Go's zero `time.Time`) — see the compat doc.
 pub const EPOCH_RFC3339: &str = "1970-01-01T00:00:00Z";
 
+pub mod acl;
 pub mod adapter;
 pub mod adapter_type;
 pub mod atomic;
@@ -52,6 +53,7 @@ pub mod tunnel_mode;
 #[doc(hidden)]
 pub mod yaml;
 
+pub use acl::LanAcl;
 pub use adapter::{
     reset_sessions_reachable, DelayHistory, GroupDisplay, NodeDialerOpts, ProviderSlot, Proxy,
     ProxyAdapter, ProxyHealth, ProxySelection, ProxyState,

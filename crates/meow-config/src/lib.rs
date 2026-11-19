@@ -874,6 +874,12 @@ pub struct ListenerConfig {
     /// [`meow_common::TcpKeepaliveConfig`]). Engine-wide: per-listener
     /// overrides are deliberately not offered.
     pub tcp_keepalive: meow_common::TcpKeepaliveConfig,
+    /// `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound TCP
+    /// ACL the mixed/HTTP/SOCKS accept loops check the remote IP against
+    /// (upstream's `ipfilter` gate). A startup snapshot, deliberately
+    /// not hot-applied by `PATCH`/`PUT` — same lifecycle as the
+    /// listener auth store it guards alongside.
+    pub lan_acl: std::sync::Arc<meow_common::LanAcl>,
     /// All active listeners (shorthand + named), deduplicated and validated.
     pub named: Vec<NamedListener>,
 }
@@ -5329,6 +5335,80 @@ pub fn resolve_tcp_keepalive(
     Ok(config)
 }
 
+/// `lan-allowed-ips`/`lan-disallowed-ips` nested under a `listeners:`
+/// entry would land in its `extra` map and silently do nothing — an
+/// access guard that never engages is worse than none, so misplacement
+/// is a hard error pointing at the top level. Shared by
+/// `build_named_listeners` (boot/`-t`/`PUT`) and [`resolve_lan_acl`]
+/// (which `PUT /configs` additionally gates on under `force`).
+fn check_listener_acl_placement(l: &raw::RawListener) -> Result<(), anyhow::Error> {
+    for key in ["lan-allowed-ips", "lan-disallowed-ips"] {
+        if l.extra.contains_key(key) {
+            anyhow::bail!(
+                "listeners[{}].{key}: the LAN ACL keys are top-level only — \
+                 move '{key}' to the config root",
+                l.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `<ip>/<prefix>` with host bits accepted and normalized — the
+/// `lan-*-ips` contract (mihomo's `netip.Prefix` takes host bits; bare
+/// IPs and malformed prefixes are rejected).
+fn parse_lan_cidr(s: &str) -> Result<ipnet::IpNet, anyhow::Error> {
+    let (addr, plen) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("'{s}' is not a CIDR (expected 'addr/prefix')"))?;
+    let addr: std::net::IpAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("'{s}': bad address ({e})"))?;
+    let plen: u8 = plen
+        .parse()
+        .map_err(|_| anyhow::anyhow!("'{s}': bad prefix length '{plen}'"))?;
+    ipnet::IpNet::new(addr, plen)
+        .map(|n| n.trunc())
+        .map_err(|e| anyhow::anyhow!("'{s}': {e}"))
+}
+
+/// Resolve `lan-allowed-ips`/`lan-disallowed-ips` into the shared
+/// immutable [`meow_common::LanAcl`] the mixed/HTTP/SOCKS TCP accept
+/// loops consult (mihomo's `adapter/inbound/ipfilter`): admit = at
+/// least one allow match AND no deny match. An omitted allow list
+/// defaults to `0.0.0.0/0` + `::/0`; explicit `[]` admits nobody on the
+/// gated path. The deny list defaults to empty. Errors name the key
+/// and the offending element index.
+///
+/// `PUT /configs` calls this for validation only — the ACL is a startup
+/// snapshot like `listeners:`, never hot-applied — so a committed
+/// document cannot carry a value the next boot's `build_config` would
+/// hard-error on.
+pub fn resolve_lan_acl(raw: &raw::RawConfig) -> Result<meow_common::LanAcl, anyhow::Error> {
+    for l in raw.listeners.iter().flatten() {
+        check_listener_acl_placement(l)?;
+    }
+    let parse_list = |key: &str,
+                      entries: Option<&[String]>|
+     -> Result<Vec<ipnet::IpNet>, anyhow::Error> {
+        entries
+            .unwrap_or(&[])
+            .iter()
+            .enumerate()
+            .map(|(i, s)| parse_lan_cidr(s).map_err(|e| anyhow::anyhow!("{key}[{i}]: {e}")))
+            .collect()
+    };
+    let allowed = match raw.lan_allowed_ips.as_deref() {
+        None => vec![
+            "0.0.0.0/0".parse().expect("static CIDR"),
+            "::/0".parse().expect("static CIDR"),
+        ],
+        Some(list) => parse_list("lan-allowed-ips", Some(list))?,
+    };
+    let denied = parse_list("lan-disallowed-ips", raw.lan_disallowed_ips.as_deref())?;
+    Ok(meow_common::LanAcl::new(allowed, denied))
+}
+
 /// Resolve `tcp-idle-timeout` into the whole-connection relay idle bound,
 /// enforcing `build_config`'s semantics: `0` disables the bound entirely,
 /// absent also disables it (preserving pre-894 behaviour — no idle bound
@@ -5501,6 +5581,10 @@ fn build_named_listeners(
         // `type: redir` lowers to a `TProxy` spec, which erases its origin —
         // the listen-default and warn-dedupe branches below still need it.
         let is_redir = raw_l.listener_type.eq_ignore_ascii_case("redir");
+        // `lan-*-ips` nested under a listener would land in `extra` as a
+        // silently-dead access guard — hard error before `warn_extra`
+        // can mislabel them unrecognized.
+        check_listener_acl_placement(raw_l)?;
         let spec = parse_listener_spec(raw_l, global_tproxy_sni, sniffer_declared)?;
         // `type: wireguard` entries already warned their extra keys inside
         // `build_wg_listener_spec` (peer extras too); on every other type the
@@ -5940,6 +6024,11 @@ async fn build_config_inner(
     // persistence on so a committed document cannot fail this boot path.
     let tcp_keepalive = resolve_tcp_keepalive(&raw)?;
 
+    // `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound TCP ACL.
+    // Startup-only like `listeners:` (upstream live-patches the prefix
+    // lists; meow deliberately matches its listener-auth lifecycle).
+    let lan_acl = Arc::new(resolve_lan_acl(&raw)?);
+
     let listeners = ListenerConfig {
         mixed_port: raw.mixed_port,
         socks_port: raw.socks_port,
@@ -5953,6 +6042,7 @@ async fn build_config_inner(
         // `FirewallGuard::setup`, which filters again defensively).
         routing_mark: raw.routing_mark.filter(|m| *m != 0),
         tcp_keepalive,
+        lan_acl,
         named: named_listeners,
     };
 
