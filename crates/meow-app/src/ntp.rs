@@ -25,6 +25,11 @@ const MAX_ATTEMPTS: usize = 3;
 /// Offsets beyond ±24 h are rejected before publishing — a wild sample
 /// must never bend protocol timestamps.
 const MAX_OFFSET_NS: i128 = 24 * 3600 * 1_000_000_000i128;
+/// Slack on the `t3 − t2 ≤ t4 − t1` bound. The server's processing
+/// interval physically sits inside the exchange's round trip, so this
+/// only covers timestamp quantization and coarse clocks — a gap beyond
+/// it is a clock jump on the wire, not processing.
+const SERVER_PROCESSING_SLACK_NS: i128 = 1_000_000_000;
 /// NTP's 1900 epoch offset from the Unix epoch.
 const NTP_UNIX_EPOCH_DIFF_SECS: i64 = 2_208_988_800;
 
@@ -351,6 +356,14 @@ fn validate_reply(
     if t3_ns < t2_ns {
         return Err("server timestamps out of order (t3 < t2)".into());
     }
+    // The request was in flight before t2 and the reply after t3, so the
+    // server's own processing interval cannot exceed the round trip it
+    // was measured inside — a larger gap is a clock jump or a replayed
+    // packet, and folding it into the offset publishes the jump at half
+    // magnitude (issue #974 review).
+    if t3_ns - t2_ns > t4_ns - t1_ns + SERVER_PROCESSING_SLACK_NS {
+        return Err("server processing gap exceeds the exchange RTT".into());
+    }
     let offset = ((t2_ns - t1_ns) + (t3_ns - t4_ns)) / 2;
     if offset.abs() > MAX_OFFSET_NS {
         return Err("offset beyond the ±24 h cap".into());
@@ -540,6 +553,39 @@ mod tests {
         let from: SocketAddr = "0.0.0.0:123".parse().unwrap();
         let e = validate_reply(&reply, &tx, t1, t1, &target, from).unwrap_err();
         assert!(e.contains("out of order"), "{e}");
+    }
+
+    /// The server's processing interval `t3 − t2` sits inside the
+    /// measured round trip — a gap beyond `RTT + slack` is a clock jump
+    /// on the wire, and publishing it would bend the offset by half the
+    /// jump (issue #974 review).
+    #[test]
+    fn reply_validation_rejects_processing_gap_beyond_rtt() {
+        let t1 = SystemTime::now();
+        let tx = ntp_timestamp(t1);
+        let target = UdpTarget::named("ntp.test", 123);
+        let from: SocketAddr = "0.0.0.0:123".parse().unwrap();
+
+        // Instant reply (RTT = 0) but the server claims 5 s of
+        // processing — impossible inside this exchange.
+        let reply = reply_with(
+            &tx,
+            ntp_timestamp(t1),
+            ntp_timestamp(t1 + Duration::from_secs(5)),
+        );
+        let e = validate_reply(&reply, &tx, t1, t1, &target, from).unwrap_err();
+        assert!(e.contains("RTT"), "{e}");
+
+        // The same 5 s gap is plausible inside a 10 s round trip.
+        let reply = reply_with(
+            &tx,
+            ntp_timestamp(t1),
+            ntp_timestamp(t1 + Duration::from_secs(5)),
+        );
+        assert!(
+            validate_reply(&reply, &tx, t1, t1 + Duration::from_secs(10), &target, from).is_ok(),
+            "a processing gap inside the measured RTT must pass"
+        );
     }
 
     /// Mode 5 (broadcast) is not an answer to a client request — only
