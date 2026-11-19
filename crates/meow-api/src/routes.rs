@@ -2250,6 +2250,9 @@ async fn commit_raw_candidate(
         TrackedTcp::Cancel,
     )
     .await;
+    // `swap` installs the keepalive posture only on a clean TUN
+    // transition; this lane committed the document either way.
+    install_committed_keepalive(state);
     if let Some(change) = change.into() {
         change.record();
     }
@@ -4234,17 +4237,11 @@ async fn swap_config_and_reconcile_tun(
         state
             .tunnel
             .set_process_lookup_mode(candidate.find_process_mode.unwrap_or_default());
-        // `keep-alive-*` outbound policy on the same lane: the accepted
-        // candidate's posture — omission resets to the 15 s/9-probe
-        // defaults; sockets already dialed keep the posture they were
-        // built with (issue #974). Candidates were validated before this
-        // point, so a failure here means a caller skipped its gate —
-        // log loudly and keep the live posture rather than silently
-        // installing a fallback.
-        match meow_config::resolve_outbound_tcp_keepalive(&candidate) {
-            Ok(ka) => meow_common::set_outbound_tcp_keepalive(ka),
-            Err(e) => warn!("outbound keepalive resolution failed at commit: {e}"),
-        }
+        // `keep-alive-*` deliberately does NOT install here: the TUN
+        // reconcile below is fallible, and a socket dialed in the
+        // failed-spawn window would retain a posture its PATCH then
+        // rolls back. It installs after `tun_result` instead — see the
+        // install site below (issue #974 review).
         // `profile.store-selected` commits EARLIER on this lane — at the
         // route-publish sites in `apply_raw_to_tunnel` / the PUT cold
         // path — so the epoch flip lands before the candidate's group
@@ -4429,6 +4426,16 @@ async fn swap_config_and_reconcile_tun(
         Ok(())
     };
 
+    // `keep-alive-*` installs only once the TUN transition succeeded: a
+    // PATCH treats `Err` as full rejection and restores the prior
+    // document + globals, so installing early would leave sockets dialed
+    // in the failed-spawn window holding a posture that was never
+    // committed (issue #974 review). Lanes that commit the document even
+    // on `Err` (PUT/fallback — `tun.enable` rolls back inside, the rest
+    // stands) re-assert the committed value at their call site.
+    if tun_result.is_ok() {
+        install_committed_keepalive(state);
+    }
     // `ntp:` reconciles last — after the route publish, DNS install,
     // dial globals, and the TUN transition (or its rollback) settle, so
     // the worker never dials a half-published commit (issue #974). The
@@ -4442,6 +4449,20 @@ async fn swap_config_and_reconcile_tun(
         }
     }
     tun_result
+}
+
+/// Install the *committed* document's `keep-alive-*` posture. Called by
+/// every `swap_config_and_reconcile_tun` lane at its own commit point —
+/// POST-swap on the lanes that keep the document even when the TUN
+/// reconcile failed — because `swap` itself only installs on a clean
+/// transition (issue #974 review). Candidates were validated before
+/// commit, so a failure here means a caller skipped its gate: log loudly
+/// and keep the live posture rather than silently installing a fallback.
+fn install_committed_keepalive(state: &AppState) {
+    match meow_config::resolve_outbound_tcp_keepalive(&state.raw_config.read()) {
+        Ok(ka) => meow_common::set_outbound_tcp_keepalive(ka),
+        Err(e) => warn!("outbound keepalive resolution failed at commit: {e}"),
+    }
 }
 
 /// Record a TUN listener that did not (re)start, at startup or on a config
@@ -4947,6 +4968,10 @@ async fn put_configs(
             TrackedTcp::Cancel,
         )
         .await;
+        // Same committed-document keepalive re-assert as the build path —
+        // the verbatim fallback gated any posture diff out, so this is a
+        // no-op unless a caller skipped its gate.
+        install_committed_keepalive(&state);
         logbook::event(
             logbook::kind::CONFIG_RELOAD,
             Level::Error,
@@ -5223,6 +5248,9 @@ async fn put_configs(
         TrackedTcp::AlreadyCancelled,
     )
     .await;
+    // `swap` installs the keepalive posture only on a clean TUN
+    // transition; the document committed either way.
+    install_committed_keepalive(&state);
     reloaded.record();
 
     StatusCode::NO_CONTENT.into_response()
