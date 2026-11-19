@@ -4788,6 +4788,55 @@ mod ntp_resolution {
         );
     }
 
+    /// `check_ntp_dialer_target_declared` — the forced verbatim-commit
+    /// fallback must prove the name can enter the built map: a declared
+    /// node/group whose `type:` the build dispatch cannot construct is
+    /// dropped by the lenient build, so name-only presence is not enough
+    /// (Codex review: same-name unbuildable node bypass).
+    #[test]
+    fn declared_dialer_target_requires_a_buildable_type() {
+        let check = |yaml: &str| {
+            let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+            let ntp = meow_config::resolve_ntp(&raw).unwrap();
+            meow_config::check_ntp_dialer_target_declared(&ntp, &raw)
+        };
+        // A declared node with a known `type:` passes.
+        assert!(
+            check("ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: socks5\n    server: s\n    port: 1\n").is_ok()
+        );
+        // A declared group with a known `type:` passes.
+        assert!(
+            check("ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [DIRECT]\n").is_ok()
+        );
+        // A same-name node with an unknown `type:` would be dropped by
+        // the lenient build — the raw declaration must not count.
+        let e = check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: not-a-protocol\n    server: s\n    port: 1\n",
+        )
+        .expect_err("an unbuildable same-name node must fail");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
+        // A node with no `type:` at all is dropped for the same reason.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    server: s\n    port: 1\n"
+        )
+        .is_err());
+        // Same hole on the group lane: an unknown group `type:` fails.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: not-a-group\n    proxies: [DIRECT]\n"
+        )
+        .is_err());
+        // A compiled-out spelling is not buildable by this build.
+        let feature_gated = check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: wireguard\n    server: s\n    port: 1\n",
+        );
+        assert_eq!(feature_gated.is_ok(), cfg!(feature = "wireguard"));
+        // DIRECT remains the always-valid spelling.
+        assert!(check("ntp:\n  enable: true\n  dialer-proxy: DIRECT\n").is_ok());
+    }
+
     /// Local shape/range gates precede the first candidate network work
     /// (issue #974): `ech-opts.enable` with no `config:` and no query
     /// source is a deterministic strict defect that never dials, yet an

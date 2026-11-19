@@ -5841,10 +5841,12 @@ pub(crate) fn check_ntp_dialer_target(
 /// The same `ntp.enable + dialer-proxy` gate where no built candidate
 /// exists — the forced verbatim-commit fallback (issue #974 review). The
 /// name must be one the candidate's own `proxies:`/`proxy-groups:`
-/// declare, or a transport built-in: only those can possibly enter its
-/// built map, so anything else would commit a document the next
-/// startup's built-map check hard-fails. `use:`-only provider names fail
-/// here the same way they fail there.
+/// declare with a `type:` this build's dispatch can construct, or a
+/// transport built-in: only those can possibly enter its built map, so
+/// anything else would commit a document the next startup's built-map
+/// check hard-fails — including a same-name node whose unknown `type:`
+/// the lenient build drops. `use:`-only provider names fail here the
+/// same way they fail there.
 pub fn check_ntp_dialer_target_declared(
     cfg: &NtpConfig,
     raw: &raw::RawConfig,
@@ -5853,13 +5855,49 @@ pub fn check_ntp_dialer_target_declared(
         // The transports the built map always carries are spelled out —
         // there is no map to consult here.
         matches!(name, "DIRECT" | "COMPATIBLE" | "GLOBAL")
-            || raw.proxy_groups.iter().flatten().any(|g| g.name == name)
             || raw
-                .proxies
+                .proxy_groups
                 .iter()
                 .flatten()
-                .any(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(name))
+                .any(|g| g.name == name && declared_group_type_buildable(&g.group_type))
+            || raw.proxies.iter().flatten().any(|p| {
+                p.get("name").and_then(serde_json::Value::as_str) == Some(name)
+                    && p.get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(declared_proxy_type_buildable)
+            })
     })
+}
+
+/// The `proxies:` node's `type:` spellings this build's dispatch arm can
+/// construct — the buildability floor
+/// [`check_ntp_dialer_target_declared`] can prove without building. A
+/// node whose `type` is missing or unknown is dropped by the lenient
+/// build, so a same-name `dialer-proxy` reference would otherwise commit
+/// a document the next boot's built-map check rejects.
+fn declared_proxy_type_buildable(proxy_type: &str) -> bool {
+    match proxy_type {
+        "http" | "socks5" | "direct" => true,
+        "trusttunnel" => cfg!(feature = "trusttunnel"),
+        "ss" => cfg!(feature = "ss"),
+        "trojan" => cfg!(feature = "trojan"),
+        "vless" => cfg!(feature = "vless"),
+        "anytls" => cfg!(feature = "anytls"),
+        "hysteria2" => cfg!(feature = "hysteria2"),
+        "vmess" => cfg!(feature = "vmess"),
+        "snell" => cfg!(feature = "snell"),
+        "wireguard" | "WireGuard" => cfg!(feature = "wireguard"),
+        _ => false,
+    }
+}
+
+/// The `proxy-groups:` `type:` spellings the group builder dispatches on
+/// — same buildability floor as [`declared_proxy_type_buildable`].
+fn declared_group_type_buildable(group_type: &str) -> bool {
+    matches!(
+        group_type,
+        "select" | "url-test" | "fallback" | "load-balance" | "relay"
+    )
 }
 
 fn check_ntp_dialer_target_impl(
