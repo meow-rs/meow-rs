@@ -2204,7 +2204,18 @@ async fn run(
 
     // Start the NTP worker now that routing, the resolver hook, and any
     // TUN binding are settled — its own dial may ride the tunnel.
-    ntp_supervisor.reconcile(config.ntp.clone());
+    // Reconcile from the COMMITTED document rather than the boot
+    // `config.ntp` snapshot: the API lane has been serving since before
+    // the TUN wait, and a PUT committed in that window already swapped
+    // `raw_config` and fired its own reconcile — firing the stale boot
+    // target now would resurrect a worker the operator just disabled
+    // (issue #974 review). A committed document always resolves (PUT
+    // admission gates `resolve_ntp`); on a defect leave the worker
+    // stopped and say so.
+    match meow_config::resolve_ntp(&raw_config.read()) {
+        Ok(ntp) => ntp_supervisor.reconcile(ntp),
+        Err(e) => warn!("startup ntp resolution failed; worker left stopped: {e}"),
+    }
 
     // Only now: a signal before `shutdown.wait()` installs its handler
     // kills the process, which must not read as an unclean exit.
