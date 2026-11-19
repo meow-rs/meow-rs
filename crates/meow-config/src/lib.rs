@@ -5875,6 +5875,10 @@ pub fn check_ntp_dialer_target_declared(
 /// node whose `type` is missing or unknown is dropped by the lenient
 /// build, so a same-name `dialer-proxy` reference would otherwise commit
 /// a document the next boot's built-map check rejects.
+#[allow(
+    clippy::match_like_matches_macro,
+    reason = "cfg!-gated arms can't fold into matches! patterns"
+)]
 fn declared_proxy_type_buildable(proxy_type: &str) -> bool {
     match proxy_type {
         "http" | "socks5" | "direct" => true,
