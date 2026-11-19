@@ -34,7 +34,17 @@ impl SelectorStore {
             &path,
             meow_common::fs_util::SCRATCH_STALE_AGE,
         );
-        let map = match std::fs::read(&path) {
+        Arc::new(Self {
+            map: Mutex::new(Self::load_map(&path)),
+            path,
+            write_lock: Mutex::new(()),
+            dirty: AtomicBool::new(false),
+        })
+    }
+
+    /// The file-read half of [`Self::open`], shared with [`Self::reload`].
+    fn load_map(path: &Path) -> HashMap<String, String> {
+        match std::fs::read(path) {
             Ok(bytes) => {
                 serde_json::from_slice::<HashMap<String, String>>(&bytes).unwrap_or_else(|e| {
                     warn!(path = %path.display(), error = %e,
@@ -48,13 +58,19 @@ impl SelectorStore {
                     "selector store: read failed, starting empty");
                 HashMap::new()
             }
-        };
-        Arc::new(Self {
-            path,
-            map: Mutex::new(map),
-            write_lock: Mutex::new(()),
-            dirty: AtomicBool::new(false),
-        })
+        }
+    }
+
+    /// Re-read the backing file into the map. Only used for a parked
+    /// `pending` store — its writers are epoch-fenced until the enable
+    /// commit, so the map is always a pure disk snapshot and replacing it
+    /// wholesale cannot lose state. The write lock keeps this serialized
+    /// with `set` the same way two writers are.
+    fn reload(&self) {
+        let map = Self::load_map(&self.path);
+        let _write = self.write_lock.lock();
+        *self.map.lock() = map;
+        self.dirty.store(false, Ordering::Relaxed);
     }
 
     pub fn get(&self, group: &str) -> Option<String> {
@@ -170,8 +186,9 @@ impl SelectorWriter {
 /// rejected candidate never installs (or sweeps siblings of) the live
 /// backing. `commit` adopts the pending store on the enable transition
 /// and drains it on every commit, so a rejected build's snapshot can
-/// never be restored by a later enable — each enabling build re-opens
-/// into `pending` first.
+/// never be restored by a later enable — each enabling build re-reads
+/// the file into `pending` first (the parked object is refreshed, never
+/// swapped — see `install_opened`).
 pub struct SelectionBacking {
     /// `None` disables persistence structurally (no backing file).
     path: Option<PathBuf>,
@@ -179,8 +196,11 @@ pub struct SelectionBacking {
     /// it stays open across a disable so re-enable reuses one store.
     store: Mutex<Option<Arc<SelectorStore>>>,
     /// The store an uncommitted enable-transition build opened —
-    /// candidate-scoped until `commit` adopts it. Lock order: `pending`
-    /// before `store` (never nested the other way).
+    /// candidate-scoped until `commit` adopts it. Once parked the object
+    /// is stable (later `prepare`s refresh its map, never replace it) so
+    /// a writer `attach` bound before a commit is always a writer on the
+    /// store that commit adopts (issue #974 review). Lock order:
+    /// `pending` before `store` (never nested the other way).
     pending: Mutex<Option<Arc<SelectorStore>>>,
     epoch: Arc<AtomicU64>,
     /// The last *committed* resolved flag — `attach` prices a not-yet-
@@ -238,6 +258,14 @@ impl SelectionBacking {
     }
 
     /// The slot choice behind both `prepare` variants — see [`Self::prepare`].
+    /// The `pending` arm never swaps the object an earlier build parked:
+    /// `attach` hands out writers bound to that store and `commit` adopts
+    /// this slot, so a cancelled/rejected build finishing its open
+    /// detached must not displace it — that would split one backing file
+    /// across two maps/locks (issue #974 review). The parked store is
+    /// instead refreshed from disk: its map is a pure snapshot (writers
+    /// stay fenced pre-commit), so reloading keeps the "each enabling
+    /// build re-reads the file" contract without moving object identity.
     fn install_opened(&self, store: Arc<SelectorStore>) {
         if self.enabled.load(Ordering::Acquire) {
             let mut guard = self.store.lock();
@@ -245,7 +273,11 @@ impl SelectionBacking {
                 *guard = Some(store);
             }
         } else {
-            *self.pending.lock() = Some(store);
+            let mut guard = self.pending.lock();
+            match guard.as_ref() {
+                Some(existing) => existing.reload(),
+                None => *guard = Some(store),
+            }
         }
     }
 
@@ -508,6 +540,41 @@ mod tests {
             Some("new")
         );
         assert!(backing.pending.lock().is_none(), "commit drains pending");
+    }
+
+    #[test]
+    fn detached_prepare_cannot_split_writer_from_adopted_store() {
+        // Issue #974 review: a cancelled PUT keeps its blocking rebuild
+        // running detached, and its late `prepare` used to overwrite the
+        // `pending` slot — `attach` already bound the winner's writers to
+        // the parked object while `commit` adopted the interloper, so the
+        // file ended up owned by two maps/locks and the live selections
+        // went to a store nobody held. The parked object must stay put;
+        // the late build only refreshes its snapshot.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sel.json");
+        let backing = SelectionBacking::new(Some(path));
+
+        // The winner parks its store and attaches a writer against it.
+        backing.prepare_sync(true);
+        let parked = backing.pending.lock().as_ref().map(Arc::clone).unwrap();
+        let writer = backing.attach(true).unwrap();
+
+        // A detached build's install lands before the winner's commit:
+        // it must refresh the parked store, not displace it.
+        backing.prepare_sync(true);
+        assert!(
+            Arc::ptr_eq(&parked, backing.pending.lock().as_ref().unwrap()),
+            "a late build must not swap the parked pending store"
+        );
+
+        backing.commit(true);
+        writer.set("g", "picked");
+        assert_eq!(
+            backing.store.lock().as_ref().unwrap().get("g").as_deref(),
+            Some("picked"),
+            "the writer and the adopted store must be the same object"
+        );
     }
 
     #[test]
