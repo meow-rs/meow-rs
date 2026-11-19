@@ -5832,14 +5832,47 @@ pub(crate) fn check_ntp_dialer_target(
     cfg: &NtpConfig,
     proxies: &HashMap<SmolStr, Arc<dyn meow_common::Proxy>>,
 ) -> Result<(), anyhow::Error> {
+    // DIRECT/COMPATIBLE dial directly and GLOBAL is a real group — the
+    // map carries all three; DIRECT is also spelled out for hand-built
+    // `NtpConfig`s that skipped `resolve_ntp`'s normalization.
+    check_ntp_dialer_target_impl(cfg, |name| name == "DIRECT" || proxies.contains_key(name))
+}
+
+/// The same `ntp.enable + dialer-proxy` gate where no built candidate
+/// exists — the forced verbatim-commit fallback (issue #974 review). The
+/// name must be one the candidate's own `proxies:`/`proxy-groups:`
+/// declare, or a transport built-in: only those can possibly enter its
+/// built map, so anything else would commit a document the next
+/// startup's built-map check hard-fails. `use:`-only provider names fail
+/// here the same way they fail there.
+pub fn check_ntp_dialer_target_declared(
+    cfg: &NtpConfig,
+    raw: &raw::RawConfig,
+) -> Result<(), anyhow::Error> {
+    check_ntp_dialer_target_impl(cfg, |name| {
+        // The transports the built map always carries are spelled out —
+        // there is no map to consult here.
+        matches!(name, "DIRECT" | "COMPATIBLE" | "GLOBAL")
+            || raw.proxy_groups.iter().flatten().any(|g| g.name == name)
+            || raw
+                .proxies
+                .iter()
+                .flatten()
+                .any(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(name))
+    })
+}
+
+fn check_ntp_dialer_target_impl(
+    cfg: &NtpConfig,
+    target_exists: impl Fn(&str) -> bool,
+) -> Result<(), anyhow::Error> {
     if !cfg.enable {
         return Ok(());
     }
     if let Some(name) = &cfg.dialer_proxy {
         // REJECT/REJECT-DROP/PASS/PASS-RULE sit in the built map but are
         // match-engine signals, not transports — they can never carry the
-        // exchange. DIRECT/COMPATIBLE dial directly and GLOBAL is a real
-        // group, so those stay valid targets (issue #974).
+        // exchange on either lane.
         anyhow::ensure!(
             !matches!(
                 name.as_str(),
@@ -5850,7 +5883,7 @@ pub(crate) fn check_ntp_dialer_target(
              or GLOBAL"
         );
         anyhow::ensure!(
-            name == "DIRECT" || proxies.contains_key(name.as_str()),
+            target_exists(name.as_str()),
             "ntp.dialer-proxy '{name}': no such top-level proxy or group — \
              name a built proxy/group or DIRECT (provider-member and \
              built-in non-dialer names are not valid targets)"

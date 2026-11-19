@@ -4915,6 +4915,17 @@ async fn put_configs(
                      apply; fix the defect and retry",
                 );
             }
+            // An unchanged `ntp:` block escapes the diff gate even when
+            // the candidate deleted the dialer target itself — committing
+            // it verbatim would persist a reference the next startup's
+            // built-map check hard-fails. With no built candidate the
+            // name can only be proven against the candidate's own
+            // declared proxies/groups (issue #974 review).
+            if let Ok(ntp) = meow_config::resolve_ntp(&raw_config) {
+                if let Err(e) = meow_config::check_ntp_dialer_target_declared(&ntp, &raw_config) {
+                    return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+                }
+            }
         }
         let prior_resolver = state.tunnel.resolver();
         // No `reload_routing` ran, so tracked TCP predating the binding

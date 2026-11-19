@@ -1957,6 +1957,119 @@ async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
     );
 }
 
+/// Issue #974 review: the forced verbatim-commit fallback compares
+/// effective `ntp:` values only — a candidate that keeps the committed
+/// `ntp:` block verbatim but deletes the named `dialer-proxy` target
+/// shows no ntp diff, and without the raw-level declared-name check it
+/// would commit a reference the next startup's built-map check
+/// hard-fails. A target the candidate still declares commits as before.
+#[tokio::test]
+async fn put_configs_force_fallback_rejects_dangling_ntp_target() {
+    use base64::Engine as _;
+    // Committed: ntp enabled through `front`, `front` itself declared.
+    let state = test_state(
+        meow_config::parse_raw_yaml(
+            "mode: rule\nntp:\n  enable: true\n  dialer-proxy: front\n\
+             proxies:\n  - {name: front, type: direct}\nrules:\n  - MATCH,front\n",
+        )
+        .unwrap(),
+    );
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs?force=true")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // Duplicate group names fail strict AND lenient — the unbuildable
+    // document the verbatim fallback would otherwise commit as written.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+
+    // `front` deleted, `ntp:` kept verbatim — the dangling reference must
+    // be refused rather than persisted for the next boot to trip over.
+    let resp = put(&format!(
+        "mode: rule\nntp:\n  enable: true\n  dialer-proxy: front\n\
+         {UNBUILDABLE}rules:\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a dangling ntp.dialer-proxy must not commit through the verbatim fallback"
+    );
+    {
+        let raw = state.raw_config.read();
+        assert!(
+            raw.proxies.as_deref().is_some_and(|proxies| proxies
+                .iter()
+                .any(|p| p.get("name").and_then(serde_json::Value::as_str) == Some("front"))),
+            "the rejected document must not replace the committed one"
+        );
+    }
+
+    // A non-transport built-in is refused on the same lane — committed
+    // below with the same `dialer-proxy` so the ntp diff gate stays
+    // silent and only the declared-name check can catch it.
+    {
+        let mut raw = state.raw_config.write();
+        raw.ntp = Some(meow_config::raw::RawNtp {
+            enable: Some(true),
+            dialer_proxy: Some("REJECT".into()),
+            ..Default::default()
+        });
+    }
+    let resp = put(&format!(
+        "mode: rule\nntp:\n  enable: true\n  dialer-proxy: REJECT\n\
+         {UNBUILDABLE}rules:\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a non-transport built-in must not dial ntp through the verbatim fallback"
+    );
+    assert_eq!(
+        state.raw_config.read().ntp.as_ref().unwrap().enable,
+        Some(true),
+        "the rejected document must not persist"
+    );
+
+    // `front` still declared in the candidate → the verbatim commit keeps
+    // working (the enabled ntp block resolves through the raw names).
+    {
+        let mut raw = state.raw_config.write();
+        raw.ntp = Some(meow_config::raw::RawNtp {
+            enable: Some(true),
+            dialer_proxy: Some("front".into()),
+            ..Default::default()
+        });
+    }
+    let resp = put(&format!(
+        "mode: rule\nntp:\n  enable: true\n  dialer-proxy: front\n\
+         proxies:\n  - {{name: front, type: direct}}\n\
+         {UNBUILDABLE}rules:\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a declared target keeps the verbatim commit"
+    );
+}
+
 /// Issue #974: the local shape/range gates precede the first candidate
 /// network work — `ech-opts.enable` with no `config:` and no query
 /// source is a deterministic strict defect that never dials, yet an
