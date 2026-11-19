@@ -3370,17 +3370,26 @@ fn parse_mux_options(
              own connection; consider the 4/4/4 defaults"
         );
     }
-    // Parsed but unsupported upstream fields: `statistic` (per-connection
-    // traffic attribution in mihomo's dialer) and `brutal-opts` (TCP Brutal,
-    // Linux-only upstream).  Warn once so operators know the divergence.
-    for unsupported in ["statistic", "brutal-opts"] {
-        if mux_cfg.get(unsupported).is_some() {
-            tracing::warn!(
-                proxy = %name,
-                "mux option '{}' is not supported in meow-rs and will be ignored",
-                unsupported
-            );
-        }
+    // `statistic` opts into mihomo's per-carrier traffic attribution, which
+    // meow does not model — the logical-flow APIs (`GET /connections`,
+    // `GET /traffic`, `GET /statistics`) already report the same totals.
+    // Validate the flag so a malformed value is a node defect like every
+    // other mux bool, but warn rather than fail when set: the node still
+    // works, just without carrier-level accounting.
+    if mux_bool_field(name, mux_cfg, "statistic", false)? {
+        tracing::warn!(
+            proxy = %name,
+            "mux option 'statistic' is not supported in meow-rs (carrier-level traffic \
+             accounting is not modeled); use GET /connections or GET /statistics for \
+             per-flow counters"
+        );
+    }
+    // `brutal-opts` (TCP Brutal, Linux-only upstream) stays warn-ignore.
+    if mux_cfg.get("brutal-opts").is_some() {
+        tracing::warn!(
+            proxy = %name,
+            "mux option 'brutal-opts' is not supported in meow-rs and will be ignored"
+        );
     }
     // Padding is a sing-mux session layer; Mux.Cool has none, so honouring
     // the flag is impossible and ignoring it would send the unpadded traffic

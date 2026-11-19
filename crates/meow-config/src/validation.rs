@@ -86,6 +86,24 @@ const MISPLACED_KEYS: &[(&str, &str)] = &[
         "the top-level config (use 'client-fingerprint' on a proxies: entry)",
     ),
     ("global-ua", "the top-level config"),
+    (
+        "statistic",
+        "a proxies: entry's smux: block (and is ignored there: \
+         carrier-level traffic accounting is not modeled)",
+    ),
+    (
+        "max-connections",
+        "the top-level config or a trusttunnel: node (a smux: block \
+         accepts it on trojan/vless/ss/vmess nodes)",
+    ),
+    (
+        "min-streams",
+        "a trusttunnel: node or a proxies: entry's smux: block",
+    ),
+    (
+        "max-streams",
+        "a trusttunnel: node or a proxies: entry's smux: block",
+    ),
 ];
 
 /// Frequent misspellings of a real mihomo key — the hint renders inline
