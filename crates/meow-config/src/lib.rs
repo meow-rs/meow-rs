@@ -123,6 +123,10 @@ pub struct Config {
     /// runtime rebuild lane shares this build's store and epoch
     /// (issue #974).
     pub selection: std::sync::Arc<meow_proxy::SelectionBacking>,
+    /// The resolved `ntp:` service configuration — the supervisor
+    /// reconciles workers against it; `PUT` diffs a new resolution on
+    /// this (issue #974).
+    pub ntp: NtpConfig,
     pub listeners: ListenerConfig,
     pub tun: TunConfig,
     pub api: ApiConfig,
@@ -3593,6 +3597,11 @@ fn rebuild_from_raw_impl(
     // default UA, the same effective value the static would give.
     let candidate_ua =
         validate_global_ua(raw.global_ua.as_deref())?.unwrap_or(meow_common::DEFAULT_USER_AGENT);
+    // `ntp:` shape/ranges resolve before any candidate network work —
+    // disabled included: `-t` and PUT reject an out-of-range endpoint
+    // regardless of `enable` (issue #974). The named-target reference is
+    // checked against the built map below.
+    let ntp_resolved = resolve_ntp(raw)?;
     dns_parser::validate_node_policy_sources(raw)?;
     // Warn-only unknown-key reporting (issue #974): classify-and-warn every
     // key the typed schema dropped. Runs on every rebuild pass — startup's
@@ -3656,6 +3665,11 @@ fn rebuild_from_raw_impl(
         registry,
         strict,
     )?;
+    // An enabled `ntp.dialer-proxy` must name a BUILT target — checked
+    // here so every publication lane (startup, `-t`, PUT, warm republish)
+    // enforces it the same way, and removing a target together with its
+    // reference in one document stays legal (issue #974).
+    check_ntp_dialer_target(&ntp_resolved, &proxies)?;
 
     // Publish the finished registry: the `dialer-proxy` chains bound during
     // the layer build resolve their front hop by name against it, and only
@@ -5722,6 +5736,101 @@ pub fn resolve_profile(raw: &raw::RawConfig) -> ResolvedProfile {
     }
 }
 
+/// The resolved `ntp:` service configuration (issue #974) — what
+/// `Config` carries, `GET /configs` reports, and the supervisor
+/// reconciles against. `write-to-system` never appears here: it is
+/// warn-and-ignore at admission, not a runtime knob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtpConfig {
+    pub enable: bool,
+    /// Host or IP literal (bracketed IPv6 unwrapped) — `time.apple.com`
+    /// by upstream default.
+    pub server: String,
+    pub port: u16,
+    /// Poll period — `interval` minutes, `1..=525600`, default 30.
+    pub interval_minutes: u32,
+    /// The named `dialer-proxy` target, `None` = direct dial. Admission
+    /// pins it to a built top-level proxy/group name or `DIRECT` when
+    /// enabled — see the check in `rebuild_from_raw_impl`.
+    pub dialer_proxy: Option<String>,
+}
+
+/// Resolve `ntp:` — ranges are checked even when disabled (`-t`
+/// rejects an out-of-range endpoint the same way a running load does).
+/// `server` must be a bare host or IP literal: bracketed IPv6 unwraps,
+/// a `host:port`/`scheme://` spelling fails; `port` and `interval`
+/// hold upstream-compatible bounds.
+pub fn resolve_ntp(raw: &raw::RawConfig) -> Result<NtpConfig, anyhow::Error> {
+    let ntp = raw.ntp.as_ref();
+    let server_raw = ntp
+        .and_then(|n| n.server.as_deref())
+        .unwrap_or("time.apple.com");
+    let server = {
+        let s = server_raw.trim();
+        anyhow::ensure!(!s.is_empty(), "ntp.server must not be empty");
+        // Bracketed IPv6 (`[::1]`) unwraps to the literal; a bare
+        // `host:port` or URI fails the IpAddr parse and the colon test.
+        let inner = s
+            .strip_prefix('[')
+            .and_then(|r| r.strip_suffix(']'))
+            .unwrap_or(s);
+        if inner.parse::<std::net::IpAddr>().is_err() {
+            anyhow::ensure!(
+                !inner.contains(':') && !inner.contains('/'),
+                "ntp.server '{server_raw}': expected a host or IP literal, not a host:port or URI"
+            );
+        }
+        inner.to_string()
+    };
+    let port = ntp.and_then(|n| n.port).unwrap_or(123);
+    anyhow::ensure!(port >= 1, "ntp.port {port}: expected 1..=65535");
+    let interval = ntp.and_then(|n| n.interval).unwrap_or(30);
+    anyhow::ensure!(
+        (1..=525_600).contains(&interval),
+        "ntp.interval {interval}: expected 1..=525600 minutes"
+    );
+    let interval_minutes = u32::try_from(interval)
+        .map_err(|_| anyhow::anyhow!("ntp.interval {interval} is out of range"))?;
+    let dialer_proxy = ntp
+        .and_then(|n| n.dialer_proxy.as_deref())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    Ok(NtpConfig {
+        enable: ntp.and_then(|n| n.enable).unwrap_or(false),
+        server,
+        port,
+        interval_minutes,
+        dialer_proxy,
+    })
+}
+
+/// The `ntp.enable + dialer-proxy` reference gate every prospective
+/// routing publication runs (issue #974): an enabled named target must
+/// resolve to a built top-level proxy/group or `DIRECT` — provider-only
+/// names and non-transport built-ins are not valid dialers. Runs against
+/// the BUILT map, not the raw names, so a group dropped by lenient
+/// parsing still fails and a `use:`-only name never slips through.
+/// Called on every `rebuild_from_raw_impl` — startup, `-t`, PUT and the
+/// subscription/geodata republish lanes all pass through it.
+pub(crate) fn check_ntp_dialer_target(
+    cfg: &NtpConfig,
+    proxies: &HashMap<SmolStr, Arc<dyn meow_common::Proxy>>,
+) -> Result<(), anyhow::Error> {
+    if !cfg.enable {
+        return Ok(());
+    }
+    if let Some(name) = &cfg.dialer_proxy {
+        anyhow::ensure!(
+            name == "DIRECT" || proxies.contains_key(name.as_str()),
+            "ntp.dialer-proxy '{name}': no such top-level proxy or group — \
+             name a built proxy/group or DIRECT (provider-member and \
+             built-in non-dialer names are not valid targets)"
+        );
+    }
+    Ok(())
+}
+
 /// Resolve `keep-alive-idle`/`keep-alive-interval`/`disable-keep-alive`
 /// — mihomo's keepalive knobs, scoped here to *outbound* dials (the
 /// inbound side stays with `tcp-keepalive*` / [`resolve_tcp_keepalive`],
@@ -6529,6 +6638,10 @@ async fn build_config_inner(
             .map(|d| d.join("selector-cache.json")),
     ));
     let resolved_profile = resolve_profile(&raw);
+    // `ntp:` resolves at admission even when disabled — `-t` and PUT
+    // reject out-of-range endpoints up front; the resolved config rides
+    // `Config` out to the supervisor and `GET /configs` (issue #974).
+    let ntp_resolved_for_config = resolve_ntp(&raw)?;
     if !is_offline_validate() {
         selection_backing
             .prepare(resolved_profile.store_selected)
@@ -6770,6 +6883,7 @@ async fn build_config_inner(
         dropped_providers,
         dialer_registry,
         selection: selection_backing,
+        ntp: ntp_resolved_for_config,
         listeners,
         tun,
         api,

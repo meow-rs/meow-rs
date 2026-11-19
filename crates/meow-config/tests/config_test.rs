@@ -3830,17 +3830,11 @@ mod unknown_key_warns {
         let (_config, logs) = load_and_capture_warns(
             r#"
 brutal-delay: 1
-ntp:
-  enable: true
 tcp-idl-timeout: 5
 "#,
         );
         assert!(
             logs.contains("unsupported key in top-level config: brutal-delay"),
-            "got: {logs}"
-        );
-        assert!(
-            logs.contains("unsupported key in top-level config: ntp (issue #974)"),
             "got: {logs}"
         );
         assert!(
@@ -4605,4 +4599,78 @@ fn test_resolve_profile_matrix() {
     let profile = raw.profile.as_ref().unwrap();
     assert!(profile.extra.contains_key("selected"));
     assert!(profile.extra.contains_key("tracing"));
+}
+
+/// `resolve_ntp` — upstream defaults, the disabled-section range
+/// checks, server-shape rules, and `write-to-system` compatibility
+/// (issue #974).
+mod ntp_resolution {
+
+    fn resolve(yaml: &str) -> Result<meow_config::NtpConfig, anyhow::Error> {
+        let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+        meow_config::resolve_ntp(&raw)
+    }
+
+    #[test]
+    fn defaults_apply_when_absent_or_partial() {
+        let c = resolve("{}").unwrap();
+        assert!(!c.enable);
+        assert_eq!(c.server, "time.apple.com");
+        assert_eq!(c.port, 123);
+        assert_eq!(c.interval_minutes, 30);
+        assert_eq!(c.dialer_proxy, None);
+
+        let c = resolve("ntp:\n  enable: true\n").unwrap();
+        assert!(c.enable);
+        assert_eq!(c.server, "time.apple.com");
+        assert_eq!(c.port, 123);
+        assert_eq!(c.interval_minutes, 30);
+    }
+
+    #[test]
+    fn explicit_values_and_direct_spelling() {
+        let c = resolve(
+            "ntp:\n  enable: true\n  server: pool.ntp.org\n  port: 1123\n  interval: 60\n  dialer-proxy: DIRECT\n",
+        )
+        .unwrap();
+        assert_eq!(c.server, "pool.ntp.org");
+        assert_eq!(c.port, 1123);
+        assert_eq!(c.interval_minutes, 60);
+        assert_eq!(c.dialer_proxy.as_deref(), Some("DIRECT"));
+    }
+
+    #[test]
+    fn server_shape_accepts_hosts_and_literals_rejects_compound() {
+        for good in ["1.2.3.4", "time.apple.com", "[2001:db8::1]", "2001:db8::1"] {
+            let y = format!("ntp:\n  server: '{good}'\n");
+            let c = resolve(&y).unwrap_or_else(|e| panic!("{good}: {e}"));
+            assert_eq!(c.server, good.trim_matches(|x| x == '[' || x == ']'));
+        }
+        for bad in [
+            "",
+            "host:123",
+            "udp://host",
+            "host/path",
+            "ntp://pool.ntp.org:123",
+        ] {
+            let y = format!("ntp:\n  server: '{bad}'\n");
+            assert!(resolve(&y).is_err(), "{bad} must fail");
+        }
+    }
+
+    #[test]
+    fn ranges_checked_even_when_disabled() {
+        assert!(resolve("ntp:\n  enable: false\n  port: 0\n").is_err());
+        assert!(resolve("ntp:\n  enable: false\n  interval: 0\n").is_err());
+        assert!(resolve("ntp:\n  enable: false\n  interval: 525601\n").is_err());
+        assert!(resolve("ntp:\n  enable: false\n  interval: 525600\n").is_ok());
+        assert!(resolve("ntp:\n  interval: 1\n").is_ok());
+    }
+
+    #[test]
+    fn write_to_system_resolves_but_stays_out_of_the_config() {
+        // The raw field parses; the resolved config has no such knob.
+        let c = resolve("ntp:\n  enable: true\n  write-to-system: true\n").unwrap();
+        assert!(c.enable);
+    }
 }

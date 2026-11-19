@@ -66,6 +66,11 @@ pub struct TrafficFeed {
     sender: std::sync::Mutex<Option<broadcast::Sender<Arc<str>>>>,
 }
 
+/// The commit lane's handle into the daemon's NTP supervisor: called
+/// with each accepted document's resolved [`meow_config::NtpConfig`]
+/// (issue #974).
+pub type NtpReconcile = Arc<dyn Fn(meow_config::NtpConfig) + Send + Sync>;
+
 pub struct AppState {
     pub tunnel: Tunnel,
     /// Optional Bearer token enforced by `require_auth`. `None` or empty disables auth.
@@ -76,6 +81,10 @@ pub struct AppState {
     pub raw_config: Arc<RwLock<RawConfig>>,
     /// Fan-out channel for log events. Each WS client subscribes a Receiver.
     pub log_tx: broadcast::Sender<LogMessage>,
+    /// The NTP supervisor's reconcile handle — the commit lane feeds it
+    /// each accepted document's resolved service config; `None` for
+    /// embedders/tests without a supervisor (issue #974).
+    pub ntp_reconcile: Option<NtpReconcile>,
     /// Live proxy-provider registry — refreshed by background task and PUT endpoint.
     pub proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
     /// The cell provider-sourced `dialer-proxy` targets resolve against.
@@ -923,6 +932,38 @@ async fn close_connection(
     }
 }
 
+/// The `ntp:` section as `GET /configs` reports it — the resolved
+/// service configuration (`enable`/`server`/`port`/`interval`/
+/// `dialer-proxy`), with `write-to-system` always `false`: the knob is
+/// parsed for compatibility but meow never writes the OS clock
+/// (issue #974). The offset reaches only the protocol clock — there is
+/// no "synced" claim.
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+struct NtpFields {
+    enable: bool,
+    server: String,
+    port: u16,
+    /// `interval` in minutes, as the config spells it.
+    interval: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dialer_proxy: Option<String>,
+    write_to_system: bool,
+}
+
+impl From<meow_config::NtpConfig> for NtpFields {
+    fn from(cfg: meow_config::NtpConfig) -> Self {
+        Self {
+            enable: cfg.enable,
+            server: cfg.server,
+            port: cfg.port,
+            interval: cfg.interval_minutes,
+            dialer_proxy: cfg.dialer_proxy,
+            write_to_system: false,
+        }
+    }
+}
+
 #[derive(Serialize)]
 struct ConfigResponse {
     mode: String,
@@ -1009,6 +1050,8 @@ struct ConfigResponse {
     /// `tun.enable` rather than `tun-enable`: `enable` is the running
     /// state, the other keys echo the committed section.
     tun: TunFields,
+    /// The resolved `ntp:` section (issue #974).
+    ntp: NtpFields,
 }
 
 async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse> {
@@ -1087,6 +1130,19 @@ async fn get_configs(State(state): State<Arc<AppState>>) -> Json<ConfigResponse>
         store_fake_ip: meow_config::resolve_profile(&raw).store_fake_ip,
         tun_enable: tun_running,
         tun: TunFields::reported(raw.tun.as_ref(), tun_running),
+        // The committed document always resolves — it passed admission;
+        // the fallback keeps a hand-rolled test raw from failing the GET.
+        ntp: meow_config::resolve_ntp(&raw).map_or(
+            NtpFields {
+                enable: false,
+                server: "time.apple.com".to_string(),
+                port: 123,
+                interval: 30,
+                dialer_proxy: None,
+                write_to_system: false,
+            },
+            NtpFields::from,
+        ),
     })
 }
 
@@ -4182,6 +4238,17 @@ async fn swap_config_and_reconcile_tun(
             .tunnel
             .selection_backing()
             .commit(meow_config::resolve_profile(&candidate).store_selected);
+        // `ntp:` on the same lane: the supervisor sees every committed
+        // document's resolved service config and restarts only on a real
+        // change; a disabled/unchanged section never re-schedules
+        // (issue #974). The candidate already resolved inside the
+        // rebuild — an error here means a caller skipped its gate.
+        if let Some(reconcile) = &state.ntp_reconcile {
+            match meow_config::resolve_ntp(&candidate) {
+                Ok(cfg) => reconcile(cfg),
+                Err(e) => warn!("ntp resolution failed at commit: {e}"),
+            }
+        }
         let ledger = candidate.traffic_ledger.as_ref();
         let ledger = (
             meow_config::raw::RawTrafficLedger::enabled(ledger),
@@ -4659,6 +4726,17 @@ async fn put_configs(
     // `disable-keep-alive` (negative values already failed raw parse).
     if let Err(e) = meow_config::resolve_outbound_tcp_keepalive(&raw_config) {
         return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+    }
+
+    // `ntp:` semantic admission on the same unbypassable footing
+    // (issue #974): ranges and server shape are validated even when the
+    // section is disabled, and the supervisor is reconciled at commit,
+    // so a candidate that cannot resolve must never persist. The named
+    // `dialer-proxy` target additionally resolves against the built
+    // candidate inside `rebuild_from_raw_impl` — under the verbatim
+    // fallback below the change-gate refuses an `ntp:` diff instead.
+    if let Err(e) = meow_config::resolve_ntp(&raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &format!("ntp config error: {e}"));
     }
 
     // Same admission contract for `global-ua`: it is validated inside
@@ -6554,6 +6632,7 @@ mod outbound_flush_tests {
             log_tx: broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
+            ntp_reconcile: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),
@@ -6699,6 +6778,7 @@ mod global_route_binding_tests {
             log_tx: broadcast::channel(16).0,
             proxy_providers: Arc::new(DashMap::new()),
             provider_dialer_registry: Default::default(),
+            ntp_reconcile: None,
             rule_providers: Arc::new(RwLock::new(HashMap::new())),
             rule_provider_refresh: Default::default(),
             proxy_provider_refresh: Default::default(),

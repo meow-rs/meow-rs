@@ -238,7 +238,9 @@ pub async fn read_aead_response_header<R: AsyncRead + Unpin>(
 fn build_auth_id(cmd_key: &[u8; 16], rng: &mut impl RngCore) -> [u8; 16] {
     let auth_id_key = kdf16(cmd_key, &[b"AES Auth ID Encryption"]);
 
-    let now = std::time::SystemTime::now()
+    // Auth ID is a protocol field: read the shared protocol clock so an
+    // `ntp:`-observed offset applies (issue #974).
+    let now = meow_common::protocol_now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();

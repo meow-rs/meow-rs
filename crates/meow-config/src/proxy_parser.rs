@@ -3896,6 +3896,9 @@ fn parse_vless_reality_opts(
         public_key,
         short_id,
         support_x25519_mlkem768,
+        // The REALITY timestamp is a protocol field; ride the shared
+        // protocol clock so `ntp:` offsets apply (issue #974).
+        protocol_clock: Some(meow_common::protocol_now),
     }))
 }
 

@@ -41,6 +41,7 @@ pub mod network;
 pub mod nftset;
 pub mod outbound_iface;
 pub mod process_lookup;
+pub mod protocol_clock;
 pub mod replay_window;
 pub mod rule;
 pub mod sniffer;
@@ -87,6 +88,7 @@ pub use process_lookup::{
     disable_socket_table_cache, find_process, find_process_async, FlowLookup, ProcessInfo,
     ProcessLookupMode, ProcessLookupPolicy,
 };
+pub use protocol_clock::{protocol_now, set_protocol_offset_ns};
 pub use replay_window::ReplayWindow;
 pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};
 pub use sniffer::SnifferConfig;

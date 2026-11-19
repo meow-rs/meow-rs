@@ -88,11 +88,18 @@ pub enum EchOpts {
 ///
 /// Built by `meow-config` from `reality-opts:`. The public key is the server's
 /// X25519 public key, and `short_id` is the decoded, zero-padded short id.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct RealityConfig {
     pub public_key: [u8; 32],
     pub short_id: [u8; 8],
     pub support_x25519_mlkem768: bool,
+    /// Clock for the REALITY auth-payload timestamp. `meow-config` sets
+    /// this to the daemon's protocol clock (`meow_common::protocol_now`)
+    /// so an `ntp:`-observed offset reaches the one protocol field a
+    /// remote validates; `None` falls back to `SystemTime::now`
+    /// (issue #974). A bare `fn` keeps `meow-transport` dependency-free
+    /// (ADR-0001).
+    pub protocol_clock: Option<fn() -> std::time::SystemTime>,
 }
 
 /// TLS layer configuration, built by `meow-config` from YAML and passed

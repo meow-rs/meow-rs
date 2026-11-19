@@ -669,6 +669,8 @@ pub struct RawConfig {
     /// `profile:` — mihomo's selection/fake-IP persistence switches
     /// ([`RawProfile`]).
     pub profile: Option<RawProfile>,
+    /// `ntp:` — mihomo's protocol-clock sync service ([`RawNtp`]).
+    pub ntp: Option<RawNtp>,
     /// Keys no field above models land here — `validation::validate_and_warn`
     /// warns on them by name (forward-compat, ADR-0002) instead of serde
     /// dropping them silently (issue #974). `BTreeMap` so the save path
@@ -694,6 +696,31 @@ pub struct RawProfile {
     /// `store-fake-ip` — persist fake-IP forward/reverse mappings to a
     /// JSON file. Resolution is `profile` > `dns.store-fake-ip` > `false`.
     pub store_fake_ip: Option<bool>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
+/// The `ntp:` section — mihomo's SNTP clock-sync service (issue #974).
+/// Ranges are validated at [`crate::resolve_ntp`] even when `enable` is
+/// false; unmodeled children land in `extra` for the scoped warning.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct RawNtp {
+    /// `enable` — run the supervisor. Absent resolves `false`.
+    pub enable: Option<bool>,
+    /// `server` — host or IP literal (bracketed IPv6 accepted) to poll;
+    /// absent resolves `time.apple.com` like upstream.
+    pub server: Option<String>,
+    /// `port` — `1..=65535`, default `123`.
+    pub port: Option<u16>,
+    /// `interval` — poll period in minutes, `1..=525600`, default `30`.
+    pub interval: Option<u64>,
+    /// `dialer-proxy` — a top-level proxy/group name to carry the poll;
+    /// absent or empty dials direct.
+    pub dialer_proxy: Option<String>,
+    /// `write-to-system` — parsed for compatibility and always ignored
+    /// (with a warning when true): meow never invokes a clock syscall.
+    pub write_to_system: Option<bool>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, UnknownYamlValue>,
 }

@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+mod ntp;
 #[cfg(target_os = "windows")]
 mod windows_service;
 
@@ -1528,6 +1529,11 @@ async fn run(
     // rebuild lane (API PUT, subscription/geodata republish) attaches
     // through it so groups share the startup store and enable epoch.
     tunnel.set_selection_backing(Arc::clone(&config.selection));
+    // The `ntp:` supervisor holds only a Weak at the tunnel so shutdown's
+    // drop order can't strand it; the worker starts after TUN binding
+    // settles below, and PUT reconciles it through the API lane
+    // (issue #974).
+    let ntp_supervisor = Arc::new(ntp::NtpSupervisor::new(&tunnel));
     meow_tunnel::nftset::install(
         &tunnel,
         config
@@ -2080,6 +2086,10 @@ async fn run(
             config.api.external_ui.clone(),
             Arc::clone(&dns_server_handle),
             config.provider_dialer_registry.clone(),
+            Some({
+                let supervisor = Arc::clone(&ntp_supervisor);
+                Arc::new(move |cfg| supervisor.reconcile(cfg)) as meow_api::routes::NtpReconcile
+            }),
         );
         // Bind eagerly like the DNS listener and the `listeners:` entries:
         // an `external-controller` failure is a hard startup error, not a
@@ -2192,6 +2202,10 @@ async fn run(
         }
     }
 
+    // Start the NTP worker now that routing, the resolver hook, and any
+    // TUN binding are settled — its own dial may ride the tunnel.
+    ntp_supervisor.reconcile(config.ntp.clone());
+
     // Only now: a signal before `shutdown.wait()` installs its handler
     // kills the process, which must not read as an unclean exit.
     meow_common::logbook::engine_started(config_path.as_deref().unwrap_or("--config-string"));
@@ -2203,6 +2217,7 @@ async fn run(
     // Wait for shutdown signal
     let by = shutdown.wait().await?;
     info!("Shutting down ({by})...");
+    ntp_supervisor.shutdown().await;
     meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Requested(by));
     meow_common::traffic_ledger::uninstall();
     drop(controller_file);

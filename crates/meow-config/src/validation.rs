@@ -16,7 +16,6 @@ use tracing::warn;
 const UNSUPPORTED_KEYS: &[(&str, Option<u32>, &str)] = &[
     ("brutal-delay", None, "experimental, no spec"),
     ("brutal-opts", None, "experimental, no spec"),
-    ("ntp", Some(974), "NTP time sync not implemented"),
     (
         "geox-update-interval",
         None,
@@ -524,6 +523,16 @@ pub(crate) fn validate_and_warn(raw: &crate::raw::RawConfig) {
         }
     }
 
+    if let Some(ntp) = &raw.ntp {
+        warn_extra("ntp", &ntp.extra);
+        // Always warn-and-ignore, even when disabled: the knob reads like
+        // it writes the OS clock and meow never invokes one (issue #974).
+        if ntp.write_to_system == Some(true) {
+            warn!(
+                "ntp.write-to-system: ignored — meow never writes the system clock;                  the offset adjusts VMess/REALITY protocol timestamps only"
+            );
+        }
+    }
     if let Some(profile) = &raw.profile {
         warn_extra("profile", &profile.extra);
         // `store-fake-ip` has two spellings; `profile` wins when they

@@ -725,6 +725,7 @@ mod vless_vision {
                     // Xray 26.9.8's mandatory hybrid share; a newer pin
                     // would need `true` here.
                     support_x25519_mlkem768: false,
+                    protocol_clock: None,
                 }),
                 ..TlsConfig::new("localhost")
             };
