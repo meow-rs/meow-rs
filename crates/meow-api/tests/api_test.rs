@@ -1894,11 +1894,15 @@ async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
          \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
          \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
 
-    // Each effective-knob diff rejects before the fallback commits.
+    // Each effective-knob diff rejects before the fallback commits. The
+    // `tun:` enable flip is the same refusal: the verbatim commit keeps
+    // the previous routing and resolver, so a transition it cannot back
+    // with a built candidate must not fire (issue #974).
     for (label, knob) in [
         ("profile", "profile:\n  store-selected: false\n"),
         ("ntp", "ntp:\n  enable: true\n  server: ntp.test\n"),
         ("keepalive", "keep-alive-idle: 60\n"),
+        ("tun", "tun:\n  enable: true\n"),
     ] {
         let before = seen.lock().unwrap().len();
         let resp = put(
@@ -1920,7 +1924,10 @@ async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
         {
             let raw = state.raw_config.read();
             assert!(
-                raw.ntp.is_none() && raw.profile.is_none() && raw.keep_alive_idle.is_none(),
+                raw.ntp.is_none()
+                    && raw.profile.is_none()
+                    && raw.keep_alive_idle.is_none()
+                    && raw.tun.is_none(),
                 "{label}: a rejected PUT must not touch the committed document"
             );
         }
@@ -2031,6 +2038,24 @@ async fn put_configs_force_broken_dns_gates_store_fake_ip() {
     );
     assert!(
         state.raw_config.read().profile.is_none(),
+        "the rejected document must not persist"
+    );
+
+    // A `tun:` transition is refused on the same footing — with the
+    // resolver kept, the device would respawn on fake-IP geometry the
+    // kept generation does not implement.
+    let resp = put(
+        "/configs?force=true",
+        &format!("mode: rule\ntun:\n  enable: true\n{BROKEN_DNS}rules:\n  - MATCH,DIRECT\n"),
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a tun transition must not commit through the kept resolver"
+    );
+    assert!(
+        state.raw_config.read().tun.is_none(),
         "the rejected document must not persist"
     );
 

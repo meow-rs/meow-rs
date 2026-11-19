@@ -2307,6 +2307,68 @@ fn named_tun_fake_ip_guard(
     Ok(())
 }
 
+/// The `tun:` reconcile tuple `swap_config_and_reconcile_tun` restarts a
+/// running device on — extracted so the forced-commit fallbacks can
+/// refuse a transition the candidate cannot safely fire (issue #974):
+/// when the rebuild (or just its dns half) failed under `force`, the
+/// committed document keeps the PREVIOUS resolver generation, so a
+/// respawned device would derive its fake-IP geometry from a document
+/// whose pool the kept resolver does not implement — mismatched routes
+/// and hijack target. The compare itself mirrors the reconcile's:
+/// semantic diff on the PARSED `TunConfig`s plus the sniffer-enable
+/// half, raw-diff conservative when either side fails to parse.
+fn tun_reconcile_differs(old: &RawConfig, candidate: &RawConfig) -> bool {
+    if old.tun == candidate.tun
+        && old.max_connections == candidate.max_connections
+        && old.sniffer == candidate.sniffer
+        && old.tproxy_sni == candidate.tproxy_sni
+        && old.fake_ip_range() == candidate.fake_ip_range()
+    {
+        // Fast path: identical raw sections cannot differ semantically —
+        // and skipping the parse avoids re-warn!ing on every commit that
+        // never touched `tun:` (upstream-only fields like `strict-route:`
+        // and `stack:`'s warn-and-fall-back spellings all warn at parse).
+        return false;
+    }
+    match (
+        meow_config::parse_tun_config(old.tun.as_ref(), old.max_connections, old.fake_ip_range()),
+        meow_config::parse_tun_config(
+            candidate.tun.as_ref(),
+            candidate.max_connections,
+            candidate.fake_ip_range(),
+        ),
+    ) {
+        (Ok(o), Ok(n)) => {
+            o != n
+                || match (
+                    meow_config::sniffer_config_from_raw(old),
+                    meow_config::sniffer_config_from_raw(candidate),
+                ) {
+                    // A disabled sniffer's remaining fields are dead
+                    // config — `enable: false` with a different timeout
+                    // or port list is the same off state, not a
+                    // restart-worthy change (review #887).
+                    (Ok(a), Ok(b)) => a.enable != b.enable || (a.enable && a != b),
+                    _ => old.sniffer != candidate.sniffer,
+                }
+        }
+        // Raw sections already known to differ — a broken candidate stays
+        // conservative: restart → spawn fails → `enable` rolls back.
+        _ => true,
+    }
+}
+
+/// Whether committing `candidate` would fire the TUN reconcile — an
+/// `enable` flip, or a restart-worthy `tun:`-tuple diff while a device
+/// runs. The resolver-kept forced fallbacks refuse it wholesale: the
+/// transition would run on a document whose fake-IP geometry the kept
+/// resolver generation does not implement.
+fn tun_transition_pending(old: &RawConfig, candidate: &RawConfig) -> bool {
+    let old_enable = old.tun.as_ref().is_some_and(|t| t.enable);
+    let new_enable = candidate.tun.as_ref().is_some_and(|t| t.enable);
+    old_enable != new_enable || (old_enable && tun_reconcile_differs(old, candidate))
+}
+
 /// The prospective-route dependency sweep every publication must pass:
 ///
 /// 1. The candidate's own `listeners[].proxy`/`rule` references must
@@ -4108,66 +4170,9 @@ async fn swap_config_and_reconcile_tun(
         // (`auto-route: true` vs `fake-ip`, explicit defaults, `stack`
         // spellings that parse to the same `TunStack`) and warn-only
         // ignored fields (`strict-route`, `auto-detect-interface`, …)
-        // do not.
-        // When either side fails to parse, fall back to the raw diff —
-        // a broken candidate stays conservative: restart → spawn fails
-        // → `enable` rolls back.
-        let tun_changed = if guard.tun == candidate.tun
-            && guard.max_connections == candidate.max_connections
-            // The TUN carries the sniffer it was spawned with — and the
-            // deprecated `tproxy-sni` alias feeds the same parse, so it
-            // belongs to this tuple too: an alias flip is a real sniffer
-            // change (synthesised-enable ↔ default-disabled) that must
-            // reach the slow path (review #887).
-            && guard.sniffer == candidate.sniffer
-            && guard.tproxy_sni == candidate.tproxy_sni
-            // The default device address derives from it.
-            && guard.fake_ip_range() == candidate.fake_ip_range()
-        {
-            // Fast path: identical raw sections cannot differ
-            // semantically — and skipping the parse avoids re-warn!ing
-            // on every commit that never touched `tun:` (upstream-only
-            // fields like `strict-route:` and `stack:`'s warn-and-fall-
-            // back spellings all warn at parse).
-            false
-        } else {
-            match (
-                meow_config::parse_tun_config(
-                    guard.tun.as_ref(),
-                    guard.max_connections,
-                    guard.fake_ip_range(),
-                ),
-                meow_config::parse_tun_config(
-                    candidate.tun.as_ref(),
-                    candidate.max_connections,
-                    candidate.fake_ip_range(),
-                ),
-            ) {
-                // The TUN also carries the sniffer it was spawned with:
-                // a sniffer-only diff must restart it too — compared
-                // semantically, like `TunConfig`, so a no-op respelling
-                // does not (review #887).
-                (Ok(o), Ok(n)) => {
-                    o != n
-                        || match (
-                            meow_config::sniffer_config_from_raw(&guard),
-                            meow_config::sniffer_config_from_raw(&candidate),
-                        ) {
-                            // A disabled sniffer's remaining fields are
-                            // dead config — `enable: false` with a
-                            // different timeout or port list is the same
-                            // off state, not a restart-worthy change
-                            // (review #887).
-                            (Ok(a), Ok(b)) => a.enable != b.enable || (a.enable && a != b),
-                            _ => guard.sniffer != candidate.sniffer,
-                        }
-                }
-                // Raw sections already known to differ — a broken
-                // candidate stays conservative: restart → spawn fails
-                // → `enable` rolls back.
-                _ => true,
-            }
-        };
+        // do not. Shared with the forced-commit fallbacks above as
+        // [`tun_reconcile_differs`].
+        let tun_changed = tun_reconcile_differs(&guard, &candidate);
         let snapshot = (new_enable && !old).then(|| candidate.clone());
         // Extract health-check specs straight from the candidate before it
         // is moved into the lock — no second read of `raw_config` and no
@@ -4891,13 +4896,23 @@ async fn put_configs(
                 (Ok(old), Ok(new)) => old.enable.then_some(old) != new.enable.then_some(new),
                 _ => true,
             };
-            if profile_changed || keepalive_changed || ntp_changed {
+            // And the TUN reconcile: the verbatim commit below still runs
+            // `swap_config_and_reconcile_tun`, but with the PREVIOUS
+            // routing and resolver — an `enable` flip or a restart-worthy
+            // `tun:`/`fake-ip-range` diff would (re)spawn the device on a
+            // document whose pool geometry the kept resolver does not
+            // implement. The raw-checkable listener-dep half is already
+            // gated unconditionally above (`listener_proxy_target_shape_err`
+            // + `resolve_named_listeners`); the live-state half cannot be
+            // proven without a built candidate, so refuse it (issue #974).
+            let tun_changed = tun_transition_pending(&committed, &raw_config);
+            if profile_changed || keepalive_changed || ntp_changed || tun_changed {
                 return reload_rejected(
                     StatusCode::BAD_REQUEST,
                     "config validation failed under force, and the candidate \
-                     changes an effective profile/ntp/outbound-keepalive policy — \
-                     the fallback would claim a switch it cannot apply; \
-                     fix the defect and retry",
+                     changes an effective profile/ntp/outbound-keepalive/tun \
+                     policy — the fallback would claim a switch it cannot \
+                     apply; fix the defect and retry",
                 );
             }
         }
@@ -5074,7 +5089,8 @@ async fn put_configs(
                 // implements — reject instead (issue #974). A `Some` carries
                 // the dns-less build above: no fake-IP pool, nothing to
                 // diverge.
-                if kept.is_none()
+                let resolver_kept = kept.is_none();
+                if resolver_kept
                     && meow_config::resolve_profile(&state.raw_config.read()).store_fake_ip
                         != meow_config::resolve_profile(&raw_config).store_fake_ip
                 {
@@ -5084,6 +5100,22 @@ async fn put_configs(
                          changes the effective store-fake-ip flag while the \
                          kept resolver still implements the old one — \
                          fix the defect and retry",
+                    );
+                }
+                // Same exposure for the TUN reconcile (issue #974): with
+                // the previous resolver kept, `swap_config_and_reconcile_tun`
+                // below would still fire an `enable` flip or a `tun:`-tuple
+                // restart — respawning the device on a document whose
+                // fake-IP geometry (`fake-ip-range` feeds both the device
+                // address and the pool) the kept generation does not
+                // implement.
+                if resolver_kept && tun_transition_pending(&state.raw_config.read(), &raw_config) {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        "config validation failed under force, and the candidate \
+                         fires a tun transition while the kept resolver still \
+                         implements the old fake-IP geometry — fix the defect \
+                         and retry",
                     );
                 }
                 kept
