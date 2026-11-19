@@ -1950,6 +1950,40 @@ async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
     );
 }
 
+/// Issue #974: the local shape/range gates precede the first candidate
+/// network work — `ech-opts.enable` with no `config:` and no query
+/// source is a deterministic strict defect that never dials, yet an
+/// out-of-range `ntp.interval` must still be the reported failure.
+#[tokio::test]
+async fn put_configs_local_gates_precede_ech_preresolve() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let app = create_router(Arc::clone(&state));
+    let document =
+        "strict: true\nntp:\n  interval: 0\nproxies:\n  - name: p\n    type: direct\n    ech-opts:\n      enable: true\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(document);
+    let resp = app
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "payload": payload }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let msg = body["message"].as_str().unwrap_or_default();
+    assert!(
+        msg.contains("ntp.interval"),
+        "the ntp range defect must surface before the strict ECH defect: {msg}"
+    );
+}
+
 /// Issue #974: under `force`, a `dns:` section that fails its rebuild
 /// keeps the previous resolver — but a candidate whose EFFECTIVE
 /// store-fake-ip flag (profile > dns > false) differs from the committed

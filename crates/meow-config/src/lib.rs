@@ -6542,22 +6542,50 @@ async fn build_config_inner(
     mut raw: raw::RawConfig,
     cache_dir: Option<&Path>,
 ) -> Result<Config, anyhow::Error> {
-    // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
-    // sync `parse_proxy` path that follows can stay sync. Failures warn
-    // and leave the map unchanged — except the `enable: true` with no
-    // query-source defect, which `strict` promotes to an error.
-    if let Some(ps) = raw.proxies.as_mut() {
-        ech_dns::preresolve_ech(ps, raw.strict.unwrap_or(false))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
-    }
-
-    // Geodata config — parse and validate early so path errors surface before
-    // anything tries to load the DBs. `geox-url` is the mihomo top-level
-    // alias, merged per-key under the explicit `geodata.url.*` values.
+    // Local shape/range gates BEFORE any candidate network work (issue
+    // #974): a defect in `ntp:`/`keep-alive-*`/`tcp-*`/`listeners:`/`tun:`
+    // must reject the document without the ECH pre-resolution or provider
+    // fetches below ever opening a socket. The resolvers are pure over
+    // `raw` — nothing they read is mutated by the passes that follow.
+    let ntp_resolved_for_config = resolve_ntp(&raw)?;
+    // `tcp-idle-timeout` — resolution and validation live in
+    // [`resolve_tcp_idle_timeout`], which `PUT /configs` also gates
+    // persistence and hot-apply on so a committed document cannot fail
+    // this boot path.
+    let tcp_idle_timeout = resolve_tcp_idle_timeout(&raw)?;
+    // `tcp-keepalive*` — the keepalive posture every inbound listener
+    // applies to accepted sockets. Resolution and validation live in
+    // [`resolve_tcp_keepalive`], which `PUT /configs` also gates
+    // persistence on so a committed document cannot fail this boot path.
+    let tcp_keepalive = resolve_tcp_keepalive(&raw)?;
+    // `keep-alive-*` — the keepalive posture `connect_tcp` applies to
+    // outbound dials. Validated here (and on `-t`) so a bad value fails
+    // admission; the process-global install belongs to the launcher's
+    // commit point — a candidate build must never mutate live policy.
+    let _ = resolve_outbound_tcp_keepalive(&raw)?;
+    // `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound TCP ACL.
+    // Startup-only like `listeners:` (upstream live-patches the prefix
+    // lists; meow deliberately matches its listener-auth lifecycle).
+    let lan_acl = Arc::new(resolve_lan_acl(&raw)?);
+    // The `listeners:` shape: duplicate names/ports, `rule:`/`proxy:`
+    // declaration checks, the one-TUN gates — all document-local.
+    let (bind_addr, global_tproxy_sni) = listener_bind_inputs(&raw);
+    let named_listeners = build_named_listeners(&raw, &bind_addr, global_tproxy_sni)?;
+    // TUN inbound (issue #326) — parses `tun:`/`sniffer:` off raw only.
+    let tun = parse_tun_config(raw.tun.as_ref(), raw.max_connections, raw.fake_ip_range())?;
+    let sniffer = parse_sniffer_config(&raw, raw.strict.unwrap_or(false))?;
+    let auth = Arc::new(
+        auth::parse_auth_config(
+            raw.authentication.as_deref(),
+            raw.skip_auth_prefixes.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+    // Geodata config — `geox-url` is the mihomo top-level alias, merged
+    // per-key under the explicit `geodata.url.*` values.
     let geodata = geodata::parse_geodata(&raw)?;
-
-    // General config
+    // `mode` is a shape check too — under `strict` an unknown value
+    // hard-fails.
     let mode = match raw.mode.as_deref().unwrap_or("rule").parse::<TunnelMode>() {
         Ok(m) => m,
         Err(e) if raw.strict.unwrap_or(false) => {
@@ -6568,6 +6596,18 @@ async fn build_config_inner(
             TunnelMode::Rule
         }
     };
+
+    // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
+    // sync `parse_proxy` path that follows can stay sync. Failures warn
+    // and leave the map unchanged — except the `enable: true` with no
+    // query-source defect, which `strict` promotes to an error.
+    if let Some(ps) = raw.proxies.as_mut() {
+        ech_dns::preresolve_ech(ps, raw.strict.unwrap_or(false))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
+    }
+
+    // General config
     let log_level = raw.log_level.clone().unwrap_or_else(|| "info".to_string());
     // mihomo (and Clash Verge output) use `bind-address: '*'` as the
     // all-interfaces wildcard; normalize it here so listeners never see the
@@ -6578,12 +6618,6 @@ async fn build_config_inner(
         Some("*" | "") => "0.0.0.0".to_string(),
         Some(addr) => addr.to_string(),
     };
-
-    // `tcp-idle-timeout` — resolution and validation live in
-    // [`resolve_tcp_idle_timeout`], which `PUT /configs` also gates
-    // persistence and hot-apply on so a committed document cannot fail
-    // this boot path.
-    let tcp_idle_timeout = resolve_tcp_idle_timeout(&raw)?;
 
     let general = GeneralConfig {
         mode,
@@ -6659,10 +6693,6 @@ async fn build_config_inner(
             .map(|d| d.join("selector-cache.json")),
     ));
     let resolved_profile = resolve_profile(&raw);
-    // `ntp:` resolves at admission even when disabled — `-t` and PUT
-    // reject out-of-range endpoints up front; the resolved config rides
-    // `Config` out to the supervisor and `GET /configs` (issue #974).
-    let ntp_resolved_for_config = resolve_ntp(&raw)?;
     if !is_offline_validate() {
         selection_backing
             .prepare(resolved_profile.store_selected)
@@ -6798,29 +6828,9 @@ async fn build_config_inner(
         (res.proxies, res.rules, res.sub_rules, res.dialer_registry)
     };
 
-    // Listener config
-    let (bind_addr, global_tproxy_sni) = listener_bind_inputs(&raw);
-
-    // Build the named-listener list, checking for duplicate ports/names.
-    let named_listeners = build_named_listeners(&raw, &bind_addr, global_tproxy_sni)?;
-
-    // `tcp-keepalive*` — the keepalive posture every inbound listener
-    // applies to accepted sockets. Resolution and validation live in
-    // [`resolve_tcp_keepalive`], which `PUT /configs` also gates
-    // persistence on so a committed document cannot fail this boot path.
-    let tcp_keepalive = resolve_tcp_keepalive(&raw)?;
-
-    // `keep-alive-*` — the keepalive posture `connect_tcp` applies to
-    // outbound dials. Validated here (and on `-t`) so a bad value fails
-    // admission; the process-global install belongs to the launcher's
-    // commit point — a candidate build must never mutate live policy.
-    let _ = resolve_outbound_tcp_keepalive(&raw)?;
-
-    // `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound TCP ACL.
-    // Startup-only like `listeners:` (upstream live-patches the prefix
-    // lists; meow deliberately matches its listener-auth lifecycle).
-    let lan_acl = Arc::new(resolve_lan_acl(&raw)?);
-
+    // Listener config — `named_listeners`, `tcp_keepalive` and `lan_acl`
+    // resolved in the local-gates block above, before the ECH/provider
+    // network passes (issue #974).
     let listeners = ListenerConfig {
         mixed_port: raw.mixed_port,
         socks_port: raw.socks_port,
@@ -6837,9 +6847,6 @@ async fn build_config_inner(
         lan_acl,
         named: named_listeners,
     };
-
-    // TUN inbound (issue #326).
-    let tun = parse_tun_config(raw.tun.as_ref(), raw.max_connections, raw.fake_ip_range())?;
 
     // API config
     let external_ui = raw
@@ -6867,17 +6874,6 @@ async fn build_config_inner(
             .filter(|s| !s.is_empty())
             .map(String::from),
     };
-
-    // Sniffer config — also handles deprecated `tproxy_sni` alias.
-    let sniffer = parse_sniffer_config(&raw, raw.strict.unwrap_or(false))?;
-
-    // Auth config.
-    let auth = auth::parse_auth_config(
-        raw.authentication.as_deref(),
-        raw.skip_auth_prefixes.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let auth = Arc::new(auth);
 
     info!(
         "Config loaded: mode={}, proxies={}, rules={}",

@@ -4619,6 +4619,113 @@ async fn put_configs(
     if let Some(msg) = meow_config::listener_proxy_target_shape_err(&raw_config) {
         return reload_rejected(StatusCode::BAD_REQUEST, &msg);
     }
+    // Errors `force` pushed past, for the logbook.
+    let mut forced: Vec<String> = Vec::new();
+
+    // Local shape/range gates BEFORE the first candidate network work
+    // (issue #974): the ECH pre-resolution below opens sockets — a
+    // defect these resolvers would catch must reject the request before
+    // that, not after. Each gate also has to land before the rebuild's
+    // force early-return, which commits `raw_config` when nothing
+    // builds — a check placed after that arm could not gate the
+    // persisted document.
+    //
+    // `tcp-idle-timeout`: the rebuild never sees general fields, so its
+    // ceiling must gate persistence here — committed unchecked, the next
+    // boot's `build_config` would hard-error on a value this PUT
+    // accepted. `force` keeps the running bound, the same degrade the
+    // dns arm applies below — AND normalizes the committed field to that
+    // bound: the warm-path commits (`commit_raw_candidate` →
+    // `apply_raw_to_tunnel`) re-resolve this field on every mutation, so
+    // persisting the invalid value would make every later unrelated
+    // PATCH fail with this same error.
+    let tcp_idle_timeout = match resolve_tcp_idle_timeout(&raw_config) {
+        Ok(timeout) => timeout,
+        Err(msg) => {
+            if force {
+                tracing::error!("config reload forced despite {msg}");
+                forced.push(msg);
+                let running = state.tunnel.inner().tcp_idle_timeout();
+                // Rewrite the invalid value to what is actually running —
+                // semantically equivalent for the next boot's
+                // `build_config` (0 = disabled) and boot-valid by
+                // construction.
+                raw_config.tcp_idle_timeout = Some(running.map_or(0, |d| d.as_secs()));
+                running
+            } else {
+                return reload_rejected(StatusCode::BAD_REQUEST, &msg);
+            }
+        }
+    };
+
+    // `tcp-keepalive*`: same boot-validity contract. The resolved posture
+    // is a startup snapshot like `listeners:` (no hot-apply), so under
+    // `force` there is no running value to keep — the degrade is warn +
+    // commit, matching the listeners arm. Unlike `tcp-idle-timeout` the
+    // committed value is NOT normalized (nothing running to normalize
+    // to): a forced bad value can still reach `save_config` and
+    // hard-error the next boot, the same exposure `listeners:`/`tun:`
+    // already carry.
+    if let Err(e) = meow_config::resolve_tcp_keepalive(&raw_config) {
+        if force {
+            tracing::error!("config reload forced despite {e}");
+            forced.push(e.to_string());
+        } else {
+            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+    }
+
+    // `keep-alive-*` semantic admission — unbypassable by `?force` like
+    // the document-shape gates: the outbound socket policy is installed
+    // at commit, so a candidate that cannot resolve it must never
+    // persist. `keep-alive-idle`/`-interval` hold 0–32767 s even under
+    // `disable-keep-alive` (negative values already failed raw parse).
+    if let Err(e) = meow_config::resolve_outbound_tcp_keepalive(&raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+    }
+
+    // `ntp:` semantic admission on the same unbypassable footing
+    // (issue #974): ranges and server shape are validated even when the
+    // section is disabled, and the supervisor is reconciled at commit,
+    // so a candidate that cannot resolve must never persist. The named
+    // `dialer-proxy` target additionally resolves against the built
+    // candidate inside `rebuild_from_raw_impl` — under the verbatim
+    // fallback below the change-gate refuses an `ntp:` diff instead.
+    if let Err(e) = meow_config::resolve_ntp(&raw_config) {
+        return reload_rejected(StatusCode::BAD_REQUEST, &format!("ntp config error: {e}"));
+    }
+
+    // `global-ua`: it is validated inside `rebuild_from_raw_impl`, but
+    // under `force` a candidate whose strict and lenient rebuilds both
+    // fail commits `raw_config` verbatim — and the value is re-validated
+    // on every warm mutation (`commit_raw_candidate` →
+    // `apply_raw_to_tunnel`) and on the next boot's `build_config`, so
+    // persisting an invalid UA would latch every later mutation to a 400
+    // and fail the reload. Under `force`, rewrite it to the live
+    // override — boot-valid by construction (None clears, matching
+    // `set_global_ua`'s own normalization).
+    if let Err(e) = meow_config::validate_global_ua(raw_config.global_ua.as_deref()) {
+        if force {
+            tracing::error!("config reload forced despite {e}");
+            forced.push(e.to_string());
+            raw_config.global_ua = meow_common::global_ua().map(|ua| ua.to_string());
+        } else {
+            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+        }
+    }
+
+    // The geo schedule resolves inside `parse_geodata`, which the rebuild
+    // reaches only when it gets that far — a forced fallback would commit
+    // the verbatim poison and the next boot's `build_config` hard-errors
+    // on it. So the gate is unconditional (like duplicate subscription
+    // names): `force` cannot push an invalid effective interval through.
+    if let Err(e) = meow_config::geodata::parse_geodata(&raw_config) {
+        return reload_rejected(
+            StatusCode::BAD_REQUEST,
+            &format!("geodata config error: {e}"),
+        );
+    }
+
     let preinstalled = preinstall_global_route_binding(
         &raw_config,
         PreinstallScope::Mutation {
@@ -4628,9 +4735,6 @@ async fn put_configs(
             ),
         },
     );
-    // Errors `force` pushed past, for the logbook.
-    let mut forced: Vec<String> = Vec::new();
-
     // Pre-resolve any DNS-sourced ECH configs into inline base64. Under
     // `force`, a strict-ECH defect is retried leniently so it degrades the
     // same way as every other strict defect class (issue #533 review).
@@ -4682,111 +4786,6 @@ async fn put_configs(
     // subscriptions it keeps — clamp claims to entries that actually
     // made it into the PUT.
     meow_config::subscription::reconcile_contribution_claims(&mut raw_config);
-
-    // Same admission contract for `tcp-idle-timeout`: the rebuild never
-    // sees general fields either, so its ceiling must gate persistence
-    // here — committed unchecked, the next boot's `build_config` would
-    // hard-error on a value this PUT accepted. `force` keeps the running
-    // bound, the same degrade the dns arm applies below — AND normalizes
-    // the committed field to that bound: the warm-path commits
-    // (`commit_raw_candidate` → `apply_raw_to_tunnel`) re-resolve this
-    // field on every mutation, so persisting the invalid value would make
-    // every later unrelated PATCH fail with this same error. This gate
-    // must run BEFORE the rebuild — the force early-return below commits
-    // `raw_config` when nothing builds, so a check placed after that arm
-    // would leave the verbatim poison in the committed document.
-    let tcp_idle_timeout = match resolve_tcp_idle_timeout(&raw_config) {
-        Ok(timeout) => timeout,
-        Err(msg) => {
-            if force {
-                tracing::error!("config reload forced despite {msg}");
-                forced.push(msg);
-                let running = state.tunnel.inner().tcp_idle_timeout();
-                // Rewrite the invalid value to what is actually running —
-                // semantically equivalent for the next boot's
-                // `build_config` (0 = disabled) and boot-valid by
-                // construction.
-                raw_config.tcp_idle_timeout = Some(running.map_or(0, |d| d.as_secs()));
-                running
-            } else {
-                return reload_rejected(StatusCode::BAD_REQUEST, &msg);
-            }
-        }
-    };
-
-    // Same admission contract for `tcp-keepalive*`: the rebuild never sees
-    // general fields either, so their semantic validation must gate
-    // persistence here — committed unchecked, the next boot's
-    // `build_config` would hard-error on a value this PUT accepted. The
-    // resolved posture is a startup snapshot like `listeners:` (no
-    // hot-apply), so under `force` there is no running value to keep —
-    // the degrade is warn + commit, matching the listeners arm. Unlike
-    // `tcp-idle-timeout` the committed value is NOT normalized (nothing
-    // running to normalize to): a forced bad value can still reach
-    // `save_config` and hard-error the next boot, the same exposure
-    // `listeners:`/`tun:` already carry — but hoisting the check above
-    // the rebuild at least records it in `forced` on every commit path.
-    if let Err(e) = meow_config::resolve_tcp_keepalive(&raw_config) {
-        if force {
-            tracing::error!("config reload forced despite {e}");
-            forced.push(e.to_string());
-        } else {
-            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
-        }
-    }
-
-    // `keep-alive-*` semantic admission — unbypassable by `?force` like
-    // the document-shape gates: the outbound socket policy is installed
-    // at commit, so a candidate that cannot resolve it must never
-    // persist. `keep-alive-idle`/`-interval` hold 0–32767 s even under
-    // `disable-keep-alive` (negative values already failed raw parse).
-    if let Err(e) = meow_config::resolve_outbound_tcp_keepalive(&raw_config) {
-        return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
-    }
-
-    // `ntp:` semantic admission on the same unbypassable footing
-    // (issue #974): ranges and server shape are validated even when the
-    // section is disabled, and the supervisor is reconciled at commit,
-    // so a candidate that cannot resolve must never persist. The named
-    // `dialer-proxy` target additionally resolves against the built
-    // candidate inside `rebuild_from_raw_impl` — under the verbatim
-    // fallback below the change-gate refuses an `ntp:` diff instead.
-    if let Err(e) = meow_config::resolve_ntp(&raw_config) {
-        return reload_rejected(StatusCode::BAD_REQUEST, &format!("ntp config error: {e}"));
-    }
-
-    // Same admission contract for `global-ua`: it is validated inside
-    // `rebuild_from_raw_impl`, but under `force` a candidate whose strict
-    // and lenient rebuilds both fail commits `raw_config` verbatim — and
-    // the value is re-validated on every warm mutation
-    // (`commit_raw_candidate` → `apply_raw_to_tunnel`) and on the next
-    // boot's `build_config`, so persisting an invalid UA would latch every
-    // later mutation to a 400 and fail the reload. Under `force`, rewrite
-    // it to the live override — boot-valid by construction (None clears,
-    // matching `set_global_ua`'s own normalization).
-    if let Err(e) = meow_config::validate_global_ua(raw_config.global_ua.as_deref()) {
-        if force {
-            tracing::error!("config reload forced despite {e}");
-            forced.push(e.to_string());
-            raw_config.global_ua = meow_common::global_ua().map(|ua| ua.to_string());
-        } else {
-            return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
-        }
-    }
-
-    // The geo schedule resolves inside `parse_geodata`, which the rebuild
-    // reaches only when it gets that far — a forced fallback would commit
-    // the verbatim poison and the next boot's `build_config` hard-errors
-    // on it. So the gate is unconditional (like duplicate subscription
-    // names): `force` cannot push an invalid effective interval through.
-    // It must run BEFORE the rebuild — the force early-return below
-    // commits `raw_config` when nothing builds.
-    if let Err(e) = meow_config::geodata::parse_geodata(&raw_config) {
-        return reload_rejected(
-            StatusCode::BAD_REQUEST,
-            &format!("geodata config error: {e}"),
-        );
-    }
 
     // Semantic rebuild (proxy/rule parsing). Share the tunnel's resolver
     // slot so the rebuilt map's DIRECT adapter tracks later

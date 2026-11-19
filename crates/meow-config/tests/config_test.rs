@@ -4748,4 +4748,25 @@ mod ntp_resolution {
             "unexpected error: {e}"
         );
     }
+
+    /// Local shape/range gates precede the first candidate network work
+    /// (issue #974): `ech-opts.enable` with no `config:` and no query
+    /// source is a deterministic strict defect that never dials, yet an
+    /// out-of-range `ntp.interval` must still be the reported failure —
+    /// ECH pre-resolution may not open a socket before it.
+    #[tokio::test]
+    async fn build_config_local_gates_precede_ech_preresolve() {
+        let raw = meow_config::parse_raw_yaml(
+            "strict: true\nntp:\n  interval: 0\nproxies:\n  - name: p\n    type: direct\n    ech-opts:\n      enable: true\n",
+        )
+        .unwrap();
+        let e = meow_config::build_config(raw, None)
+            .await
+            .err()
+            .expect("interval 0 must fail");
+        assert!(
+            e.to_string().contains("ntp.interval"),
+            "the ntp range defect must surface before the strict ECH defect: {e}"
+        );
+    }
 }
