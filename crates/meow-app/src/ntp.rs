@@ -39,6 +39,11 @@ pub struct NtpSupervisor {
     /// Worker generation — bumped on every reconcile so a stale worker's
     /// late exchange can never publish over a successor's offset.
     generation: Arc<AtomicU64>,
+    /// Serializes a worker's generation-check + offset-store against the
+    /// supervisor's bump + clear — a superseded publish must not slip
+    /// between the two and resurrect a cleared offset. Held only across
+    /// the check+store pair, never across an `.await`.
+    publish: Arc<Mutex<()>>,
 }
 
 struct WorkerState {
@@ -55,6 +60,7 @@ impl NtpSupervisor {
                 task: None,
             }),
             generation: Arc::new(AtomicU64::new(0)),
+            publish: Arc::new(Mutex::new(())),
         }
     }
 
@@ -71,12 +77,17 @@ impl NtpSupervisor {
         if let Some(task) = st.task.take() {
             task.abort();
         }
-        let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        if st.config.is_some() && next.is_none() {
-            // Disable clears the offset — a dead worker must not leave a
-            // stale correction bending protocol timestamps.
+        let gen = {
+            let _publish = self.publish.lock().unwrap();
+            let gen = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
+            // Any change — disable OR a new endpoint/interval/dialer —
+            // clears the published offset: the outgoing worker's last
+            // good sample belongs to a dead configuration and must not
+            // keep bending protocol timestamps while its successor has
+            // not sampled yet.
             meow_common::set_protocol_offset_ns(None);
-        }
+            gen
+        };
         st.task = next.clone().map(|cfg| {
             info!(
                 server = %cfg.server,
@@ -90,6 +101,7 @@ impl NtpSupervisor {
                 Weak::clone(&self.tunnel),
                 Arc::clone(&self.generation),
                 gen,
+                Arc::clone(&self.publish),
             ))
         });
         st.config = next;
@@ -102,6 +114,19 @@ impl NtpSupervisor {
             task.abort();
             let _ = task.await;
         }
+        let _publish = self.publish.lock().unwrap();
+        meow_common::set_protocol_offset_ns(None);
+    }
+}
+
+impl Drop for NtpSupervisor {
+    /// A dropped supervisor must not leak a forever-polling worker or
+    /// leave its last offset bending protocol timestamps.
+    fn drop(&mut self) {
+        if let Some(task) = self.state.lock().unwrap().task.take() {
+            task.abort();
+        }
+        let _publish = self.publish.lock().unwrap();
         meow_common::set_protocol_offset_ns(None);
     }
 }
@@ -111,6 +136,7 @@ async fn run_worker(
     tunnel: Weak<meow_tunnel::TunnelInner>,
     generation: Arc<AtomicU64>,
     gen: u64,
+    publish: Arc<Mutex<()>>,
 ) {
     let mut ticker =
         tokio::time::interval(Duration::from_secs(u64::from(cfg.interval_minutes) * 60));
@@ -124,7 +150,11 @@ async fn run_worker(
             match tokio::time::timeout(ATTEMPT_TIMEOUT, poll_once(&cfg, &tunnel)).await {
                 Ok(Ok(offset_ns)) => {
                     // Fence: a worker superseded mid-exchange must not
-                    // overwrite its successor's offset.
+                    // overwrite its successor's offset. The check and the
+                    // store share `publish` with the supervisor's
+                    // bump + clear, so a reconcile can't slip the clear
+                    // between them and leave a stale offset published.
+                    let _publish = publish.lock().unwrap();
                     if generation.load(Ordering::Acquire) != gen {
                         return;
                     }
@@ -491,5 +521,113 @@ mod tests {
         let ns = ntp_secs_to_unix_nanos(ntp_sec, 0, &now);
         let unix_ns = d.as_nanos() as i128;
         assert!((ns - unix_ns).abs() < 2_000_000_000, "ns {ns} vs {unix_ns}");
+    }
+
+    /// `set_protocol_offset_ns` is a process global — the supervisor
+    /// tests below would clear/publish over each other under parallel
+    /// `cargo test`, so they serialize through this gate.
+    static PUBLISHED_OFFSET_GATE: StdMutex<()> = StdMutex::new(());
+
+    fn offset_gate() -> std::sync::MutexGuard<'static, ()> {
+        PUBLISHED_OFFSET_GATE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn test_cfg(server: &str) -> meow_config::NtpConfig {
+        meow_config::NtpConfig {
+            enable: true,
+            server: server.to_string(),
+            port: 9,
+            // A year between polls — the worker only ever runs its
+            // immediate exchange (a UDP dial to the literal that never
+            // answers inside the 5 s attempt bound).
+            interval_minutes: 525_600,
+            dialer_proxy: None,
+        }
+    }
+
+    fn supervisor() -> NtpSupervisor {
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec!["8.8.8.8:53".parse().unwrap()],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        ));
+        NtpSupervisor::new(&meow_tunnel::Tunnel::new(resolver))
+    }
+
+    /// Signed seconds `protocol_now()` currently reports ahead of wall
+    /// time — ~3600 while an offset is published, ~0 once cleared.
+    fn published_shift_secs() -> i64 {
+        meow_common::protocol_now()
+            .duration_since(SystemTime::now())
+            .map_or_else(|e| -(e.duration().as_secs() as i64), |d| d.as_secs() as i64)
+    }
+
+    /// Reconcile clears the published offset on ANY config change — not
+    /// only enabled→disabled — while an unchanged config leaves it
+    /// (issue #974): the outgoing worker's last good sample belongs to a
+    /// dead configuration.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_clears_offset_on_any_change() {
+        let _gate = offset_gate();
+        let sup = supervisor();
+        let cfg_a = test_cfg("127.0.0.1");
+        let cfg_b = test_cfg("127.0.0.2");
+        let shift = Some(3_600_000_000_000); // +1 h
+
+        sup.reconcile(cfg_a.clone());
+        // An identical reconcile is a no-op — the offset a live worker
+        // published stays published.
+        meow_common::set_protocol_offset_ns(shift);
+        sup.reconcile(cfg_a.clone());
+        assert!(
+            published_shift_secs() > 3_500,
+            "unchanged reconcile must keep the published offset"
+        );
+
+        // enabled → enabled with a different endpoint clears it.
+        sup.reconcile(cfg_b.clone());
+        assert!(
+            published_shift_secs() < 60,
+            "a changed reconcile must clear the published offset"
+        );
+
+        // enabled → disabled clears it too.
+        meow_common::set_protocol_offset_ns(shift);
+        sup.reconcile(meow_config::NtpConfig {
+            enable: false,
+            ..cfg_b.clone()
+        });
+        assert!(
+            published_shift_secs() < 60,
+            "disable must clear the published offset"
+        );
+        // The std gate must release before any `.await` — the offset
+        // assertions are done, shutdown is plain cleanup.
+        drop(_gate);
+        sup.shutdown().await;
+    }
+
+    /// A dropped supervisor aborts its worker and clears the offset —
+    /// no forever-polling task, no stale correction (issue #974).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn drop_aborts_worker_and_clears_offset() {
+        let _gate = offset_gate();
+        let sup = supervisor();
+        sup.reconcile(test_cfg("127.0.0.1"));
+        assert!(
+            sup.state.lock().unwrap().task.is_some(),
+            "enabled reconcile must spawn the worker"
+        );
+        meow_common::set_protocol_offset_ns(Some(3_600_000_000_000));
+        drop(sup);
+        assert!(
+            published_shift_secs() < 60,
+            "drop must clear the published offset"
+        );
     }
 }
