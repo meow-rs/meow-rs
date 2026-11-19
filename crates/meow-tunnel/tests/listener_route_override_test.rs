@@ -24,13 +24,17 @@ fn test_resolver() -> Arc<Resolver> {
 
 /// Publish proxies + top-level rules + named sub-rules blocks through the
 /// same `update_routing` call the app/API make — one coherent snapshot.
-fn tunnel_with(yaml: &str) -> Tunnel {
+fn tunnel_with_resolver(yaml: &str, resolver: Arc<Resolver>) -> Tunnel {
     let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(yaml).unwrap();
     let res = meow_config::rebuild_from_raw(&raw).unwrap();
-    let tunnel = Tunnel::new(test_resolver());
+    let tunnel = Tunnel::new(resolver);
     tunnel.set_mode(TunnelMode::Rule);
     tunnel.update_routing(res.proxies, res.rules, res.sub_rules, res.dialer_registry);
     tunnel
+}
+
+fn tunnel_with(yaml: &str) -> Tunnel {
+    tunnel_with_resolver(yaml, test_resolver())
 }
 
 /// The adapter a resolution picked IS the registry entry for `name` —
@@ -244,14 +248,15 @@ sub-rules:
     assert_resolved_to(&t, "REJECT");
 }
 
-/// A listener-selectable block's IP demand must reach the eager
-/// `pre_resolve` gate even when the top-level list demands none: UDP
-/// callers still resolve `dst_ip` through `needs_ip_resolution` before
-/// matching (the lazy scan enriches mid-scan, but UDP's NAT key is built
-/// ahead of it), so `RouteTable::needs_ip_resolution` ORs every named
-/// block's compiled set in.
+/// The eager `pre_resolve` gate is scoped to the rule set the flow
+/// actually scans: a `sub-rules` block's IP demand must NOT set the
+/// main-table flag an ordinary flow consults — that would hold flows
+/// that can never select the block on the resolver — while a `rule:`
+/// override flow consults only its own block and a `proxy:` override
+/// flow never consults rules at all (the lazy scan still enriches
+/// mid-scan; this pins the eager path's gate selection).
 #[tokio::test]
-async fn sub_rules_ip_rule_flips_needs_ip_resolution() {
+async fn sub_rules_ip_demand_scopes_to_the_selecting_flow() {
     let yaml = "\
 rules:
   - MATCH,DIRECT
@@ -259,24 +264,55 @@ sub-rules:
   ipblk:
     - IP-CIDR,203.0.113.0/24,DIRECT
     - MATCH,DIRECT
+  domblk:
+    - DOMAIN-SUFFIX,inner.example,DIRECT
 ";
-    let tunnel = tunnel_with(yaml);
+    let mut hosts: DomainTrie<meow_dns::HostEntry> = DomainTrie::new();
+    let real = std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4));
+    hosts.insert("example.test", vec![real].into());
+    let resolver = Arc::new(Resolver::new(
+        vec![],
+        vec![],
+        meow_common::DnsMode::Normal,
+        hosts,
+        true,
+        true,
+    ));
+    let tunnel = tunnel_with_resolver(yaml, resolver);
+    // Only the block demands an IP — the main-table flag stays clear so
+    // flows that can never select `ipblk` never wait on the resolver.
     assert!(
-        tunnel
+        !tunnel
             .inner()
             .needs_ip_resolution
             .load(std::sync::atomic::Ordering::Relaxed),
-        "a block's IP-CIDR demand must publish needs_ip_resolution"
+        "a block's IP demand must not flip the main-table flag"
     );
 
-    // Negative control: without the block's IP rule the same shape stays
-    // false — the flip comes from the block, not from `sub-rules:` alone.
-    let tunnel =
-        tunnel_with("rules:\n  - MATCH,DIRECT\nsub-rules:\n  ipblk:\n    - MATCH,DIRECT\n");
-    assert!(!tunnel
-        .inner()
-        .needs_ip_resolution
-        .load(std::sync::atomic::Ordering::Relaxed));
+    // An ordinary flow scans the main table: no resolution, even though
+    // the block would want one.
+    let mut md = tcp_md("example.test");
+    tunnel.inner().pre_resolve(&mut md).await;
+    assert_eq!(md.dst_ip, None, "ordinary flow must not pay block demand");
+
+    // A flow selecting the IP block resolves; one selecting the
+    // domain-only block does not.
+    let mut md = tcp_md("example.test");
+    md.set_special_route(None, Some("ipblk"));
+    tunnel.inner().pre_resolve(&mut md).await;
+    assert_eq!(md.dst_ip, Some(real), "selected block's demand must gate");
+
+    let mut md = tcp_md("example.test");
+    md.set_special_route(None, Some("domblk"));
+    tunnel.inner().pre_resolve(&mut md).await;
+    assert_eq!(md.dst_ip, None, "a domain-only block demands no IP");
+
+    // A forced proxy never reaches rule matching — resolution is skipped
+    // even when the flow's block would want one.
+    let mut md = tcp_md("example.test");
+    md.set_special_route(Some("DIRECT"), Some("ipblk"));
+    tunnel.inner().pre_resolve(&mut md).await;
+    assert_eq!(md.dst_ip, None, "forced proxy never scans rules");
 }
 
 /// `listeners[].proxy` forced-target admission (Class A): a name that

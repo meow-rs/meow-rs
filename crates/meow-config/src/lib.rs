@@ -6300,7 +6300,11 @@ fn build_named_listeners(
             }
             _ => raw_l.routing_mark.filter(|m| *m != 0),
         };
-        #[cfg(not(target_os = "linux"))]
+        // Same predicate the mark impls use (`SO_MARK` is set only under
+        // `all(linux, not(ohos))`): OHOS reports `target_os = "linux"` but
+        // its impl is cfg'd out, so a plain `not(linux)` guard would let an
+        // OHOS mark pass silently instead of warning like other platforms.
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
         if routing_mark.is_some() {
             warn!(
                 "listeners[{}].routing-mark: SO_MARK is Linux-only — ignored \

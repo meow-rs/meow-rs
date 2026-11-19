@@ -761,9 +761,8 @@ type EarlyOutboundBinding = Option<std::convert::Infallible>;
 /// before, and until then no global route exists for a socket to loop on.
 #[cfg(feature = "listener-tun")]
 fn preinstall_global_route_binding(raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
-    // Startup: no TUN is running yet, so a named-TUN global route is
-    // free to install its own interface binding.
-    meow_api::preinstall_global_route_binding(raw, false).into_binding()
+    meow_api::preinstall_global_route_binding(raw, meow_api::PreinstallScope::Startup)
+        .into_binding()
 }
 
 #[cfg(not(feature = "listener-tun"))]
@@ -1667,6 +1666,9 @@ async fn run(
         let proxy_providers = Arc::clone(&proxy_providers);
         let dns_server = Arc::clone(&dns_server_handle);
         let cache_dir = geodata_cache_dir.clone();
+        // Refreshes never rebind listeners — the startup snapshot is the
+        // republish sweep's dependency set, as subscription_refresh's.
+        let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
             meow_app::geodata_fetch::missing_geosite_retry_loop(
                 geodata,
@@ -1674,6 +1676,7 @@ async fn run(
                 raw_config,
                 rule_providers,
                 proxy_providers,
+                running_listeners,
                 dns_server,
                 cache_dir,
             )
@@ -1693,6 +1696,7 @@ async fn run(
         let proxy_providers = Arc::clone(&proxy_providers);
         let dns_server = Arc::clone(&dns_server_handle);
         let cache_dir = geodata_cache_dir;
+        let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
             meow_app::geodata_fetch::auto_update_loop(
                 geodata,
@@ -1701,6 +1705,7 @@ async fn run(
                 raw_config,
                 rule_providers,
                 proxy_providers,
+                running_listeners,
                 dns_server,
                 cache_dir,
             )
@@ -2099,7 +2104,8 @@ async fn run(
                 "meow-tun".to_string(),
             )
             .with_readiness_signal(ready_tx)
-            .with_sniffer(Arc::clone(&sniffer_runtime));
+            .with_sniffer(Arc::clone(&sniffer_runtime))
+            .with_tcp_dns_hijack(config.tun.dns_hijack);
             // The global-route binding installed before the config build
             // moves into the listener, which clears it with its routes —
             // or right away if startup fails (issue #695).

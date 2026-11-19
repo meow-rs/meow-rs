@@ -177,14 +177,19 @@ impl NatAddrs {
 pub(super) struct Nat {
     pub(super) addrs: NatAddrs,
     nets: TunNets,
+    /// Top-level devices only: TCP :53 escapes the subnet loopback drop —
+    /// the accept loop diverts those flows into the DNS service. A named
+    /// `type: tun` entry is UDP-only and passes `false` here.
+    tcp_dns: bool,
     table: Mutex<Table>,
 }
 
 impl Nat {
-    pub(super) fn new(addrs: NatAddrs, nets: TunNets) -> Self {
+    pub(super) fn new(addrs: NatAddrs, nets: TunNets, tcp_dns: bool) -> Self {
         Self {
             addrs,
             nets,
+            tcp_dns,
             table: Mutex::new(Table::default()),
         }
     }
@@ -244,7 +249,7 @@ impl Nat {
             if src == a.b4 {
                 return Verdict::Drop;
             }
-            if super::tcp_loop_guard(SocketAddr::from((dst, dport)), self.nets) {
+            if super::tcp_loop_guard(SocketAddr::from((dst, dport)), self.tcp_dns, self.nets) {
                 return Verdict::Drop;
             }
             let client = SocketAddr::V4(SocketAddrV4::new(src, sport));
@@ -313,7 +318,7 @@ impl Nat {
             if src == b6 {
                 return Verdict::Drop;
             }
-            if super::tcp_loop_guard(SocketAddr::from((dst, dport)), self.nets) {
+            if super::tcp_loop_guard(SocketAddr::from((dst, dport)), self.tcp_dns, self.nets) {
                 return Verdict::Drop;
             }
             let client = SocketAddr::V6(SocketAddrV6::new(src, sport, 0, 0));
@@ -465,11 +470,14 @@ pub(super) struct SystemStack {
 impl SystemStack {
     /// Bind the listeners on the device's addresses (the device must be up
     /// with them assigned) and pick the NAT peers. Fails when the IPv4
-    /// subnet has no second host address (a /31 or /32).
+    /// subnet has no second host address (a /31 or /32). `tcp_dns`: let
+    /// TCP :53 reach the accept loop for the DNS diversion (the top-level
+    /// `tun:` contract — named `type: tun` devices pass `false`).
     pub(super) async fn bind(
         nets: TunNets,
         a4: Ipv4Addr,
         a6: Option<Ipv6Addr>,
+        tcp_dns: bool,
     ) -> io::Result<Self> {
         let b4 = nets.v4.hosts().find(|h| *h != a4).ok_or_else(|| {
             io::Error::other(format!(
@@ -512,7 +520,7 @@ impl SystemStack {
             v6: v6_addrs,
         };
         Ok(Self {
-            nat: Arc::new(Nat::new(addrs, nets)),
+            nat: Arc::new(Nat::new(addrs, nets, tcp_dns)),
             v4,
             v6,
         })
@@ -744,6 +752,10 @@ mod tests {
     }
 
     fn nat() -> Nat {
+        nat_tcp_dns(true)
+    }
+
+    fn nat_tcp_dns(tcp_dns: bool) -> Nat {
         let a6: Ipv6Addr = "fdfe:dcba:9876::1".parse().unwrap();
         let b6: Ipv6Addr = "fdfe:dcba:9876::2".parse().unwrap();
         Nat::new(
@@ -758,6 +770,7 @@ mod tests {
                 v6: Some("fdfe:dcba:9876::1/126".parse::<Ipv6Net>().unwrap()),
                 nat: None,
             },
+            tcp_dns,
         )
     }
 
@@ -769,13 +782,19 @@ mod tests {
     }
 
     #[test]
-    fn nat_drops_subnet_syn_on_every_port() {
-        // `dns-hijack` is UDP-only — a TCP SYN at the device's own subnet
-        // address is a loop on :53 like on any other port and must drop.
-        let nat = nat();
-        for port in [53, 80] {
+    fn nat_subnet_syn_gate_on_tcp_dns() {
+        // On the top-level device (tcp_dns) a TCP SYN at the NAT peer's
+        // :53 is the DNS diversion and must translate; a named device
+        // drops it like any other subnet-port loop. Non-:53 subnet dials
+        // drop on both.
+        for (tcp_dns, port, want) in [
+            (true, 53, Verdict::Write),
+            (true, 80, Verdict::Drop),
+            (false, 53, Verdict::Drop),
+            (false, 80, Verdict::Drop),
+        ] {
+            let nat = nat_tcp_dns(tcp_dns);
             let mut v4 = v4_packet([192, 168, 1, 10], 51000, [172, 31, 0, 2], port, TCP_SYN);
-            assert_eq!(nat.translate(&mut v4, false), Verdict::Drop);
             let mut v6 = v6_packet(
                 "2001:db8::10".parse().unwrap(),
                 51000,
@@ -783,7 +802,8 @@ mod tests {
                 port,
                 TCP_SYN,
             );
-            assert_eq!(nat.translate(&mut v6, false), Verdict::Drop);
+            assert_eq!(nat.translate(&mut v4, false), want, "v4 :{port}");
+            assert_eq!(nat.translate(&mut v6, false), want, "v6 :{port}");
         }
     }
 

@@ -33,7 +33,9 @@ use meow_listener::TunListener;
 
 use crate::log_stream::{parse_log_level, LogMessage};
 use crate::ui;
-use crate::{preinstall_global_route_binding, OutboundBinding, PreinstalledBinding};
+use crate::{
+    preinstall_global_route_binding, OutboundBinding, PreinstallScope, PreinstalledBinding,
+};
 
 struct MaybeWebSocket(Option<WebSocketUpgrade>);
 
@@ -1332,10 +1334,12 @@ async fn update_configs(
         );
         let preinstalled = preinstall_global_route_binding(
             &candidate,
-            matches!(
-                state.tunnel.tun_owner(),
-                Some(meow_tunnel::TunOwner::Named(_))
-            ),
+            PreinstallScope::Mutation {
+                named_tun_running: matches!(
+                    state.tunnel.tun_owner(),
+                    Some(meow_tunnel::TunOwner::Named(_))
+                ),
+            },
         );
         // No routing publish runs here, so tracked TCP predating a
         // pre-installed global-route binding is still live.
@@ -2070,10 +2074,12 @@ async fn commit_raw_candidate(
     }
     let preinstalled = preinstall_global_route_binding(
         &candidate,
-        matches!(
-            state.tunnel.tun_owner(),
-            Some(meow_tunnel::TunOwner::Named(_))
-        ),
+        PreinstallScope::Mutation {
+            named_tun_running: matches!(
+                state.tunnel.tun_owner(),
+                Some(meow_tunnel::TunOwner::Named(_))
+            ),
+        },
     );
     let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     // `apply_raw_to_tunnel` publishes through `update_routing`, which keeps
@@ -3779,7 +3785,8 @@ async fn spawn_tun_from_raw(
         crate::tun_config_to_listener_config(&tun_cfg),
         "meow-tun".to_string(),
     )
-    .with_readiness_signal(ready_tx);
+    .with_readiness_signal(ready_tx)
+    .with_tcp_dns_hijack(tun_cfg.dns_hijack);
     // A broken `sniffer:` section is a parse error like `tun:`'s above,
     // not a warn-and-continue — silently spawning a snifferless TUN while
     // the API still reports success hides the defect (review #887).
@@ -4402,10 +4409,12 @@ async fn put_configs(
     }
     let preinstalled = preinstall_global_route_binding(
         &raw_config,
-        matches!(
-            state.tunnel.tun_owner(),
-            Some(meow_tunnel::TunOwner::Named(_))
-        ),
+        PreinstallScope::Mutation {
+            named_tun_running: matches!(
+                state.tunnel.tun_owner(),
+                Some(meow_tunnel::TunOwner::Named(_))
+            ),
+        },
     );
     // Errors `force` pushed past, for the logbook.
     let mut forced: Vec<String> = Vec::new();
@@ -6664,6 +6673,12 @@ mod global_route_binding_tests {
         (status, String::from_utf8_lossy(&bytes).into_owned())
     }
 
+    /// A mutation-scope call with no named TUN running — what PUT/PATCH
+    /// pass while the slot is free or top-level-owned.
+    const MUT: PreinstallScope = PreinstallScope::Mutation {
+        named_tun_running: false,
+    };
+
     /// Stand-in for the running global-scope listener: owns a binding, and
     /// records the binding in effect right after giving its own up — i.e.
     /// across `stop_tun`, before the successor spawns.
@@ -6695,20 +6710,20 @@ mod global_route_binding_tests {
             // A missing interface: not fatal here, nothing installed.
             "tun:\n  enable: true\n  auto-route: global\n  outbound-interface: no-such-iface-zz9\n",
         ] {
-            let p = preinstall_global_route_binding(&raw(yaml), false);
+            let p = preinstall_global_route_binding(&raw(yaml), MUT);
             assert!(!p.is_installed() && !p.interface_changed(), "{yaml}");
             assert_eq!(iface(), None, "{yaml}");
         }
         // None → Some(lo) is a change; a second owner of the same
         // interface is not; a non-global candidate leaves it alone.
-        let first = preinstall_global_route_binding(&raw(GLOBAL_LO), false);
+        let first = preinstall_global_route_binding(&raw(GLOBAL_LO), MUT);
         assert!(first.is_installed() && first.interface_changed());
         assert_eq!(iface().as_deref(), Some("lo"));
-        let second = preinstall_global_route_binding(&raw(GLOBAL_LO), false);
+        let second = preinstall_global_route_binding(&raw(GLOBAL_LO), MUT);
         assert!(second.is_installed() && !second.interface_changed());
         let fake_ip = preinstall_global_route_binding(
             &raw("tun:\n  enable: true\n  auto-route: fake-ip\n"),
-            false,
+            MUT,
         );
         assert!(!fake_ip.is_installed() && !fake_ip.interface_changed());
         drop(second);
@@ -6720,7 +6735,7 @@ mod global_route_binding_tests {
             "tun:\n  enable: true\n  outbound-interface: lo\n",
             "tun:\n  enable: true\n  auto-route: true\n  outbound-interface: lo\n",
         ] {
-            let p = preinstall_global_route_binding(&raw(yaml), false);
+            let p = preinstall_global_route_binding(&raw(yaml), MUT);
             assert!(p.is_installed() && p.interface_changed(), "{yaml}");
             assert_eq!(iface().as_deref(), Some("lo"), "{yaml}");
             drop(p);
@@ -6822,6 +6837,44 @@ mod global_route_binding_tests {
         );
         assert!(!state.tunnel.has_tun());
         assert_eq!(iface(), None, "nothing runs, so nothing stays bound");
+
+        // ── A staged named global-route TUN is next-boot only: no
+        // mutation may install its binding, so the rebuild's fetch and
+        // every dial before it stay unbound. Startup does take the same
+        // document's named arm.
+        const NAMED_GLOBAL_LO: &str = "listeners:\n  - name: ntun\n    type: tun\n    \
+                                     auto-route: global\n    outbound-interface: lo\n";
+        let p = preinstall_global_route_binding(&raw(NAMED_GLOBAL_LO), MUT);
+        assert!(!p.is_installed() && !p.interface_changed());
+        assert_eq!(iface(), None);
+        let p = preinstall_global_route_binding(&raw(NAMED_GLOBAL_LO), PreinstallScope::Startup);
+        assert!(p.is_installed() && p.interface_changed());
+        assert_eq!(iface().as_deref(), Some("lo"));
+        drop(p);
+        assert_eq!(iface(), None);
+        // While a named TUN runs, even a global `tun:` candidate installs
+        // nothing — the running device's binding survives the reconcile.
+        // (Admission separately refuses `tun.enable` here; the scope gate
+        // is the hard backstop.)
+        let running = meow_listener::OutboundBinding::install(Some("lo")).unwrap();
+        let p = preinstall_global_route_binding(
+            &raw(GLOBAL_LO),
+            PreinstallScope::Mutation {
+                named_tun_running: true,
+            },
+        );
+        assert!(!p.is_installed());
+        assert_eq!(iface().as_deref(), Some("lo"), "running binding untouched");
+        drop(p);
+        assert_eq!(iface().as_deref(), Some("lo"));
+        drop(running);
+        assert_eq!(iface(), None);
+        // The PUT-level pin: a candidate staging only the named device
+        // fetches unbound — the named arm is startup-only.
+        let (status, body) = put(&state, &candidate("", &origin, NAMED_GLOBAL_LO)).await;
+        assert_eq!(status, StatusCode::NO_CONTENT, "{body}");
+        assert_eq!(origin.take_seen(), vec![None]);
+        assert_eq!(iface(), None);
     }
 }
 

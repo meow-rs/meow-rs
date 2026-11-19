@@ -130,18 +130,15 @@ impl RouteTable {
         }
     }
 
-    /// Whether any scannable rule set demands a resolved `dst_ip`:
-    /// top-level rules OR a `sub-rules:` block a listener `rule:`
-    /// override selects (its compiled set is reachable only via the
-    /// override, so its demand must reach the eager `pre_resolve` gate
-    /// the same way — a block of IP-CIDR/GEOIP rules otherwise never
-    /// sees a resolved destination).
+    /// Whether the TOP-LEVEL rule set demands a resolved `dst_ip`.
+    /// Feeds the `needs_ip_resolution` atomic `pre_resolve` consults for
+    /// flows that scan the main table. A `sub-rules:` block's demand is
+    /// deliberately not folded in: only a `rule:`-override flow can scan
+    /// its block, so [`TunnelInner::pre_resolve`] reads the demand of the
+    /// block the flow actually selected instead of holding unrelated
+    /// flows on the resolver.
     fn needs_ip_resolution(&self) -> bool {
         self.compiled_rules.needs_ip_resolution()
-            || self
-                .sub_rules
-                .values()
-                .any(|b| b.compiled.needs_ip_resolution())
     }
 }
 
@@ -585,18 +582,36 @@ impl TunnelInner {
         unmapped && resolver.reverse_lookup(ip).is_none()
     }
 
-    /// Pre-process metadata before rule matching: if any rule needs IP
-    /// resolution and we don't yet have a destination IP, resolve
-    /// `metadata.host` via the internal resolver and populate `dst_ip`.
+    /// Pre-process metadata before rule matching: if the rule set this
+    /// flow will scan needs IP resolution and we don't yet have a
+    /// destination IP, resolve `metadata.host` via the internal resolver
+    /// and populate `dst_ip`.
+    ///
+    /// The gate mirrors the scan `resolve_proxy_inner` runs: a
+    /// `proxy:` override never reaches rule matching; a `rule:` override
+    /// scans only its `sub-rules:` block, so that block's compiled demand
+    /// — not the main table's — decides; anything else consults the main
+    /// table's cached flag. A missing block resolves nothing (the flow
+    /// rejects at resolve time anyway).
     ///
     /// `Metadata::remote_address()` prefers `host` over `dst_ip`, so
     /// overwriting `dst_ip` here does not change which destination the proxy
     /// adapter dials.
     pub async fn pre_resolve(&self, metadata: &mut Metadata) {
-        if !self.needs_ip_resolution.load(Ordering::Relaxed) {
+        if metadata.host.is_empty() || metadata.dst_ip.is_some() {
             return;
         }
-        if metadata.host.is_empty() || metadata.dst_ip.is_some() {
+        let needed = if !metadata.special_proxy().is_empty() {
+            false
+        } else if metadata.special_rules().is_empty() {
+            self.needs_ip_resolution.load(Ordering::Relaxed)
+        } else {
+            self.route()
+                .sub_rules
+                .get(metadata.special_rules())
+                .is_some_and(|b| b.compiled.needs_ip_resolution())
+        };
+        if !needed {
             return;
         }
         if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await {
