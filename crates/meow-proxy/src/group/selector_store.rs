@@ -266,6 +266,12 @@ impl SelectionBacking {
     /// instead refreshed from disk: its map is a pure snapshot (writers
     /// stay fenced pre-commit), so reloading keeps the "each enabling
     /// build re-reads the file" contract without moving object identity.
+    ///
+    /// It only parks while the live slot is empty: a store kept open
+    /// across a disable is the truth `commit` keeps and `attach` serves
+    /// on re-enable, so a detached open that lands after the disable
+    /// must not shadow it with a snapshot taken before its latest picks
+    /// (Codex review: parked stale store displacing the live one).
     fn install_opened(&self, store: Arc<SelectorStore>) {
         if self.enabled.load(Ordering::Acquire) {
             let mut guard = self.store.lock();
@@ -276,7 +282,8 @@ impl SelectionBacking {
             let mut guard = self.pending.lock();
             match guard.as_ref() {
                 Some(existing) => existing.reload(),
-                None => *guard = Some(store),
+                None if self.store.lock().is_none() => *guard = Some(store),
+                None => {}
             }
         }
     }
@@ -287,27 +294,27 @@ impl SelectionBacking {
     /// `epoch + 1`: exactly the value [`Self::commit`] will publish for
     /// the disable→enable transition, so a rejected candidate's writers
     /// stay fenced without a wasted bump. The writer's store is the one
-    /// `commit` will adopt — `pending` first, the committed store (kept
-    /// open across a disable) as the fallback.
+    /// `commit` keeps — the committed store (kept open across a disable)
+    /// first, `pending` only while no live store exists.
     pub fn attach(&self, enabled: bool) -> Option<SelectorWriter> {
         if !enabled {
             return None;
         }
         let committed = self.enabled.load(Ordering::Acquire);
         let epoch = self.epoch.load(Ordering::Acquire) + u64::from(!committed);
-        // The writer's store is the one `commit` will adopt: a pending-
-        // enable generation gets `pending` (the committed store kept open
-        // across a disable is the fallback, so re-enable reuses it); an
-        // already-enabled generation gets the live slot only — a stale
-        // `pending` is never its store.
+        // The writer's store is the one `commit` keeps: an already-enabled
+        // generation gets the live slot only — a stale `pending` is never
+        // its store. A pending-enable generation gets the live store when
+        // one is kept open across the disable — `commit` keeps it over
+        // any parked `pending`, which is adopted only into an empty slot.
         let store = if committed {
             self.store.lock().as_ref().cloned()
         } else {
-            self.pending
-                .lock()
-                .as_ref()
-                .cloned()
-                .or_else(|| self.store.lock().as_ref().cloned())
+            let parked = self.pending.lock().as_ref().cloned();
+            match self.store.lock().as_ref() {
+                Some(live) => Some(Arc::clone(live)),
+                None => parked,
+            }
         };
         store.map(|store| SelectorWriter {
             store,
@@ -324,10 +331,11 @@ impl SelectionBacking {
     /// so an enable transition publishes exactly the epoch they fence on.
     ///
     /// Every commit drains `pending`: an enable transition adopts it into
-    /// the live slot (`pending.is_some()` implies `store` was `None`
-    /// throughout — `install_opened` only parks when nothing is live),
-    /// and any other commit drops it — a rejected enable build's
-    /// snapshot is never the store a later enable restores (issue #974).
+    /// an EMPTY live slot — refreshed from disk first, the snapshot is
+    /// parked state while the file is truth — and any other commit drops
+    /// it: a rejected enable build's snapshot is never the store a later
+    /// enable restores, and a parked store never displaces the live one
+    /// a disable kept open (issue #974, Codex review).
     pub fn commit(&self, enabled: bool) {
         let transition = self.enabled.swap(enabled, Ordering::AcqRel) != enabled;
         let pending = self.pending.lock().take();
@@ -335,8 +343,11 @@ impl SelectionBacking {
             return;
         }
         let mut guard = self.store.lock();
-        if pending.is_some() {
-            *guard = pending;
+        if enabled && guard.is_none() {
+            if let Some(store) = pending {
+                store.reload();
+                *guard = Some(store);
+            }
         }
         let _write = guard.as_ref().map(|store| store.write_lock.lock());
         self.epoch.fetch_add(1, Ordering::AcqRel);
@@ -574,6 +585,69 @@ mod tests {
             backing.store.lock().as_ref().unwrap().get("g").as_deref(),
             Some("picked"),
             "the writer and the adopted store must be the same object"
+        );
+    }
+
+    #[test]
+    fn parked_snapshot_never_shadows_the_live_store() {
+        // Codex review: a cancelled enable build's detached open could
+        // park a snapshot taken BEFORE picks the live store went on to
+        // save; the next disable/re-enable then adopted the stale park —
+        // resurrecting old picks and letting a whole-map write erase the
+        // newer ones. The live store is the truth: a parked store only
+        // ever fills an empty slot, and never displaces it.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sel.json");
+        std::fs::write(&path, r#"{"g": "old"}"#).unwrap();
+        let backing = SelectionBacking::new(Some(path.clone()));
+
+        // A detached enable build's open reads the file before the pick
+        // below is saved — a snapshot of {"g": "old"}.
+        let detached = SelectorStore::open(path.clone());
+
+        // The winning build enables for real and persists "new".
+        backing.prepare_sync(true);
+        backing.commit(true);
+        backing.attach(true).unwrap().set("g", "new");
+        let live = backing.store.lock().as_ref().map(Arc::clone).unwrap();
+
+        // Disable — the live store stays open across it.
+        backing.commit(false);
+        assert!(backing.store.lock().is_some());
+
+        // The detached open lands now: it must not park over the live
+        // store, and a re-enable must keep serving the live map.
+        backing.install_opened(detached);
+        assert!(
+            backing.pending.lock().is_none(),
+            "a parked snapshot must not shadow a live store"
+        );
+        let gen = backing.attach(true).unwrap();
+        assert_eq!(
+            gen.get("g").as_deref(),
+            Some("new"),
+            "re-enable must prime from the live map, not the stale park"
+        );
+        backing.commit(true);
+        assert!(Arc::ptr_eq(&live, backing.store.lock().as_ref().unwrap()));
+        gen.set("g", "newest");
+        let on_disk: HashMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(
+            on_disk.get("g").map(String::as_str),
+            Some("newest"),
+            "the live store's whole-map write must reach disk intact"
+        );
+
+        // A stale park left in the slot by a race before a disable
+        // commit is dropped — never adopted over the live store.
+        let stale = SelectorStore::open(path);
+        *backing.pending.lock() = Some(stale);
+        backing.commit(false);
+        assert!(backing.pending.lock().is_none());
+        assert!(
+            Arc::ptr_eq(&live, backing.store.lock().as_ref().unwrap()),
+            "a disable transition must not adopt a parked store"
         );
     }
 
