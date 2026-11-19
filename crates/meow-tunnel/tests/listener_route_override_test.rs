@@ -1,7 +1,7 @@
 /// `listeners[].proxy` / `listeners[].rule` route overrides
 /// (SPEC_LISTENER_SURFACE item 2): the tunnel resolves
-/// `Metadata.special_proxy` before mode dispatch and process lookup,
-/// resolves `Metadata.special_rules` against the route table's named
+/// `Metadata::special_proxy` before mode dispatch and process lookup,
+/// resolves `Metadata::special_rules` against the route table's named
 /// `sub-rules` blocks instead of the top-level list, fails closed on a
 /// missing forced proxy or block, and never stamps a fictitious
 /// top-level rule hit or disable state for block matches.
@@ -89,7 +89,7 @@ async fn forced_proxy_beats_rule_match_and_mode() {
     let tunnel = tunnel_with(BASE);
     // `top.example` matches top-level rule 1 → A, but the listener forced B.
     let mut md = tcp_md("top.example");
-    md.special_proxy = "B".into();
+    md.set_special_route(Some("B"), None);
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     assert_eq!(t.rule_name.as_str(), "ListenerProxy");
     assert_eq!(t.rule_payload.as_str(), "B");
@@ -98,7 +98,7 @@ async fn forced_proxy_beats_rule_match_and_mode() {
     // Global mode does not shield a flow from its listener's forced proxy.
     tunnel.set_mode(TunnelMode::Global);
     let mut md = tcp_md("anything.example");
-    md.special_proxy = "A".into();
+    md.set_special_route(Some("A"), None);
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     assert_resolved_to(&t, "A");
 }
@@ -107,14 +107,14 @@ async fn forced_proxy_beats_rule_match_and_mode() {
 async fn forced_proxy_direct_and_group_resolve_live() {
     let tunnel = tunnel_with(BASE);
     let mut md = tcp_md("x.example");
-    md.special_proxy = "DIRECT".into();
+    md.set_special_route(Some("DIRECT"), None);
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     assert_resolved_to(&t, "DIRECT");
 
     // A group name resolves to the live group adapter — membership is
     // consulted per-flow, never a startup-cached leaf.
     let mut md = tcp_md("x.example");
-    md.special_proxy = "GRP".into();
+    md.set_special_route(Some("GRP"), None);
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     assert_resolved_to(&t, "GRP");
 }
@@ -123,7 +123,7 @@ async fn forced_proxy_direct_and_group_resolve_live() {
 async fn forced_proxy_missing_fails_closed() {
     let tunnel = tunnel_with(BASE);
     let mut md = tcp_md("top.example");
-    md.special_proxy = "GHOST".into();
+    md.set_special_route(Some("GHOST"), None);
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     // Fail closed, no slide to the top-level A match or DIRECT.
     assert_eq!(t.rule_name.as_str(), "ListenerProxy");
@@ -138,14 +138,14 @@ async fn named_rule_block_replaces_top_level_scan() {
     // the selected block's DOMAIN-SUFFIX sends it to B as well — so use a
     // host the top list would send to A and the block sends DIRECT.
     let mut md = tcp_md("top.example");
-    md.special_rules = "inner".into();
+    md.set_special_route(None, Some("inner"));
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     // The block has no top.example rule → its own MATCH → DIRECT; the
     // top-level DOMAIN-SUFFIX→A is never consulted.
     assert_resolved_to(&t, "DIRECT");
 
     let mut md = tcp_md("inner.example");
-    md.special_rules = "inner".into();
+    md.set_special_route(None, Some("inner"));
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     assert_resolved_to(&t, "B");
 }
@@ -154,7 +154,7 @@ async fn named_rule_block_replaces_top_level_scan() {
 async fn named_rule_block_empty_or_exhausted_goes_direct() {
     let tunnel = tunnel_with(BASE);
     let mut md = tcp_md("top.example");
-    md.special_rules = "empty-block".into();
+    md.set_special_route(None, Some("empty-block"));
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     assert_resolved_to(&t, "DIRECT");
 }
@@ -163,7 +163,7 @@ async fn named_rule_block_empty_or_exhausted_goes_direct() {
 async fn named_rule_block_missing_fails_closed() {
     let tunnel = tunnel_with(BASE);
     let mut md = tcp_md("top.example");
-    md.special_rules = "no-such-block".into();
+    md.set_special_route(None, Some("no-such-block"));
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     assert_eq!(t.rule_name.as_str(), "ListenerProxy");
     assert_resolved_to(&t, "REJECT");
@@ -174,8 +174,7 @@ async fn forced_proxy_wins_over_named_rule_block() {
     let tunnel = tunnel_with(BASE);
     // Both set: upstream `resolveMetadata` applies specialProxy first.
     let mut md = tcp_md("inner.example");
-    md.special_proxy = "A".into();
-    md.special_rules = "inner".into();
+    md.set_special_route(Some("A"), Some("inner"));
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     assert_eq!(t.rule_name.as_str(), "ListenerProxy");
     assert_resolved_to(&t, "A");
@@ -189,7 +188,7 @@ async fn sub_rules_survive_partial_route_updates() {
     let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
     tunnel.update_proxies(res.proxies, res.dialer_registry);
     let mut md = tcp_md("inner.example");
-    md.special_rules = "inner".into();
+    md.set_special_route(None, Some("inner"));
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     // B is gone from the proxy map, so the block's DOMAIN-SUFFIX,B match
     // is skipped (upstream `continue`); MATCH,DIRECT still lands.
@@ -235,7 +234,7 @@ sub-rules:
     let tunnel = tunnel_with(yaml);
     let mut md = tcp_md("udp.example");
     md.network = Network::Udp;
-    md.special_rules = "blk".into();
+    md.set_special_route(None, Some("blk"));
     let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
     // The block rule DID match — this is the fail-closed arm, not the
     // missing-block ListenerProxy path; had the scan slid, the block's

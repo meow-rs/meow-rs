@@ -1828,10 +1828,9 @@ impl WgActor {
                 ..Default::default()
             };
             // The named listener's `proxy:`/`rule:` override stamps before
-            // the sniff and the route scan (upstream Additions order).
-            if let Some(ov) = &route_override {
-                ov.apply(&mut metadata);
-            }
+            // the sniff and the route scan (upstream Additions order) —
+            // shared, not cloned: the task's Arc is dead after this point.
+            metadata.special_route = route_override;
             let mut prefix = prefix;
             if let Some(rt) = &sniffer {
                 crate::sniffer::prefill_host(&inner.resolver(), &mut metadata);

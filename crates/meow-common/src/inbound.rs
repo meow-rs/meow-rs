@@ -11,16 +11,17 @@
 use crate::metadata::Metadata;
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
+use std::sync::Arc;
 
 /// `listeners[].proxy` + `listeners[].rule` — a named inbound's
 /// forced-route override, immutable after config build.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct InboundRouteOverride {
-    /// Forced proxy/group name — lands on `metadata.special_proxy` and
+    /// Forced proxy/group name — lands on `metadata.special_route` and
     /// resolves before all mode dispatch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub proxy: Option<SmolStr>,
-    /// `sub-rules:` block name — lands on `metadata.special_rules` and
+    /// `sub-rules:` block name — lands on `metadata.special_route` and
     /// replaces the top-level rule list for this flow's scan.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rule: Option<SmolStr>,
@@ -39,13 +40,26 @@ impl InboundRouteOverride {
 
     /// Stamp the override onto `metadata` — run at the same sites
     /// upstream's `Additions` execute: inbound flow construction, before
-    /// routing, eager destination resolution, or any rule scan.
+    /// routing, eager destination resolution, or any rule scan. Each set
+    /// half overwrites what the flow carries and a `None` half leaves it,
+    /// exactly as upstream's per-field `SpecialProxy`/`SpecialRules`
+    /// assignments do; a route shared with other clones is copied first
+    /// (`Arc::make_mut`), never mutated out from under them.
     pub fn apply(&self, metadata: &mut Metadata) {
-        if let Some(p) = &self.proxy {
-            metadata.special_proxy = p.clone();
+        if self.proxy.is_none() && self.rule.is_none() {
+            return;
         }
-        if let Some(r) = &self.rule {
-            metadata.special_rules = r.clone();
+        match &mut metadata.special_route {
+            slot @ None => *slot = Some(Arc::new(self.clone())),
+            Some(route) => {
+                let route = Arc::make_mut(route);
+                if let Some(p) = &self.proxy {
+                    route.proxy = Some(p.clone());
+                }
+                if let Some(r) = &self.rule {
+                    route.rule = Some(r.clone());
+                }
+            }
         }
     }
 }

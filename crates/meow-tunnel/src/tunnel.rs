@@ -701,7 +701,7 @@ impl TunnelInner {
     /// fails the same way — it must not fall back to the main rules.
     fn resolve_listener_proxy(&self, metadata: &Metadata, record_hit: bool) -> ResolvedTarget {
         let route = self.route();
-        let name = metadata.special_proxy.as_str();
+        let name = metadata.special_proxy();
         // Built-ins resolve through the map like any other name: the
         // published DIRECT carries the build's resolver slot and
         // `tcp-connect-timeout`, so a forced `proxy: DIRECT` must dial
@@ -748,7 +748,7 @@ impl TunnelInner {
         metadata: &Metadata,
         record_hit: bool,
     ) -> ResolvedTarget {
-        let name = metadata.special_rules.as_str();
+        let name = metadata.special_rules();
         warn!("listener sub-rules block '{name}' is not in the route table; rejecting flow");
         if record_hit {
             self.stats.rule_match.increment("ListenerProxy", "REJECT");
@@ -766,7 +766,7 @@ impl TunnelInner {
     /// or the top-level set when unset. `Err(())` = the named block is
     /// missing from the table: the caller fails the flow closed.
     fn rule_scan<'a>(route: &'a RouteTable, metadata: &Metadata) -> Result<RuleScan<'a>, ()> {
-        let name = metadata.special_rules.as_str();
+        let name = metadata.special_rules();
         if name.is_empty() {
             return Ok(RuleScan {
                 rules: route.rules.as_slice(),
@@ -801,7 +801,7 @@ impl TunnelInner {
         // in the current proxy map BEFORE process lookup and before
         // direct/global/rule dispatch — it overrides every mode,
         // including when `rule:` is also set.
-        if !metadata.special_proxy.is_empty() {
+        if !metadata.special_proxy().is_empty() {
             // The `always`-mode lookup this early return skips is a real
             // skip, not "untried": record it like `maybe_lookup_flow_process`
             // does so the ledger's app lane does not queue an OS scan for
@@ -884,7 +884,7 @@ impl TunnelInner {
         // A forced `proxy:` overrides every mode upstream — it must win
         // before this early-out; the special-proxy flow then resolves
         // inside `resolve_proxy_inner` and never reaches lazy scanning.
-        if mode != TunnelMode::Rule || !metadata.special_proxy.is_empty() {
+        if mode != TunnelMode::Rule || !metadata.special_proxy().is_empty() {
             return self.resolve_proxy_flow(metadata).await;
         }
         let process_mode = self.process_policy.get();
@@ -1024,7 +1024,7 @@ impl TunnelInner {
         if process_mode != ProcessLookupMode::Always {
             return;
         }
-        if metadata.is_internal() || !metadata.special_proxy.is_empty() {
+        if metadata.is_internal() || !metadata.special_proxy().is_empty() {
             metadata.flow_lookup.record_process(None);
             return;
         }
@@ -1380,7 +1380,7 @@ pub enum PreHandleVerdict {
 }
 
 /// The `(rules, compiled, stats)` a rule-mode scan runs over for `metadata`
-/// — the named `sub-rules` block `special_rules` selects, or the top-level
+/// — the named `sub-rules` block `special_rules()` selects, or the top-level
 /// set when unset. `Err(())` = the named block is missing from the table:
 /// the caller fails the flow closed.
 #[derive(Clone, Copy)]
@@ -3930,7 +3930,7 @@ mod tests {
         tunnel.inner().resolve_proxy_flow(&mut internal).await;
 
         let mut proxied = flow_meta();
-        proxied.special_proxy = "PROXY".into();
+        proxied.set_special_route(Some("PROXY"), None);
         tunnel.inner().resolve_proxy_flow(&mut proxied).await;
 
         let mut named = flow_meta();

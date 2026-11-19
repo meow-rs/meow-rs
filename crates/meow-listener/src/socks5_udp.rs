@@ -287,8 +287,7 @@ fn handle_client_datagram(
         // The named listener's `proxy:`/`rule:` override — stamped onto
         // the handshake's inbound tag by the caller, carried here so the
         // association's flows route through it too.
-        special_proxy: inbound.special_proxy.clone(),
-        special_rules: inbound.special_rules.clone(),
+        special_route: inbound.special_route.clone(),
         ..Default::default()
     };
 

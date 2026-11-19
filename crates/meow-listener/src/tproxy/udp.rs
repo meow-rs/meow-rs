@@ -112,10 +112,9 @@ pub(super) mod flow {
             ..Default::default()
         };
         // The named listener's `proxy:`/`rule:` override stamps before
-        // the fake-IP guard and the route scan (upstream Additions order).
-        if let Some(ov) = &route_override {
-            ov.apply(&mut metadata);
-        }
+        // the fake-IP guard and the route scan (upstream Additions order)
+        // — shared, not cloned: the ctx Arc is dead after this point.
+        metadata.special_route = route_override;
 
         let inner = tunnel.inner();
         if matches!(

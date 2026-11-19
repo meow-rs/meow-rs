@@ -115,10 +115,9 @@ pub(super) async fn run_flow(args: FlowArgs, mut rx: mpsc::Receiver<Bytes>) -> R
         ..Default::default()
     };
     // The named listener's `proxy:`/`rule:` override stamps before the
-    // fake-IP guard and the route scan (upstream Additions order).
-    if let Some(ov) = &route_override {
-        ov.apply(&mut metadata);
-    }
+    // fake-IP guard and the route scan (upstream Additions order) —
+    // shared, not cloned: the flow-args Arc is dead after this point.
+    metadata.special_route = route_override;
 
     if matches!(
         inner.pre_handle_metadata(&mut metadata),
