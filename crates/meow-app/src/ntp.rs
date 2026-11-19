@@ -54,6 +54,10 @@ pub struct NtpSupervisor {
 struct WorkerState {
     config: Option<meow_config::NtpConfig>,
     task: Option<JoinHandle<()>>,
+    /// Terminal once `shutdown` runs — a reconcile racing the shutdown
+    /// path (the API lane is still serving then) must not spawn a worker
+    /// out of the grave (issue #974 review).
+    closed: bool,
 }
 
 impl NtpSupervisor {
@@ -63,6 +67,7 @@ impl NtpSupervisor {
             state: Mutex::new(WorkerState {
                 config: None,
                 task: None,
+                closed: false,
             }),
             generation: Arc::new(AtomicU64::new(0)),
             publish: Arc::new(Mutex::new(())),
@@ -76,7 +81,7 @@ impl NtpSupervisor {
     pub fn reconcile(&self, cfg: meow_config::NtpConfig) {
         let next = cfg.enable.then_some(cfg);
         let mut st = self.state.lock().unwrap();
-        if st.config == next {
+        if st.closed || st.config == next {
             return;
         }
         if let Some(task) = st.task.take() {
@@ -112,26 +117,37 @@ impl NtpSupervisor {
         st.config = next;
     }
 
-    /// Cancel and join the worker — it must not outlive the supervisor.
+    /// Cancel and join the worker, then make the supervisor terminal:
+    /// `closed` fences any reconcile still racing the shutdown path, and
+    /// the generation bump fences a worker whose abort had not landed.
     pub async fn shutdown(&self) {
-        let task = self.state.lock().unwrap().task.take();
+        let task = {
+            let mut st = self.state.lock().unwrap();
+            st.closed = true;
+            st.task.take()
+        };
         if let Some(task) = task {
             task.abort();
             let _ = task.await;
         }
         let _publish = self.publish.lock().unwrap();
+        self.generation.fetch_add(1, Ordering::AcqRel);
         meow_common::set_protocol_offset_ns(None);
     }
 }
 
 impl Drop for NtpSupervisor {
     /// A dropped supervisor must not leak a forever-polling worker or
-    /// leave its last offset bending protocol timestamps.
+    /// leave its last offset bending protocol timestamps. `abort` only
+    /// cancels at the next await point — a worker already past its
+    /// exchange can still reach the fence check, so the generation must
+    /// move before the offset is cleared.
     fn drop(&mut self) {
         if let Some(task) = self.state.lock().unwrap().task.take() {
             task.abort();
         }
         let _publish = self.publish.lock().unwrap();
+        self.generation.fetch_add(1, Ordering::AcqRel);
         meow_common::set_protocol_offset_ns(None);
     }
 }
@@ -799,6 +815,23 @@ mod tests {
         );
         // Same gate-through-shutdown contract as the sibling test.
         sup.shutdown().await;
+    }
+
+    /// `shutdown` is terminal: a reconcile that lands after it — the API
+    /// lane is still serving while shutdown runs — must not spawn a
+    /// worker out of the grave (issue #974 review).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_after_shutdown_stays_stopped() {
+        let _gate = offset_gate().await;
+        let sup = supervisor();
+        sup.reconcile(test_cfg("127.0.0.1"));
+        sup.shutdown().await;
+        sup.reconcile(test_cfg("127.0.0.2"));
+        assert!(
+            sup.state.lock().unwrap().task.is_none(),
+            "a post-shutdown reconcile must not spawn a worker"
+        );
+        sup.shutdown().await; // idempotent
     }
 
     /// A dropped supervisor aborts its worker and clears the offset —
