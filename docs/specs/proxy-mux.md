@@ -126,9 +126,12 @@ to the destination in the stream request; afterwards both directions are
 [len u16 BE][data] datagram frames (the same framing as meow's VLESS
 UDP-over-TCP), with no per-packet addresses. The server handles them via
 serverPacketConn. meow-rs's `MuxPacketConn` implements this framing;
-`only-tcp: true` routes UDP over the plain non-mux path instead. The
-`statistic`/`brutal-opts` fields are not supported yet (each gets a warn
-on parse; brutal is Linux-only upstream).
+`only-tcp: true` routes UDP over the plain non-mux path instead.
+`statistic: true` is parsed and warns that physical carrier tracking is
+unavailable — per-flow accounting lives in the existing
+`/connections`/`/traffic` APIs, there is no mux-carrier surface
+(issue #974); `brutal-opts` is still unsupported (warn on parse,
+Linux-only upstream).
 
 ### 5. Client session management (aligned with sing-mux client.go)
 

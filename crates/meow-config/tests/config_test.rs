@@ -4431,7 +4431,10 @@ strict-bogus-key: 1
             "max-connections",
             "mixed-port",
             "mode",
+            // Typed `ntp:`/`profile:` sections (issue #974) — deliberate.
+            "ntp",
             "port",
+            "profile",
             "proxies",
             "proxy-groups",
             "proxy-providers",

@@ -5724,7 +5724,7 @@ pub struct ResolvedProfile {
 /// Resolve `profile:` — `store-selected` defaults to upstream's `true`;
 /// `store-fake-ip` follows `profile` > `dns` > `false`. When both
 /// explicit spellings disagree, `profile` wins and the caller warns once
-/// per admission ([`validation::validate_and_warn`]).
+/// per admission (`validation::validate_and_warn`).
 pub fn resolve_profile(raw: &raw::RawConfig) -> ResolvedProfile {
     let profile = raw.profile.as_ref();
     ResolvedProfile {

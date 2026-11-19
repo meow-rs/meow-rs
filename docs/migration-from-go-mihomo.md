@@ -139,7 +139,11 @@ These fields parse without error but behave differently from Go mihomo:
 | `find-process-mode` | `always`/`strict`/`off` | Same modes; `strict` scans only at the first *reached* process-demanding rule (never for a flow an earlier rule already decided, never per packet on established UDP flows). `off` also suppresses the traffic ledger's app lookup | — |
 | `dns.listen` / `external-controller` bind failure at startup | Logs error, daemon keeps running | Hard startup error (process exits non-zero) — no prior listener exists to fall back to (the `dns.listen` half keeps its tolerant keep-old semantics on runtime `PUT /configs` rebind; `external-controller` has no runtime rebind) | A |
 | `dns.listen` set while `dns.enable: false` | Silently ignored | Warn-once that no listener is started | B |
-| `keep-alive-idle` / `keep-alive-interval` / `disable-keep-alive` | Tune keepalive on inbound listeners AND outbound dials | Parsed and ignored with a warn pointing to `tcp-keepalive*` — which covers the inbound half only; the outbound-dialer keepalive tuning is not honored | B |
+| `keep-alive-idle` / `keep-alive-interval` / `disable-keep-alive` | Tune keepalive on inbound listeners AND outbound dials | Honored on the outbound half only — applied once per physical upstream dial (`0`/absent → 15 s, `0..=32767` hard bounds, `disable-keep-alive` turns it off). The inbound half keeps its own `tcp-keepalive*` family — different defaults (300 s) and different scope; see "Two keepalive families" below | B |
+| `profile.store-selected` | `select`-group choices persist to `cache.db` (BoltDB) | Same semantics — restore on load, write on successful selection — but persisted as JSON next to the config; see "Selection persistence" below | B |
+| `profile.store-fake-ip` | Persists fake-IP mappings when `true` | Resolution is `profile.store-fake-ip` > `dns.store-fake-ip` > `false`; a disagreement between the two spellings warns once per admission | B |
+| `ntp:` | Polls SNTP and (optionally) writes the OS clock | Bounded poll feeding protocol timestamps only — never the OS clock; see "NTP scope" below | A |
+| `smux.statistic` | Tracks mux carrier statistics | Parsed and warn-ignored: physical carrier tracking is unavailable; use `/connections`/`/traffic` for per-flow accounting | B |
 
 ### Fields that are silently ignored in Go mihomo but error in meow-rs
 
@@ -720,6 +724,59 @@ using them will produce a clear error at startup.
 | TUN inbound | L3-device transparent proxy (issue #326) | `tun:` section or a named `listeners:` `type: tun` entry (flat form, one effective TUN), with the `listener-tun` Cargo feature |
 
 ---
+
+## Top-level knobs (`profile:`, `ntp:`, `keep-alive-*`)
+
+Three sections Go mihomo users already have in their configs resolve to
+slightly different machinery in meow-rs.
+
+**Selection persistence.** `profile.store-selected` (default `true`,
+matching upstream) restores `select`-group choices at load and records
+successful `PUT /proxies/{name}` selections — but meow-rs stores the map
+as JSON next to the config file, while mihomo uses BoltDB `cache.db`.
+The files are not interchangeable: migrating means keeping the directory
+contents and letting meow write its own store (nothing crashes; the old
+`cache.db` is simply never read). `store-selected: false` disables both
+restoration and writes, like upstream, and does not delete an existing
+cache file. Configs loaded via `--config-string` have no backing path
+and persist nothing.
+
+**Fake-IP persistence.** `profile.store-fake-ip` outranks
+`dns.store-fake-ip`, which outranks `false` — declare both with
+different values and one warns which spelling won. The flag only takes
+effect for fake-IP DNS modes.
+
+**NTP scope.** The `ntp:` section polls the configured server (default
+`time.apple.com:123`, every `interval` minutes, at most three attempts
+per poll, ±24 h offset cap) and feeds the offset into exactly two
+protocol fields: VMess auth-ID timestamps and the REALITY client
+timestamp. Before the first successful sample — and after the section
+is disabled — those fields use wall time. Everything else keeps the OS
+clock: **TLS/QUIC certificate verification is unchanged**, so a host
+whose clock is badly skewed still fails certificate checks until the OS
+time is fixed (the NTP offset only ever *adds* skew-tolerance to the two
+protocol fields it owns; it cannot repair TLS). `write-to-system: true`
+is parsed for config compatibility and warn-ignored — meow-rs never
+invokes a clock-setting syscall, even under root. `dialer-proxy` names
+an existing top-level proxy/group (or `DIRECT`) the poll dials through;
+the name must exist whenever the section is enabled.
+
+**Two keepalive families.** mihomo's flat `keep-alive-*` keys tune both
+accept-side and dial-side sockets; meow-rs splits them. `tcp-keepalive`,
+`tcp-keepalive-idle`, `-interval`, `-probes` stay the *inbound* family
+(defaults 300 s/30 s/5, listener-startup scope, applied to accepted
+sockets). `keep-alive-idle`, `keep-alive-interval`,
+`disable-keep-alive` are now honored on the *outbound* family — applied
+once per physical upstream connect on every dial path (defaults 15 s,
+bounds `0..=32767`, probes fixed at 9). Setting only the flat keys no
+longer silently does nothing; wanting the old inbound tuning still means
+`tcp-keepalive*`.
+
+**Mux `statistic`.** The flag parses and, when `true`, warns that
+physical carrier tracking is unavailable — the mux pool has no
+per-carrier surface; per-flow accounting lives in `/connections` and
+`/traffic`. `0/0/0` pool sizing keeps warning it disables sharing; the
+shipped defaults are `4/4/4` from a single source (`MuxOptions::default`).
 
 ## meow-rs-only features
 
