@@ -2250,8 +2250,8 @@ async fn commit_raw_candidate(
         TrackedTcp::Cancel,
     )
     .await;
-    // `swap` installs the keepalive posture only on a clean TUN
-    // transition; this lane committed the document either way.
+    // `swap` already installed the committed posture ahead of its `ntp:`
+    // reconcile; re-assert it at this lane's own commit point.
     install_committed_keepalive(state);
     if let Some(change) = change.into() {
         change.record();
@@ -4151,7 +4151,7 @@ pub fn tun_fake_ip_changed(prior: &meow_dns::Resolver, current: &meow_dns::Resol
 /// (`reload_routing`), for [`outbound_binding_adopted`]'s flush.
 async fn swap_config_and_reconcile_tun(
     state: &AppState,
-    candidate: RawConfig,
+    mut candidate: RawConfig,
     dns: Option<meow_config::DnsConfig>,
     prior_resolver: Arc<meow_dns::Resolver>,
     mut preinstalled: PreinstalledBinding,
@@ -4162,20 +4162,22 @@ async fn swap_config_and_reconcile_tun(
         "caller must hold the CONFIG_MUTATION lane"
     );
     let new_enable = candidate.tun.as_ref().is_some_and(|t| t.enable);
-    // Snapshot the candidate (only on an off→on transition, before it is
-    // moved into the lock) so the parking_lot write guard — which is
-    // !Send — is dropped before the first .await below.
+    // Read the committed document for the old-side diffs — a read guard
+    // only: `CONFIG_MUTATION` is the sole writer lane, so these stay true
+    // through the candidate-stage settles below. Nothing here may await:
+    // every settle is hoisted above the publish so a cancelled request
+    // never leaves a committed document whose tail (the keepalive install
+    // and `ntp:` reconcile) never ran.
     let (
         old_enable,
         tun_changed,
-        snapshot,
         specs,
         new_log_level,
         (logbook_enable, ledger),
         geo_schedule_changed,
         ntp_resolved,
     ) = {
-        let mut guard = state.raw_config.write();
+        let guard = state.raw_config.read();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
         // any real listener-parameter change (`mtu`, `auto-route`,
@@ -4187,10 +4189,9 @@ async fn swap_config_and_reconcile_tun(
         // do not. Shared with the forced-commit fallbacks above as
         // [`tun_reconcile_differs`].
         let tun_changed = tun_reconcile_differs(&guard, &candidate);
-        let snapshot = (new_enable && !old).then(|| candidate.clone());
-        // Extract health-check specs straight from the candidate before it
-        // is moved into the lock — no second read of `raw_config` and no
-        // deep clone of the group section (issue #514 review).
+        // Extract health-check specs straight from the candidate — no
+        // second read of `raw_config` and no deep clone of the group
+        // section (issue #514 review).
         let specs = meow_config::extract_health_check_specs(
             candidate.proxy_groups.as_deref().unwrap_or(&[]),
         );
@@ -4211,10 +4212,165 @@ async fn swap_config_and_reconcile_tun(
         // that to the operator rather than letting it sit silently stale.
         let geo_schedule_changed = meow_config::geodata::update_schedule(&guard)
             != meow_config::geodata::update_schedule(&candidate);
-        // Commit point: a rejected candidate never reaches here.
+        // `ntp:` resolved here but reconciled once the commit below
+        // settles (issue #974 — the worker must never dial through a
+        // half-published commit). The candidate already resolved inside
+        // the rebuild — an error here means a caller skipped its gate.
+        let ntp_resolved = meow_config::resolve_ntp(&candidate);
+        let ledger = candidate.traffic_ledger.as_ref();
+        let ledger = (
+            meow_config::raw::RawTrafficLedger::enabled(ledger),
+            meow_config::raw::RawTrafficLedger::options(ledger),
+        );
+        (
+            old,
+            tun_changed,
+            specs,
+            new_log_level,
+            (logbook_enable, ledger),
+            geo_schedule_changed,
+            ntp_resolved,
+        )
+    };
+
+    // Opening or closing the ledger waits on its database.
+    let _ = tokio::task::spawn_blocking(move || {
+        meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
+    })
+    .await;
+
+    // Publish the rebuilt DNS runtime — independent of TUN transitions,
+    // so it must run even when the `tun:` tuple compares equal
+    // (issue #514). The fake-IP inputs of the resolver being replaced
+    // come from `prior_resolver` — the caller already early-installed the
+    // candidate's resolver, so `tunnel.resolver()` would read the NEW
+    // generation and the on→on `fake_ip_changed` check below could never
+    // fire (issue #533 review).
+    let dns_rebuilt = dns.is_some();
+    if let Some(dns) = dns {
+        publish_dns(&state.tunnel, &state.dns_server, &dns).await;
+    }
+    // The TUN listener snapshots both fake-IP pool prefixes, the v4 gateway
+    // and DnsGuard when the stack is built; after a resolver swap those are
+    // stale — restart it so either fake-ip range or enhanced-mode changes
+    // take effect instead of blackholing the new pool (issue #514).
+    let fake_ip_changed =
+        dns_rebuilt && tun_fake_ip_changed(&prior_resolver, &state.tunnel.resolver());
+
+    // The TUN transition is the last candidate-stage settle: a failed
+    // (re)spawn rolls `tun.enable` back inside the candidate, so the
+    // committed document lands exactly like the old in-place rollback —
+    // and a caller cancelled mid-spawn leaves the PREVIOUS document
+    // committed rather than a new one whose tail never ran. Its value
+    // still decides the keepalive install and the return below.
+    let tun_result = if old_enable == new_enable {
+        // on → on with changed fake-IP inputs or any real `tun:` parameter
+        // change: restart the listener so the running stack matches the
+        // committed raw (issue #543). No `has_tun()` gate — a dead
+        // but-enabled listener must attempt a respawn too, and a failed
+        // one rolls `enable` back so it self-limits to one attempt.
+        if old_enable && (fake_ip_changed || tun_changed) {
+            // The candidate's binding (if global) is already in effect, so
+            // the stop → spawn gap below is covered (issue #695).
+            state.tunnel.stop_tun().await;
+            let binding = preinstalled.take_binding();
+            let adopted = binding.is_some();
+            match spawn_tun_from_raw(&state.tunnel, &candidate, binding).await {
+                Ok(Some(handle)) => {
+                    state.tunnel.set_tun_handle(handle).await;
+                    info!(
+                        fake_ip_changed,
+                        tun_changed, "TUN listener restarted via config reload"
+                    );
+                    if adopted {
+                        outbound_binding_adopted(
+                            state,
+                            preinstalled.interface_changed(),
+                            tracked_tcp,
+                        );
+                    }
+                    Ok(())
+                }
+                // Unreachable like the off→on arm — `enable` is still true
+                // in the candidate. Roll back the same way rather than
+                // persist `enable: true` with nothing running.
+                Ok(None) => {
+                    warn!("TUN listener restart returned no handle (config rolled back)");
+                    if let Some(ref mut tun) = candidate.tun {
+                        tun.enable = false;
+                    }
+                    Err("TUN did not restart and was turned off".into())
+                }
+                Err(e) => {
+                    warn!("TUN listener failed to restart: {e} (config rolled back)");
+                    let message = format!("TUN failed to restart and was turned off: {e}");
+                    tun_failed(message.clone());
+                    if let Some(ref mut tun) = candidate.tun {
+                        tun.enable = false;
+                    }
+                    Err(message)
+                }
+            }
+        } else {
+            Ok(())
+        }
+    } else if new_enable {
+        // off → on. Defensive: if a handle somehow outlives a raw config
+        // that already says `enable: false`, stop it first — the new
+        // listener must never build a second lwIP core over a live one
+        // (its PREVIOUS_CORE gate hard-fails the spawn after a 10 s
+        // teardown timeout rather than stack two generations).
+        state.tunnel.stop_tun().await;
+        let binding = preinstalled.take_binding();
+        let adopted = binding.is_some();
+        match spawn_tun_from_raw(&state.tunnel, &candidate, binding).await {
+            Ok(Some(handle)) => {
+                state.tunnel.set_tun_handle(handle).await;
+                info!("TUN listener started via config reload");
+                if adopted {
+                    outbound_binding_adopted(state, preinstalled.interface_changed(), tracked_tcp);
+                }
+                Ok(())
+            }
+            Ok(None) => {
+                // Unreachable today — `spawn_tun_from_raw` only yields
+                // `Ok(None)` when `tun.enable` is false and this arm only
+                // runs for off→on. Roll back like the `Err` arm rather
+                // than persist `enable: true` with nothing running.
+                warn!("TUN listener spawn returned no handle on off→on (config rolled back)");
+                if let Some(ref mut tun) = candidate.tun {
+                    tun.enable = false;
+                }
+                Err("TUN did not start and was turned off".into())
+            }
+            Err(e) => {
+                // TUN failed to start — roll back tun.enable to false so
+                // nyanpasu / the dashboard don't show TUN as active when
+                // nothing is actually running.
+                warn!("TUN listener failed to start: {e} (config rolled back)");
+                let message = format!("TUN failed to start and was turned off: {e}");
+                tun_failed(message.clone());
+                if let Some(ref mut tun) = candidate.tun {
+                    tun.enable = false;
+                }
+                Err(message)
+            }
+        }
+    } else {
+        // on → off
+        state.tunnel.stop_tun().await;
+        info!("TUN listener stopped via config reload");
+        Ok(())
+    };
+
+    // Commit point: a rejected candidate never reaches here. From the
+    // publish on nothing may await — the synchronous tail below must
+    // always land once the document does.
+    {
+        let mut guard = state.raw_config.write();
+        // (mihomo re-applies `routing-mark` on every load); a change
+        // under pinned managed rules was refused before this.
         meow_proxy::health::set_unified_delay(candidate.unified_delay.unwrap_or(false));
-        // Commit point (mihomo re-applies `routing-mark` on every load); a
-        // change under pinned managed rules was refused before this.
         meow_common::set_routing_mark(candidate.routing_mark);
         // `interface-name` re-applies on every load the same way
         // (issue #974); the setter normalizes — trimmed, empty meaning
@@ -4238,7 +4394,7 @@ async fn swap_config_and_reconcile_tun(
             .tunnel
             .set_process_lookup_mode(candidate.find_process_mode.unwrap_or_default());
         // `keep-alive-*` deliberately does NOT install here: the TUN
-        // reconcile below is fallible, and a socket dialed in the
+        // reconcile above is fallible, and a socket dialed in the
         // failed-spawn window would retain a posture its PATCH then
         // rolls back. It installs after `tun_result` instead — see the
         // install site below (issue #974 review).
@@ -4248,29 +4404,9 @@ async fn swap_config_and_reconcile_tun(
         // writers go live (issue #974 review). Lanes that reach here
         // without a publish (the verbatim fallback, a knobs-only PATCH)
         // never carry a flag diff, so nothing remains to retire.
-        // `ntp:` on the same lane, resolved here but reconciled once the
-        // route/DNS/dial-globals/TUN commit below settles (issue #974 —
-        // the worker must never dial through a half-published commit).
-        // The candidate already resolved inside the rebuild — an error
-        // here means a caller skipped its gate.
-        let ntp_resolved = meow_config::resolve_ntp(&candidate);
-        let ledger = candidate.traffic_ledger.as_ref();
-        let ledger = (
-            meow_config::raw::RawTrafficLedger::enabled(ledger),
-            meow_config::raw::RawTrafficLedger::options(ledger),
-        );
         *guard = candidate;
-        (
-            old,
-            tun_changed,
-            snapshot,
-            specs,
-            new_log_level,
-            (logbook_enable, ledger),
-            geo_schedule_changed,
-            ntp_resolved,
-        )
-    };
+    }
+
     if geo_schedule_changed {
         warn!(
             "geodata update schedule changed (geo-auto-update / geo-update-interval / \
@@ -4279,11 +4415,6 @@ async fn swap_config_and_reconcile_tun(
         );
     }
     logbook::reconfigure(logbook_enable);
-    // Opening or closing the ledger waits on its database.
-    let _ = tokio::task::spawn_blocking(move || {
-        meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
-    })
-    .await;
 
     if let Some(new_log_level) = new_log_level {
         let level = new_log_level.as_deref().unwrap_or("info");
@@ -4304,144 +4435,22 @@ async fn swap_config_and_reconcile_tun(
     // (issue #514). Sync; spawns under the lane lock are cheap.
     state.tunnel.reconcile_health_checks(&specs);
 
-    // Publish the rebuilt DNS runtime — independent of TUN transitions, so
-    // it must run before the equal-state early return (issue #514).
-    // The fake-IP inputs of the resolver being replaced come from
-    // `prior_resolver` — the caller already early-installed the candidate's
-    // resolver, so `tunnel.resolver()` would read the NEW generation and
-    // the on→on `fake_ip_changed` check below could never fire
-    // (issue #533 review).
-    let dns_rebuilt = dns.is_some();
-    if let Some(dns) = dns {
-        publish_dns(&state.tunnel, &state.dns_server, &dns).await;
-    }
-    // The TUN listener snapshots both fake-IP pool prefixes, the v4 gateway
-    // and DnsGuard when the stack is built; after a resolver swap those are
-    // stale — restart it so either fake-ip range or enhanced-mode changes
-    // take effect instead of blackholing the new pool (issue #514).
-    let fake_ip_changed =
-        dns_rebuilt && tun_fake_ip_changed(&prior_resolver, &state.tunnel.resolver());
-
-    // The TUN transition as a value so the `ntp:` reconcile below runs on
-    // every exit — a rolled-back spawn still committed the document, so
-    // the supervisor must see its `ntp:` section either way (issue #974).
-    let tun_result = if old_enable == new_enable {
-        // on → on with changed fake-IP inputs or any real `tun:` parameter
-        // change: restart the listener so the running stack matches the
-        // committed raw (issue #543). No `has_tun()` gate — a dead
-        // but-enabled listener must attempt a respawn too, and a failed
-        // one rolls `enable` back so it self-limits to one attempt.
-        if old_enable && (fake_ip_changed || tun_changed) {
-            // The candidate's binding (if global) is already in effect, so
-            // the stop → spawn gap below is covered (issue #695).
-            state.tunnel.stop_tun().await;
-            let raw = state.raw_config.read().clone();
-            let binding = preinstalled.take_binding();
-            let adopted = binding.is_some();
-            match spawn_tun_from_raw(&state.tunnel, &raw, binding).await {
-                Ok(Some(handle)) => {
-                    state.tunnel.set_tun_handle(handle).await;
-                    info!(
-                        fake_ip_changed,
-                        tun_changed, "TUN listener restarted via config reload"
-                    );
-                    if adopted {
-                        outbound_binding_adopted(
-                            state,
-                            preinstalled.interface_changed(),
-                            tracked_tcp,
-                        );
-                    }
-                    Ok(())
-                }
-                // Unreachable like the off→on arm — `enable` is still true
-                // in the committed raw. Roll back the same way rather than
-                // persist `enable: true` with nothing running.
-                Ok(None) => {
-                    warn!("TUN listener restart returned no handle (config rolled back)");
-                    if let Some(ref mut tun) = state.raw_config.write().tun {
-                        tun.enable = false;
-                    }
-                    Err("TUN did not restart and was turned off".into())
-                }
-                Err(e) => {
-                    warn!("TUN listener failed to restart: {e} (config rolled back)");
-                    let message = format!("TUN failed to restart and was turned off: {e}");
-                    tun_failed(message.clone());
-                    if let Some(ref mut tun) = state.raw_config.write().tun {
-                        tun.enable = false;
-                    }
-                    Err(message)
-                }
-            }
-        } else {
-            Ok(())
-        }
-    } else if let Some(snapshot) = snapshot {
-        // off → on. Defensive: if a handle somehow outlives a raw config
-        // that already says `enable: false`, stop it first — the new
-        // listener must never build a second lwIP core over a live one
-        // (its PREVIOUS_CORE gate hard-fails the spawn after a 10 s
-        // teardown timeout rather than stack two generations).
-        state.tunnel.stop_tun().await;
-        let binding = preinstalled.take_binding();
-        let adopted = binding.is_some();
-        match spawn_tun_from_raw(&state.tunnel, &snapshot, binding).await {
-            Ok(Some(handle)) => {
-                state.tunnel.set_tun_handle(handle).await;
-                info!("TUN listener started via config reload");
-                if adopted {
-                    outbound_binding_adopted(state, preinstalled.interface_changed(), tracked_tcp);
-                }
-                Ok(())
-            }
-            Ok(None) => {
-                // Unreachable today — `spawn_tun_from_raw` only yields
-                // `Ok(None)` when `tun.enable` is false and this arm only
-                // runs for off→on. Roll back like the `Err` arm rather
-                // than persist `enable: true` with nothing running.
-                warn!("TUN listener spawn returned no handle on off→on (config rolled back)");
-                if let Some(ref mut tun) = state.raw_config.write().tun {
-                    tun.enable = false;
-                }
-                Err("TUN did not start and was turned off".into())
-            }
-            Err(e) => {
-                // TUN failed to start — roll back tun.enable to false so
-                // nyanpasu / the dashboard don't show TUN as active when
-                // nothing is actually running.
-                warn!("TUN listener failed to start: {e} (config rolled back)");
-                let message = format!("TUN failed to start and was turned off: {e}");
-                tun_failed(message.clone());
-                if let Some(ref mut tun) = state.raw_config.write().tun {
-                    tun.enable = false;
-                }
-                Err(message)
-            }
-        }
-    } else {
-        // on → off
-        state.tunnel.stop_tun().await;
-        info!("TUN listener stopped via config reload");
-        Ok(())
-    };
-
-    // `keep-alive-*` installs only once the TUN transition succeeded: a
-    // PATCH treats `Err` as full rejection and restores the prior
-    // document + globals, so installing early would leave sockets dialed
-    // in the failed-spawn window holding a posture that was never
-    // committed (issue #974 review). Lanes that commit the document even
-    // on `Err` (PUT/fallback — `tun.enable` rolls back inside, the rest
-    // stands) re-assert the committed value at their call site.
-    if tun_result.is_ok() {
-        install_committed_keepalive(state);
-    }
+    // `keep-alive-*` installs once the document is committed — and
+    // BEFORE the `ntp:` reconcile below, so a worker this mutation
+    // (re)starts carries the committed posture on its first poll: on the
+    // cold-PUT TUN-failure lane the call-site re-assert used to trail
+    // the reconcile, leaving the first-poll carrier on the old policy
+    // (Codex review). The installed posture is read from the committed
+    // document — the `Err` lanes keep it (PUT/fallback — `tun.enable`
+    // rolls back inside, the rest stands) or restore it with the rest
+    // of the snapshotted globals (PATCH).
+    install_committed_keepalive(state);
     // `ntp:` reconciles last — after the route publish, DNS install,
-    // dial globals, and the TUN transition (or its rollback) settle, so
-    // the worker never dials a half-published commit (issue #974). The
-    // supervisor sees every committed document's resolved service config
-    // and restarts only on a real change; a disabled/unchanged section
-    // never re-schedules.
+    // dial globals, the keepalive posture, and the TUN transition (or
+    // its rollback) settle, so the worker never dials a half-published
+    // commit (issue #974). The supervisor sees every committed
+    // document's resolved service config and restarts only on a real
+    // change; a disabled/unchanged section never re-schedules.
     if let Some(reconcile) = &state.ntp_reconcile {
         match ntp_resolved {
             Ok(cfg) => reconcile(cfg),
@@ -4451,13 +4460,14 @@ async fn swap_config_and_reconcile_tun(
     tun_result
 }
 
-/// Install the *committed* document's `keep-alive-*` posture. Called by
-/// every `swap_config_and_reconcile_tun` lane at its own commit point —
-/// POST-swap on the lanes that keep the document even when the TUN
-/// reconcile failed — because `swap` itself only installs on a clean
-/// transition (issue #974 review). Candidates were validated before
-/// commit, so a failure here means a caller skipped its gate: log loudly
-/// and keep the live posture rather than silently installing a fallback.
+/// Install the *committed* document's `keep-alive-*` posture. Runs inside
+/// `swap_config_and_reconcile_tun` after the publish — ahead of the
+/// `ntp:` reconcile — and is re-asserted by every lane at its own commit
+/// point, POST-swap on the lanes that keep the document even when the
+/// TUN reconcile failed (issue #974 review). Candidates were validated
+/// before commit, so a failure here means a caller skipped its gate: log
+/// loudly and keep the live posture rather than silently installing a
+/// fallback.
 fn install_committed_keepalive(state: &AppState) {
     match meow_config::resolve_outbound_tcp_keepalive(&state.raw_config.read()) {
         Ok(ka) => meow_common::set_outbound_tcp_keepalive(ka),
@@ -5264,8 +5274,8 @@ async fn put_configs(
         TrackedTcp::AlreadyCancelled,
     )
     .await;
-    // `swap` installs the keepalive posture only on a clean TUN
-    // transition; the document committed either way.
+    // `swap` already installed the committed posture ahead of its `ntp:`
+    // reconcile; re-assert it at this lane's own commit point.
     install_committed_keepalive(&state);
     reloaded.record();
 
