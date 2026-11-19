@@ -4759,6 +4759,27 @@ async fn put_configs(
         );
     }
 
+    // A `tun:` section the listener cannot parse must be rejected before
+    // commit (issue #543): admitted unchecked, the reconcile's restart
+    // would tear down a healthy listener and only then fail the spawn-side
+    // parse — leaving TUN down on a 204. `force` degrades to an error log
+    // like the dns arm below; the restart's rollback still prevents a
+    // false `enable`. This is a raw-level gate (section + `max-connections`
+    // + `fake-ip-range` — no built artifacts), so it runs with the other
+    // local gates BEFORE the ECH pre-resolution opens sockets.
+    if let Err(e) = meow_config::parse_tun_config(
+        raw_config.tun.as_ref(),
+        raw_config.max_connections,
+        raw_config.fake_ip_range(),
+    ) {
+        if force {
+            tracing::error!("config reload forced despite tun config error: {e}");
+            forced.push(format!("tun config error: {e}"));
+        } else {
+            return reload_rejected(StatusCode::BAD_REQUEST, &format!("tun config error: {e}"));
+        }
+    }
+
     let preinstalled = preinstall_global_route_binding(
         &raw_config,
         PreinstallScope::Mutation {
@@ -5009,36 +5030,17 @@ async fn put_configs(
         dropped_providers,
     } = result;
 
-    // A `tun:` section the listener cannot parse must be rejected before
-    // commit (issue #543): admitted unchecked, the reconcile's restart
-    // would tear down a healthy listener and only then fail the spawn-side
-    // parse — leaving TUN down on a 204. `force` degrades to an error log
-    // like the dns arm; the restart's rollback still prevents a false
-    // `enable`.
-    // Checked before `reconcile_dns_config` so a doomed PUT cannot trigger
-    // that path's provider-registry side effects.
-    if let Err(e) = meow_config::parse_tun_config(
-        raw_config.tun.as_ref(),
-        raw_config.max_connections,
-        raw_config.fake_ip_range(),
-    ) {
-        if force {
-            tracing::error!("config reload forced despite tun config error: {e}");
-            forced.push(format!("tun config error: {e}"));
-        } else {
-            return reload_rejected(StatusCode::BAD_REQUEST, &format!("tun config error: {e}"));
-        }
-    }
-
     // Same admission contract for `sniffer:` (review #887): the TUN
     // carries the parsed `SnifferConfig` it was spawned with, and a
     // section `spawn_tun_from_raw` cannot parse fails the same restart a
     // sniffer diff triggers — tearing a healthy listener down on a 204
-    // exactly as an unparsable `tun:` did before the gate above. `force`
+    // exactly as an unparsable `tun:` did before its gate. `force`
     // degrades the same way; the restart's rollback still prevents a
     // false `enable`. The rebuild never sees this section either, so it
     // must gate here — committed unchecked, the next boot's
     // `build_config` would hard-error on a value this PUT accepted.
+    // Still ahead of `reconcile_dns_config` so a doomed PUT cannot
+    // trigger that path's provider-registry side effects.
     if let Err(e) = meow_config::sniffer_config_from_raw(&raw_config) {
         if force {
             tracing::error!("config reload forced despite sniffer config error: {e}");
