@@ -164,12 +164,24 @@ impl SelectorWriter {
 ///   holds; an unchanged flag is a no-op, so ordinary enabled rebuilds
 ///   keep sharing store and epoch. Rejected candidates never reach
 ///   `commit` — their attached writers die fenced with them.
+///
+/// The off→on half is transactional (issue #974): a not-yet-committed
+/// enable build opens its store into `pending`, not the live slot, so a
+/// rejected candidate never installs (or sweeps siblings of) the live
+/// backing. `commit` adopts the pending store on the enable transition
+/// and drains it on every commit, so a rejected build's snapshot can
+/// never be restored by a later enable — each enabling build re-opens
+/// into `pending` first.
 pub struct SelectionBacking {
     /// `None` disables persistence structurally (no backing file).
     path: Option<PathBuf>,
     /// Lazily opened — `prepare` fills it on the first enabled build and
     /// it stays open across a disable so re-enable reuses one store.
     store: Mutex<Option<Arc<SelectorStore>>>,
+    /// The store an uncommitted enable-transition build opened —
+    /// candidate-scoped until `commit` adopts it. Lock order: `pending`
+    /// before `store` (never nested the other way).
+    pending: Mutex<Option<Arc<SelectorStore>>>,
     epoch: Arc<AtomicU64>,
     /// The last *committed* resolved flag — `attach` prices a not-yet-
     /// committed generation's epoch from it.
@@ -181,6 +193,7 @@ impl SelectionBacking {
         Self {
             path,
             store: Mutex::new(None),
+            pending: Mutex::new(None),
             epoch: Arc::new(AtomicU64::new(0)),
             enabled: AtomicBool::new(false),
         }
@@ -195,6 +208,12 @@ impl SelectionBacking {
     /// a blocking thread for async callers; `prepare_sync` is the same
     /// step for callers already on a blocking thread. Idempotent — an
     /// already-open store is reused across disable/re-enable cycles.
+    ///
+    /// Where the opened store lands depends on the committed flag: an
+    /// already-enabled generation re-opens straight into `store` (the
+    /// failed-open retry), while a pending off→on build parks it in
+    /// `pending` for `commit` to adopt — the candidate never installs
+    /// live backing it has not earned (issue #974).
     pub async fn prepare(&self, enabled: bool) {
         if !enabled || self.store.lock().is_some() {
             return;
@@ -204,23 +223,29 @@ impl SelectionBacking {
         };
         let store = tokio::task::spawn_blocking(move || SelectorStore::open(path)).await;
         if let Ok(store) = store {
-            let mut guard = self.store.lock();
-            if guard.is_none() {
-                *guard = Some(store);
-            }
+            self.install_opened(store);
         }
     }
 
     /// [`Self::prepare`] for callers already on a blocking thread.
     pub fn prepare_sync(&self, enabled: bool) {
-        if !enabled {
+        if !enabled || self.store.lock().is_some() {
             return;
         }
-        let mut guard = self.store.lock();
-        if guard.is_none() {
-            if let Some(path) = &self.path {
-                *guard = Some(SelectorStore::open(path.clone()));
+        if let Some(path) = &self.path {
+            self.install_opened(SelectorStore::open(path.clone()));
+        }
+    }
+
+    /// The slot choice behind both `prepare` variants — see [`Self::prepare`].
+    fn install_opened(&self, store: Arc<SelectorStore>) {
+        if self.enabled.load(Ordering::Acquire) {
+            let mut guard = self.store.lock();
+            if guard.is_none() {
+                *guard = Some(store);
             }
+        } else {
+            *self.pending.lock() = Some(store);
         }
     }
 
@@ -229,15 +254,31 @@ impl SelectionBacking {
     /// still `false` the pending generation's writers price their epoch at
     /// `epoch + 1`: exactly the value [`Self::commit`] will publish for
     /// the disable→enable transition, so a rejected candidate's writers
-    /// stay fenced without a wasted bump.
+    /// stay fenced without a wasted bump. The writer's store is the one
+    /// `commit` will adopt — `pending` first, the committed store (kept
+    /// open across a disable) as the fallback.
     pub fn attach(&self, enabled: bool) -> Option<SelectorWriter> {
         if !enabled {
             return None;
         }
-        let epoch =
-            self.epoch.load(Ordering::Acquire) + u64::from(!self.enabled.load(Ordering::Acquire));
-        self.store.lock().as_ref().map(|store| SelectorWriter {
-            store: Arc::clone(store),
+        let committed = self.enabled.load(Ordering::Acquire);
+        let epoch = self.epoch.load(Ordering::Acquire) + u64::from(!committed);
+        // The writer's store is the one `commit` will adopt: a pending-
+        // enable generation gets `pending` (the committed store kept open
+        // across a disable is the fallback, so re-enable reuses it); an
+        // already-enabled generation gets the live slot only — a stale
+        // `pending` is never its store.
+        let store = if committed {
+            self.store.lock().as_ref().cloned()
+        } else {
+            self.pending
+                .lock()
+                .as_ref()
+                .cloned()
+                .or_else(|| self.store.lock().as_ref().cloned())
+        };
+        store.map(|store| SelectorWriter {
+            store,
             epoch,
             epochs: Arc::clone(&self.epoch),
         })
@@ -249,17 +290,24 @@ impl SelectionBacking {
     /// two writers already serialize their renames. Writers attached for
     /// the pending generation captured `epoch + 1` at [`Self::attach`],
     /// so an enable transition publishes exactly the epoch they fence on.
+    ///
+    /// Every commit drains `pending`: an enable transition adopts it into
+    /// the live slot (`pending.is_some()` implies `store` was `None`
+    /// throughout — `install_opened` only parks when nothing is live),
+    /// and any other commit drops it — a rejected enable build's
+    /// snapshot is never the store a later enable restores (issue #974).
     pub fn commit(&self, enabled: bool) {
-        if self.enabled.swap(enabled, Ordering::AcqRel) == enabled {
+        let transition = self.enabled.swap(enabled, Ordering::AcqRel) != enabled;
+        let pending = self.pending.lock().take();
+        if !transition {
             return;
         }
-        let guard = self.store.lock();
-        if let Some(store) = guard.as_ref() {
-            let _write = store.write_lock.lock();
-            self.epoch.fetch_add(1, Ordering::AcqRel);
-        } else {
-            self.epoch.fetch_add(1, Ordering::AcqRel);
+        let mut guard = self.store.lock();
+        if pending.is_some() {
+            *guard = pending;
         }
+        let _write = guard.as_ref().map(|store| store.write_lock.lock());
+        self.epoch.fetch_add(1, Ordering::AcqRel);
     }
 }
 
@@ -368,12 +416,17 @@ mod tests {
         assert!(!path.exists(), "disabled profile must not touch disk");
 
         // First enabled generation: the pending writer is fenced until
-        // the commit publishes its epoch.
+        // the commit publishes its epoch — and the freshly opened store
+        // stays candidate-side until then (issue #974).
         backing.prepare_sync(true);
+        assert!(
+            backing.store.lock().is_none(),
+            "a not-yet-committed enable build must not install the live store"
+        );
         let gen1 = backing.attach(true).expect("enabled attaches a writer");
         gen1.set("g", "a");
         assert!(
-            backing.store.lock().as_ref().unwrap().get("g").is_none(),
+            backing.pending.lock().as_ref().unwrap().get("g").is_none(),
             "a not-yet-committed generation must not reach the map"
         );
         backing.commit(true);
@@ -419,6 +472,42 @@ mod tests {
         drop(backing);
         let reopened = SelectorStore::open(path);
         assert_eq!(reopened.get("g").as_deref(), Some("d"));
+    }
+
+    #[test]
+    fn rejected_enable_candidate_leaves_no_adoptable_snapshot() {
+        // Issue #974: an off→on candidate that never commits must neither
+        // install the live store nor leave a pending snapshot a later
+        // enable restores — each enabling build re-opens into `pending`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sel.json");
+        std::fs::write(&path, r#"{"g": "old"}"#).unwrap();
+        let backing = SelectionBacking::new(Some(path.clone()));
+
+        // Candidate A builds, opens the file into `pending`, is rejected.
+        backing.prepare_sync(true);
+        assert!(backing.store.lock().is_none());
+        assert_eq!(
+            backing.pending.lock().as_ref().unwrap().get("g").as_deref(),
+            Some("old")
+        );
+        // No commit — the build's result is dropped.
+
+        // The persisted file moves on meanwhile.
+        std::fs::write(&path, r#"{"g": "new"}"#).unwrap();
+
+        // Candidate B enables for real: its own prepare refreshes
+        // `pending`, so the commit adopts the fresh snapshot — never the
+        // stale one candidate A left behind.
+        backing.prepare_sync(true);
+        let gen_b = backing.attach(true).unwrap();
+        assert_eq!(gen_b.get("g").as_deref(), Some("new"));
+        backing.commit(true);
+        assert_eq!(
+            backing.store.lock().as_ref().unwrap().get("g").as_deref(),
+            Some("new")
+        );
+        assert!(backing.pending.lock().is_none(), "commit drains pending");
     }
 
     #[test]
