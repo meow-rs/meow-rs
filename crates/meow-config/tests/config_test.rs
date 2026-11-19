@@ -4823,16 +4823,41 @@ mod ntp_resolution {
             "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    server: s\n    port: 1\n"
         )
         .is_err());
+        // A known `type:` with missing required fields fails the real
+        // parse the check runs — the lenient build drops the node
+        // (socks5 is not placeholder-eligible), so the name never lands.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: socks5\n"
+        )
+        .is_err());
         // Same hole on the group lane: an unknown group `type:` fails.
         assert!(check(
             "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: not-a-group\n    proxies: [DIRECT]\n"
         )
         .is_err());
-        // A compiled-out spelling is not buildable by this build.
-        let feature_gated = check(
-            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: wireguard\n    server: s\n    port: 1\n",
+        // A group whose only member is undeliverable drops too.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [ghost]\n"
+        )
+        .is_err());
+        // A relay below its two-member floor drops.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: relay\n    proxies: [DIRECT]\n"
+        )
+        .is_err());
+        // A member that names a later group resolves once that group
+        // lands — the fixpoint mirrors the build's multi-pass settle.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g1\nproxy-groups:\n  - name: g1\n    type: select\n    proxies: [g2]\n  - name: g2\n    type: select\n    proxies: [DIRECT]\n"
+        )
+        .is_ok());
+        // A compiled-out spelling keeps an unavailable placeholder in
+        // the built map, but the placeholder carries no transport — it
+        // cannot serve as the NTP dialer target.
+        let tt = check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: trusttunnel\n    server: s\n    port: 1\n    username: u\n    password: p\n",
         );
-        assert_eq!(feature_gated.is_ok(), cfg!(feature = "wireguard"));
+        assert_eq!(tt.is_ok(), cfg!(feature = "trusttunnel"));
         // DIRECT remains the always-valid spelling.
         assert!(check("ntp:\n  enable: true\n  dialer-proxy: DIRECT\n").is_ok());
     }

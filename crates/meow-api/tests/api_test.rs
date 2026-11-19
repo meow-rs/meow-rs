@@ -16,6 +16,18 @@ use std::sync::Arc;
 use tokio::sync::broadcast;
 use tower::ServiceExt;
 
+/// Serialization for every test that commits `/configs`: a commit
+/// re-asserts the process-wide knobs (interface name, UA, tcp-concurrent,
+/// find-process-mode, outbound keepalive), so a sibling commit between a
+/// test's request and its observation is the only way the globals go
+/// stale. Holding this lane for a test's whole body keeps the committed
+/// posture stable to observe — no retry windows.
+static PROCESS_GLOBALS_LANE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+async fn process_globals_lane() -> tokio::sync::MutexGuard<'static, ()> {
+    PROCESS_GLOBALS_LANE.lock().await
+}
+
 fn test_log_tx() -> broadcast::Sender<meow_api::log_stream::LogMessage> {
     broadcast::channel(16).0
 }
@@ -446,6 +458,7 @@ async fn get_json(state: &Arc<AppState>, path: &str) -> (StatusCode, serde_json:
 /// (`{dir}` in `config` expands to that directory), then wait for every
 /// provider's detached first load to publish its nodes.
 async fn state_with_file_providers(config: &str, providers: &[(&str, &str)]) -> Arc<AppState> {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let dir = std::path::Path::new(state.config_path.as_deref().unwrap())
@@ -859,6 +872,7 @@ async fn get_configs_returns_default_ipv6_false_when_omitted() {
 
 #[tokio::test]
 async fn patch_configs_change_mode() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -890,6 +904,7 @@ async fn patch_configs_change_mode() {
 
 #[tokio::test]
 async fn patch_configs_invalid_mode() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(state);
     let resp = app
@@ -917,6 +932,7 @@ async fn patch_configs_invalid_mode() {
 /// serialize on): once held, the observed global is stable.
 #[tokio::test]
 async fn patch_configs_interface_name_lifecycle() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let patch = |body: &str| {
         let app = create_router(Arc::clone(&state));
@@ -1000,6 +1016,7 @@ async fn patch_configs_interface_name_lifecycle() {
 /// `CONFIG_MUTATION` against racing writers.
 #[tokio::test]
 async fn patch_configs_global_ua_lifecycle() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let patch = |body: &str| {
         let app = create_router(Arc::clone(&state));
@@ -1132,6 +1149,7 @@ async fn patch_configs_global_ua_lifecycle() {
 /// assertions run under `CONFIG_MUTATION` like `global_ua`'s.
 #[tokio::test]
 async fn patch_configs_tcp_concurrent_lifecycle() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     // The process-global must return to `true` even if this test panics —
     // a leaked `false` silently sequentializes every sibling's dials.
@@ -1308,6 +1326,7 @@ async fn patch_configs_tcp_concurrent_lifecycle() {
 /// any bundled mutation lands (issue #974).
 #[tokio::test]
 async fn patch_configs_find_process_mode_lifecycle() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state_default();
     let patch = |body: &str| {
@@ -1451,6 +1470,7 @@ async fn patch_configs_find_process_mode_lifecycle() {
 /// never mutates the live override.
 #[tokio::test]
 async fn put_configs_commits_global_ua_and_client_fingerprint() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state_default();
     // This test leaves `Some("mihomo/v1.18.0")` installed on the happy
@@ -1706,6 +1726,7 @@ async fn put_configs_force_invalid_global_ua_commits_live_value() {
 /// keep-alive keys while leaving the PUT-only sections untouched.
 #[tokio::test]
 async fn put_configs_roundtrips_top_level_knobs() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     // The PUT installs a non-default keepalive posture on the process
@@ -1751,42 +1772,35 @@ async fn put_configs_roundtrips_top_level_knobs() {
         }
     };
 
-    // GET reports keep-alive from the live process global — a racing
-    // sibling PUT can reset it between this PUT and the read. The whole
-    // assert block therefore runs under the mutation lane, and the PUT
-    // sits INSIDE the retry loop so each pass re-publishes our posture
-    // before the lane freezes writers (the global-ua test above uses
-    // the same pattern).
-    let mut attempts = 0;
-    loop {
-        let resp = put(
-            "mode: rule\n\
-             keep-alive-idle: 45\n\
-             keep-alive-interval: 5\n\
-             disable-keep-alive: true\n\
-             profile:\n  store-selected: false\n  store-fake-ip: true\n\
-             ntp:\n  enable: true\n  server: ntp.test\n  port: 1123\n  interval: 60\n  dialer-proxy: DIRECT\n  write-to-system: true\n\
-             rules:\n  - MATCH,DIRECT\n",
-        )
-        .await;
-        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    // GET reports keep-alive from the live process global. The lane
+    // `process_globals_lane` keeps every config-committing sibling out
+    // for this test's whole body, so the PUT's committed posture is
+    // stable to observe — the mutation-lane assert below can never see
+    // it reset mid-flight (no retry window).
+    let resp = put(
+        "mode: rule\n\
+         keep-alive-idle: 45\n\
+         keep-alive-interval: 5\n\
+         disable-keep-alive: true\n\
+         profile:\n  store-selected: false\n  store-fake-ip: true\n\
+         ntp:\n  enable: true\n  server: ntp.test\n  port: 1123\n  interval: 60\n  dialer-proxy: DIRECT\n  write-to-system: true\n\
+         rules:\n  - MATCH,DIRECT\n",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
 
+    {
         let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
         let live = meow_common::outbound_tcp_keepalive();
-        if live.enabled || live.idle.as_secs() != 45 || live.interval.as_secs() != 5 {
-            drop(_lane);
-            attempts += 1;
-            assert!(attempts < 20, "siblings kept resetting outbound keepalive");
-            continue;
-        }
-
+        assert!(!live.enabled);
+        assert_eq!(live.idle.as_secs(), 45);
+        assert_eq!(live.interval.as_secs(), 5);
         let json = get().await;
         assert_eq!(json["keep-alive-idle"], 45);
         assert_eq!(json["keep-alive-interval"], 5);
         assert_eq!(json["disable-keep-alive"], true);
         assert_eq!(json["store-selected"], false);
         assert_eq!(json["store-fake-ip"], true);
-        break;
     }
     let json = get().await;
     assert_eq!(
@@ -2076,6 +2090,7 @@ async fn put_configs_force_fallback_rejects_dangling_ntp_target() {
 /// out-of-range `ntp.interval` must still be the reported failure.
 #[tokio::test]
 async fn put_configs_local_gates_precede_ech_preresolve() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let app = create_router(Arc::clone(&state));
@@ -2112,6 +2127,7 @@ async fn put_configs_local_gates_precede_ech_preresolve() {
 /// document commits.
 #[tokio::test]
 async fn put_configs_strict_bad_mux_gate_force_drops_node() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
     let yaml = "strict: true\nmode: rule\n\
         proxies:\n  - {name: badmux, type: vless, server: vless.test, port: 443, uuid: b831381d-6324-4d53-ad4f-8cda48b30811, smux: true}\n\
@@ -2233,6 +2249,7 @@ async fn put_configs_force_broken_dns_gates_store_fake_ip() {
 /// carry the exchange — while `DIRECT` stays a valid dialer.
 #[tokio::test]
 async fn put_configs_rejects_ntp_dialer_proxy_builtin_policies() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let put = |document: String| {
@@ -6879,6 +6896,7 @@ async fn delete_all_connections_terminates_both_stream_directions() {
 
 #[tokio::test]
 async fn cold_reload_terminates_live_stream_without_drain_delay() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
         ..Default::default()
@@ -6929,6 +6947,7 @@ async fn cold_reload_terminates_live_stream_without_drain_delay() {
 /// using the old IP-CIDR rule, even though the active policy is now REJECT.
 #[tokio::test]
 async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     use hickory_proto::{
         op::Message,
@@ -7071,6 +7090,7 @@ async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
 /// host-resolver hook all kept the startup generation forever.
 #[tokio::test]
 async fn put_configs_swaps_running_dns_resolver() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
@@ -7219,6 +7239,7 @@ async fn put_configs_requires_restart_to_change_the_controller_secret() {
 /// location/path plumbing shows up at the HTTP boundary.
 #[tokio::test]
 async fn put_configs_parse_error_reports_line_column_and_path() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let payload = base64::engine::general_purpose::STANDARD
@@ -7263,6 +7284,7 @@ async fn put_configs_parse_error_reports_line_column_and_path() {
 /// routing" branch (204 with the old map retained).
 #[tokio::test]
 async fn put_configs_duplicate_group_names_rejected() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let yaml = concat!(
@@ -7346,6 +7368,7 @@ async fn put_configs_duplicate_group_names_rejected() {
 /// contribution).
 #[tokio::test]
 async fn put_configs_carries_subscription_tracking_forward() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     let mut node = std::collections::HashMap::new();
@@ -7437,6 +7460,7 @@ async fn put_configs_carries_subscription_tracking_forward() {
 /// previous routing" branch (204 with the old map retained).
 #[tokio::test]
 async fn put_configs_group_cycle_rejected() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let yaml = concat!(
@@ -7518,6 +7542,7 @@ async fn put_configs_group_cycle_rejected() {
 /// until the next dns-changing PUT.
 #[tokio::test]
 async fn put_configs_dns_rebind_failure_keeps_old_listener() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
@@ -7608,6 +7633,7 @@ async fn put_configs_dns_rebind_failure_keeps_old_listener() {
 /// it must not 400 against the startup-frozen provider registry.
 #[tokio::test]
 async fn put_configs_rule_set_policy_uses_candidate_providers() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
@@ -7719,6 +7745,7 @@ async fn put_configs_rule_set_policy_uses_candidate_providers() {
 /// a changed rule must still swap the resolver generation.
 #[tokio::test]
 async fn put_configs_rebuilds_resolver_when_dns_uses_runtime_refs() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
@@ -7778,6 +7805,7 @@ async fn put_configs_rebuilds_resolver_when_dns_uses_runtime_refs() {
 /// in that feed operator's hands. Credentials never reach a response.
 #[tokio::test]
 async fn put_configs_trusttunnel_provider_binds_a_placeholder_instead_of_rejecting() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let directory = tempfile::tempdir_in(
@@ -7911,6 +7939,7 @@ async fn unavailable_trusttunnel_node_fails_udp_closed_through_rule_resolution()
 /// nothing) while the matchers referenced a detached generation (#543).
 #[tokio::test]
 async fn put_configs_publishes_rule_provider_registry_changes() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(RawConfig {
         rules: Some(vec!["MATCH,DIRECT".into()]),
@@ -8041,6 +8070,7 @@ async fn put_configs_publishes_rule_provider_registry_changes() {
 /// fetch hits the wire.
 #[tokio::test]
 async fn put_configs_fetches_rule_provider_payload_once() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     use std::io::{Read, Write};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -8173,6 +8203,7 @@ fn fake_tun_handle_owned(
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_tun_param_change_reconciles_running_listener() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -8235,6 +8266,7 @@ async fn put_configs_tun_param_change_reconciles_running_listener() {
 /// treats as unchanged.
 #[tokio::test]
 async fn put_configs_tun_unchanged_does_not_reconcile() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -8290,6 +8322,7 @@ async fn put_configs_tun_unchanged_does_not_reconcile() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_fake_ip_range_change_moves_the_default_tun_address() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
@@ -8341,6 +8374,7 @@ async fn put_configs_fake_ip_range_change_moves_the_default_tun_address() {
 /// listener before the spawn-side parse fails (issue #543 review).
 #[tokio::test]
 async fn put_configs_invalid_tun_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -8401,6 +8435,7 @@ async fn put_configs_invalid_tun_rejected_before_commit() {
 /// handle proves the gate ran before the reconcile.
 #[tokio::test]
 async fn put_configs_invalid_sniffer_rejected_keeps_running_tun() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -8466,6 +8501,7 @@ async fn put_configs_invalid_sniffer_rejected_keeps_running_tun() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_sniffer_respelling_does_not_reconcile() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
@@ -8553,6 +8589,7 @@ async fn put_configs_sniffer_respelling_does_not_reconcile() {
 /// worthy diff (review #887).
 #[tokio::test]
 async fn put_configs_disabled_sniffer_field_change_does_not_reconcile() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
@@ -8613,6 +8650,7 @@ async fn put_configs_disabled_sniffer_field_change_does_not_reconcile() {
 /// `load_config` would hard-error on boot (issue #564 review).
 #[tokio::test]
 async fn put_configs_invalid_listeners_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -8663,6 +8701,7 @@ async fn put_configs_invalid_listeners_rejected_before_commit() {
 /// without hot-applying anything.
 #[tokio::test]
 async fn put_configs_lan_acl_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -8770,6 +8809,7 @@ async fn put_configs_lan_acl_rejected_before_commit() {
 /// snapshot). A malformed entry still 400s before commit.
 #[tokio::test]
 async fn put_configs_socks_listener_alias_admitted() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -8846,6 +8886,7 @@ async fn put_configs_socks_listener_alias_admitted() {
 /// cannot push it through.
 #[tokio::test]
 async fn put_configs_geo_interval_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -8923,6 +8964,7 @@ async fn put_configs_geo_interval_rejected_before_commit() {
 /// `load_config` refuses.
 #[tokio::test]
 async fn put_configs_invalid_tcp_keepalive_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -8973,6 +9015,7 @@ async fn put_configs_invalid_tcp_keepalive_rejected_before_commit() {
 /// gate a PUT could persist a config the next `load_config` refuses.
 #[tokio::test]
 async fn put_configs_invalid_tcp_idle_timeout_rejected_before_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -9010,6 +9053,7 @@ async fn put_configs_invalid_tcp_idle_timeout_rejected_before_commit() {
 /// tunnel (`set_tcp_idle_timeout`), where `0` disables it.
 #[tokio::test]
 async fn put_configs_tcp_idle_timeout_hot_applies() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -9239,6 +9283,7 @@ async fn put_configs_force_invalid_tun_commits_and_rolls_back() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_max_connections_change_reconciles_tun() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true").unwrap());
@@ -9291,6 +9336,7 @@ async fn put_configs_max_connections_change_reconciles_tun() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_tun_enable_on_attempts_spawn() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
 
@@ -9336,6 +9382,7 @@ async fn put_configs_tun_enable_on_attempts_spawn() {
 /// device.
 #[tokio::test]
 async fn put_configs_tun_enable_off_stops_listener() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -9377,6 +9424,7 @@ async fn put_configs_tun_enable_off_stops_listener() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_tun_param_change_without_handle_rolls_back() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -9425,6 +9473,7 @@ async fn put_configs_tun_param_change_without_handle_rolls_back() {
 /// handle stands in for a listener that must not be stopped.
 #[tokio::test]
 async fn put_configs_tun_disabled_param_change_no_restart() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: false\nmtu: 1500").unwrap());
@@ -9471,6 +9520,7 @@ async fn put_configs_tun_disabled_param_change_no_restart() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn put_configs_tun_fake_ip_change_restarts_listener() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -9584,6 +9634,7 @@ async fn get_configs_json(state: &Arc<AppState>) -> serde_json::Value {
 /// Deterministic under both feature sets — `stop_tun` needs no device.
 #[tokio::test]
 async fn patch_configs_tun_disable_stops_listener_and_round_trips() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
@@ -9631,6 +9682,7 @@ async fn patch_configs_tun_disable_stops_listener_and_round_trips() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
     assert_eq!(
         get_configs_json(&state).await["tun"],
@@ -9638,6 +9690,8 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
         "no tun: section still reports the switch"
     );
 
+    // The socket policy starts at the default (enabled) posture.
+    assert!(meow_common::outbound_tcp_keepalive().enabled);
     let resp = patch_configs(
         &state,
         serde_json::json!({
@@ -9645,6 +9699,7 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
             "tun": {"enable": true, "mtu": 1400},
             "tcp-concurrent": false,
             "find-process-mode": "off",
+            "disable-keep-alive": true,
         }),
     )
     .await;
@@ -9680,6 +9735,18 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
         meow_common::ProcessLookupMode::Strict,
         "the live find-process-mode must be restored"
     );
+    // The riding `disable-keep-alive` must not reach the socket policy
+    // either — the candidate keepalive is gated on the TUN outcome
+    // (issue #974 review).
+    assert!(
+        meow_common::outbound_tcp_keepalive().enabled,
+        "a failed TUN patch must leave the socket keepalive posture alone"
+    );
+    assert_eq!(
+        state.raw_config.read().disable_keep_alive,
+        None,
+        "the committed document must not carry the rolled-back key"
+    );
     let configs = get_configs_json(&state).await;
     assert_eq!(configs["tun"]["enable"], false);
     assert_eq!(
@@ -9695,6 +9762,7 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
 #[cfg(not(feature = "listener-tun"))]
 #[tokio::test]
 async fn patch_configs_tun_param_change_restarts_running_listener() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
@@ -9719,6 +9787,7 @@ async fn patch_configs_tun_param_change_restarts_running_listener() {
 /// sends as `null`, keeps its value.
 #[tokio::test]
 async fn patch_configs_tun_merges_over_committed_section() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(
         serde_saphyr::from_str("enable: false\ndevice: utun9\nmtu: 1500\ndns-hijack: [any:53]")
@@ -9781,6 +9850,7 @@ async fn get_configs_tun_inet4_address_reports_the_string_form() {
 /// spelling the client sent while `GET /configs` still reports a string.
 #[tokio::test]
 async fn patch_configs_tun_inet4_address_accepts_string_and_list_forms() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: false").unwrap());
     let state = test_state(raw);
@@ -9817,6 +9887,7 @@ async fn patch_configs_tun_inet4_address_accepts_string_and_list_forms() {
 /// string, like a config file load would.
 #[tokio::test]
 async fn put_configs_tun_inet4_address_list_form_reports_the_string_form() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let yaml = concat!(
@@ -9900,6 +9971,7 @@ async fn put_configs_force_garbage_inet4_address_never_reports_non_string() {
 /// not stored and not rejected.
 #[tokio::test]
 async fn patch_configs_tun_ignores_unknown_keys() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
 
     let resp = patch_configs(
@@ -9932,6 +10004,7 @@ async fn patch_configs_tun_ignores_unknown_keys() {
 /// both feature sets: no `enable` transition, no respawn.
 #[tokio::test]
 async fn patch_configs_tun_stack_commits_and_echoes() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
@@ -9983,6 +10056,7 @@ async fn patch_configs_tun_stack_commits_and_echoes() {
 /// alone.
 #[tokio::test]
 async fn patch_configs_without_tun_leaves_tun_untouched() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
@@ -10005,6 +10079,7 @@ async fn patch_configs_without_tun_leaves_tun_untouched() {
 /// committed section and the rest of the body stay as they were.
 #[tokio::test]
 async fn patch_configs_tun_rejects_invalid_section() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
@@ -10038,6 +10113,7 @@ async fn patch_configs_tun_rejects_invalid_section() {
 /// `apply_raw_to_tunnel` (issue #533 review).
 #[tokio::test]
 async fn put_configs_does_not_await_provider_downloads_in_the_mutation_lane() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     use tokio::io::AsyncReadExt as _;
     let state = test_state(test_raw_config());
@@ -10107,6 +10183,7 @@ async fn put_configs_does_not_await_provider_downloads_in_the_mutation_lane() {
 /// ever load synchronously during materialize (`is_file_vehicle`).
 #[tokio::test]
 async fn put_configs_does_not_fetch_remote_providers_in_the_mutation_lane() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     use tokio::io::AsyncReadExt as _;
     let state = test_state(test_raw_config());
@@ -10705,6 +10782,7 @@ fn backing_dir(state: &Arc<AppState>) -> std::path::PathBuf {
 /// node is warn-skipped and the provider commits empty.
 #[tokio::test]
 async fn put_configs_strict_rejects_malformed_file_provider_payload() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
     let dir = backing_dir(&state);
     std::fs::write(
@@ -10759,6 +10837,7 @@ async fn put_configs_strict_rejects_malformed_file_provider_payload() {
 /// the node is warn-skipped and the provider registers empty.
 #[tokio::test]
 async fn put_configs_lenient_commits_malformed_file_provider() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
     let dir = backing_dir(&state);
     std::fs::write(
@@ -10779,6 +10858,7 @@ async fn put_configs_lenient_commits_malformed_file_provider() {
 /// so `use:` groups have members the moment the PUT returns.
 #[tokio::test]
 async fn put_configs_commits_valid_file_provider_payload() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
     let dir = backing_dir(&state);
     std::fs::write(
@@ -10807,6 +10887,7 @@ async fn put_configs_commits_valid_file_provider_payload() {
 /// empty and the detached acquisition retries it — no 400.
 #[tokio::test]
 async fn put_configs_strict_remote_payload_defect_commits_empty() {
+    let _globals_lane = process_globals_lane().await;
     let origin = UserinfoOrigin::spawn(OriginReply {
         status: 200,
         userinfo: None,
@@ -11156,6 +11237,7 @@ async fn configs_sniffing_uses_resolved_sniffer() {
 
 #[tokio::test]
 async fn response_rules_reload_order_provider_generation_and_rejection() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
     use hickory_proto::rr::{Name, RecordType};
@@ -11302,6 +11384,7 @@ fn put_configs_warns_on_unknown_keys() {
             .build()
             .unwrap()
             .block_on(async {
+                let _globals_lane = process_globals_lane().await;
                 create_router(Arc::clone(&state))
                     .oneshot(
                         Request::builder()
@@ -11368,6 +11451,7 @@ async fn install_named_tun(
 /// `type: tun` device holds the slot — and the named device stays up.
 #[tokio::test]
 async fn put_configs_tun_enable_while_named_tun_owns_slot_rejected() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
     let stopped = install_named_tun(&state, "edge-tun").await;
     // The request even *removes* the listeners section — the slot stays
@@ -11409,6 +11493,7 @@ async fn put_configs_tun_enable_while_named_tun_owns_slot_rejected() {
 /// (the listeners-gate bail alone would be force-degradable).
 #[tokio::test]
 async fn put_configs_tun_enable_with_named_tun_entry_rejected() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state(test_raw_config());
     for query in ["", "?force=true"] {
         let resp = put_configs_payload(
@@ -11442,6 +11527,7 @@ async fn put_configs_tun_enable_with_named_tun_entry_rejected() {
 /// cannot drop `listeners:`.
 #[tokio::test]
 async fn patch_configs_tun_enable_while_named_tun_rejected() {
+    let _globals_lane = process_globals_lane().await;
     // (a) slot owned by a live named device
     let state = test_state(test_raw_config());
     let stopped = install_named_tun(&state, "edge-tun").await;
@@ -11473,6 +11559,7 @@ async fn patch_configs_tun_enable_while_named_tun_rejected() {
 /// device starts only at next boot.
 #[tokio::test]
 async fn put_configs_tun_disable_plus_named_tun_staged_ok() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
     let state = test_state(raw);
@@ -11522,6 +11609,7 @@ async fn get_configs_tun_enable_ignores_named_tun() {
 /// change keeps the device alive.
 #[tokio::test]
 async fn put_configs_fake_ip_move_while_named_tun_runs_rejected() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.dns = Some(
         serde_saphyr::from_str(

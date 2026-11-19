@@ -1478,12 +1478,13 @@ async fn update_configs(
         if let Err(e) = swap_config_and_reconcile_tun(
             &state,
             candidate,
-            None,
+            PendingPublish::default(),
             state.tunnel.resolver(),
             preinstalled,
             TrackedTcp::Cancel,
         )
         .await
+        .tun
         {
             meow_proxy::health::set_unified_delay(live.0);
             meow_common::set_routing_mark(Some(live.1));
@@ -1990,16 +1991,20 @@ fn resolve_tcp_idle_timeout(raw: &RawConfig) -> Result<Option<Duration>, String>
 /// clone-and-drop their `parking_lot` guard before awaiting — those guards
 /// are not Send and would otherwise break the axum Handler bound.
 ///
-/// Returns the rebuilt [`meow_config::DnsConfig`] (when its inputs changed)
-/// plus the resolver generation that was live before the early install —
-/// the caller passes it to [`swap_config_and_reconcile_tun`] so the TUN
-/// fake-IP comparison sees the true old state (issue #533 review).
+/// Returns the candidate's publish payload — the rebuilt route table,
+/// provider registries and [`meow_config::DnsConfig`] when its inputs
+/// changed, unpublished — plus the resolver generation that was live
+/// before the rebuild, which the caller passes to
+/// [`swap_config_and_reconcile_tun`] so the TUN fake-IP comparison sees
+/// the true old state (issue #533 review). Nothing here installs a live
+/// structure: every publish lands inside the swap's synchronous commit
+/// section so a cancelled request changes nothing (issue #974 review).
 ///
 /// Callers must hold the `CONFIG_MUTATION` lane (issue #543).
 async fn apply_raw_to_tunnel(
     raw: RawConfig,
     state: &AppState,
-) -> Result<(Option<meow_config::DnsConfig>, Arc<meow_dns::Resolver>), (StatusCode, String)> {
+) -> Result<(PendingPublish, Arc<meow_dns::Resolver>), (StatusCode, String)> {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
@@ -2105,63 +2110,45 @@ async fn apply_raw_to_tunnel(
         Some(&dialer_registry),
     )
     .await?;
-    // Snapshot the resolver being replaced BEFORE the early install below
-    // — `swap_config_and_reconcile_tun` compares its fake-IP inputs against
-    // the new generation's; reading `tunnel.resolver()` there would already
-    // see the candidate and never detect a change (issue #533 review).
+    // Snapshot the resolver being replaced before the commit — the swap
+    // compares its fake-IP inputs against the candidate's; reading
+    // `tunnel.resolver()` at the commit still sees the old generation
+    // because nothing has installed yet (issue #533 review).
     let prior_resolver = state.tunnel.resolver();
-    // Publish the rebuilt resolver to every consumer before the route swap
-    // drops the old registry cell: a `#name` upstream still resolving
-    // through the standalone DNS server's or host hook's OLD resolver
-    // would fail closed in the gap until `publish_dns` runs (issue #533
-    // review). Idempotent — `publish_dns` installs the same Arc again.
     // The named-TUN fake-IP pin gates first so a rejected candidate never
-    // publishes the moving pool.
+    // publishes the moving pool. The resolver itself — and every other
+    // install this rebuild produced — stays unpublished until the swap's
+    // synchronous commit section (issue #974 review): a candidate-side
+    // await or cancellation below changes nothing live.
     if let Some(dns) = &dns {
         named_tun_fake_ip_guard(state, &prior_resolver, dns)?;
-        install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
     }
-    // Selection-persistence commit BEFORE the route swap exposes the
-    // candidate's groups (issue #974 review): every fallible gate has
-    // passed, and the epoch flip must land before any live `select` can
-    // reach the new writers — an off→on select admitted in the gap would
-    // be acknowledged but fenced (in-memory only, lost on restart), and
-    // an on→off stale writer could still flush to the file. The pending
-    // store's adoption rides the same call.
-    state
-        .tunnel
-        .selection_backing()
-        .commit(meow_config::resolve_profile(&raw).store_selected);
-    state
-        .tunnel
-        .update_routing(proxies, rules, sub_rules, dialer_registry);
-    state.tunnel.set_connection_notes(connection_notes);
-    meow_tunnel::nftset::install(
-        &state.tunnel,
-        raw.dns
-            .as_ref()
-            .and_then(|d| d.nftset.as_ref())
-            .and_then(|n| n.parse().ok().flatten()),
-    );
-    state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
-    // Commit point reached: every fallible check passed. The candidate's
-    // provider sets become the live registries — the rules and DNS
-    // `rule-set:` matchers installed above already reference these Arcs
-    // (issue #533 review). `commit_registry` publishes the map *and*
-    // reconciles the interval refresh loops so providers added, removed,
-    // or re-intervalled by this commit gain/lose their task (issue #543).
-    state
-        .rule_provider_refresh
-        .commit_registry(&state.rule_providers, rule_providers);
-    commit_proxy_providers(
-        &state.proxy_providers,
-        &proxy_providers,
-        raw.strict.unwrap_or(false),
-        raw.proxy_providers.as_ref(),
-        &state.proxy_provider_refresh,
-    );
-    dropped_providers.record();
-    Ok((dns, prior_resolver))
+    Ok((
+        PendingPublish {
+            routing: Some(PendingRouting {
+                proxies,
+                rules,
+                sub_rules,
+                dialer_registry,
+                rule_providers,
+                proxy_providers,
+                dropped_providers,
+                connection_notes,
+                nftset: raw
+                    .dns
+                    .as_ref()
+                    .and_then(|d| d.nftset.as_ref())
+                    .and_then(|n| n.parse().ok().flatten()),
+                tcp_idle_timeout,
+                store_selected: meow_config::resolve_profile(&raw).store_selected,
+                strict: raw.strict.unwrap_or(false),
+                raw_proxy_providers: raw.proxy_providers,
+                install: RouteInstall::KeepTrackedTcp,
+            }),
+            dns,
+        },
+        prior_resolver,
+    ))
 }
 
 /// Rebuild routing + DNS from `candidate`, then commit it as the new raw
@@ -2236,7 +2223,7 @@ async fn commit_raw_candidate(
             ),
         },
     );
-    let (dns, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
+    let (publish, prior_resolver) = apply_raw_to_tunnel(candidate.clone(), state).await?;
     // `apply_raw_to_tunnel` publishes through `update_routing`, which keeps
     // tracked TCP: a flush must cancel the flows that predate the binding.
     // A TUN restart that fails is rolled back and recorded there; the edit
@@ -2244,7 +2231,7 @@ async fn commit_raw_candidate(
     let _ = swap_config_and_reconcile_tun(
         state,
         candidate,
-        dns,
+        publish,
         prior_resolver,
         preinstalled,
         TrackedTcp::Cancel,
@@ -2893,6 +2880,130 @@ pub fn install_resolver_everywhere(
     }
 }
 
+/// The standalone `dns.listen` outcome a commit applies — decided and
+/// bound in the await phase so [`install_dns_publish`] needs no `.await`
+/// inside the raw-config write guard (issue #974 review).
+enum DnsListenPlan {
+    /// Existing listener keeps serving — `install_resolver_everywhere`
+    /// already moved its resolver slot; nothing else to do.
+    Keep,
+    /// The rebind's socket was bound pre-commit: spawn it and replace
+    /// the handle, detaching the old listener's teardown.
+    Bound(meow_dns::BoundDnsServer, meow_dns::ResolverSlot),
+    /// A rebind was wanted (`dns.enabled` + `listen`) but the socket
+    /// bind failed: keep the old listener (a live-but-stale listener
+    /// beats none; the config is already committed — issue #514 review).
+    /// Its resolver slot still follows — `install_resolver_everywhere`
+    /// moved it.
+    BindFailed,
+    /// Server off or no `listen` — drop the handle; teardown detached.
+    Remove,
+}
+
+/// Decide the standalone `dns.listen` outcome and attempt any required
+/// socket bind — the only `await` the DNS publish needs. Must run before
+/// the commit point: a bind is fallible I/O, and a failed bind must not
+/// strand the running server (issue #514). Callers must hold the
+/// `CONFIG_MUTATION` lane.
+async fn plan_dns_listen(
+    dns_server: &RwLock<Option<DnsServerHandle>>,
+    dns: &meow_config::DnsConfig,
+) -> DnsListenPlan {
+    debug_assert!(
+        CONFIG_MUTATION.try_lock().is_err(),
+        "caller must hold the CONFIG_MUTATION lane"
+    );
+    // Keep-decision: an unchanged listen addr with a live serve task
+    // needs nothing but the resolver slot's swap at install.
+    {
+        let guard = dns_server.read();
+        if let Some(h) = guard.as_ref() {
+            if dns.enabled && dns.listen_addr == Some(h.listen) && !h.task.is_finished() {
+                return DnsListenPlan::Keep;
+            }
+        }
+    }
+    if !dns.enabled {
+        return DnsListenPlan::Remove;
+    }
+    match dns.listen_addr {
+        Some(addr) => {
+            let server = meow_dns::DnsServer::new(Arc::clone(&dns.resolver), addr);
+            let slot = server.resolver_slot();
+            match server.bind().await {
+                Ok(bound) => DnsListenPlan::Bound(bound, slot),
+                Err(e) => {
+                    warn!("dns.listen {addr} bind failed after config reload: {e}");
+                    DnsListenPlan::BindFailed
+                }
+            }
+        }
+        None => DnsListenPlan::Remove,
+    }
+}
+
+/// Apply a [`plan_dns_listen`] outcome plus the resolver-slot installs —
+/// the synchronous half of [`publish_dns`], callable inside the commit
+/// section's write guard. Replaced listeners abort now and join on a
+/// detached task: `abort` is synchronous, so the handle swap can never
+/// leave the slot empty with zero DNS listeners (issue #621).
+fn install_dns_publish(
+    tunnel: &Tunnel,
+    dns_server: &RwLock<Option<DnsServerHandle>>,
+    dns: &meow_config::DnsConfig,
+    plan: DnsListenPlan,
+) {
+    install_resolver_everywhere(tunnel, dns_server, dns);
+    match plan {
+        DnsListenPlan::Keep => {
+            info!("DNS resolver hot-swapped on unchanged listen socket");
+        }
+        DnsListenPlan::BindFailed => {
+            let mut guard = dns_server.write();
+            match guard.as_ref() {
+                Some(h) if !h.task.is_finished() => {
+                    warn!(
+                        "dns.listen rebind failed; keeping existing listener on {}",
+                        h.listen
+                    );
+                }
+                _ => {
+                    // A finished task is no working path — drop the dead
+                    // handle the way the awaited tail used to abort it.
+                    let _ = guard.take();
+                }
+            }
+        }
+        DnsListenPlan::Remove => {
+            let old = dns_server.write().take();
+            if let Some(old) = old {
+                old.task.abort();
+                tokio::spawn(async move {
+                    let _ = old.task.await;
+                });
+            }
+        }
+        DnsListenPlan::Bound(bound, slot) => {
+            let task = tokio::spawn(async move {
+                if let Err(e) = bound.run().await {
+                    warn!("DNS server error: {e}");
+                }
+            });
+            let old = dns_server.write().replace(DnsServerHandle {
+                listen: dns.listen_addr.unwrap(),
+                task,
+                resolver_slot: slot,
+            });
+            if let Some(old) = old {
+                old.task.abort();
+                tokio::spawn(async move {
+                    let _ = old.task.await;
+                });
+            }
+        }
+    }
+}
+
 /// Publish a rebuilt [`meow_config::DnsConfig`]: swap the tunnel's resolver
 /// slot (routing lookups + built-in DIRECT), refresh the standalone DNS
 /// server (in-place resolver swap when the listen addr is unchanged,
@@ -2908,99 +3019,8 @@ pub async fn publish_dns(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
-    install_resolver_everywhere(tunnel, dns_server, dns);
-
-    // Standalone `dns.listen` server keep-decision: `keep` also requires a
-    // live serve task — the slot was already swapped above, so an
-    // unchanged listen addr with a live task needs nothing more.
-    {
-        let guard = dns_server.read();
-        if let Some(h) = guard.as_ref() {
-            if dns.enabled && dns.listen_addr == Some(h.listen) && !h.task.is_finished() {
-                info!("DNS resolver hot-swapped on unchanged listen socket");
-                return;
-            }
-        }
-    }
-
-    // Listen addr changed, server toggled, or its task died: bind the new
-    // socket BEFORE tearing the old listener down — a failed bind must not
-    // strand the running server (the config is already committed; the old
-    // listener is the only working path left).
-    let new_bound = if dns.enabled {
-        match dns.listen_addr {
-            Some(addr) => {
-                let server = meow_dns::DnsServer::new(Arc::clone(&dns.resolver), addr);
-                let slot = server.resolver_slot();
-                match server.bind().await {
-                    Ok(bound) => Some((bound, slot)),
-                    Err(e) => {
-                        warn!("dns.listen {addr} bind failed after config reload: {e}");
-                        None
-                    }
-                }
-            }
-            None => None,
-        }
-    } else {
-        None
-    };
-    match new_bound {
-        Some((bound, slot)) => {
-            let task = tokio::spawn(async move {
-                if let Err(e) = bound.run().await {
-                    warn!("DNS server error: {e}");
-                }
-            });
-            // Install the new handle BEFORE tearing the old listener down:
-            // `replace` commits the swap synchronously, so a cancellation
-            // in the abort/await below can never leave the slot empty with
-            // zero DNS listeners (issue #621).
-            let old = dns_server.write().replace(DnsServerHandle {
-                listen: dns.listen_addr.unwrap(),
-                task,
-                resolver_slot: slot,
-            });
-            if let Some(old) = old {
-                old.task.abort();
-                let _ = old.task.await;
-            }
-        }
-        None => {
-            // No new listener. Two sub-cases: the config turned the server
-            // OFF (`!dns.enabled || listen_addr: None`) — tear the old one
-            // down — or a rebind FAILED while the config still wants one —
-            // keep the old listener alive (a live-but-stale listener beats
-            // none; the config is already committed). All parking_lot guard
-            // work stays inside the block — only the Send-able handle
-            // escapes, so the abort/await below keeps this future Send.
-            let old = {
-                let mut guard = dns_server.write();
-                let wanted = dns.enabled && dns.listen_addr.is_some();
-                match guard.take() {
-                    Some(old) if wanted && !old.task.is_finished() => {
-                        warn!(
-                            "dns.listen rebind failed; keeping existing listener on {}",
-                            old.listen
-                        );
-                        // The socket stays, but the resolver generation
-                        // must still follow — `tunnel.set_resolver` already
-                        // swapped routing; leaving the kept listener on its
-                        // old slot would serve a stale generation
-                        // (issue #514 review).
-                        *old.resolver_slot.write() = Arc::clone(&dns.resolver);
-                        *guard = Some(old);
-                        None
-                    }
-                    other => other,
-                }
-            };
-            if let Some(old) = old {
-                old.task.abort();
-                let _ = old.task.await;
-            }
-        }
-    }
+    let plan = plan_dns_listen(dns_server, dns).await;
+    install_dns_publish(tunnel, dns_server, dns, plan);
 }
 
 async fn rebuild_from_raw_runtime_async(
@@ -4130,13 +4150,65 @@ pub fn tun_fake_ip_changed(prior: &meow_dns::Resolver, current: &meow_dns::Resol
 /// committed, while `PATCH /configs`, whose `tun` change is the request,
 /// answers it with an error.
 ///
-/// `dns` is the candidate's rebuilt [`meow_config::DnsConfig`] when its
-/// DNS-relevant inputs changed (`Some`), already validated by the caller —
-/// publishing it here keeps the swap inside the same lane (issue #514).
-/// `prior_resolver` is the resolver generation that was live BEFORE the
-/// caller early-installed the candidate's — the fake-IP comparison must
-/// read its inputs, not `tunnel.resolver()` (which already serves the new
-/// generation and would always compare equal) (issue #533 review).
+/// Everything a mutation's commit section publishes atomically with the
+/// document — assembled candidate-side and carried unpublished so the
+/// whole install fits inside one `raw_config` write guard with no
+/// `await` between its steps (issue #974 review).
+#[derive(Default)]
+struct PendingPublish {
+    /// The rebuilt route table plus the provider registries its rules
+    /// reference — `None` on lanes with no routing publish (PATCH, the
+    /// forced verbatim fallback).
+    routing: Option<PendingRouting>,
+    /// The rebuilt DNS runtime — `None` when `dns:`/`hosts:`/`ipv6:`/
+    /// `geodata:` inputs did not move.
+    dns: Option<meow_config::DnsConfig>,
+}
+
+/// The route-table halves a rebuild produced plus everything that must
+/// publish with them.
+struct PendingRouting {
+    proxies: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
+    rules: Vec<Box<dyn meow_common::Rule>>,
+    sub_rules: meow_config::sub_rules_parser::SubRuleBlocks,
+    dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    rule_providers: HashMap<String, Arc<RuleProvider>>,
+    proxy_providers: HashMap<String, Arc<ProxyProvider>>,
+    dropped_providers: meow_config::DroppedProviders,
+    connection_notes: bool,
+    nftset: Option<meow_common::nftset::NftsetConfig>,
+    tcp_idle_timeout: Option<Duration>,
+    /// `profile.store-selected` resolved from the candidate — committed
+    /// with the epoch flip, before the new group writers go live.
+    store_selected: bool,
+    strict: bool,
+    raw_proxy_providers: Option<HashMap<String, meow_config::raw::RawProxyProvider>>,
+    install: RouteInstall,
+}
+
+/// Which routing publish the commit section runs.
+enum RouteInstall {
+    /// `update_routing` — keeps tracked TCP flows (warm mutations).
+    KeepTrackedTcp,
+    /// `reload_routing` — cancels tracked TCP and may install `mode`
+    /// (the `PUT /configs` cold path).
+    CancelTrackedTcp { mode: Option<TunnelMode> },
+}
+
+/// What a [`swap_config_and_reconcile_tun`] call settled.
+struct PublishReceipt {
+    /// Tracked TCP flows the routing publish closed — 0 on lanes that
+    /// publish no routing or keep tracked TCP.
+    dropped: usize,
+    /// The TUN reconcile outcome — `Err` means the candidate's
+    /// `tun.enable` was rolled back inside the committed document.
+    tun: Result<(), String>,
+}
+
+/// `dns`/`prior_resolver` carry the rebuilt DNS runtime and the resolver
+/// generation it replaces — the fake-IP comparison must read its inputs,
+/// not `tunnel.resolver()` (nothing has installed the candidate yet, so
+/// the live slot still serves the old generation — issue #533 review).
 ///
 /// `preinstalled` is the candidate's global-route binding, installed by
 /// the caller under this lane before the mutation's first dial
@@ -4146,17 +4218,17 @@ pub fn tun_fake_ip_changed(prior: &meow_dns::Resolver, current: &meow_dns::Resol
 /// after it. Without a spawn it is dropped on return, handing the binding
 /// back to the running listener (or clearing it when none runs).
 ///
-/// `tracked_tcp` says whether the caller's routing publish already
-/// cancelled every tracked TCP flow after the binding was installed
+/// `tracked_tcp` says whether the publish payload's routing install
+/// already cancels every tracked TCP flow after the binding was installed
 /// (`reload_routing`), for [`outbound_binding_adopted`]'s flush.
 async fn swap_config_and_reconcile_tun(
     state: &AppState,
     mut candidate: RawConfig,
-    dns: Option<meow_config::DnsConfig>,
+    publish: PendingPublish,
     prior_resolver: Arc<meow_dns::Resolver>,
     mut preinstalled: PreinstalledBinding,
     tracked_tcp: TrackedTcp,
-) -> Result<(), String> {
+) -> PublishReceipt {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
@@ -4233,36 +4305,39 @@ async fn swap_config_and_reconcile_tun(
         )
     };
 
-    // Opening or closing the ledger waits on its database.
-    let _ = tokio::task::spawn_blocking(move || {
-        meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
-    })
-    .await;
-
-    // Publish the rebuilt DNS runtime — independent of TUN transitions,
-    // so it must run even when the `tun:` tuple compares equal
-    // (issue #514). The fake-IP inputs of the resolver being replaced
-    // come from `prior_resolver` — the caller already early-installed the
-    // candidate's resolver, so `tunnel.resolver()` would read the NEW
-    // generation and the on→on `fake_ip_changed` check below could never
-    // fire (issue #533 review).
-    let dns_rebuilt = dns.is_some();
-    if let Some(dns) = dns {
-        publish_dns(&state.tunnel, &state.dns_server, &dns).await;
-    }
+    // The standalone `dns.listen` bind — fallible socket I/O — belongs
+    // to the candidate-side await phase like every other settle; the
+    // handle itself installs inside the commit section.
+    let dns_plan = match &publish.dns {
+        Some(dns) => Some(plan_dns_listen(&state.dns_server, dns).await),
+        None => None,
+    };
     // The TUN listener snapshots both fake-IP pool prefixes, the v4 gateway
     // and DnsGuard when the stack is built; after a resolver swap those are
     // stale — restart it so either fake-ip range or enhanced-mode changes
     // take effect instead of blackholing the new pool (issue #514).
-    let fake_ip_changed =
-        dns_rebuilt && tun_fake_ip_changed(&prior_resolver, &state.tunnel.resolver());
+    // Nothing is installed yet: the fake-IP inputs of the resolver being
+    // replaced come from `prior_resolver`, the candidate's from the
+    // publish payload's `dns.resolver` (issue #533 review).
+    let fake_ip_changed = publish
+        .dns
+        .as_ref()
+        .is_some_and(|dns| tun_fake_ip_changed(&prior_resolver, &dns.resolver));
 
-    // The TUN transition is the last candidate-stage settle: a failed
-    // (re)spawn rolls `tun.enable` back inside the candidate, so the
-    // committed document lands exactly like the old in-place rollback —
-    // and a caller cancelled mid-spawn leaves the PREVIOUS document
-    // committed rather than a new one whose tail never ran. Its value
-    // still decides the keepalive install and the return below.
+    // The TUN transition is the last candidate-stage settle: `stop_tun`
+    // tears the previous listener down and a (re)spawn brings its device
+    // up, so both must resolve — and may fail — before the commit. A
+    // failed (re)spawn rolls `tun.enable` back inside the candidate, so
+    // the committed document lands exactly like the old in-place rollback.
+    // The spawned listener's handle is only stored inside the commit
+    // section (`install_tun_handle` is synchronous; `stop_tun`/`spawn`
+    // are not), and its value still decides the keepalive install and
+    // the receipt below.
+    let mut tun_handle: Option<meow_tunnel::TunHandle> = None;
+    // Whether the (re)spawned listener adopted the pre-installed global
+    // binding — the commit section then flushes sessions opened before
+    // its interface went live.
+    let mut adopted_binding: Option<bool> = None;
     let tun_result = if old_enable == new_enable {
         // on → on with changed fake-IP inputs or any real `tun:` parameter
         // change: restart the listener so the running stack matches the
@@ -4277,18 +4352,12 @@ async fn swap_config_and_reconcile_tun(
             let adopted = binding.is_some();
             match spawn_tun_from_raw(&state.tunnel, &candidate, binding).await {
                 Ok(Some(handle)) => {
-                    state.tunnel.set_tun_handle(handle).await;
+                    tun_handle = Some(handle);
+                    adopted_binding = adopted.then(|| preinstalled.interface_changed());
                     info!(
                         fake_ip_changed,
                         tun_changed, "TUN listener restarted via config reload"
                     );
-                    if adopted {
-                        outbound_binding_adopted(
-                            state,
-                            preinstalled.interface_changed(),
-                            tracked_tcp,
-                        );
-                    }
                     Ok(())
                 }
                 // Unreachable like the off→on arm — `enable` is still true
@@ -4325,11 +4394,9 @@ async fn swap_config_and_reconcile_tun(
         let adopted = binding.is_some();
         match spawn_tun_from_raw(&state.tunnel, &candidate, binding).await {
             Ok(Some(handle)) => {
-                state.tunnel.set_tun_handle(handle).await;
+                tun_handle = Some(handle);
+                adopted_binding = adopted.then(|| preinstalled.interface_changed());
                 info!("TUN listener started via config reload");
-                if adopted {
-                    outbound_binding_adopted(state, preinstalled.interface_changed(), tracked_tcp);
-                }
                 Ok(())
             }
             Ok(None) => {
@@ -4363,9 +4430,36 @@ async fn swap_config_and_reconcile_tun(
         Ok(())
     };
 
-    // Commit point: a rejected candidate never reaches here. From the
-    // publish on nothing may await — the synchronous tail below must
-    // always land once the document does.
+    // `keep-alive-*` resolves from the candidate now but installs inside
+    // the commit section only on a clean TUN outcome (issue #974 review):
+    // a PATCH whose spawn failed restores its snapshotted policy instead,
+    // and a socket dialed in the failed-spawn window must not retain a
+    // posture the request rolls back. On the lanes that keep the
+    // committed document on `Err` (PUT/fallback) the call-site
+    // re-assert installs the same posture after this returns.
+    let keepalive = if tun_result.is_ok() {
+        match meow_config::resolve_outbound_tcp_keepalive(&candidate) {
+            Ok(ka) => Some(ka),
+            Err(e) => {
+                warn!("outbound keepalive resolution failed at commit: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // Commit point: a rejected candidate never reaches here. ONE
+    // synchronous section inside the write guard — no awaits — installs
+    // the document, the riding dial globals, the keepalive posture, the
+    // selection epoch, the resolver + DNS listener, the route table, the
+    // provider registries, the TUN handle and the binding flush together,
+    // so a request cancelled anywhere above leaves zero live change and
+    // no reader can observe a new document against stale globals or old
+    // routes (issue #974 review).
+    let PendingPublish { routing, dns } = publish;
+    let dns = dns.zip(dns_plan);
+    let mut dropped = 0;
     {
         let mut guard = state.raw_config.write();
         // (mihomo re-applies `routing-mark` on every load); a change
@@ -4393,18 +4487,121 @@ async fn swap_config_and_reconcile_tun(
         state
             .tunnel
             .set_process_lookup_mode(candidate.find_process_mode.unwrap_or_default());
-        // `keep-alive-*` deliberately does NOT install here: the TUN
-        // reconcile above is fallible, and a socket dialed in the
-        // failed-spawn window would retain a posture its PATCH then
-        // rolls back. It installs after `tun_result` instead — see the
-        // install site below (issue #974 review).
-        // `profile.store-selected` commits EARLIER on this lane — at the
-        // route-publish sites in `apply_raw_to_tunnel` / the PUT cold
-        // path — so the epoch flip lands before the candidate's group
-        // writers go live (issue #974 review). Lanes that reach here
-        // without a publish (the verbatim fallback, a knobs-only PATCH)
-        // never carry a flag diff, so nothing remains to retire.
+        if let Some(ka) = keepalive {
+            meow_common::set_outbound_tcp_keepalive(ka);
+        }
+        if let Some(routing) = routing {
+            // Selection-persistence commit BEFORE the route swap exposes
+            // the candidate's groups (issue #974 review): the epoch flip
+            // must land before any live `select` can reach the new
+            // writers — an off→on select admitted in the gap would be
+            // acknowledged but fenced (in-memory only, lost on restart),
+            // and an on→off stale writer could still flush to the file.
+            // The pending store's adoption rides the same call.
+            state
+                .tunnel
+                .selection_backing()
+                .commit(routing.store_selected);
+            // The resolver swap precedes the route publish: the swap drops
+            // the old `RouteTable` and its dialer-registry cell, so every
+            // consumer — the tunnel slot, the host hook, a live
+            // `dns.listen` server — must already serve the new generation
+            // or chained `#name` upstreams fail closed in between
+            // (issue #533 review).
+            if let Some((dns, plan)) = dns {
+                install_dns_publish(&state.tunnel, &state.dns_server, &dns, plan);
+            }
+            dropped = match routing.install {
+                RouteInstall::KeepTrackedTcp => {
+                    state.tunnel.update_routing(
+                        routing.proxies,
+                        routing.rules,
+                        routing.sub_rules,
+                        routing.dialer_registry,
+                    );
+                    0
+                }
+                RouteInstall::CancelTrackedTcp { mode } => {
+                    let n = state.tunnel.reload_routing(
+                        routing.proxies,
+                        routing.rules,
+                        routing.sub_rules,
+                        mode,
+                        routing.dialer_registry,
+                    );
+                    if n > 0 {
+                        tracing::warn!(
+                            connections_dropped = n,
+                            "connection closure requested for cold reload"
+                        );
+                    }
+                    n
+                }
+            };
+            state.tunnel.set_connection_notes(routing.connection_notes);
+            meow_tunnel::nftset::install(&state.tunnel, routing.nftset);
+            state.tunnel.set_tcp_idle_timeout(routing.tcp_idle_timeout);
+            // The candidate's provider sets become the live registries —
+            // the rules and DNS `rule-set:` matchers installed above
+            // already reference these Arcs (issue #533 review).
+            // `commit_registry` publishes the map *and* reconciles the
+            // interval refresh loops so providers added, removed, or
+            // re-intervalled by this commit gain/lose their task
+            // (issue #543).
+            state
+                .rule_provider_refresh
+                .commit_registry(&state.rule_providers, routing.rule_providers);
+            commit_proxy_providers(
+                &state.proxy_providers,
+                &routing.proxy_providers,
+                routing.strict,
+                routing.raw_proxy_providers.as_ref(),
+                &state.proxy_provider_refresh,
+            );
+            routing.dropped_providers.record();
+        } else if let Some((dns, plan)) = dns {
+            install_dns_publish(&state.tunnel, &state.dns_server, &dns, plan);
+        }
+        // The (re)spawned listener's device already runs — its handle
+        // joins the published runtime; a replaced straggler tears down
+        // on a detached task since nothing here may await it.
+        if let Some(handle) = tun_handle {
+            if let Some(prev) = state.tunnel.install_tun_handle(handle) {
+                let tunnel = state.tunnel.clone();
+                tokio::spawn(async move {
+                    tunnel.teardown_tun_handle(prev).await;
+                });
+            }
+        }
+        // The adopted binding's flush closes the sessions that predate
+        // its interface — after the provider registries so provider
+        // member roots resolve against the committed set.
+        if let Some(interface_changed) = adopted_binding {
+            outbound_binding_adopted(state, interface_changed, tracked_tcp);
+        }
+        // `profile.store-selected` committed above with the route
+        // publish; lanes that reach here without one (the verbatim
+        // fallback, a knobs-only PATCH) never carry a flag diff, so
+        // nothing remains to retire.
         *guard = candidate;
+        // Reconcile health-check tasks with the committed proxy-group
+        // section — groups added get a check, removed abort, changed
+        // specs respawn (issue #514). Sync; spawns under the lane lock
+        // are cheap.
+        state.tunnel.reconcile_health_checks(&specs);
+        // `ntp:` reconciles last — after the route publish, DNS install,
+        // dial globals, the keepalive posture, and the TUN transition
+        // (or its rollback) settle, so the worker never dials a
+        // half-published commit (issue #974). The supervisor sees every
+        // committed document's resolved service config and restarts
+        // only on a real change; a disabled/unchanged section never
+        // re-schedules.
+        if let Some(reconcile) = &state.ntp_reconcile {
+            match ntp_resolved {
+                Ok(cfg) => reconcile(cfg),
+                Err(e) => warn!("ntp resolution failed at commit: {e}"),
+            }
+        }
     }
 
     if geo_schedule_changed {
@@ -4430,44 +4627,31 @@ async fn swap_config_and_reconcile_tun(
         }
     }
 
-    // Reconcile health-check tasks with the committed proxy-group section
-    // — groups added get a check, removed abort, changed specs respawn
-    // (issue #514). Sync; spawns under the lane lock are cheap.
-    state.tunnel.reconcile_health_checks(&specs);
-
-    // `keep-alive-*` installs once the document is committed — and
-    // BEFORE the `ntp:` reconcile below, so a worker this mutation
-    // (re)starts carries the committed posture on its first poll: on the
-    // cold-PUT TUN-failure lane the call-site re-assert used to trail
-    // the reconcile, leaving the first-poll carrier on the old policy
-    // (Codex review). The installed posture is read from the committed
-    // document — the `Err` lanes keep it (PUT/fallback — `tun.enable`
-    // rolls back inside, the rest stands) or restore it with the rest
-    // of the snapshotted globals (PATCH).
-    install_committed_keepalive(state);
-    // `ntp:` reconciles last — after the route publish, DNS install,
-    // dial globals, the keepalive posture, and the TUN transition (or
-    // its rollback) settle, so the worker never dials a half-published
-    // commit (issue #974). The supervisor sees every committed
-    // document's resolved service config and restarts only on a real
-    // change; a disabled/unchanged section never re-schedules.
-    if let Some(reconcile) = &state.ntp_reconcile {
-        match ntp_resolved {
-            Ok(cfg) => reconcile(cfg),
-            Err(e) => warn!("ntp resolution failed at commit: {e}"),
-        }
+    // The ledger's sqlite open/close cannot join the synchronous section
+    // — it waits on its database — so it runs detached on the blocking
+    // pool, serialized by the mutation lane it re-acquires, keeping the
+    // commit order of consecutive mutations.
+    tokio::spawn(async move {
+        let _lane = CONFIG_MUTATION.lock().await;
+        let _ = tokio::task::spawn_blocking(move || {
+            meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
+        })
+        .await;
+    });
+    PublishReceipt {
+        dropped,
+        tun: tun_result,
     }
-    tun_result
 }
 
-/// Install the *committed* document's `keep-alive-*` posture. Runs inside
-/// `swap_config_and_reconcile_tun` after the publish — ahead of the
-/// `ntp:` reconcile — and is re-asserted by every lane at its own commit
-/// point, POST-swap on the lanes that keep the document even when the
-/// TUN reconcile failed (issue #974 review). Candidates were validated
-/// before commit, so a failure here means a caller skipped its gate: log
-/// loudly and keep the live posture rather than silently installing a
-/// fallback.
+/// Install the *committed* document's `keep-alive-*` posture. Inside
+/// `swap_config_and_reconcile_tun` the same posture is installed in the
+/// commit section — ahead of the `ntp:` reconcile — only on a clean TUN
+/// outcome (issue #974 review); this re-assert runs at each lane's own
+/// commit point, POST-swap on the lanes that keep the document even when
+/// the TUN reconcile failed. Candidates were validated before commit, so
+/// a failure here means a caller skipped its gate: log loudly and keep
+/// the live posture rather than silently installing a fallback.
 fn install_committed_keepalive(state: &AppState) {
     match meow_config::resolve_outbound_tcp_keepalive(&state.raw_config.read()) {
         Ok(ka) => meow_common::set_outbound_tcp_keepalive(ka),
@@ -5007,7 +5191,7 @@ async fn put_configs(
         let _ = swap_config_and_reconcile_tun(
             &state,
             raw_config,
-            None,
+            PendingPublish::default(),
             prior_resolver,
             preinstalled,
             TrackedTcp::Cancel,
@@ -5200,80 +5384,62 @@ async fn put_configs(
         .mode
         .as_deref()
         .and_then(|mode| mode.parse().ok());
-    // Snapshot the resolver being replaced BEFORE the early install — the
-    // TUN reconcile compares its fake-IP inputs against the new
-    // generation's (issue #533 review).
+    // Snapshot the resolver being replaced before the commit — the swap
+    // compares its fake-IP inputs against the publish payload's new
+    // generation (issue #533 review).
     let prior_resolver = state.tunnel.resolver();
-    // Same early-install as the warm path: `reload_routing` drops the old
-    // route table — and its registry cell — before `publish_dns` runs
-    // below, so every resolver consumer (tunnel, host hook, live
-    // `dns.listen` server) must be on the new generation first. The
-    // named-TUN fake-IP pin gates first — unbypassable by `force`, like
-    // the enable check above.
+    // The named-TUN fake-IP pin gates first — unbypassable by `force`,
+    // like the enable check above. Nothing else installs until the
+    // swap's synchronous commit section (issue #974 review).
     if let Some(dns) = &dns {
         if let Err((status, msg)) = named_tun_fake_ip_guard(&state, &prior_resolver, dns) {
             return reload_rejected(status, &msg);
         }
-        install_resolver_everywhere(&state.tunnel, state.dns_server.as_ref(), dns);
     }
-    // Same selection-persistence ordering as `apply_raw_to_tunnel`
-    // (issue #974 review): the epoch flip commits before the new route
-    // table — and its group writers — go live.
-    state
-        .tunnel
-        .selection_backing()
-        .commit(meow_config::resolve_profile(&raw_config).store_selected);
-    let dropped = state
-        .tunnel
-        .reload_routing(proxies, rules, sub_rules, mode, dialer_registry);
-    state
-        .tunnel
-        .set_connection_notes(raw_config.connection_notes.unwrap_or(false));
-    meow_tunnel::nftset::install(
-        &state.tunnel,
-        raw_config
-            .dns
-            .as_ref()
-            .and_then(|d| d.nftset.as_ref())
-            .and_then(|n| n.parse().ok().flatten()),
+    // The logbook event's section counts — the document moves into the
+    // swap before the publish's drop count is known.
+    let reload_counts = (
+        raw_config.proxies.as_ref().map_or(0, Vec::len),
+        raw_config.proxy_groups.as_ref().map_or(0, Vec::len),
+        raw_config.rules.as_ref().map_or(0, Vec::len),
     );
-    state.tunnel.set_tcp_idle_timeout(tcp_idle_timeout);
-    if dropped > 0 {
-        tracing::warn!(
-            connections_dropped = dropped,
-            "connection closure requested for cold reload"
-        );
-    }
-    // Commit point: install the candidate's provider sets — the rules and
-    // DNS `rule-set:` matchers above already reference these Arcs
-    // (issue #533 review). `commit_registry` publishes the map *and*
-    // reconciles the interval refresh loops in one step (issue #543).
-    state
-        .rule_provider_refresh
-        .commit_registry(&state.rule_providers, rule_providers);
-    commit_proxy_providers(
-        &state.proxy_providers,
-        &proxy_providers,
-        raw_config.strict.unwrap_or(false),
-        raw_config.proxy_providers.as_ref(),
-        &state.proxy_provider_refresh,
-    );
-    dropped_providers.record();
-
-    let reloaded = reload_succeeded(&raw_config, &forced, dropped);
-    // `reload_routing` above ran after the pre-install and cancelled every
-    // tracked TCP flow; any admitted since dialled under the binding. A TUN
+    let publish = PendingPublish {
+        routing: Some(PendingRouting {
+            proxies,
+            rules,
+            sub_rules,
+            dialer_registry,
+            rule_providers,
+            proxy_providers,
+            dropped_providers,
+            connection_notes: raw_config.connection_notes.unwrap_or(false),
+            nftset: raw_config
+                .dns
+                .as_ref()
+                .and_then(|d| d.nftset.as_ref())
+                .and_then(|n| n.parse().ok().flatten()),
+            tcp_idle_timeout,
+            store_selected: meow_config::resolve_profile(&raw_config).store_selected,
+            strict: raw_config.strict.unwrap_or(false),
+            raw_proxy_providers: raw_config.proxy_providers.clone(),
+            install: RouteInstall::CancelTrackedTcp { mode },
+        }),
+        dns,
+    };
+    // `reload_routing` inside the commit section cancels every tracked
+    // TCP flow; any admitted since dialled under the binding. A TUN
     // that fails to come up is rolled back and recorded there; the
     // document is committed, so the PUT succeeds.
-    let _ = swap_config_and_reconcile_tun(
+    let receipt = swap_config_and_reconcile_tun(
         &state,
         raw_config,
-        dns,
+        publish,
         prior_resolver,
         preinstalled,
         TrackedTcp::AlreadyCancelled,
     )
     .await;
+    let reloaded = reload_succeeded(reload_counts, &forced, receipt.dropped);
     // `swap` already installed the committed posture ahead of its `ntp:`
     // reconcile; re-assert it at this lane's own commit point.
     install_committed_keepalive(&state);
@@ -5296,10 +5462,11 @@ fn reload_rejected(status: StatusCode, message: &str) -> Response {
 
 /// The logbook event of a committed `PUT /configs`; a warning when `force`
 /// pushed past errors.
-fn reload_succeeded(raw: &RawConfig, forced: &[String], dropped: usize) -> logbook::Event {
-    let proxies = raw.proxies.as_ref().map_or(0, Vec::len);
-    let groups = raw.proxy_groups.as_ref().map_or(0, Vec::len);
-    let rules = raw.rules.as_ref().map_or(0, Vec::len);
+fn reload_succeeded(
+    (proxies, groups, rules): (usize, usize, usize),
+    forced: &[String],
+    dropped: usize,
+) -> logbook::Event {
     let counts = format!("{proxies} proxies, {groups} groups, {rules} rules");
     let event = if forced.is_empty() {
         logbook::event(

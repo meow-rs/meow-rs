@@ -58,6 +58,12 @@ struct WorkerState {
     /// path (the API lane is still serving then) must not spawn a worker
     /// out of the grave (issue #974 review).
     closed: bool,
+    /// Reconciles before [`NtpSupervisor::settle`] store the effective
+    /// config but spawn no worker: the API lane goes live before the
+    /// TUN readiness wait ends, and a worker started in that window
+    /// would dial through a startup that has not settled (issue #974
+    /// review).
+    armed: bool,
 }
 
 impl NtpSupervisor {
@@ -68,6 +74,7 @@ impl NtpSupervisor {
                 config: None,
                 task: None,
                 closed: false,
+                armed: false,
             }),
             generation: Arc::new(AtomicU64::new(0)),
             publish: Arc::new(Mutex::new(())),
@@ -98,23 +105,48 @@ impl NtpSupervisor {
             meow_common::set_protocol_offset_ns(None);
             gen
         };
-        st.task = next.clone().map(|cfg| {
-            info!(
-                server = %cfg.server,
-                port = cfg.port,
-                interval = cfg.interval_minutes,
-                dialer_proxy = cfg.dialer_proxy.as_deref().unwrap_or("direct"),
-                "ntp: starting sync worker"
-            );
-            tokio::spawn(run_worker(
-                cfg,
-                Weak::clone(&self.tunnel),
-                Arc::clone(&self.generation),
-                gen,
-                Arc::clone(&self.publish),
-            ))
-        });
+        st.task = if st.armed {
+            next.clone().map(|cfg| self.spawn(cfg, gen))
+        } else {
+            None
+        };
         st.config = next;
+    }
+
+    /// Arm the supervisor once startup has settled — the boot calls this
+    /// inside the `CONFIG_MUTATION` lane after the TUN readiness wait,
+    /// then reconciles the committed document. A config a PUT reconciled
+    /// while unarmed is already stored; the stored worker (if any)
+    /// starts here with the latest generation — a reconcile's bump
+    /// already ran when it was stored, so no stale publish can shadow it.
+    pub fn settle(&self) {
+        let mut st = self.state.lock().unwrap();
+        st.armed = true;
+        if st.closed || st.task.is_some() {
+            return;
+        }
+        let Some(cfg) = st.config.clone() else {
+            return;
+        };
+        let gen = self.generation.load(Ordering::Acquire);
+        st.task = Some(self.spawn(cfg, gen));
+    }
+
+    fn spawn(&self, cfg: meow_config::NtpConfig, gen: u64) -> JoinHandle<()> {
+        info!(
+            server = %cfg.server,
+            port = cfg.port,
+            interval = cfg.interval_minutes,
+            dialer_proxy = cfg.dialer_proxy.as_deref().unwrap_or("direct"),
+            "ntp: starting sync worker"
+        );
+        tokio::spawn(run_worker(
+            cfg,
+            Weak::clone(&self.tunnel),
+            Arc::clone(&self.generation),
+            gen,
+            Arc::clone(&self.publish),
+        ))
     }
 
     /// Cancel and join the worker, then make the supervisor terminal:
@@ -834,12 +866,45 @@ mod tests {
         sup.shutdown().await; // idempotent
     }
 
+    /// A reconcile that lands before `settle` (the API lane is live
+    /// while startup's TUN readiness wait still runs) stores the
+    /// effective config but spawns no worker; `settle` then starts the
+    /// stored config — the callback is live but cannot dial early
+    /// (issue #974 review).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reconcile_before_settle_stores_then_arms_on_settle() {
+        let _gate = offset_gate().await;
+        let sup = supervisor();
+        sup.reconcile(test_cfg("127.0.0.1"));
+        assert!(
+            sup.state.lock().unwrap().task.is_none(),
+            "a pre-settle reconcile must store, not spawn"
+        );
+        assert_eq!(
+            sup.state
+                .lock()
+                .unwrap()
+                .config
+                .as_ref()
+                .map(|c| c.server.as_str()),
+            Some("127.0.0.1"),
+            "the effective config must be stored for settle"
+        );
+        sup.settle();
+        assert!(
+            sup.state.lock().unwrap().task.is_some(),
+            "settle must start the stored config"
+        );
+        sup.shutdown().await;
+    }
+
     /// A dropped supervisor aborts its worker and clears the offset —
     /// no forever-polling task, no stale correction (issue #974).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drop_aborts_worker_and_clears_offset() {
         let _gate = offset_gate().await;
         let sup = supervisor();
+        sup.settle();
         sup.reconcile(test_cfg("127.0.0.1"));
         assert!(
             sup.state.lock().unwrap().task.is_some(),

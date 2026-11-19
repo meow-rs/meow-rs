@@ -2218,6 +2218,11 @@ async fn run(
     // say so.
     {
         let _mutation = meow_api::routes::CONFIG_MUTATION.lock().await;
+        // Arm the supervisor only now that readiness settled: a PUT
+        // committed while the TUN wait was open already fired its own
+        // reconcile — stored, never spawned — and its stored config
+        // starts below (issue #974 review).
+        ntp_supervisor.settle();
         match meow_config::resolve_ntp(&raw_config.read()) {
             Ok(ntp) => ntp_supervisor.reconcile(ntp),
             Err(e) => warn!("startup ntp resolution failed; worker left stopped: {e}"),

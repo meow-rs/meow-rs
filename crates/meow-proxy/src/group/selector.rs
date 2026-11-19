@@ -52,15 +52,15 @@ impl SelectorGroup {
         }
     }
 
-    /// Attach the epoch-fenced persistence writer. The saved choice (if
-    /// any) is loaded into `selected` immediately so the group dials it on
-    /// first use; subsequent `select()`s flush through while the writer's
-    /// generation still owns the persistence epoch.
+    /// Attach the epoch-fenced persistence writer. The saved choice is
+    /// not copied out here: `selected_proxy` asks the store lazily, so
+    /// the group serves the exact map the backing's `commit` adopts —
+    /// adoption re-reads the file, and a build-time snapshot could name
+    /// whatever it read before the file changed (issue #974 review).
+    /// `select()` writes still flush through while the writer's
+    /// generation owns the persistence epoch.
     #[must_use]
     pub fn with_store(mut self, store: SelectorWriter) -> Self {
-        if let Some(prev) = store.get(&self.name) {
-            *self.selected.write() = Some(SmolStr::from(prev));
-        }
         self.store = Some(store);
         self
     }
@@ -100,11 +100,23 @@ impl SelectorGroup {
         }
     }
 
+    /// The name this group would dial: a `select()`/`force_set` pick in
+    /// the lock first, else the store's saved choice — read lazily so it
+    /// always reflects the map the persistence backing serves.
+    fn effective_selection(&self) -> Option<SmolStr> {
+        self.selected.read().clone().or_else(|| {
+            self.store
+                .as_ref()
+                .and_then(|store| store.get(&self.name))
+                .map(SmolStr::from)
+        })
+    }
+
     /// Resolve `selected` to an `Arc<dyn Proxy>` without allocating a unified
     /// `Vec`. Walks `static_proxies` then provider slots; falls back to the
     /// first proxy if `selected` is unset or names something no longer present.
     pub fn selected_proxy(&self) -> Option<Arc<dyn Proxy>> {
-        let sel: Option<SmolStr> = self.selected.read().clone();
+        let sel: Option<SmolStr> = self.effective_selection();
         let mut first_any: Option<Arc<dyn Proxy>> = None;
         if let Some(name) = sel {
             for p in &self.static_proxies {

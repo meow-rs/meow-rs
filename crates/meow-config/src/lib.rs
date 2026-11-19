@@ -5855,48 +5855,233 @@ pub fn check_ntp_dialer_target_declared(
         // The transports the built map always carries are spelled out —
         // there is no map to consult here.
         matches!(name, "DIRECT" | "COMPATIBLE" | "GLOBAL")
-            || raw
-                .proxy_groups
-                .iter()
-                .flatten()
-                .any(|g| g.name == name && declared_group_type_buildable(&g.group_type))
-            || raw.proxies.iter().flatten().any(|p| {
-                p.get("name").and_then(serde_json::Value::as_str) == Some(name)
-                    && p.get("type")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(declared_proxy_type_buildable)
-            })
+            || declared_leaf_binding(name, raw) == Some(false)
+            || declared_group_lands(name, raw)
     })
 }
 
-/// The `proxies:` node's `type:` spellings this build's dispatch arm can
-/// construct — the buildability floor
-/// [`check_ntp_dialer_target_declared`] can prove without building. A
-/// node whose `type` is missing or unknown is dropped by the lenient
-/// build, so a same-name `dialer-proxy` reference would otherwise commit
-/// a document the next boot's built-map check rejects.
-#[allow(
-    clippy::match_like_matches_macro,
-    reason = "cfg!-gated arms can't fold into matches! patterns"
-)]
-fn declared_proxy_type_buildable(proxy_type: &str) -> bool {
-    match proxy_type {
-        "http" | "socks5" | "direct" => true,
-        "trusttunnel" => cfg!(feature = "trusttunnel"),
-        "ss" => cfg!(feature = "ss"),
-        "trojan" => cfg!(feature = "trojan"),
-        "vless" => cfg!(feature = "vless"),
-        "anytls" => cfg!(feature = "anytls"),
-        "hysteria2" => cfg!(feature = "hysteria2"),
-        "vmess" => cfg!(feature = "vmess"),
-        "snell" => cfg!(feature = "snell"),
-        "wireguard" | "WireGuard" => cfg!(feature = "wireguard"),
-        _ => false,
+/// Whether a `proxies:` declaration named `name` would land in the
+/// lenient build's map — the same parse the build runs, restricted to
+/// the name's own blocks (local and synchronous; a parse never dials —
+/// issue #974 review). Mirrors [`insert_parsed_leaves`]: later same-name
+/// blocks win a live binding; a block on a `dialer-proxy` edge goes
+/// through [`parse_dialered_leaf`] against the earlier same-name
+/// binding; an unparseable block fills the slot with an unavailable
+/// placeholder only while nothing live is bound and its `type:` is
+/// placeholder-eligible — so a `{type: socks5}` without `server` drops
+/// out, while a compiled-out `trusttunnel` still binds a placeholder.
+/// The placeholder counts for *group membership* (a group listing it
+/// still lands) but not as the dialer target itself: it carries no
+/// transport, so an NTP dialer named on it would fail every dial.
+/// A build-fatal error (self-edge, a `strict` parse failure, a
+/// malformed-edges bail) can never land the name.
+/// Returns `Some(false)` for a live binding, `Some(true)` when only an
+/// unavailable placeholder holds the slot, `None` when nothing lands.
+fn declared_leaf_binding(name: &str, raw: &raw::RawConfig) -> Option<bool> {
+    // A block shadowing a built-in is dropped before it binds — the
+    // built-in itself was already answered by the caller's arms.
+    if BUILTIN_ADAPTER_NAMES.contains(&name) {
+        return None;
+    }
+    let raw_proxies = raw.proxies.as_ref()?;
+    let strict = raw.strict.unwrap_or(false);
+    let Ok(edges) = collect_dialer_edges(raw_proxies, strict) else {
+        // The whole build bails on the declared edges — no map exists
+        // for the name to land in.
+        return None;
+    };
+    let ipv6 = effective_ipv6(raw.ipv6);
+    let fp = raw.global_client_fingerprint.as_deref();
+    let registry = meow_proxy::dialer::ProxyRegistry::default();
+    let key = SmolStr::from(name);
+    // (binding, is_placeholder) — `parse_dialered_leaf` consults both.
+    let mut bound: Option<(Arc<dyn Proxy>, bool)> = None;
+    for (index, block) in raw_proxies.iter().enumerate() {
+        if block.get("name").and_then(|v| v.as_str()) != Some(name) {
+            continue;
+        }
+        if let Some(dialer) = edges.by_index.get(&index) {
+            let mut prior = HashMap::new();
+            let mut placeholder_names = std::collections::HashSet::new();
+            if let Some((proxy, placeholder)) = &bound {
+                prior.insert(key.clone(), Arc::clone(proxy));
+                if *placeholder {
+                    placeholder_names.insert(key.clone());
+                }
+            }
+            match parse_dialered_leaf(
+                block,
+                dialer,
+                &prior,
+                &placeholder_names,
+                None,
+                ipv6,
+                strict,
+                &registry,
+                fp,
+            ) {
+                Ok(Some(b)) => bound = Some(b),
+                // Skipped — the earlier same-name binding stands.
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+            continue;
+        }
+        match proxy_parser::parse_static_proxy(block, ipv6, None, fp) {
+            Ok(proxy) => bound = Some((proxy, false)),
+            Err(e) => {
+                if strict {
+                    return None;
+                }
+                if bound.is_none() {
+                    if let Some(declared) = proxy_parser::placeholder_adapter_type(block) {
+                        bound = Some((
+                            unavailable_placeholder(name, &e.to_string(), declared),
+                            true,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    bound.map(|(_, placeholder)| placeholder)
+}
+
+/// Whether a `proxy-groups:` declaration named `name` lands in the
+/// lenient build — mirroring [`proxy_parser::parse_proxy_group_inner`]'s
+/// kept-verdict without fabricating provider objects: the group survives
+/// when at least one static member or provider slot resolves and its
+/// type-specific gates pass. Member names resolve against the set the
+/// build's map carries at group-parse time — the transports (built-ins),
+/// every landed leaf, and every group that already landed — computed as
+/// a fixpoint over the declared groups, since a group member that names
+/// a later group resolves once that group lands.
+fn declared_group_lands(name: &str, raw: &raw::RawConfig) -> bool {
+    let Some(groups) = raw.proxy_groups.as_ref() else {
+        return false;
+    };
+    let strict = raw.strict.unwrap_or(false);
+    let mut resolvable: std::collections::HashSet<&str> =
+        BUILTIN_ADAPTER_NAMES.iter().copied().collect();
+    let mut landed_leaves = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for block in raw.proxies.as_deref().unwrap_or(&[]) {
+        let Some(n) = block.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !seen.insert(n) {
+            continue;
+        }
+        // Placeholder-bound names resolve as members too — they occupy
+        // the built map's slot exactly like a live adapter.
+        if declared_leaf_binding(n, raw).is_some() {
+            resolvable.insert(n);
+            landed_leaves += 1;
+        }
+    }
+    let providers: std::collections::HashSet<&str> = raw
+        .proxy_providers
+        .as_ref()
+        .map(|defs| defs.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    let mut landed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    loop {
+        let before = landed.len();
+        for g in groups {
+            if landed.contains(g.name.as_str()) {
+                continue;
+            }
+            if declared_group_would_land(g, &resolvable, &providers, landed_leaves, strict) {
+                landed.insert(g.name.as_str());
+                resolvable.insert(g.name.as_str());
+            }
+        }
+        if landed.len() == before {
+            return landed.contains(name);
+        }
     }
 }
 
-/// The `proxy-groups:` `type:` spellings the group builder dispatches on
-/// — same buildability floor as [`declared_proxy_type_buildable`].
+/// The kept-verdict of one group parse — see [`declared_group_lands`].
+/// `resolvable` is the member-name set the built map would hold at this
+/// point (transports + landed leaves + landed groups); `providers` the
+/// declared `proxy-providers:` names — a slot wires for every declared
+/// name `use:` references and for `include-all*` only while providers
+/// exist, matching the map lookups in `parse_proxy_group_inner`.
+fn declared_group_would_land(
+    g: &raw::RawProxyGroup,
+    resolvable: &std::collections::HashSet<&str>,
+    providers: &std::collections::HashSet<&str>,
+    landed_leaves: usize,
+    strict: bool,
+) -> bool {
+    if !declared_group_type_buildable(&g.group_type) {
+        return false;
+    }
+    // A bad group filter rejects the parse outright.
+    if crate::proxy_provider::GroupFilter::from_raw_group(g).is_err() {
+        return false;
+    }
+    let is_relay = g.group_type == "relay";
+    let proxy_names = g.proxies.as_deref().unwrap_or(&[]);
+    // Under `strict` an unresolved static member (or a non-relay group's
+    // unknown `use:`) fails the parse — and the build it belongs to.
+    if strict {
+        if proxy_names.iter().any(|n| !resolvable.contains(n.as_str())) {
+            return false;
+        }
+        if !is_relay
+            && g.use_providers
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|p| !providers.contains(p.as_str()))
+        {
+            return false;
+        }
+    }
+    let mut members = proxy_names
+        .iter()
+        .filter(|n| resolvable.contains(n.as_str()))
+        .count();
+    if g.include_all_proxies.unwrap_or(false) {
+        members += landed_leaves;
+    }
+    // Provider slots never supply relay members — a `use:` there is
+    // inert (issue #533) — so they count only for the other types.
+    let slots = if is_relay {
+        0
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        let used = g
+            .use_providers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|p| providers.contains(p.as_str()) && seen.insert(p.as_str()))
+            .count();
+        let include_all_providers =
+            g.include_all.unwrap_or(false) || g.include_all_providers.unwrap_or(false);
+        used + if include_all_providers {
+            providers.len()
+        } else {
+            0
+        }
+    };
+    if members == 0 && slots == 0 {
+        return false;
+    }
+    match g.group_type.as_str() {
+        "load-balance" => proxy_parser::parse_lb_strategy(g.strategy.as_deref()).is_ok(),
+        // `proxies` is the only member source a relay parses — it
+        // hard-errors below 2 members.
+        "relay" => members >= 2,
+        _ => true,
+    }
+}
+
+/// The `proxy-groups:` `type:` spellings the group builder dispatches
+/// on — anything else fails the parse before membership is read.
 fn declared_group_type_buildable(group_type: &str) -> bool {
     matches!(
         group_type,

@@ -2789,7 +2789,7 @@ fn parse_wg_reserved(
 /// Hard error on unknown values (Class A per ADR-0002): unknown strategy means
 /// the user may get different distribution behaviour than intended.
 /// Upstream also rejects (`errStrategy` in adapter/outboundgroup/loadbalance.go).
-fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, String> {
+pub(crate) fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, String> {
     match strategy.unwrap_or("round-robin") {
         "round-robin" => Ok(LbStrategy::RoundRobin),
         // Upstream maps "" to consistent-hashing (`case "",

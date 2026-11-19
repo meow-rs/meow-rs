@@ -517,6 +517,42 @@ mod tests {
         assert_eq!(reopened.get("g").as_deref(), Some("d"));
     }
 
+    /// Issue #974 review: a group built under a pending enable primed
+    /// its pick from the parked store, but `commit` re-reads the file on
+    /// adoption — a pick that lands on disk between the build's open and
+    /// the commit must be the one the group serves.
+    #[test]
+    fn first_enable_group_serves_the_adopted_map() {
+        use crate::group::selector::SelectorGroup;
+        use crate::group::test_support::MockProxy;
+        use meow_common::Proxy;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sel.json");
+        let write_file = |map: &HashMap<String, String>| {
+            std::fs::write(&path, serde_json::to_vec(map).unwrap()).unwrap();
+        };
+        write_file(&HashMap::from([("g".to_string(), "a".to_string())]));
+        let backing = SelectionBacking::new(Some(path.clone()));
+        backing.prepare_sync(true);
+        let writer = backing.attach(true).unwrap();
+        let group = SelectorGroup::new(
+            "g",
+            vec![
+                MockProxy::new("a") as Arc<dyn Proxy>,
+                MockProxy::new("b") as Arc<dyn Proxy>,
+            ],
+        )
+        .with_store(writer);
+        // The file changes between the build's open and the enable commit.
+        write_file(&HashMap::from([("g".to_string(), "b".to_string())]));
+        backing.commit(true);
+        assert_eq!(
+            group.current().as_deref(),
+            Some("b"),
+            "the group must serve the map `commit` adopted, not its build-time snapshot"
+        );
+    }
+
     #[test]
     fn rejected_enable_candidate_leaves_no_adoptable_snapshot() {
         // Issue #974: an off→on candidate that never commits must neither

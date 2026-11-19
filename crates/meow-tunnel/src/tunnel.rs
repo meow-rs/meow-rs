@@ -2139,6 +2139,14 @@ impl Tunnel {
         );
     }
 
+    /// The commit-section half of [`Self::set_tun_handle`]: store the
+    /// handle synchronously and return any replaced one, whose teardown
+    /// the caller detaches — a config mutation's publish section holds
+    /// the document write guard and may not await (issue #974 review).
+    pub fn install_tun_handle(&self, handle: TunHandle) -> Option<TunHandle> {
+        self.inner.tun_handle.write().replace(handle)
+    }
+
     /// Store a running TUN listener handle. If a previous TUN listener was
     /// running, it is aborted and awaited — including its lwIP core's
     /// teardown — before this returns (issue #514).
