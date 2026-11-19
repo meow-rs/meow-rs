@@ -210,10 +210,98 @@ async fn config_rejects_listener_rule_without_block() {
     assert!(err.contains("ghost") && err.contains("sub-rules"), "{err}");
 }
 
+/// A block match on a UDP-incapable target fails closed: `udp: false` is
+/// a routing preference the TOP-LEVEL scan slides past (issue #969), but
+/// a `rule:` override owns the flow's whole policy, so the block scan
+/// stops on the match and the materialize arm rejects rather than slide
+/// to block-exhaustion DIRECT (`RouteTargetProbe::check`'s
+/// `stats.is_none()` arm).
+#[tokio::test]
+async fn named_rule_block_udp_incapable_match_rejects() {
+    let yaml = "\
+proxies:
+  - name: no-udp
+    type: socks5
+    server: 127.0.0.1
+    port: 1080
+    udp: false
+rules:
+  - MATCH,DIRECT
+sub-rules:
+  blk:
+    - DOMAIN-SUFFIX,udp.example,no-udp
+    - MATCH,DIRECT
+";
+    let tunnel = tunnel_with(yaml);
+    let mut md = tcp_md("udp.example");
+    md.network = Network::Udp;
+    md.special_rules = "blk".into();
+    let t = tunnel.inner().resolve_proxy_lazy(&mut md).await.unwrap();
+    // The block rule DID match — this is the fail-closed arm, not the
+    // missing-block ListenerProxy path; had the scan slid, the block's
+    // own MATCH would have landed DIRECT.
+    assert_eq!(t.rule_name.as_str(), "DomainSuffix");
+    assert_eq!(t.rule_payload.as_str(), "udp.example");
+    assert_resolved_to(&t, "REJECT");
+}
+
+/// A listener-selectable block's IP demand must reach the eager
+/// `pre_resolve` gate even when the top-level list demands none: UDP
+/// callers still resolve `dst_ip` through `needs_ip_resolution` before
+/// matching (the lazy scan enriches mid-scan, but UDP's NAT key is built
+/// ahead of it), so `RouteTable::needs_ip_resolution` ORs every named
+/// block's compiled set in.
+#[tokio::test]
+async fn sub_rules_ip_rule_flips_needs_ip_resolution() {
+    let yaml = "\
+rules:
+  - MATCH,DIRECT
+sub-rules:
+  ipblk:
+    - IP-CIDR,203.0.113.0/24,DIRECT
+    - MATCH,DIRECT
+";
+    let tunnel = tunnel_with(yaml);
+    assert!(
+        tunnel
+            .inner()
+            .needs_ip_resolution
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "a block's IP-CIDR demand must publish needs_ip_resolution"
+    );
+
+    // Negative control: without the block's IP rule the same shape stays
+    // false — the flip comes from the block, not from `sub-rules:` alone.
+    let tunnel =
+        tunnel_with("rules:\n  - MATCH,DIRECT\nsub-rules:\n  ipblk:\n    - MATCH,DIRECT\n");
+    assert!(!tunnel
+        .inner()
+        .needs_ip_resolution
+        .load(std::sync::atomic::Ordering::Relaxed));
+}
+
+/// `listeners[].proxy` forced-target admission (Class A): a name that
+/// declares no proxy, group, or built-in is a hard config-build error,
+/// not a per-flow fail-closed the inbound would only discover at runtime.
+#[tokio::test]
+async fn config_rejects_listener_proxy_naming_nothing() {
+    let err = meow_config::load_config_from_str(
+        "listeners:\n  - name: in1\n    type: mixed\n    port: 0\n    proxy: ghost\n",
+    )
+    .await
+    .err()
+    .map(|e| e.to_string())
+    .unwrap_or_default();
+    assert!(err.contains("ghost") && err.contains("proxy"), "{err}");
+}
+
 #[tokio::test]
 async fn config_carries_proxy_rule_override_on_named_listener() {
+    // `proxy:` names a same-document entry — admission rejects dangling
+    // forced targets, so P must exist here for the override to be carried.
     let cfg = meow_config::load_config_from_str(
-        "sub-rules:\n  blk:\n    - MATCH,DIRECT\n\
+        "proxies:\n  - name: P\n    type: direct\n\
+         sub-rules:\n  blk:\n    - MATCH,DIRECT\n\
          listeners:\n  - name: in1\n    type: mixed\n    port: 0\n    proxy: P\n    rule: blk\n",
     )
     .await

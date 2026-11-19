@@ -847,6 +847,10 @@ mod linux {
     /// `local_addrs` is the listener's interface-address snapshot — the
     /// self-target half of `is_safe_orig_dst`; `None` keeps the
     /// conservative same-port rule.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the listener's UDP knobs, passed once at task spawn"
+    )]
     pub async fn run_udp(
         tunnel: Tunnel,
         socket: UdpSocket,
