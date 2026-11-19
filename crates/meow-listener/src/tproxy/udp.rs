@@ -140,7 +140,7 @@ pub(super) mod flow {
             rule_name,
             rule_payload,
             route: _route,
-        }) = inner.resolve_proxy(&metadata).await
+        }) = inner.resolve_proxy_flow(&mut metadata).await
         else {
             return Err(format!(
                 "no matching rule for {}",
@@ -1587,7 +1587,7 @@ mod tests {
 
     /// A `REJECT` verdict must route to the REJECT-named adapter — never a
     /// silent DIRECT fallback (the issue's hard requirement). The map key
-    /// is what `resolve_proxy` looks up, so the recording stub stands in
+    /// is what `resolve_proxy_flow` looks up, so the recording stub stands in
     /// for the real reject adapter; a DIRECT fallback leaves the dial
     /// counter at zero, while the reject path dials it exactly once and
     /// then parks on the drop conn until idle eviction.

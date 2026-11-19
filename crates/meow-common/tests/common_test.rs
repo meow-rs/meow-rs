@@ -514,7 +514,14 @@ fn test_error_from_io() {
 /// ADR-0011 footprint guard — `Metadata` is the per-connection hot type
 /// (M2 baseline 272 B). Fields must land in existing tail padding; a
 /// growth needs a measured justification in the commit body.
+///
+/// 272 → 280 B (issue #974): `flow_lookup: Arc<FlowLookup>` is one
+/// pointer the flow's process-lookup memo lives behind — `find-process-
+/// mode` shares it between this metadata and every clone the routing,
+/// UDP probe and tracking paths make, so it cannot be a plain field (a
+/// `Clone` would sever the memo) and a smaller non-owning type has
+/// nowhere to point.
 #[test]
-fn metadata_stays_272_bytes() {
-    assert_eq!(std::mem::size_of::<meow_common::Metadata>(), 272);
+fn metadata_stays_280_bytes() {
+    assert_eq!(std::mem::size_of::<meow_common::Metadata>(), 280);
 }

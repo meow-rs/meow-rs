@@ -240,6 +240,10 @@ struct InTypeMask {
 struct MatchInput<'a> {
     metadata: &'a Metadata,
     host: &'a str,
+    /// Which metadata demands may stop a demand-driven scan. The strict
+    /// paths never consult it — `Default` (nothing actionable) is their
+    /// value.
+    gate: DemandGate,
 }
 
 /// Control-flow result of one scan pass over a slot range.
@@ -278,11 +282,33 @@ pub enum LazyMatchOutcome<'a> {
     NoMatch,
 }
 
+/// Which metadata demands a demand-stop scan may block on (`find-process-
+/// mode`, issue #974): `ip` only where the caller materializes `dst_ip`
+/// itself (lazy TCP); `process` under every mode but `off`, and only
+/// while the flow's one lookup has not run — callers fold the flow memo
+/// in when they build the gate, so a miss cannot re-block the next pass.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DemandGate {
+    pub ip: bool,
+    pub process: bool,
+}
+
+impl DemandGate {
+    /// Every demand actionable — the pre-`find-process-mode` lazy gate.
+    pub const ALL: Self = Self {
+        ip: true,
+        process: true,
+    };
+}
+
 /// The scan cannot evaluate this slot yet: its predicate demands a field
-/// that is missing from the metadata but can still be materialized.
+/// that is missing from the metadata, still materializable, and enabled
+/// by `gate` (`off` never stops on a process demand; the eager dispatch
+/// never stops on an IP one).
 fn slot_blocked(slot: &CompiledRuleSlot, input: &MatchInput<'_>) -> bool {
-    (slot.demands_ip && ip_missing(input))
-        || (slot.demands_process && process_missing(input.metadata))
+    let gate = input.gate;
+    (gate.ip && slot.demands_ip && ip_missing(input))
+        || (gate.process && slot.demands_process && process_missing(input.metadata))
 }
 
 /// `dst_ip` is absent but resolvable: there is a hostname the enricher can
@@ -297,6 +323,14 @@ fn ip_missing(input: &MatchInput<'_>) -> bool {
 
 /// Process info is absent but discoverable: a source socket exists to look
 /// up. Mirrors the guards in `match_engine::maybe_enrich_with_process`.
+///
+/// The demand is process-granular, not field-granular: a UID-only rule
+/// sets the same `demands_process` bit as a PROCESS-NAME one, so a flow
+/// carrying `uid` but no `process` still pays one scan for the name it
+/// may not need. Splitting the bit per field would mean threading a
+/// `should_find_process` field-set through every `Rule` impl, the
+/// composites and the provider sets — not worth it for a cost bounded at
+/// one scan per flow (issue #974).
 fn process_missing(metadata: &Metadata) -> bool {
     metadata.process.is_empty() && metadata.src_ip.is_some() && metadata.src_port != 0
 }
@@ -735,11 +769,14 @@ impl CompiledRuleSet {
     /// whose target is absent are skipped and the scan continues — with the
     /// warn deferred so the strict re-scan after `NeedsEnrichment` is the
     /// single place it fires (skipping that re-run loses the warnings).
+    ///
+    /// `gate` caps which demands may stop the scan — see [`DemandGate`].
     pub fn match_rules_lazy<'a>(
         &'a self,
         metadata: &Metadata,
         rules: &'a [Box<dyn Rule>],
         probe: &dyn TargetProbe,
+        gate: DemandGate,
     ) -> LazyMatchOutcome<'a> {
         debug_assert_eq!(
             self.source_rule_count,
@@ -757,7 +794,7 @@ impl CompiledRuleSet {
             let mut on_missing = |m: CompiledMatchResult<'a>| skipped.push(m);
 
             let helper = RuleMatchHelper;
-            let input = MatchInput::new(metadata);
+            let input = MatchInput::new(metadata).with_gate(gate);
             'scan: {
                 if self.execution_plan == ExecutionPlan::LinearScan {
                     break 'scan match self.scan_range_ctl::<true, true>(
@@ -851,18 +888,18 @@ impl CompiledRuleSet {
         outcome
     }
 
-    /// Union the demands of every slot at or after `from_pos`, filtered to
-    /// the fields actually missing from this connection's metadata, so one
-    /// enrichment round suffices before the strict re-match.
+    /// The demand report of the slot the scan stopped at — that slot's
+    /// own missing-and-gated fields only. A *later* slot's demand is
+    /// deliberately not pulled forward: an IP-only block must not spend a
+    /// process scan on a rule the scan never reached, and the next pass
+    /// decides the demand from the slot it reaches then (upstream's
+    /// `strict` invokes the lookup callback from the reached predicate
+    /// itself — issue #974 `find-process-mode`).
     fn enrichment_needs(&self, from_pos: usize, input: &MatchInput<'_>) -> LazyMatchOutcome<'_> {
-        let mut needs_ip = false;
-        let mut needs_process = false;
-        for slot in &self.slots[from_pos..] {
-            needs_ip |= slot.demands_ip;
-            needs_process |= slot.demands_process;
-        }
-        needs_ip &= ip_missing(input);
-        needs_process &= process_missing(input.metadata);
+        let slot = &self.slots[from_pos];
+        let gate = input.gate;
+        let needs_ip = gate.ip && slot.demands_ip && ip_missing(input);
+        let needs_process = gate.process && slot.demands_process && process_missing(input.metadata);
         debug_assert!(
             needs_ip || needs_process,
             "scan blocked without an actionable demand",
@@ -870,7 +907,7 @@ impl CompiledRuleSet {
         LazyMatchOutcome::NeedsEnrichment {
             needs_ip,
             needs_process,
-            blocked_rule: self.slots[from_pos].rule_index as usize,
+            blocked_rule: slot.rule_index as usize,
         }
     }
 
@@ -941,6 +978,8 @@ impl CompiledRuleSet {
     /// miss-scan hot path is unchanged (issue #513). The sink is a callback
     /// so the lazy path can defer warnings when a strict re-scan will
     /// re-emit them.
+    /// `input.gate` is consulted only under `STOP_ON_DEMAND`; the strict
+    /// scans build their input with [`DemandGate::default()`].
     fn scan_range_ctl<'a, const STOP_ON_DEMAND: bool, const EVAL_TRIE: bool>(
         &'a self,
         range: Range<usize>,
@@ -1050,7 +1089,15 @@ impl<'a> MatchInput<'a> {
         Self {
             metadata,
             host: metadata.rule_host(),
+            gate: DemandGate::default(),
         }
+    }
+
+    /// The input with its demand gate set — [`Self::match_rules_lazy`]'s
+    /// callers decide which demands may stop the scan.
+    fn with_gate(mut self, gate: DemandGate) -> Self {
+        self.gate = gate;
+        self
     }
 }
 
@@ -2541,7 +2588,7 @@ mod tests {
         };
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL),
                 LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
             ),
             "lazy scan must stop for resolution instead of falling through",
@@ -2710,7 +2757,7 @@ mod tests {
         };
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL),
                 LazyMatchOutcome::Matched(_)
             ),
             "sniff_host-only input must not stop for IP enrichment"
@@ -2728,7 +2775,7 @@ mod tests {
         };
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL),
                 LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
             ),
             "a real host must still trigger IP enrichment"
@@ -2768,7 +2815,7 @@ mod tests {
         // And the lazy scan must not stop on it.
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL),
                 LazyMatchOutcome::Matched(_)
             ),
             "an unconditional-match slot must not demand enrichment"
@@ -3111,7 +3158,7 @@ mod tests {
                 .to_string()
         };
         let lazy = |host: &str| -> String {
-            match set.match_rules_lazy(&meta(host), &rules, &|_: &str| true) {
+            match set.match_rules_lazy(&meta(host), &rules, &|_: &str| true, DemandGate::ALL) {
                 LazyMatchOutcome::Matched(result) => result.adapter_name.to_string(),
                 LazyMatchOutcome::NeedsEnrichment { .. } => {
                     panic!("a domain set never demands enrichment")
@@ -3309,7 +3356,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
@@ -3376,7 +3423,8 @@ mod tests {
 
         // Phase 1: the dead-target domain rule matches and the IP-CIDR slot
         // blocks → NeedsEnrichment. The warn must be deferred to phase 2.
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(
             matches!(
                 outcome,
@@ -3419,7 +3467,8 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
         let warns = logs.matches("'DEAD'").count();
         assert_eq!(
@@ -3450,7 +3499,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3493,7 +3543,8 @@ mod tests {
         assert_eq!(result.map(|m| m.adapter_name), Some("LIVE"));
         assert_eq!(logs.matches("DEAD-PREFIX").count(), 1, "strict: {logs}");
 
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(matches!(outcome, LazyMatchOutcome::Matched(_)));
         assert_eq!(logs.matches("DEAD-PREFIX").count(), 1, "lazy: {logs}");
     }
@@ -3517,7 +3568,8 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe, DemandGate::ALL));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3542,7 +3594,8 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(matches!(outcome, LazyMatchOutcome::NoMatch));
         let warns = logs.matches("'DEAD'").count();
         assert_eq!(
@@ -3570,7 +3623,8 @@ mod tests {
             ..Default::default()
         };
 
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &usable, DemandGate::ALL));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3656,7 +3710,7 @@ mod tests {
                 set.match_rules(&meta, &rules, &BuiltinProbe)
                     .map(|m| m.adapter_name)
             } else {
-                match set.match_rules_lazy(&meta, &rules, &BuiltinProbe) {
+                match set.match_rules_lazy(&meta, &rules, &BuiltinProbe, DemandGate::ALL) {
                     LazyMatchOutcome::Matched(m) => Some(m.adapter_name),
                     _ => panic!("lazy scan must not defer or miss"),
                 }
@@ -3795,7 +3849,8 @@ mod tests {
         };
         // Phase 1: PASS rule skipped, then the scan hits the IP-demanding
         // slot → NeedsEnrichment with no warns.
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe, DemandGate::ALL));
         assert!(matches!(
             outcome,
             LazyMatchOutcome::NeedsEnrichment { needs_ip: true, .. }
@@ -3824,7 +3879,8 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &BuiltinProbe, DemandGate::ALL));
         match outcome {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
             LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => {
@@ -3880,7 +3936,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DomainProxy"),
             _ => panic!("domain match must complete without enrichment"),
         }
@@ -3900,7 +3956,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
             _ => panic!("must fall through to FINAL without demanding enrichment"),
         }
@@ -3921,7 +3977,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "DIRECT"),
             _ => panic!("no-resolve rule must not demand enrichment"),
         }
@@ -3945,7 +4001,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::NeedsEnrichment {
                 needs_ip,
                 needs_process,
@@ -3976,7 +4032,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match set.match_rules_lazy(&meta, &rules, &|_: &str| true) {
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::NeedsEnrichment { needs_ip, .. } => assert!(needs_ip),
             _ => panic!("blocked slot before the trie hit must demand enrichment"),
         }
@@ -4082,7 +4138,7 @@ mod tests {
         };
         assert!(
             matches!(
-                set.match_rules_lazy(&meta, &rules, &|_: &str| true),
+                set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL),
                 LazyMatchOutcome::Matched(_)
             ),
             "a GEOSITE hit must return Matched, not NeedsEnrichment"
@@ -4379,7 +4435,8 @@ mod tests {
         // exactly once on the terminal outcome (the hit-slot arm reports
         // through the same on_missing sink; dropping it silently loses
         // this warn since no strict re-scan runs on Matched).
-        let (outcome, logs) = capture_warns(|| set.match_rules_lazy(&meta, &rules, &present));
+        let (outcome, logs) =
+            capture_warns(|| set.match_rules_lazy(&meta, &rules, &present, DemandGate::ALL));
         match outcome {
             LazyMatchOutcome::Matched(m) => assert_eq!(m.adapter_name, "REJECT"),
             LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => {
@@ -4714,7 +4771,7 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        match compiled.match_rules_lazy(&unresolved, &rules, &|_: &str| true) {
+        match compiled.match_rules_lazy(&unresolved, &rules, &|_: &str| true, DemandGate::ALL) {
             LazyMatchOutcome::Matched(result) => assert_eq!(result.adapter_name, "Src"),
             LazyMatchOutcome::NeedsEnrichment { .. } => {
                 panic!("a src RULE-SET must not demand dst_ip resolution")
@@ -5058,7 +5115,8 @@ mod tests {
             let strict = compiled
                 .match_rules(&metadata, &rules, &present)
                 .map(|m| (m.adapter_name, m.rule_type, m.rule_payload));
-            let lazy = match compiled.match_rules_lazy(&metadata, &rules, &present) {
+            let lazy = match compiled.match_rules_lazy(&metadata, &rules, &present, DemandGate::ALL)
+            {
                 LazyMatchOutcome::Matched(m) => Some((m.adapter_name, m.rule_type, m.rule_payload)),
                 LazyMatchOutcome::NeedsEnrichment { .. } | LazyMatchOutcome::NoMatch => None,
             };

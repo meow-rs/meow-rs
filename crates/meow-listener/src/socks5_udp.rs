@@ -501,7 +501,7 @@ async fn run_session(
             rule_name,
             rule_payload,
             route: _route,
-        }) = inner.resolve_proxy(&metadata).await
+        }) = inner.resolve_proxy_flow(&mut metadata).await
         else {
             return Err(format!(
                 "no matching rule for {}",

@@ -3048,6 +3048,75 @@ listeners:
     assert_eq!(s.spec, ListenerSpec::Socks5);
 }
 
+/// mihomo spells the named SOCKS inbound `type: socks`; meow-rs accepts
+/// both spellings (any case) and resolves them to the same `Socks5` spec —
+/// `socks5` stays the canonical runtime name.
+#[tokio::test]
+async fn test_socks_listener_spelling_alias() {
+    for spelling in ["socks", "socks5", "SOCKS", "Socks5", "SoCkS"] {
+        let yaml = format!(
+            r#"
+listeners:
+  - name: s
+    type: {spelling}
+    listen: 0.0.0.0:7891
+    max-connections: 42
+"#
+        );
+        let config = load_config_from_str(&yaml)
+            .await
+            .unwrap_or_else(|e| panic!("type {spelling:?} must resolve: {e}"));
+        let nl = &config.listeners.named[0];
+        assert_eq!(
+            nl.spec,
+            ListenerSpec::Socks5,
+            "type {spelling:?} must resolve to the canonical Socks5 spec"
+        );
+        assert_eq!(nl.spec.type_name(), "socks5");
+        assert_eq!(nl.name, "s");
+        assert_eq!(nl.listen, "0.0.0.0");
+        assert_eq!(nl.port, 7891);
+        assert_eq!(nl.max_connections, 42);
+    }
+
+    // Same aliasing on the `port:`-field path, explicit ephemeral `0`.
+    for spelling in ["socks", "socks5"] {
+        let yaml = format!(
+            r#"
+listeners:
+  - name: s
+    type: {spelling}
+    port: 0
+"#
+        );
+        let config = load_config_from_str(&yaml).await.unwrap();
+        let nl = &config.listeners.named[0];
+        assert_eq!(nl.spec, ListenerSpec::Socks5);
+        assert_eq!(nl.port, 0);
+    }
+}
+
+/// The `socks` spelling occupies the same port space as the `socks-port`
+/// shorthand — a collision still trips the duplicate-port check.
+#[tokio::test]
+async fn test_socks_alias_collides_with_socks_port() {
+    let yaml = r#"
+socks-port: 7892
+listeners:
+  - name: s
+    type: socks
+    listen: 127.0.0.1:7892
+"#;
+    let Err(err) = load_config_from_str(yaml).await else {
+        panic!("named `socks` listener on the socks-port must hard-error");
+    };
+    let msg = format!("{err:#}");
+    assert!(
+        msg.contains("7892") && msg.contains("already used"),
+        "expected the duplicate-port diagnostic, got: {msg}"
+    );
+}
+
 #[tokio::test]
 async fn test_listener_type_name() {
     // type_name() is the canonical string used by the API (`GET /listeners`)
@@ -3271,6 +3340,106 @@ geox-url:
         "https://explicit.test/Country.mmdb"
     );
     assert_eq!(config.geodata.geosite_url, "https://alias.test/geosite.dat");
+}
+
+/// mihomo's flat `geo-auto-update` / `geo-update-interval` alias onto the
+/// resolved geodata schedule — the same `parse_geodata` boundary the
+/// startup spawn gate consumes.
+#[tokio::test]
+async fn test_geo_flat_keys_alias_schedule() {
+    // Flat-only: no `geodata:` block required.
+    let config = load_config_from_str("geo-auto-update: true\ngeo-update-interval: 6\n")
+        .await
+        .unwrap();
+    assert!(config.geodata.auto_update);
+    assert_eq!(config.geodata.auto_update_interval, 6);
+
+    // An explicit nested value beats the flat alias per field — including
+    // an explicit `false`.
+    let config = load_config_from_str(
+        "geo-auto-update: true\ngeo-update-interval: 1\n\
+         geodata:\n  auto-update: false\n",
+    )
+    .await
+    .unwrap();
+    assert!(!config.geodata.auto_update);
+    assert_eq!(
+        config.geodata.auto_update_interval, 1,
+        "nested block without an interval must not shadow the flat one"
+    );
+
+    // The flat interval validates even when auto-update is off.
+    let err = load_config_from_str("geo-update-interval: 0\n")
+        .await
+        .err()
+        .expect("geo-update-interval: 0 must be rejected");
+    assert!(
+        err.to_string().contains("geo-update-interval"),
+        "unexpected error: {err}"
+    );
+}
+
+/// The unsupported selectors are compatibility inputs, not errors —
+/// including under `strict: true`, where they stay warn-only.
+#[tokio::test]
+async fn test_geo_selectors_warn_only_even_under_strict() {
+    for strict in ["", "strict: true\n"] {
+        let yaml =
+            format!("{strict}geodata-mode: true\ngeodata-loader: standard\ngeosite-matcher: mph\n");
+        load_config_from_str(&yaml).await.unwrap_or_else(|e| {
+            panic!("geo selectors must stay warn-only (strict={strict:?}): {e}")
+        });
+    }
+}
+
+// ─── find-process-mode (issue #974) ────────────────────────────────────
+
+/// Omitted resolves to upstream's `strict` default; every spelling —
+/// case-insensitive — parses to its mode, and serialization is the
+/// canonical lowercase.
+#[tokio::test]
+async fn test_find_process_mode_parses_and_defaults() {
+    use meow_common::ProcessLookupMode;
+
+    let config = load_config_from_str("mixed-port: 7890\n").await.unwrap();
+    assert_eq!(config.general.find_process_mode, ProcessLookupMode::Strict);
+    assert_eq!(config.raw.find_process_mode, None);
+
+    for (spelling, mode) in [
+        ("always", ProcessLookupMode::Always),
+        ("Strict", ProcessLookupMode::Strict),
+        ("OFF", ProcessLookupMode::Off),
+    ] {
+        let yaml = format!("find-process-mode: {spelling}\n");
+        let config = load_config_from_str(&yaml).await.unwrap();
+        assert_eq!(
+            config.general.find_process_mode, mode,
+            "spelling {spelling:?}"
+        );
+        assert_eq!(config.raw.find_process_mode, Some(mode));
+        // The raw document serializes the canonical lowercase.
+        let v = serde_json::to_value(&config.raw).unwrap();
+        assert_eq!(
+            v["find-process-mode"].as_str().unwrap(),
+            mode.as_str(),
+            "spelling {spelling:?} must serialize lowercase"
+        );
+    }
+}
+
+/// An unknown spelling fails at the raw boundary — even in lenient mode
+/// there is no warn-and-continue path for this key (upstream's
+/// `ParseFindProcessMode` error propagates the same way).
+#[tokio::test]
+async fn test_find_process_mode_rejects_unknown_spelling() {
+    let err = load_config_from_str("find-process-mode: sometimes\n")
+        .await
+        .err()
+        .expect("an unknown find-process-mode must fail");
+    assert!(
+        err.to_string().contains("find-process-mode"),
+        "unexpected error: {err}"
+    );
 }
 
 // ─── tcp-keepalive* / tcp-idle-timeout (zombie-connection bound) ───────────
@@ -3916,6 +4085,104 @@ geox-url:
         }
     }
 
+    /// The flat `geo-*` selectors are typed compat inputs: they warn on
+    /// their effective value with the winning key's path — never under
+    /// the generic unknown-key line.
+    #[test]
+    fn flat_geo_selectors_warn_by_effective_path() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+geodata-mode: true
+geodata-loader: standard
+geosite-matcher: mph
+"#,
+        );
+        for want in [
+            "geodata-mode: `true` selects mihomo's geoip.dat backend",
+            "geodata-loader: value \"standard\" selects a DAT loader",
+            "geosite-matcher: value \"mph\" selects a geosite matcher",
+        ] {
+            assert!(logs.contains(want), "missing '{want}' in: {logs}");
+        }
+        for key in [
+            "geo-auto-update",
+            "geo-update-interval",
+            "geodata-mode",
+            "geodata-loader",
+            "geosite-matcher",
+        ] {
+            assert!(
+                !logs.contains(&format!("unknown keys in top-level config: {key}"))
+                    && !logs.contains(&format!("unsupported key in top-level config: {key}")),
+                "{key} is a recognized typed field — it must not warn as unknown: {logs}"
+            );
+        }
+    }
+
+    /// An explicit nested selector wins the merge, so the nested path is
+    /// the one the warning names — and `geodata-mode: false` (the
+    /// MMDB-compatible value) does not warn at all.
+    #[test]
+    fn geo_selector_warns_follow_the_winning_spelling() {
+        let (_config, logs) = load_and_capture_warns(
+            r#"
+geodata-mode: false
+geodata-loader: standard
+geosite-matcher: hybrid
+geodata:
+  geodata-mode: true
+  geosite-matcher: succinct
+"#,
+        );
+        // Nested true wins over flat false → the nested path warns.
+        assert!(
+            logs.contains("geodata.geodata-mode: `true` selects mihomo's geoip.dat backend"),
+            "got: {logs}"
+        );
+        assert!(
+            !logs.contains("geodata-mode: `false`"),
+            "flat false never warns: {logs}"
+        );
+        // Flat loader has no nested rival → the flat path warns.
+        assert!(
+            logs.contains("geodata-loader: value \"standard\" selects a DAT loader"),
+            "got: {logs}"
+        );
+        // Nested matcher wins over flat.
+        assert!(
+            logs.contains("geodata.geosite-matcher: value \"succinct\" selects a geosite matcher"),
+            "got: {logs}"
+        );
+        assert!(
+            !logs.contains("geosite-matcher: value \"hybrid\""),
+            "the shadowed flat value must not warn: {logs}"
+        );
+    }
+
+    /// A legacy non-boolean nested `geodata-mode` and the nested-only
+    /// `geoip-matcher` warn without failing — the selectors never become
+    /// errors even under `strict: true`.
+    #[test]
+    fn geo_legacy_selector_values_warn_not_fail() {
+        let (config, logs) = load_and_capture_warns(
+            r#"
+strict: true
+geodata:
+  geodata-mode: memconservative
+  geoip-matcher: mph
+"#,
+        );
+        assert!(
+            logs.contains("geodata.geodata-mode: unsupported value"),
+            "got: {logs}"
+        );
+        assert!(
+            logs.contains("geodata.geoip-matcher: field is not supported"),
+            "got: {logs}"
+        );
+        drop(config);
+    }
+
     /// `nameserver-policy` keys are domain patterns, not config keys —
     /// they must never warn.
     #[test]
@@ -4102,8 +4369,14 @@ strict-bogus-key: 1
             "external-ui",
             "external-ui-name",
             "external-ui-url",
+            "find-process-mode",
             "firewall",
+            "geo-auto-update",
+            "geo-update-interval",
             "geodata",
+            "geodata-loader",
+            "geodata-mode",
+            "geosite-matcher",
             "geox-url",
             "global-client-fingerprint",
             "global-ua",
@@ -4133,6 +4406,7 @@ strict-bogus-key: 1
             "strict",
             "sub-rules",
             "subscriptions",
+            "tcp-concurrent",
             "tcp-connect-timeout",
             "tcp-idle-timeout",
             "tcp-keepalive",

@@ -688,7 +688,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
             drop_held(&held);
             return Ok(());
         }
-        target = inner.resolve_proxy(&metadata) => target,
+        target = inner.resolve_proxy_flow(&mut metadata) => target,
     };
     let Some(ResolvedTarget {
         adapter: proxy,

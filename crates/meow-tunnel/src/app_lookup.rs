@@ -12,7 +12,9 @@
 //! LAN gateway) have no app, and cost no scan.
 
 use crate::statistics::ConnCounters;
-use meow_common::process_lookup::PROCESS_LOOKUP_SUPPORTED;
+use meow_common::process_lookup::{
+    ProcessInfo, ProcessLookupMode, ProcessLookupPolicy, PROCESS_LOOKUP_SUPPORTED,
+};
 use meow_common::{find_process, traffic_ledger, ConnType, Metadata, Network};
 use smol_str::SmolStr;
 use std::net::{IpAddr, SocketAddr};
@@ -26,6 +28,14 @@ struct Lookup {
     network: Network,
     local: SocketAddr,
     counters: Arc<ConnCounters>,
+    /// The submitting tunnel's live `find-process-mode`, rechecked at scan
+    /// time: `off` cancels even work queued before the switch (issue #974).
+    policy: Arc<ProcessLookupPolicy>,
+    /// A flow memo's already-found owner, when the submitter holds one:
+    /// the locality read still gates the filing — a LAN client's
+    /// wildcard-table hit names no local app — but the OS walk never
+    /// repeats for this flow (issue #974).
+    known: Option<ProcessInfo>,
 }
 
 /// The lookup thread's queue, started with the first lookup; `None` when
@@ -132,15 +142,48 @@ fn interface_addresses() -> Vec<IpAddr> {
 }
 
 /// Look up the app of the flow `counters` count, from `local`, and hand it
-/// to them; no app when the queue is full.
-pub(crate) fn submit(network: Network, local: SocketAddr, counters: &Arc<ConnCounters>) {
-    let lookup = Lookup {
+/// to them; no app when the queue is full. `policy` is the live
+/// `find-process-mode` the worker rechecks before scanning.
+pub(crate) fn submit(
+    network: Network,
+    local: SocketAddr,
+    counters: &Arc<ConnCounters>,
+    policy: &Arc<ProcessLookupPolicy>,
+) {
+    enqueue(Lookup {
         network,
         local,
         counters: Arc::clone(counters),
-    };
+        policy: Arc::clone(policy),
+        known: None,
+    });
+}
+
+/// [`submit`] for a flow whose owner the routing path already found and
+/// memoized in the flow's [`FlowLookup`](meow_common::FlowLookup): the
+/// worker's locality read still decides whether the name files — the
+/// source of a TUN or transparent flow may be another host's, whose
+/// wildcard-table hit is no local app — and no socket-table walk runs at
+/// all for this flow (issue #974).
+pub(crate) fn submit_known(
+    network: Network,
+    local: SocketAddr,
+    known: ProcessInfo,
+    counters: &Arc<ConnCounters>,
+    policy: &Arc<ProcessLookupPolicy>,
+) {
+    enqueue(Lookup {
+        network,
+        local,
+        counters: Arc::clone(counters),
+        policy: Arc::clone(policy),
+        known: Some(known),
+    });
+}
+
+fn enqueue(lookup: Lookup) {
     let Some(lookups) = LOOKUPS.get_or_init(start) else {
-        counters.resolve_app(SmolStr::default());
+        lookup.counters.resolve_app(SmolStr::default());
         return;
     };
     if let Err(TrySendError::Full(lookup) | TrySendError::Disconnected(lookup)) =
@@ -160,19 +203,30 @@ fn start() -> Option<SyncSender<Lookup>> {
                 network,
                 local,
                 counters,
+                policy,
+                known,
             } in queue
             {
-                // No scan once the ledger or its apps went off, nor for a
-                // LAN client's flow.
-                let scan = traffic_ledger::enabled()
+                // A source of this host, the ledger still filing apps —
+                // the one locality read gates a queued scan and a
+                // memoized owner alike, so a LAN client's flow files no
+                // app however its name was found.
+                let local_flow = traffic_ledger::enabled()
                     && traffic_ledger::apps()
                     && addresses.contains(local.ip());
+                // Rechecked after the blocking locality read, right before
+                // the walk: an `off` landing meanwhile cancels the scan
+                // (issue #974). A `known` owner needs no walk — `off`
+                // suppresses the scan, not the filing of what routing
+                // already found (the supplied-attribution case).
+                let scan = local_flow && known.is_none() && policy.get() != ProcessLookupMode::Off;
                 // A panic in a platform scan files the flow under no app
                 // rather than leave its counters waiting.
-                let info = scan
-                    .then(|| std::panic::catch_unwind(move || find_process(network, local)))
-                    .and_then(Result::ok)
-                    .flatten();
+                let info = known.filter(|_| local_flow).or_else(|| {
+                    scan.then(|| std::panic::catch_unwind(move || find_process(network, local)))
+                        .and_then(Result::ok)
+                        .flatten()
+                });
                 let app = info
                     .map(|info| traffic_ledger::app_name(&info.name, &info.path))
                     .unwrap_or_default();

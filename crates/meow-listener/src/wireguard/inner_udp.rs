@@ -133,7 +133,7 @@ pub(super) async fn run_flow(args: FlowArgs, mut rx: mpsc::Receiver<Bytes>) -> R
         rule_name,
         rule_payload,
         route: _route,
-    }) = inner.resolve_proxy(&metadata).await
+    }) = inner.resolve_proxy_flow(&mut metadata).await
     else {
         return Err(format!(
             "no matching rule for {}",

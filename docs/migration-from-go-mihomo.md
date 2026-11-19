@@ -48,7 +48,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `external-controller` | ✓ | REST API on same port. |
 | `secret` (Bearer auth) | ✓ | Enforced (security fix vs upstream). |
 | `authentication` + `skip-auth-prefixes` | ✓ | Inbound proxy auth (M1.F-3). |
-| `listeners:` named listeners | ✓ | Named listener array (M1.F-1). |
+| `listeners:` named listeners | ✓ | Named listener array (M1.F-1). `type: socks` is accepted as an alias of `type: socks5` (canonical name stays `socks5`); the named-listener `udp` SOCKS option is not ported. |
 | `proxies:` — Shadowsocks | ✓ | Including AEAD 2022 ciphers. |
 | `proxies:` — Trojan | ✓ | TLS + WebSocket transport. |
 | `proxies:` — Direct, Reject | ✓ | Fully supported. |
@@ -69,7 +69,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `rules:` — GEOIP | ✓ | MaxMind MMDB. |
 | `rules:` — GEOSITE | ✓ | mrs format only — see §Rules. |
 | `rules:` — RULE-SET | ✓ | M1.D-5, mrs + yaml formats. |
-| `rules:` — PROCESS-NAME | ✓ | Platform lookup wired. |
+| `rules:` — PROCESS-NAME | ✓ | Platform lookup wired. `find-process-mode` selects when it runs (below). |
 | `rules:` — IN-NAME, IN-TYPE, IN-PORT, IN-USER | ✓ | Named listeners and auth metadata are wired. |
 | `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection. |
 | `rules:` — AND, OR, NOT | ✓ | Logic composition supported. |
@@ -96,6 +96,9 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `global-ua` | ✓ | `User-Agent` override on internal HTTP fetches (providers, subscriptions, geodata, external-ui) and latency probes; `""`/unset = `clash.meta/<version>`. A request-supplied `User-Agent` still wins; values with CR/LF/NUL/control bytes are rejected at admission. `PATCH /configs` applies it live. |
 | `proxy-providers:` | ✓ | http/file sources, provider filters, health checks, and group `use:`. |
 | `geodata:` | ✓ | Path overrides, auto-update, interval, and download URL overrides. |
+| `geo-auto-update`, `geo-update-interval` (flat) | ✓ | Aliases of `geodata.auto-update` / `geodata.auto-update-interval`; the nested keys win when both are set. The schedule is a startup snapshot — a committed `PUT /configs` change warns that a restart applies it. `geodata-mode`, `geodata-loader`, `geosite-matcher` are accepted and warned on (unsupported selectors), even under `strict: true`. |
+| `find-process-mode` | ✓ | `always` looks up every eligible new inbound flow's owner before mode dispatch (and shows it in `/connections`); `strict` (the default) runs the lookup once, only when the first reached rule predicate needs it; `off` never looks up — process rules still evaluate whatever identity the inbound supplied. `PATCH /configs` flips it live; `GET` reports the running mode. |
+| `tcp-concurrent` | ✓ | `false` dials each destination's filtered, ordered candidate list strictly sequentially under one shared deadline; `true` keeps the candidate race. **Divergence:** unset defaults to `true` — meow-rs keeps its historical race where upstream defaults `false`. `PATCH /configs` flips it live; a race already in progress keeps its policy. |
 | `/metrics` Prometheus endpoint | ✓ | meow-rs enhancement (no Go upstream equiv). |
 
 ---
@@ -130,7 +133,9 @@ These fields parse without error but behave differently from Go mihomo:
 | `PUT /configs` in-flight connections | Graceful handover | Cold reload, connections dropped + logged | A |
 | `PUT /configs` payload with raw YAML (not base64) | Accepted in some versions | 400 with helpful message | B |
 | `GET /configs` response includes null Option fields | Full struct with nulls | Only non-null fields returned | B |
-| `geodata-mode`, `geodata-loader`, `geoip-matcher` | Valid fields | Ignored with warn-once (M2+) | B |
+| `geodata-mode`, `geodata-loader`, `geoip-matcher`, `geosite-matcher` (flat or nested) | Valid fields | Accepted and merged onto the `geodata:` machinery; the unsupported selectors warn-once (nested wins over flat), even under `strict: true` | B |
+| `tcp-concurrent` unset | Upstream default `false` (sequential dials) | meow-rs default `true` — the existing candidate race is preserved unless the operator opts out | B |
+| `find-process-mode` | `always`/`strict`/`off` | Same modes; `strict` scans only at the first *reached* process-demanding rule (never for a flow an earlier rule already decided, never per packet on established UDP flows). `off` also suppresses the traffic ledger's app lookup | — |
 | `dns.listen` / `external-controller` bind failure at startup | Logs error, daemon keeps running | Hard startup error (process exits non-zero) — no prior listener exists to fall back to (the `dns.listen` half keeps its tolerant keep-old semantics on runtime `PUT /configs` rebind; `external-controller` has no runtime rebind) | A |
 | `dns.listen` set while `dns.enable: false` | Silently ignored | Warn-once that no listener is started | B |
 | `keep-alive-idle` / `keep-alive-interval` / `disable-keep-alive` | Tune keepalive on inbound listeners AND outbound dials | Parsed and ignored with a warn pointing to `tcp-keepalive*` — which covers the inbound half only; the outbound-dialer keepalive tuning is not honored | B |

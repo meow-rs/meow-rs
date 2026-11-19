@@ -864,7 +864,7 @@ async fn handle_tproxy_flow(
     ) {
         return Err("unmapped fake-ip destination".into());
     }
-    // Strict `resolve_proxy` below requires the dst-IP pre-resolution
+    // Strict `resolve_proxy_flow` below requires the dst-IP pre-resolution
     // contract (match_engine doc): fake-IP rescue above may have cleared
     // `dst_ip` after recovering the hostname, and without this, IP rules
     // never matched on the TProxy TCP path at all (issue #625 review).
@@ -875,7 +875,7 @@ async fn handle_tproxy_flow(
         rule_name,
         rule_payload,
         route,
-    }) = inner.resolve_proxy(&metadata).await
+    }) = inner.resolve_proxy_flow(&mut metadata).await
     else {
         return Err("no matching rule".into());
     };
@@ -1341,8 +1341,8 @@ mod tests {
         );
     }
 
-    /// Issue #625 review: the strict `resolve_proxy` match requires the
-    /// pre-resolve contract — a fake-IP-rescued flow arrives with
+    /// Issue #625 review: the strict `resolve_proxy_flow` match requires
+    /// the pre-resolve contract — a fake-IP-rescued flow arrives with
     /// `dst_ip=None` and a recovered host, so `pre_resolve` must run or the
     /// IP-CIDR slot can never match and the flow silently falls through to
     /// `MATCH`. Without the call, this test would observe `MATCH/DIRECT`.

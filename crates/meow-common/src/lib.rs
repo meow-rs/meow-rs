@@ -80,7 +80,8 @@ pub use outbound_iface::apply_outbound_interface;
 pub use outbound_iface::apply_outbound_interface_for_peer;
 pub use outbound_iface::{install_outbound_interface, outbound_interface, OutboundIfaceGuard};
 pub use process_lookup::{
-    disable_socket_table_cache, find_process, find_process_async, ProcessInfo,
+    disable_socket_table_cache, find_process, find_process_async, FlowLookup, ProcessInfo,
+    ProcessLookupMode, ProcessLookupPolicy,
 };
 pub use replay_window::ReplayWindow;
 pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};

@@ -10,8 +10,10 @@
 //! [`enable_inbound_process_info`].
 
 use crate::network::Network;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::OnceLock;
 
 /// `true` on platforms with a real [`find_process`] implementation
 /// (Linux / macOS / Windows); `false` where it is a stub that always
@@ -115,6 +117,189 @@ pub async fn find_process_async(network: Network, local_addr: SocketAddr) -> Opt
 pub fn disable_socket_table_cache() {
     #[cfg(target_os = "linux")]
     platform::disable_socket_table_cache();
+}
+
+/// `find-process-mode` (mihomo compat, issue #974): when the tunnel may
+/// walk the OS socket table to name a flow's owning process.
+///
+/// Parsed from the `find-process-mode` config key and `PATCH /configs`;
+/// serialized lowercase. [`Self::Strict`] is the upstream default and
+/// independent of meow-rs's top-level `strict: true`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ProcessLookupMode {
+    /// Look up every eligible new inbound flow before mode dispatch, even
+    /// when no rule consumes process metadata (upstream `always`).
+    Always,
+    /// One-shot lookup, only when the first reached rule predicate demands
+    /// process metadata — upstream's `strict` lookup callback (default).
+    #[default]
+    Strict,
+    /// Never look up; predicates evaluate against the metadata the
+    /// inbound supplied (upstream `off`). Process rules still parse,
+    /// compile and evaluate normally.
+    Off,
+}
+
+impl ProcessLookupMode {
+    /// The canonical lowercase spelling (`always` / `strict` / `off`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Always => "always",
+            Self::Strict => "strict",
+            Self::Off => "off",
+        }
+    }
+}
+
+impl std::fmt::Display for ProcessLookupMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ProcessLookupMode {
+    type Err = String;
+
+    /// Case-insensitive, upstream `ParseFindProcessMode`: `ALWAYS`,
+    /// `Strict` and `off` all read the same.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.eq_ignore_ascii_case("always") {
+            Ok(Self::Always)
+        } else if s.eq_ignore_ascii_case("strict") {
+            Ok(Self::Strict)
+        } else if s.eq_ignore_ascii_case("off") {
+            Ok(Self::Off)
+        } else {
+            Err(format!(
+                "invalid find-process-mode '{s}' (expected always, strict or off)"
+            ))
+        }
+    }
+}
+
+impl Serialize for ProcessLookupMode {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+impl<'de> Deserialize<'de> for ProcessLookupMode {
+    /// A string value parsed like [`std::str::FromStr`]: an unsupported
+    /// spelling is a hard deserialization error, not a warning — matching
+    /// upstream's raw-config parse failure.
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        s.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+/// A tunnel's live [`ProcessLookupMode`], shared with its traffic ledger:
+/// one relaxed `AtomicU8` behind the `Arc`. The ledger's app-lookup
+/// worker rechecks it before each queued scan, so `off` suppresses even
+/// scans submitted while the mode was still on.
+#[derive(Debug)]
+pub struct ProcessLookupPolicy(AtomicU8);
+
+impl Default for ProcessLookupPolicy {
+    /// The derived `AtomicU8` zero would read as `Always` — the mode
+    /// enum's `Default` (`Strict`) is what a fresh policy must hold.
+    fn default() -> Self {
+        Self::new(ProcessLookupMode::default())
+    }
+}
+
+impl ProcessLookupPolicy {
+    pub fn new(mode: ProcessLookupMode) -> Self {
+        Self(AtomicU8::new(mode as u8))
+    }
+
+    pub fn get(&self) -> ProcessLookupMode {
+        match self.0.load(Ordering::Relaxed) {
+            0 => ProcessLookupMode::Always,
+            2 => ProcessLookupMode::Off,
+            _ => ProcessLookupMode::Strict,
+        }
+    }
+
+    pub fn set(&self, mode: ProcessLookupMode) {
+        self.0.store(mode as u8, Ordering::Relaxed);
+    }
+}
+
+/// One flow's memo of the owning-process lookup, `Arc`-shared by the
+/// [`crate::Metadata`] and every clone the routing and tracking paths
+/// make of it: the socket-table scan runs at most once per flow and a
+/// miss is remembered too (upstream memoizes the `strict` callback's
+/// result the same way).
+#[derive(Debug, Default)]
+pub struct FlowLookup {
+    /// `None` until a scan ran; `Some(None)` records the miss.
+    process: OnceLock<Option<ProcessInfo>>,
+    /// Held across a scan's run-and-record so a concurrent caller waits
+    /// out the in-flight walk and consumes its outcome instead of
+    /// walking the socket table twice for one flow (issue #974).
+    scan: tokio::sync::Mutex<()>,
+}
+
+impl FlowLookup {
+    /// The flow's recorded lookup outcome — `None` while no scan ran,
+    /// `Some(None)` after one found no owner.
+    pub fn process_outcome(&self) -> Option<&Option<ProcessInfo>> {
+        self.process.get()
+    }
+
+    /// `true` once any lookup ran, hit or miss — the demand gate then
+    /// treats a process demand as no longer actionable.
+    pub fn process_attempted(&self) -> bool {
+        self.process.get().is_some()
+    }
+
+    /// Whether a scan is running right now — the submission lock is held
+    /// and no outcome is recorded yet.
+    pub fn scan_pending(&self) -> bool {
+        self.process.get().is_none() && self.scan.try_lock().is_err()
+    }
+
+    /// The flow's one outcome: the recorded one if any, else `scan`'s —
+    /// run while the submission lock is held so a racing caller waits
+    /// and then consumes this record rather than duplicating the OS
+    /// walk. If the running caller is cancelled before it records, the
+    /// next waiter retries; no two walks ever run concurrently and the
+    /// recorded outcome is the same for every consumer.
+    pub async fn process_or_scan<F, Fut>(&self, scan: F) -> Option<ProcessInfo>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Option<ProcessInfo>>,
+    {
+        if let Some(outcome) = self.process.get() {
+            return outcome.clone();
+        }
+        let _permit = self.scan.lock().await;
+        if let Some(outcome) = self.process.get() {
+            return outcome.clone();
+        }
+        let info = scan().await;
+        let _ = self.process.set(info.clone());
+        info
+    }
+
+    /// Wait out a pending scan and consume the recorded outcome — `None`
+    /// when none was running, or it finished without recording (the
+    /// caller was cancelled). For consumers that must not submit a scan
+    /// of their own (the ledger's app lane): the lock handoff is what
+    /// guarantees the in-flight scan's record lands first.
+    pub async fn process_or_wait(&self) -> Option<ProcessInfo> {
+        if let Some(outcome) = self.process.get() {
+            return outcome.clone();
+        }
+        let _permit = self.scan.lock().await;
+        self.process.get().cloned().flatten()
+    }
+
+    /// Record the outcome of the flow's one lookup; first writer wins.
+    pub fn record_process(&self, info: Option<ProcessInfo>) {
+        let _ = self.process.set(info);
+    }
 }
 
 #[cfg(target_os = "linux")]

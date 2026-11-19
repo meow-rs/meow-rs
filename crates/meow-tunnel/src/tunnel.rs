@@ -1,12 +1,13 @@
-use crate::match_engine::{self, DomainIndex};
-use crate::rule_ir::{CompiledMatchResult, CompiledRuleSet, LazyMatchOutcome};
+use crate::match_engine::DomainIndex;
+use crate::rule_ir::{CompiledMatchResult, CompiledRuleSet, DemandGate, LazyMatchOutcome};
 use crate::statistics::Statistics;
 use crate::udp::{self, NatTable};
 use meow_common::conn_note;
 use meow_common::conn_notes::ConnNotes;
 use meow_common::{
-    is_valid_host, metadata_ip_literal, AdapterType, Metadata, Network, Proxy, ProxyAdapter, Rule,
-    TargetCheck, TargetProbe, TunnelMode,
+    is_valid_host, metadata_ip_literal, AdapterType, Metadata, Network, ProcessInfo,
+    ProcessLookupMode, ProcessLookupPolicy, Proxy, ProxyAdapter, Rule, TargetCheck, TargetProbe,
+    TunnelMode,
 };
 use meow_dns::Resolver;
 use meow_proxy::DirectAdapter;
@@ -162,10 +163,15 @@ pub struct TunnelInner {
     /// Cached: true if any rule needs the dst_ip resolved (GeoIP / IP-CIDR).
     /// Recomputed by `Tunnel::update_rules`.
     pub needs_ip_resolution: AtomicBool,
-    /// Cached: true if any rule needs process-name enrichment (PROCESS-NAME /
-    /// PROCESS-PATH / UID). Recomputed by `Tunnel::update_rules`. Avoids an
-    /// O(n) virtual-dispatch scan of the rule list on every connection.
-    pub needs_process_lookup: AtomicBool,
+    /// Live `find-process-mode` (issue #974): whether routing may walk the
+    /// OS socket table for a flow's owner — `always` / `strict` / `off`.
+    /// Per-tunnel and shared with the traffic ledger's app-lookup lane, so
+    /// `off` suppresses queued ledger scans too.
+    process_policy: Arc<ProcessLookupPolicy>,
+    /// Test seam: a deterministic counted replacement for the platform
+    /// socket-table scan in [`Self::flow_process`]. `None` in production.
+    #[cfg(test)]
+    process_lookup_hook: Mutex<Option<ProcessLookupHook>>,
     /// Handle to the running TUN listener (if any). Abort + await it to
     /// stop TUN. Stored so `put_configs` can start/stop TUN at runtime.
     pub tun_handle: RwLock<Option<TunHandle>>,
@@ -583,20 +589,44 @@ impl TunnelInner {
     /// `async` because the PROCESS-* enrichment runs the platform socket scan
     /// on the blocking pool — keeping it synchronous here would stall the
     /// calling worker on hosts with large socket tables (issue #515).
+    ///
+    /// Read-only callers get correct routing but no `always`-mode write-back:
+    /// enrichment lands on the private copy, matching sees it, tracking does
+    /// not. The tracked-metadata variant is [`Self::resolve_proxy_flow`].
     pub async fn resolve_proxy(&self, metadata: &Metadata) -> Option<ResolvedTarget> {
+        let mut owned = metadata.clone();
+        self.resolve_proxy_inner(&mut owned, true).await
+    }
+
+    /// [`Self::resolve_proxy`] on the caller's own metadata — the real
+    /// dispatch entry point (upstream `resolveMetadata`): under
+    /// `find-process-mode: always` the flow's owning process is looked up
+    /// *before* the mode dispatch and filled into this very metadata, so
+    /// `/connections` and the traffic ledger see it even when no rule
+    /// consumes it. Every inbound listener should prefer this.
+    pub async fn resolve_proxy_flow(&self, metadata: &mut Metadata) -> Option<ResolvedTarget> {
         self.resolve_proxy_inner(metadata, true).await
     }
 
-    /// [`Self::resolve_proxy`] with the hit bookkeeping optional:
+    /// [`Self::resolve_proxy_flow`] with the hit bookkeeping optional:
     /// `record_hit = false` for the `resolve_udp_dst` "does this route end
     /// DIRECT" probe, whose caller resolves for real right after — counting
     /// there too would double a flow's `hitCount` (and tally packets that
-    /// never dial).
+    /// never dial). The probe also skips `always` mode's unconditional
+    /// lookup: it only spends a scan when a reached rule predicate actually
+    /// needs one, sharing the flow's lookup memo either way.
     async fn resolve_proxy_inner(
         &self,
-        metadata: &Metadata,
+        metadata: &mut Metadata,
         record_hit: bool,
     ) -> Option<ResolvedTarget> {
+        // Sample the live `find-process-mode` once for the whole
+        // resolution — a PATCH lands on the next flow, not mid-scan
+        // (issue #974).
+        let process_mode = self.process_policy.get();
+        if record_hit {
+            self.maybe_lookup_flow_process(metadata, process_mode).await;
+        }
         let mode = *self.mode.read();
         match mode {
             TunnelMode::Direct => {
@@ -633,24 +663,18 @@ impl TunnelInner {
                 // One route-table snapshot — rules + index + proxies all read
                 // from a consistent table. Replaces three RwLock acquisitions.
                 let route = self.route();
-                let needs_proc = route.compiled_rules.needs_process_lookup();
-                let enriched = if needs_proc {
-                    match_engine::maybe_enrich_with_process_async(metadata).await
-                } else {
-                    None
-                };
-                let match_metadata = enriched.as_ref().unwrap_or(metadata);
-                let result = route.compiled_rules.match_rules(
-                    match_metadata,
-                    route.rules.as_ref(),
-                    &Self::target_probe(&route, match_metadata),
-                );
+                // Eager callers own destination resolution (the UDP NAT key
+                // is built from `resolve_udp_dst` output), so IP demand may
+                // not stop this scan — only process demand may.
+                let result = self
+                    .match_rule_route(&route, metadata, false, process_mode)
+                    .await;
                 Some(self.materialize_rule_match(&route, result, record_hit))
             }
         }
     }
 
-    /// Rule-mode variant of [`Self::resolve_proxy`] with **lazy metadata
+    /// Rule-mode variant of [`Self::resolve_proxy_flow`] with **lazy metadata
     /// enrichment**: DNS pre-resolution and process lookup are performed
     /// only when the rule scan actually reaches a slot that demands them —
     /// a connection matched by an earlier rule (typically a domain rule)
@@ -663,86 +687,191 @@ impl TunnelInner {
     pub async fn resolve_proxy_lazy(&self, metadata: &mut Metadata) -> Option<ResolvedTarget> {
         let mode = *self.mode.read();
         if mode != TunnelMode::Rule {
-            return self.resolve_proxy(metadata).await;
+            return self.resolve_proxy_flow(metadata).await;
         }
-
-        // Owned `Arc` snapshot: the enrichment arm holds it across an
-        // `.await`, which a lock guard must never do.
+        let process_mode = self.process_policy.get();
+        self.maybe_lookup_flow_process(metadata, process_mode).await;
         let route = self.route();
-        let probe = Self::target_probe(&route, metadata);
-        match route
-            .compiled_rules
-            .match_rules_lazy(metadata, route.rules.as_ref(), &probe)
-        {
-            LazyMatchOutcome::Matched(m) => {
-                Some(self.materialize_rule_match(&route, Some(m), true))
-            }
-            LazyMatchOutcome::NoMatch => Some(self.materialize_rule_match(&route, None, true)),
-            LazyMatchOutcome::NeedsEnrichment {
-                needs_ip,
-                needs_process,
-                blocked_rule,
-            } => {
-                if let Some(rule) = route.rules.get(blocked_rule) {
-                    let needs = match (needs_ip, needs_process) {
-                        (true, true) => "the destination IP and the owning process",
-                        (true, false) => "the destination IP",
-                        _ => "the owning process",
-                    };
-                    conn_note!(
-                        Rule,
-                        "Rule #{} {} needs {needs}",
-                        blocked_rule + 1,
-                        RuleText::new(rule.as_ref())
-                    );
-                }
-                // Process enrichment matches `resolve_proxy`: the enriched
-                // copy is used for matching only, so tracked connection
-                // metadata stays byte-identical to the eager path.
-                let mut enriched = if needs_process {
-                    match_engine::maybe_enrich_with_process_async(metadata).await
-                } else {
-                    None
-                };
-                if needs_process {
-                    match enriched.as_ref().filter(|m| !m.process.is_empty()) {
-                        Some(m) => conn_note!(Rule, "Owning process: {}", m.process),
-                        None => conn_note!(Rule, "Owning process not found"),
-                    }
-                }
-                if needs_ip {
-                    // `needs_ip` already encodes the `pre_resolve` guards:
-                    // host present, dst_ip absent.
-                    let started = std::time::Instant::now();
-                    if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await {
-                        debug!("lazy resolve: {} -> {}", metadata.host, real_ip);
+        let result = self
+            .match_rule_route(&route, metadata, true, process_mode)
+            .await;
+        Some(self.materialize_rule_match(&route, result, true))
+    }
+
+    /// The rule-table scan both dispatch paths share: a demand-stop pass,
+    /// materialize the *reached* slot's own demands (`dst_ip` into
+    /// `metadata` when `allow_ip`, the owning process into a match-only
+    /// working copy), then re-scan — until the scan matches, misses, or no
+    /// gated demand remains. Dead-target warnings fire exactly once: only
+    /// a terminal pass emits them (an earlier pass's skips are
+    /// re-buffered, not lost).
+    ///
+    /// `find-process-mode` plugs in here: `always` already filled
+    /// `metadata` pre-dispatch so process demand is never actionable;
+    /// `strict` blocks at the first reached process slot, runs the flow's
+    /// one lookup, and applies the outcome to the match-only copy —
+    /// upstream's "a reached process-dependent predicate invokes it";
+    /// `off` never lets process demand stop the scan at all.
+    async fn match_rule_route<'a>(
+        &self,
+        route: &'a Arc<RouteTable>,
+        metadata: &mut Metadata,
+        allow_ip: bool,
+        process_mode: ProcessLookupMode,
+    ) -> Option<CompiledMatchResult<'a>> {
+        // A prior pass of this flow — or its UDP route probe — may already
+        // hold the one lookup's outcome: apply a hit to the match-only
+        // copy so the scan sees it without a second OS walk.
+        let mut enriched = stored_process_clone(metadata);
+        let mut ip_attempted = false;
+        loop {
+            let input = enriched.as_ref().unwrap_or(&*metadata);
+            let gate = DemandGate {
+                ip: allow_ip && !ip_attempted,
+                process: process_mode != ProcessLookupMode::Off
+                    && !input.flow_lookup.process_attempted(),
+            };
+            match route.compiled_rules.match_rules_lazy(
+                input,
+                route.rules.as_ref(),
+                &Self::target_probe(route, input),
+                gate,
+            ) {
+                LazyMatchOutcome::Matched(m) => return Some(m),
+                LazyMatchOutcome::NoMatch => return None,
+                LazyMatchOutcome::NeedsEnrichment {
+                    needs_ip,
+                    needs_process,
+                    blocked_rule,
+                } => {
+                    if let Some(rule) = route.rules.get(blocked_rule) {
+                        let needs = match (needs_ip, needs_process) {
+                            (true, true) => "the destination IP and the owning process",
+                            (true, false) => "the destination IP",
+                            _ => "the owning process",
+                        };
                         conn_note!(
                             Rule,
-                            "Destination IP for matching: {real_ip} ({} ms)",
-                            started.elapsed().as_millis()
-                        );
-                        metadata.dst_ip = Some(real_ip);
-                    } else {
-                        conn_note!(
-                            Rule,
-                            "No address for {} after {} ms; IP rules cannot match",
-                            metadata.host,
-                            started.elapsed().as_millis()
+                            "Rule #{} {} needs {needs}",
+                            blocked_rule + 1,
+                            RuleText::new(rule.as_ref())
                         );
                     }
+                    if needs_process {
+                        // The first reached slot wants the owner: the flow's
+                        // one lookup, applied to the match-only working copy
+                        // (`strict` keeps its match-only visibility).
+                        let working = enriched.get_or_insert_with(|| metadata.clone());
+                        match self.flow_process(working).await {
+                            Some(info) => {
+                                fill_process_fields(working, &info);
+                                conn_note!(Rule, "Owning process: {}", working.process);
+                            }
+                            None => conn_note!(Rule, "Owning process not found"),
+                        }
+                    }
+                    if needs_ip {
+                        // `needs_ip` already encodes the `pre_resolve` guards:
+                        // host present, dst_ip absent.
+                        ip_attempted = true;
+                        let started = std::time::Instant::now();
+                        if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await
+                        {
+                            debug!("lazy resolve: {} -> {}", metadata.host, real_ip);
+                            conn_note!(
+                                Rule,
+                                "Destination IP for matching: {real_ip} ({} ms)",
+                                started.elapsed().as_millis()
+                            );
+                            metadata.dst_ip = Some(real_ip);
+                            if let Some(working) = enriched.as_mut() {
+                                working.dst_ip = Some(real_ip);
+                            }
+                        } else {
+                            conn_note!(
+                                Rule,
+                                "No address for {} after {} ms; IP rules cannot match",
+                                metadata.host,
+                                started.elapsed().as_millis()
+                            );
+                        }
+                    }
                 }
-                if let (Some(enriched), Some(ip)) = (enriched.as_mut(), metadata.dst_ip) {
-                    enriched.dst_ip = Some(ip);
-                }
-                let match_metadata = enriched.as_ref().unwrap_or(metadata);
-                let result = route.compiled_rules.match_rules(
-                    match_metadata,
-                    route.rules.as_ref(),
-                    &Self::target_probe(&route, match_metadata),
-                );
-                Some(self.materialize_rule_match(&route, result, true))
             }
         }
+    }
+
+    /// `find-process-mode: always` — the pre-dispatch lookup upstream runs
+    /// in `resolveMetadata`: one scan per eligible *inbound* flow, applied
+    /// to the tracked metadata itself so `/connections` and the ledger see
+    /// the owner even when no rule consumes it. Skips housekeeping
+    /// (internal) flows, an explicit `specialProxy` override, an owner the
+    /// inbound already named, and flows without a usable source tuple; a
+    /// supplied name/path/UID is never overwritten and a miss is
+    /// remembered in the flow's memo like any other.
+    ///
+    /// Every skip is recorded too: unmarked, `process_attempted()` stays
+    /// false and a later process-demanding slot could rescan a flow this
+    /// pass already refused (issue #974).
+    async fn maybe_lookup_flow_process(
+        &self,
+        metadata: &mut Metadata,
+        process_mode: ProcessLookupMode,
+    ) {
+        if process_mode != ProcessLookupMode::Always {
+            return;
+        }
+        if metadata.is_internal() || !metadata.special_proxy.is_empty() {
+            metadata.flow_lookup.record_process(None);
+            return;
+        }
+        if !metadata.process.is_empty() {
+            // The supplied owner IS this flow's outcome — record it so a
+            // reached demand pass cannot scan anyway.
+            metadata.flow_lookup.record_process(Some(ProcessInfo {
+                name: metadata.process.to_string(),
+                path: metadata.process_path.to_string(),
+                uid: metadata.uid,
+            }));
+            return;
+        }
+        if metadata.src_ip.is_none() || metadata.src_port == 0 {
+            metadata.flow_lookup.record_process(None);
+            return;
+        }
+        let Some(info) = self.flow_process(metadata).await else {
+            return;
+        };
+        fill_process_fields(metadata, &info);
+    }
+
+    /// The flow's owning process through the shared memo: one caller runs
+    /// the platform scan (on the blocking pool) while every clone holding
+    /// this `FlowLookup` waits it out and consumes the same recorded
+    /// outcome — the probe, a match pass and tracking can never duplicate
+    /// the walk (issue #974). On platforms without a lookup this records
+    /// the miss immediately; on a panic in the scan, `find_process_async`
+    /// already converts to `None`.
+    async fn flow_process(&self, metadata: &Metadata) -> Option<ProcessInfo> {
+        metadata
+            .flow_lookup
+            .process_or_scan(|| self.scan_flow_process(metadata))
+            .await
+    }
+
+    /// One platform socket-table scan for `metadata`'s source tuple —
+    /// `#[cfg(test)]` replaces it with a deterministic counted hook.
+    async fn scan_flow_process(&self, metadata: &Metadata) -> Option<ProcessInfo> {
+        #[cfg(test)]
+        if let Some(hook) = self.process_lookup_hook.lock().as_ref().cloned() {
+            return hook(metadata);
+        }
+        let src_ip = metadata.src_ip?;
+        if metadata.src_port == 0 {
+            return None;
+        }
+        let local = std::net::SocketAddr::new(src_ip, metadata.src_port);
+        meow_common::find_process_async(metadata.network, local).await
     }
 
     /// Registry probe for the match engines — upstream `match()`'s three
@@ -843,6 +972,37 @@ impl TunnelInner {
                 }
             }
         }
+    }
+}
+
+/// The test seam's replacement for the platform socket-table scan.
+#[cfg(test)]
+type ProcessLookupHook = Arc<dyn Fn(&Metadata) -> Option<ProcessInfo> + Send + Sync>;
+
+/// A hit the flow's lookup memo already holds, applied to a fresh
+/// match-only clone — `None` when the memo has no hit to apply (untried,
+/// or a miss: the caller's own metadata evaluates just as well).
+fn stored_process_clone(metadata: &Metadata) -> Option<Metadata> {
+    if !metadata.process.is_empty() {
+        return None;
+    }
+    let info = metadata.flow_lookup.process_outcome()?.as_ref()?;
+    let mut enriched = metadata.clone();
+    fill_process_fields(&mut enriched, info);
+    Some(enriched)
+}
+
+/// Fill `metadata`'s *empty* process fields from a lookup `info` — an
+/// inbound-supplied name, path or UID is never overwritten.
+fn fill_process_fields(metadata: &mut Metadata, info: &ProcessInfo) {
+    if metadata.process.is_empty() && !info.name.is_empty() {
+        metadata.process = SmolStr::from(info.name.as_str());
+    }
+    if metadata.process_path.is_empty() && !info.path.is_empty() {
+        metadata.process_path = SmolStr::from(info.path.as_str());
+    }
+    if metadata.uid.is_none() {
+        metadata.uid = info.uid;
     }
 }
 
@@ -1101,6 +1261,9 @@ impl Tunnel {
     pub fn new_with_slot(resolver: meow_dns::ResolverSlot) -> Self {
         let direct = Arc::new(DirectAdapter::new().with_resolver_slot(Arc::clone(&resolver)));
         let stats = Arc::new(Statistics::new());
+        // One live `find-process-mode` cell for the tunnel and its ledger.
+        let process_policy = Arc::new(ProcessLookupPolicy::default());
+        stats.set_process_lookup_policy(Arc::clone(&process_policy));
         let source: Arc<dyn meow_common::traffic_ledger::Source> = Arc::clone(&stats) as _;
         meow_common::traffic_ledger::register(Arc::downgrade(&source));
         Self {
@@ -1115,7 +1278,9 @@ impl Tunnel {
                 tcp_generation: RwLock::new(0),
                 health_checks: Mutex::new(crate::health_check::HealthCheckSupervisor::default()),
                 needs_ip_resolution: AtomicBool::new(false),
-                needs_process_lookup: AtomicBool::new(false),
+                process_policy,
+                #[cfg(test)]
+                process_lookup_hook: Mutex::new(None),
                 tun_handle: RwLock::new(None),
                 dialer_registry: std::sync::OnceLock::new(),
                 udp_flush: tokio::sync::watch::Sender::new(0),
@@ -1173,6 +1338,27 @@ impl Tunnel {
 
     pub fn inner(&self) -> &Arc<TunnelInner> {
         &self.inner
+    }
+
+    /// Install the live `find-process-mode` (issue #974): `always` runs the
+    /// per-flow owner lookup before dispatch, `strict` only at a reached
+    /// demanding predicate, `off` never — including the traffic ledger's
+    /// app-lookup lane, which shares this cell. Applied to flows resolved
+    /// after the call; no session flush or rule rebuild rides with it.
+    pub fn set_process_lookup_mode(&self, mode: ProcessLookupMode) {
+        self.inner.process_policy.set(mode);
+    }
+
+    /// The live `find-process-mode` currently installed.
+    pub fn process_lookup_mode(&self) -> ProcessLookupMode {
+        self.inner.process_policy.get()
+    }
+
+    /// Test seam: replace the platform socket-table scan with a counted,
+    /// deterministic hook (issue #974).
+    #[cfg(test)]
+    pub fn set_process_lookup_hook(&self, hook: ProcessLookupHook) {
+        *self.inner.process_lookup_hook.lock() = Some(hook);
     }
 
     /// Install the registry provider-sourced nodes resolve `dialer-proxy`
@@ -1266,9 +1452,6 @@ impl Tunnel {
             self.inner
                 .needs_ip_resolution
                 .store(needs_ip, Ordering::Relaxed);
-            self.inner
-                .needs_process_lookup
-                .store(needs_proc, Ordering::Relaxed);
             std::mem::replace(&mut *route, Arc::new(new_route))
         };
         // The superseded table's destructor cascade (rules, adapters,
@@ -1325,9 +1508,6 @@ impl Tunnel {
                 self.inner
                     .needs_ip_resolution
                     .store(compiled.needs_ip_resolution(), Ordering::Relaxed);
-                self.inner
-                    .needs_process_lookup
-                    .store(compiled.needs_process_lookup(), Ordering::Relaxed);
                 let new_route = RouteTable {
                     compiled_rules: Arc::new(compiled),
                     ..route.inherit()
@@ -1516,7 +1696,6 @@ impl Tunnel {
 
     fn install_routing(&self, route: Arc<RouteTable>) -> Arc<RouteTable> {
         let needs_ip = route.compiled_rules.needs_ip_resolution();
-        let needs_process = route.compiled_rules.needs_process_lookup();
         // Publish inside the write hold so registry and route table swap
         // linearly — a concurrent installer can otherwise leave the registry
         // naming proxies the live route map already dropped (issue #489
@@ -1526,9 +1705,6 @@ impl Tunnel {
         self.inner
             .needs_ip_resolution
             .store(needs_ip, Ordering::Relaxed);
-        self.inner
-            .needs_process_lookup
-            .store(needs_process, Ordering::Relaxed);
         std::mem::replace(&mut *current, route)
     }
 
@@ -3209,5 +3385,446 @@ mod tests {
         named.host = "198.18.1.220".into();
         named.dst_ip = None;
         assert!(inner.needs_sniffed_name(&named));
+    }
+
+    // ---- `find-process-mode` (issue #974) ------------------------------
+    //
+    // The platform socket-table scan is replaced by a counted hook so
+    // every assertion is deterministic on every OS.
+
+    use meow_common::{RuleMatchHelper, RuleType};
+    use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+
+    /// A flow carrying a real source tuple — what an inbound hands the
+    /// tunnel.
+    fn flow_meta() -> Metadata {
+        Metadata {
+            network: Network::Tcp,
+            src_ip: Some("127.0.0.1".parse().unwrap()),
+            src_port: 51234,
+            host: "a.example.com".into(),
+            dst_port: 443,
+            ..Default::default()
+        }
+    }
+
+    /// The counted lookup seam: installs a hook returning `hit` (or
+    /// recording a miss) and hands back the call counter.
+    fn counting_hook(
+        tunnel: &Tunnel,
+        hit: Option<ProcessInfo>,
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        tunnel.set_process_lookup_hook(Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            hit.clone()
+        }));
+        calls
+    }
+
+    fn scan_count(counter: &std::sync::atomic::AtomicUsize) -> usize {
+        counter.load(Ordering::SeqCst)
+    }
+
+    fn owner() -> ProcessInfo {
+        ProcessInfo {
+            name: "stub-owner".into(),
+            path: "/usr/bin/stub-owner".into(),
+            uid: Some(1000),
+        }
+    }
+
+    /// A PROCESS-NAME rule with a *deterministic* demand — unlike the real
+    /// `ProcessRule`, whose `should_find_process` folds to the platform,
+    /// this one demands on every OS so the tests below run everywhere.
+    /// (A negated variant cannot be a stub: the IR lowers `ProcessName`
+    /// opaquely — negation needs a real `NotRule` around a real rule.)
+    struct DemandProcess {
+        name: &'static str,
+        adapter: &'static str,
+    }
+
+    impl DemandProcess {
+        fn new(name: &'static str, adapter: &'static str) -> Self {
+            Self { name, adapter }
+        }
+    }
+
+    impl Rule for DemandProcess {
+        fn rule_type(&self) -> RuleType {
+            RuleType::ProcessName
+        }
+        fn match_metadata(&self, m: &Metadata, _: &RuleMatchHelper) -> bool {
+            m.process.eq_ignore_ascii_case(self.name)
+        }
+        fn adapter(&self) -> &str {
+            self.adapter
+        }
+        fn payload(&self) -> &str {
+            self.name
+        }
+        fn should_find_process(&self) -> bool {
+            true
+        }
+    }
+
+    /// A tunnel in Rule mode carrying `rules` over the stock proxies.
+    fn rule_tunnel(rules: Vec<Box<dyn Rule>>) -> Tunnel {
+        let tunnel = test_tunnel();
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        tunnel.set_mode(TunnelMode::Rule);
+        tunnel.update_routing(res.proxies, rules, res.dialer_registry);
+        tunnel
+    }
+
+    /// `always`: the pre-dispatch scan runs with NO process rule at all —
+    /// and writes the owner into the tracked metadata itself (upstream
+    /// fills `metadata.Process*` before dispatch).
+    #[tokio::test]
+    async fn always_enriches_rule_mode_without_process_rules() {
+        let tunnel = rule_tunnel(vec![Box::new(FinalRule::new("DIRECT"))]);
+        tunnel.set_process_lookup_mode(ProcessLookupMode::Always);
+        let calls = counting_hook(&tunnel, Some(owner()));
+
+        let mut md = flow_meta();
+        let resolved = tunnel
+            .inner()
+            .resolve_proxy_flow(&mut md)
+            .await
+            .expect("FINAL always resolves");
+        assert_eq!(resolved.adapter.name(), "DIRECT");
+        assert_eq!(scan_count(&calls), 1);
+        assert_eq!(md.process, "stub-owner", "always must write back");
+        assert_eq!(md.process_path, "/usr/bin/stub-owner");
+        assert_eq!(md.uid, Some(1000));
+    }
+
+    /// `always`: the same pre-dispatch scan runs in Direct and Global —
+    /// the lookup precedes the mode dispatch, so it is not Rule-only.
+    #[tokio::test]
+    async fn always_enriches_direct_and_global_modes() {
+        for mode in [TunnelMode::Direct, TunnelMode::Global] {
+            let tunnel = test_tunnel();
+            let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+            tunnel.update_routing(res.proxies, vec![], res.dialer_registry);
+            tunnel.set_mode(mode);
+            tunnel.set_process_lookup_mode(ProcessLookupMode::Always);
+            let calls = counting_hook(&tunnel, Some(owner()));
+
+            let mut md = flow_meta();
+            tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("every mode resolves");
+            assert_eq!(scan_count(&calls), 1, "{mode:?} must scan once");
+            assert_eq!(md.process, "stub-owner", "{mode:?} must write back");
+        }
+    }
+
+    /// `always` honors every skip: housekeeping flows, an explicit
+    /// `specialProxy`, a supplied owner, and a flow without a usable
+    /// source tuple cost no scan.
+    #[tokio::test]
+    async fn always_skips_ineligible_flows() {
+        let tunnel = rule_tunnel(vec![Box::new(FinalRule::new("DIRECT"))]);
+        tunnel.set_process_lookup_mode(ProcessLookupMode::Always);
+        let calls = counting_hook(&tunnel, Some(owner()));
+
+        let mut internal = flow_meta();
+        internal.internal = true;
+        tunnel.inner().resolve_proxy_flow(&mut internal).await;
+
+        let mut proxied = flow_meta();
+        proxied.special_proxy = "PROXY".into();
+        tunnel.inner().resolve_proxy_flow(&mut proxied).await;
+
+        let mut named = flow_meta();
+        named.process = "curl".into();
+        tunnel.inner().resolve_proxy_flow(&mut named).await;
+
+        let mut no_tuple = flow_meta();
+        no_tuple.src_ip = None;
+        tunnel.inner().resolve_proxy_flow(&mut no_tuple).await;
+        let mut no_port = flow_meta();
+        no_port.src_port = 0;
+        tunnel.inner().resolve_proxy_flow(&mut no_port).await;
+
+        assert_eq!(scan_count(&calls), 0, "ineligible flows must not scan");
+        assert_eq!(named.process, "curl", "a supplied owner is kept");
+        // Every skip is recorded on the flow's memo — unmarked, a later
+        // process-demanding slot could rescan what this pass refused
+        // (issue #974).
+        for md in [&internal, &proxied, &named, &no_tuple, &no_port] {
+            assert!(
+                md.flow_lookup.process_attempted(),
+                "the skip must be recorded"
+            );
+        }
+    }
+
+    /// `always`: a flow the pre-dispatch skip refused is marked attempted,
+    /// so a process-demanding slot reached after it cannot rescan — its
+    /// predicate just evaluates the still-empty fields (issue #974).
+    #[tokio::test]
+    async fn always_skip_marks_flow_attempted() {
+        let tunnel = rule_tunnel(vec![
+            Box::new(DemandProcess::new("stub-owner", "REJECT")),
+            Box::new(FinalRule::new("DIRECT")),
+        ]);
+        tunnel.set_process_lookup_mode(ProcessLookupMode::Always);
+        let calls = counting_hook(&tunnel, Some(owner()));
+
+        let mut md = flow_meta();
+        md.internal = true;
+        let resolved = tunnel
+            .inner()
+            .resolve_proxy_flow(&mut md)
+            .await
+            .expect("rules resolve");
+        assert_eq!(
+            resolved.adapter.name(),
+            "DIRECT",
+            "the empty process field misses the reached slot"
+        );
+        assert_eq!(
+            scan_count(&calls),
+            0,
+            "the skipped flow must not rescan at the slot"
+        );
+        assert!(md.flow_lookup.process_attempted());
+    }
+
+    /// `always` never overwrites fields the inbound already supplied: the
+    /// lookup fills only the empty ones.
+    #[tokio::test]
+    async fn always_fills_only_empty_process_fields() {
+        let tunnel = rule_tunnel(vec![Box::new(FinalRule::new("DIRECT"))]);
+        tunnel.set_process_lookup_mode(ProcessLookupMode::Always);
+        counting_hook(&tunnel, Some(owner()));
+
+        let mut md = flow_meta();
+        md.process_path = "/opt/supplied".into();
+        md.uid = Some(7);
+        tunnel.inner().resolve_proxy_flow(&mut md).await;
+        assert_eq!(md.process, "stub-owner", "empty name is filled");
+        assert_eq!(md.process_path, "/opt/supplied", "supplied path kept");
+        assert_eq!(md.uid, Some(7), "supplied uid kept");
+    }
+
+    /// `strict`: a flow decided by an earlier domain rule never pays the
+    /// scan — the reached slot demands nothing.
+    #[tokio::test]
+    async fn strict_earlier_domain_win_scans_never() {
+        let tunnel = rule_tunnel(vec![
+            Box::new(DomainSuffixRule::new("example.com", "REJECT")),
+            Box::new(DemandProcess::new("stub-owner", "DIRECT")),
+            Box::new(FinalRule::new("DIRECT")),
+        ]);
+        let calls = counting_hook(&tunnel, Some(owner()));
+
+        let mut md = flow_meta();
+        let resolved = tunnel
+            .inner()
+            .resolve_proxy_flow(&mut md)
+            .await
+            .expect("rules resolve");
+        assert_eq!(resolved.adapter.name(), "REJECT");
+        assert_eq!(scan_count(&calls), 0);
+    }
+
+    /// `strict`: a flow decided by an earlier IP rule — `dst_ip` already
+    /// resolved — likewise never scans for the later process rule.
+    #[tokio::test]
+    async fn strict_earlier_ip_win_scans_never() {
+        use meow_rules::ipcidr::IpCidrRule;
+        let tunnel = rule_tunnel(vec![
+            Box::new(IpCidrRule::new("203.0.113.0/24", "REJECT", false, false).unwrap()),
+            Box::new(DemandProcess::new("stub-owner", "DIRECT")),
+            Box::new(FinalRule::new("DIRECT")),
+        ]);
+        let calls = counting_hook(&tunnel, Some(owner()));
+
+        let mut md = flow_meta();
+        md.dst_ip = Some("203.0.113.9".parse().unwrap());
+        let resolved = tunnel
+            .inner()
+            .resolve_proxy_flow(&mut md)
+            .await
+            .expect("rules resolve");
+        assert_eq!(resolved.adapter.name(), "REJECT");
+        assert_eq!(scan_count(&calls), 0);
+    }
+
+    /// `strict`: the first reached process slot runs the flow's one
+    /// lookup, and the result decides the match — on BOTH the lazy and
+    /// the eager scans.
+    #[tokio::test]
+    async fn strict_scans_at_reached_process_rule() {
+        for lazy in [true, false] {
+            let tunnel = rule_tunnel(vec![
+                Box::new(DemandProcess::new("stub-owner", "REJECT")),
+                Box::new(FinalRule::new("DIRECT")),
+            ]);
+            let calls = counting_hook(&tunnel, Some(owner()));
+
+            let mut md = flow_meta();
+            let resolved = if lazy {
+                tunnel.inner().resolve_proxy_lazy(&mut md).await
+            } else {
+                tunnel.inner().resolve_proxy_flow(&mut md).await
+            }
+            .expect("rules resolve");
+            assert_eq!(resolved.adapter.name(), "REJECT", "lazy={lazy}");
+            assert_eq!(scan_count(&calls), 1, "lazy={lazy}");
+            // strict keeps match-only visibility: the tracked metadata
+            // does not adopt the looked-up fields.
+            assert_eq!(md.process, "", "lazy={lazy}");
+        }
+    }
+
+    /// `strict`: a miss is memoized — two reached process slots on one
+    /// flow still cost a single scan.
+    #[tokio::test]
+    async fn strict_miss_does_not_rescan_for_later_process_rules() {
+        let tunnel = rule_tunnel(vec![
+            Box::new(DemandProcess::new("first", "REJECT")),
+            Box::new(DemandProcess::new("second", "REJECT")),
+            Box::new(FinalRule::new("DIRECT")),
+        ]);
+        let calls = counting_hook(&tunnel, None);
+
+        let mut md = flow_meta();
+        let resolved = tunnel
+            .inner()
+            .resolve_proxy_flow(&mut md)
+            .await
+            .expect("rules resolve");
+        assert_eq!(resolved.adapter.name(), "DIRECT");
+        assert_eq!(scan_count(&calls), 1, "a miss must not repeat the scan");
+    }
+
+    /// `strict`: the flow-local memo is shared between the non-recording
+    /// UDP route probe and the real decision — one scan serves both.
+    #[tokio::test]
+    async fn strict_probe_and_route_share_one_scan() {
+        let tunnel = rule_tunnel(vec![
+            Box::new(DemandProcess::new("stub-owner", "REJECT")),
+            Box::new(FinalRule::new("DIRECT")),
+        ]);
+        let calls = counting_hook(&tunnel, Some(owner()));
+
+        let mut md = flow_meta();
+        // The `resolve_udp_dst` "ends DIRECT?" probe — `record_hit=false`.
+        let _ = tunnel.inner().resolve_proxy_inner(&mut md, false).await;
+        assert_eq!(scan_count(&calls), 1, "the probe's reached slot scans once");
+        let resolved = tunnel
+            .inner()
+            .resolve_proxy_flow(&mut md)
+            .await
+            .expect("rules resolve");
+        assert_eq!(resolved.adapter.name(), "REJECT");
+        assert_eq!(scan_count(&calls), 1, "the real decision reuses the memo");
+    }
+
+    /// `always`: the non-recording UDP route probe must not run the
+    /// unconditional pre-dispatch scan — the real decision still runs it.
+    #[tokio::test]
+    async fn always_probe_scans_nothing() {
+        let tunnel = rule_tunnel(vec![Box::new(FinalRule::new("DIRECT"))]);
+        tunnel.set_process_lookup_mode(ProcessLookupMode::Always);
+        let calls = counting_hook(&tunnel, Some(owner()));
+
+        let mut md = flow_meta();
+        let _ = tunnel.inner().resolve_proxy_inner(&mut md, false).await;
+        assert_eq!(scan_count(&calls), 0, "a probe alone never scans");
+        tunnel.inner().resolve_proxy_flow(&mut md).await;
+        assert_eq!(scan_count(&calls), 1, "the real decision scans once");
+    }
+
+    /// `off`: no scan ever runs — a positive process predicate misses on
+    /// empty fields while a supplied identity still matches, and a
+    /// negated predicate still applies.
+    #[tokio::test]
+    async fn off_scans_never_and_keeps_supplied_identity() {
+        // Empty fields: the positive rule misses, FINAL wins.
+        let tunnel = rule_tunnel(vec![
+            Box::new(DemandProcess::new("stub-owner", "REJECT")),
+            Box::new(FinalRule::new("DIRECT")),
+        ]);
+        tunnel.set_process_lookup_mode(ProcessLookupMode::Off);
+        let calls = counting_hook(&tunnel, Some(owner()));
+        let mut md = flow_meta();
+        let resolved = tunnel
+            .inner()
+            .resolve_proxy_flow(&mut md)
+            .await
+            .expect("rules resolve");
+        assert_eq!(resolved.adapter.name(), "DIRECT");
+        assert_eq!(scan_count(&calls), 0);
+
+        // Supplied identity: the predicate evaluates it — off suppresses
+        // the LOOKUP, not the match.
+        let mut md = flow_meta();
+        md.process = "stub-owner".into();
+        let resolved = tunnel
+            .inner()
+            .resolve_proxy_flow(&mut md)
+            .await
+            .expect("rules resolve");
+        assert_eq!(resolved.adapter.name(), "REJECT");
+        assert_eq!(scan_count(&calls), 0);
+    }
+
+    /// `off`: a negated process predicate still fires — off suppresses
+    /// lookups, not rule logic.
+    #[tokio::test]
+    async fn off_negated_process_rule_still_matches() {
+        use meow_rules::{logic::NotRule, process::ProcessRule};
+        let tunnel = rule_tunnel(vec![
+            Box::new(NotRule::new(
+                Box::new(ProcessRule::new("stub-owner", "DIRECT")),
+                "REJECT",
+            )),
+            Box::new(FinalRule::new("DIRECT")),
+        ]);
+        tunnel.set_process_lookup_mode(ProcessLookupMode::Off);
+        let calls = counting_hook(&tunnel, Some(owner()));
+
+        let mut md = flow_meta();
+        let resolved = tunnel
+            .inner()
+            .resolve_proxy_flow(&mut md)
+            .await
+            .expect("rules resolve");
+        assert_eq!(resolved.adapter.name(), "REJECT", "NOT must match");
+        assert_eq!(scan_count(&calls), 0);
+    }
+
+    /// The mode flips live: a strict flow pays nothing, an `always` PATCH
+    /// applied through the tunnel takes effect on the next flow.
+    #[tokio::test]
+    async fn process_lookup_mode_switch_takes_effect_next_flow() {
+        let tunnel = rule_tunnel(vec![Box::new(FinalRule::new("DIRECT"))]);
+        let calls = counting_hook(&tunnel, Some(owner()));
+        assert_eq!(tunnel.process_lookup_mode(), ProcessLookupMode::Strict);
+
+        let mut strict_flow = flow_meta();
+        tunnel.inner().resolve_proxy_flow(&mut strict_flow).await;
+        assert_eq!(scan_count(&calls), 0, "strict scans nothing unprompted");
+        assert_eq!(strict_flow.process, "");
+
+        tunnel.set_process_lookup_mode(ProcessLookupMode::Always);
+        let mut always_flow = flow_meta();
+        tunnel.inner().resolve_proxy_flow(&mut always_flow).await;
+        assert_eq!(scan_count(&calls), 1);
+        assert_eq!(always_flow.process, "stub-owner");
+
+        tunnel.set_process_lookup_mode(ProcessLookupMode::Off);
+        let mut off_flow = flow_meta();
+        tunnel.inner().resolve_proxy_flow(&mut off_flow).await;
+        assert_eq!(scan_count(&calls), 1, "off scans nothing");
+        assert_eq!(off_flow.process, "");
     }
 }

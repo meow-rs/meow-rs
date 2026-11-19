@@ -143,6 +143,16 @@ pub struct GeneralConfig {
     /// directions for this long is torn down. `None` disables the bound
     /// (`tcp-idle-timeout: 0`).
     pub tcp_idle_timeout: Option<std::time::Duration>,
+    /// `tcp-concurrent` — the resolved live dial policy; the process-wide
+    /// value dialers consult lives in `meow_common::dial` (installed at
+    /// the startup/PATCH/PUT commit points). Deliberate divergence from
+    /// upstream: mihomo defaults `false`, meow-rs keeps its historical
+    /// race unless the operator opts out.
+    pub tcp_concurrent: bool,
+    /// `find-process-mode` — the resolved live lookup policy installed on
+    /// the tunnel's `meow_common::ProcessLookupPolicy` at startup/PATCH/
+    /// PUT-commit (issue #974). Defaults to `strict`.
+    pub find_process_mode: meow_common::ProcessLookupMode,
 }
 
 /// Single source of truth for the effective `ipv6` setting of a config
@@ -157,6 +167,16 @@ pub struct GeneralConfig {
 /// answers IPv4-only — set `ipv6: true` for dual-stack resolution.
 pub fn effective_ipv6(raw_ipv6: Option<bool>) -> bool {
     raw_ipv6.unwrap_or(false)
+}
+
+/// The effective `tcp-concurrent` of a config whose key is unset — one
+/// helper so startup install, `GeneralConfig`, `GET /configs` and PUT
+/// commit can never disagree. Defaults to **`true`**: omission preserves
+/// meow-rs's existing candidate race (a deliberate divergence — upstream
+/// mihomo defaults `false`); only an explicit `false` requests strictly
+/// sequential dialing.
+pub fn effective_tcp_concurrent(raw_tcp_concurrent: Option<bool>) -> bool {
+    raw_tcp_concurrent.unwrap_or(true)
 }
 
 pub struct DnsConfig {
@@ -1678,7 +1698,7 @@ pub async fn parse_dns_from_raw(
     dialer_registry: Option<&meow_proxy::dialer::ProxyRegistry>,
 ) -> Result<DnsConfig, anyhow::Error> {
     dns_parser::validate_node_policy_sources(raw)?;
-    let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
+    let geo = geodata::parse_geodata(raw)?;
     let empty = rule_provider::PrefetchedPayloads::default();
     let payloads: &rule_provider::PrefetchedPayloads =
         prefetched_payloads.map_or(&empty, Arc::as_ref);
@@ -3409,7 +3429,7 @@ fn rebuild_from_raw_impl(
     let ctx = match shared_ctx {
         Some(c) => c,
         None => {
-            let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
+            let geo = geodata::parse_geodata(raw)?;
             if fetch_geodata {
                 ensure_geodata_blocking(
                     raw,
@@ -4251,7 +4271,7 @@ fn build_parser_context_from_raw(
     raw: &raw::RawConfig,
     provider_payloads: &rule_provider::PrefetchedPayloads,
 ) -> Result<meow_rules::ParserContext, anyhow::Error> {
-    let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
+    let geo = geodata::parse_geodata(raw)?;
     build_parser_context_with_geo(raw, &geo, provider_payloads)
 }
 
@@ -4719,7 +4739,9 @@ fn parse_listener_spec(
     match raw_l.listener_type.to_lowercase().as_str() {
         "mixed" => Ok(ListenerSpec::Mixed),
         "http" => Ok(ListenerSpec::Http),
-        "socks5" => Ok(ListenerSpec::Socks5),
+        // mihomo spells the named SOCKS inbound `socks`; `socks5` stays
+        // the canonical meow-rs name.
+        "socks" | "socks5" => Ok(ListenerSpec::Socks5),
         // mihomo's REDIRECT inbound: meow's tproxy TCP path without managed
         // rules — the deployer's REDIRECT rules steer traffic here.
         "redir" => {
@@ -4825,7 +4847,7 @@ fn parse_listener_spec(
         })),
         "wireguard" => Ok(ListenerSpec::WireGuard(build_wg_listener_spec(raw_l)?)),
         other => anyhow::bail!(
-            "unknown listener type '{other}'; expected mixed, http, socks5, tproxy, redir, shadowsocks, or wireguard"
+            "unknown listener type '{other}'; expected mixed, http, socks, socks5, tproxy, redir, shadowsocks, or wireguard"
         ),
     }
 }
@@ -5679,7 +5701,7 @@ async fn build_config_inner(
     // Geodata config — parse and validate early so path errors surface before
     // anything tries to load the DBs. `geox-url` is the mihomo top-level
     // alias, merged per-key under the explicit `geodata.url.*` values.
-    let geodata = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref())?;
+    let geodata = geodata::parse_geodata(&raw)?;
 
     // General config
     let mode = match raw.mode.as_deref().unwrap_or("rule").parse::<TunnelMode>() {
@@ -5718,6 +5740,8 @@ async fn build_config_inner(
         connection_notes: raw.connection_notes.unwrap_or(false),
         logbook: raw::RawLogbook::enabled(raw.logbook.as_ref()),
         tcp_idle_timeout,
+        tcp_concurrent: effective_tcp_concurrent(raw.tcp_concurrent),
+        find_process_mode: raw.find_process_mode.unwrap_or_default(),
     };
 
     // Registry the provider nodes' `dialer-proxy` targets resolve against
@@ -6606,7 +6630,7 @@ mod dialer_proxy_tests {
         let layer = prefetch_proxy_map(&raw, &providers, Some(&store))
             .expect("layer builds")
             .expect("proxies configured");
-        let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref()).unwrap();
+        let geo = geodata::parse_geodata(&raw).unwrap();
         let GeodataEgress::Proxy {
             proxy: resolved, ..
         } = super::resolve_geodata_egress(
@@ -6632,7 +6656,7 @@ mod dialer_proxy_tests {
         let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_store))
             .expect("layer builds")
             .expect("proxies configured");
-        let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref()).unwrap();
+        let geo = geodata::parse_geodata(&raw).unwrap();
         let GeodataEgress::Proxy {
             proxy: resolved, ..
         } = super::resolve_geodata_egress(
@@ -8509,7 +8533,7 @@ mod geoip_context_tests {
         chained: &[&str],
     ) -> (GeodataEgress, HashMap<SmolStr, Arc<dyn Proxy>>) {
         let raw: raw::RawConfig = serde_saphyr::from_str(yaml).unwrap();
-        let geo = geodata::parse_geodata(raw.geodata.as_ref(), raw.geox_url.as_ref()).unwrap();
+        let geo = geodata::parse_geodata(&raw).unwrap();
         let map = proxy_map(names);
         let chained = chained.iter().map(ToString::to_string).collect();
         (

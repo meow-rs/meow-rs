@@ -9,7 +9,7 @@
 use meow_common::{Metadata, Rule, RuleMatchHelper};
 use meow_config::raw::RawConfig;
 use meow_tunnel::match_engine::{match_rules, DomainIndex};
-use meow_tunnel::rule_ir::CompiledRuleSet;
+use meow_tunnel::rule_ir::{CompiledRuleSet, DemandGate};
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -168,6 +168,7 @@ fn measure_hot_loop(
                         std::hint::black_box(metadata),
                         std::hint::black_box(rules),
                         &|_: &str| true,
+                        DemandGate::ALL,
                     ));
                 }
             }

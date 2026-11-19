@@ -36,6 +36,38 @@ tokio::task_local! {
     static DIAL_DEADLINE: Instant;
 }
 
+/// Live `tcp-concurrent` policy (mihomo compat, issue #974 batch): `true`
+/// races dial candidates the way `connect_tcp_candidates` always has;
+/// `false` walks the filtered/ordered list strictly one connect at a
+/// time. Process-wide like `routing-mark` because the dialers that honor
+/// it (`connect_tcp_host`, DIRECT's candidate list) share no config
+/// struct. Read once per candidate run — an in-flight selection keeps
+/// the policy it started with, so PATCH only steers later dials.
+static TCP_CONCURRENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+
+/// Install the `tcp-concurrent` policy. Only config commit points call
+/// this (startup install, PATCH, accepted PUT swap) — candidate parsing
+/// must never mutate it.
+pub fn set_tcp_concurrent(concurrent: bool) {
+    TCP_CONCURRENT.store(concurrent, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The live `tcp-concurrent` policy (`true` unless a config set `false`).
+pub fn tcp_concurrent() -> bool {
+    TCP_CONCURRENT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Serializes tests that drive `socket_protect::connect_tcp_candidates`
+/// while a sibling flips `TCP_CONCURRENT` — the selector reads the
+/// process-global once per run, so a parallel `set_tcp_concurrent` would
+/// change the walk a timing assertion measures. `#[doc(hidden)]`: a test
+/// seam, not public API.
+#[doc(hidden)]
+pub fn tcp_concurrent_serial() -> &'static tokio::sync::Mutex<()> {
+    static SERIAL: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    SERIAL.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 /// Deadline of the outbound dial currently being polled on this task.
 ///
 /// Proxy groups capture it before awaiting a member so their cancellation

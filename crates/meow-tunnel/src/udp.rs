@@ -278,10 +278,29 @@ pub async fn handle_udp(
         return;
     }
 
+    // An established session forwards before anything that can demand the
+    // flow's owner: per-packet metadata carries a fresh lookup memo, so
+    // the NAT hit must precede `resolve_udp_dst`'s route probe and the
+    // slow path's `resolve_proxy_flow`, or an established flow could pay
+    // a socket-table walk per datagram (issue #974). Only possible when
+    // the caller already resolved `dst_ip`; a hostname waits for the
+    // key-forming resolution below.
+    if let Some(dst_ip) = metadata.dst_ip {
+        if forward_nat_hit(
+            tunnel,
+            (src, SocketAddr::new(dst_ip, metadata.dst_port)),
+            data,
+        )
+        .await
+        {
+            return;
+        }
+    }
+
     // Pre-resolve metadata (host -> real IP if rules need it). UDP keeps
-    // the eager pre_resolve + resolve_proxy pair (no lazy enrichment): the
-    // NAT session key below requires a resolved dst_ip regardless of what
-    // the rules demand.
+    // the eager pre_resolve + resolve_proxy_flow pair (no lazy
+    // enrichment): the NAT session key below requires a resolved dst_ip
+    // regardless of what the rules demand.
     tunnel.pre_resolve(&mut metadata).await;
 
     // Rule-demand gating is only an optimization. UDP still requires a real
@@ -304,49 +323,21 @@ pub async fn handle_udp(
     let key = (src, dst_addr);
 
     // Fast path: existing session — forward and return.
-    //
-    // Clone the `Arc<UdpSession>` out and DROP the DashMap guard before the
-    // `.await` below. `nat_table.get()` returns a `Ref` that holds a *read*
-    // lock on the key's shard for as long as it is alive. Two ways the old
-    // `if let Some(session) = nat_table.get(&key)` form deadlocked:
-    //   1. The guard was held across `write_packet().await`, so while this task
-    //      parked on the upstream round-trip the shard read-lock stayed held,
-    //      blocking every same-shard `insert`/`remove`/sweep.
-    //   2. On a write error it called `nat_table.remove(&key)` — a *write* lock
-    //      on the very shard whose read-lock the `session` guard still held.
-    //      A read+write on the same shard from one thread self-deadlocks the
-    //      shard's RwLock, parking the worker forever; on the 2-worker iOS
-    //      runtime both workers then wedge → total packet stall + dead control
-    //      API. Fires whenever an established session's upstream has died and
-    //      the app sends another datagram (common for QUIC / long-lived UDP).
-    // Holding only the cloned `Arc` keeps the session alive with no lock held.
-    let existing = tunnel.nat_table.get(&key).map(|s| Arc::clone(s.value()));
-    if let Some(session) = existing {
-        if let Err(e) = session.conn.write_packet(data, &dst_addr).await {
-            debug!("UDP write error for {} -> {}: {}", src, dst_addr, e);
-            // Compare-and-remove: evict only the session that actually failed.
-            // While this write was parked a concurrent slow path may have
-            // replaced the entry with a fresh healthy session; an
-            // unconditional `remove()` would tear that replacement down and
-            // force the next packet to redial (issue #432).
-            tunnel
-                .nat_table
-                .remove_if(&key, |_, s| Arc::ptr_eq(s, &session));
-        } else {
-            session.touch();
-        }
+    if forward_nat_hit(tunnel, key, data).await {
         return;
     }
 
     // Slow path: all client UDP, including port 53, follows routing policy.
     // `_route` pins this generation's dialer registry across the dial
-    // (issue #533 review).
+    // (issue #533 review). The mutable flow entry point shares this
+    // metadata's lookup memo with the `resolve_udp_dst` probe above —
+    // one socket-table scan per flow at most (issue #974).
     let Some(ResolvedTarget {
         adapter: proxy,
         rule_name,
         rule_payload,
         route: _route,
-    }) = tunnel.resolve_proxy(&metadata).await
+    }) = tunnel.resolve_proxy_flow(&mut metadata).await
     else {
         warn!("no matching rule for UDP {}", metadata.remote_address());
         return;
@@ -419,6 +410,48 @@ pub async fn handle_udp(
             warn!("UDP dial error for {} -> {}: {}", src, dst_addr, e);
         }
     }
+}
+
+/// Write `data` into the NAT session `key` names, if one is live: `true`
+/// on a hit (forwarded or the dead session evicted), `false` on a miss —
+/// the caller then takes the dial slow path.
+///
+/// Clone the `Arc<UdpSession>` out and DROP the DashMap guard before the
+/// `.await` below. `nat_table.get()` returns a `Ref` that holds a *read*
+/// lock on the key's shard for as long as it is alive. Two ways the old
+/// `if let Some(session) = nat_table.get(&key)` form deadlocked:
+///   1. The guard was held across `write_packet().await`, so while this task
+///      parked on the upstream round-trip the shard read-lock stayed held,
+///      blocking every same-shard `insert`/`remove`/sweep.
+///   2. On a write error it called `nat_table.remove(&key)` — a *write* lock
+///      on the very shard whose read-lock the `session` guard still held.
+///      A read+write on the same shard from one thread self-deadlocks the
+///      shard's RwLock, parking the worker forever; on the 2-worker iOS
+///      runtime both workers then wedge → total packet stall + dead control
+///      API. Fires whenever an established session's upstream has died and
+///      the app sends another datagram (common for QUIC / long-lived UDP).
+///
+/// Holding only the cloned `Arc` keeps the session alive with no lock held.
+async fn forward_nat_hit(tunnel: &TunnelInner, key: (SocketAddr, SocketAddr), data: &[u8]) -> bool {
+    let (src, dst_addr) = key;
+    let existing = tunnel.nat_table.get(&key).map(|s| Arc::clone(s.value()));
+    let Some(session) = existing else {
+        return false;
+    };
+    if let Err(e) = session.conn.write_packet(data, &dst_addr).await {
+        debug!("UDP write error for {} -> {}: {}", src, dst_addr, e);
+        // Compare-and-remove: evict only the session that actually failed.
+        // While this write was parked a concurrent slow path may have
+        // replaced the entry with a fresh healthy session; an
+        // unconditional `remove()` would tear that replacement down and
+        // force the next packet to redial (issue #432).
+        tunnel
+            .nat_table
+            .remove_if(&key, |_, s| Arc::ptr_eq(s, &session));
+    } else {
+        session.touch();
+    }
+    true
 }
 
 #[cfg(test)]
@@ -1115,5 +1148,106 @@ mod tests {
         let conns = proxy.conns.lock().unwrap();
         assert!(!conns[1].1.load(Ordering::SeqCst));
         assert_eq!(conns[1].0.load(Ordering::SeqCst), 1);
+    }
+
+    /// A write-counting packet conn for the established-session fixture.
+    struct RecordingConn {
+        writes: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl ProxyPacketConn for RecordingConn {
+        async fn read_packet(&self, _buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+            Ok((0, "0.0.0.0:0".parse().unwrap()))
+        }
+        async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+            self.writes.fetch_add(1, Ordering::SeqCst);
+            Ok(buf.len())
+        }
+        fn local_addr(&self) -> MeowResult<SocketAddr> {
+            Ok("0.0.0.0:0".parse().unwrap())
+        }
+        fn close(&self) -> MeowResult<()> {
+            Ok(())
+        }
+    }
+
+    /// An established NAT session must forward before anything that can
+    /// demand the flow's owner: per-packet metadata carries a fresh
+    /// lookup memo, so reaching a `strict` process slot on an established
+    /// flow would scan once per datagram (issue #974).
+    #[tokio::test]
+    async fn nat_hit_skips_process_demand_for_established_flows() {
+        use meow_common::{Rule, RuleMatchHelper, RuleType};
+
+        // Deterministic process demand on every OS — the same stub shape
+        // tunnel.rs's `DemandProcess` uses.
+        struct DemandProcess;
+        impl Rule for DemandProcess {
+            fn rule_type(&self) -> RuleType {
+                RuleType::ProcessName
+            }
+            fn match_metadata(&self, _: &Metadata, _: &RuleMatchHelper) -> bool {
+                false
+            }
+            fn adapter(&self) -> &str {
+                "DIRECT"
+            }
+            fn payload(&self) -> &str {
+                ""
+            }
+            fn should_find_process(&self) -> bool {
+                true
+            }
+        }
+
+        let tunnel = mk_tunnel();
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        tunnel.update_routing(
+            res.proxies,
+            vec![
+                Box::new(DemandProcess),
+                Box::new(meow_rules::final_rule::FinalRule::new("DIRECT")),
+            ],
+            res.dialer_registry,
+        );
+        tunnel.set_mode(TunnelMode::Rule);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let count = Arc::clone(&calls);
+        tunnel.set_process_lookup_hook(Arc::new(move |_| {
+            count.fetch_add(1, Ordering::SeqCst);
+            None
+        }));
+
+        let src: SocketAddr = "127.0.0.1:45678".parse().unwrap();
+        let dst: SocketAddr = "198.51.100.9:443".parse().unwrap();
+        let key = (src, dst);
+        let writes = Arc::new(AtomicUsize::new(0));
+        tunnel.inner().nat_table.insert(
+            key,
+            Arc::new(UdpSession::new(
+                Box::new(RecordingConn {
+                    writes: Arc::clone(&writes),
+                }),
+                Arc::from("DIRECT"),
+            )),
+        );
+
+        // Two datagrams on the established session: each carries a fresh
+        // memo, so a single scan would prove per-packet owner work.
+        for _ in 0..2 {
+            handle_udp(tunnel.inner(), b"ping", src, mk_metadata(src, dst)).await;
+        }
+        assert_eq!(writes.load(Ordering::SeqCst), 2, "the session forwards");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "an established flow must never scan"
+        );
+
+        // A brand-new flow still pays the reached slot's one scan.
+        let new_src: SocketAddr = "127.0.0.1:45679".parse().unwrap();
+        handle_udp(tunnel.inner(), b"ping", new_src, mk_metadata(new_src, dst)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "a new flow scans once");
     }
 }

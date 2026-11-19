@@ -18,12 +18,6 @@ const UNSUPPORTED_KEYS: &[(&str, Option<u32>, &str)] = &[
     ("brutal-opts", None, "experimental, no spec"),
     ("ntp", Some(974), "NTP time sync not implemented"),
     ("profile", None, "not a routing concern"),
-    ("geo-auto-update", None, "superseded by geodata.auto-update"),
-    (
-        "geo-update-interval",
-        None,
-        "superseded by geodata.auto-update-interval",
-    ),
     (
         "geox-update-interval",
         None,
@@ -43,16 +37,6 @@ const UNSUPPORTED_KEYS: &[(&str, Option<u32>, &str)] = &[
         "external-controller-pipe",
         Some(974),
         "named pipe API not implemented",
-    ),
-    (
-        "tcp-concurrent",
-        None,
-        "upstream fast-open, no equivalent here",
-    ),
-    (
-        "find-process-mode",
-        Some(974),
-        "PROCESS-NAME/PROCESS-PATH rules work; the mode switch is unmodeled",
     ),
     ("lan-allowed-ips", None, "ACL not in proxy kernel scope"),
     ("lan-disallowed-ips", None, "ACL not in proxy kernel scope"),
@@ -539,6 +523,10 @@ pub(crate) fn validate_and_warn(raw: &crate::raw::RawConfig) {
             warn_extra("geodata.url", &url.extra);
         }
     }
+    // The geo selectors (`geodata-mode`, `geodata-loader`,
+    // `geosite-matcher`, legacy `geoip-matcher`) warn on their effective
+    // value — flat alias or nested — once per validation pass.
+    crate::geodata::warn_geo_compat(raw);
     if let Some(geox) = &raw.geox_url {
         warn_extra("geox-url", &geox.extra);
     }
