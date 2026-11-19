@@ -97,11 +97,29 @@ pub async fn handle_udp_associate(
     requested_ip: Option<IpAddr>,
     requested_port: u16,
     inbound: &Metadata,
+    routing_mark: Option<u32>,
 ) -> io::Result<()> {
     // Bind the relay on the same local IP the client reached us on, so the
     // address we hand back is reachable by the client.
     let local_ip = control.local_addr()?.ip();
     let relay = Arc::new(UdpSocket::bind(SocketAddr::new(local_ip, 0)).await?);
+    // `listeners[].routing-mark` — the relay binds per association, so the
+    // listen socket's mark cannot reach it; apply before the reply goes
+    // out so every relayed datagram carries it. Same failure contract as
+    // the listen-socket mark: an association that would silently evade
+    // the declared policy routing must not run.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    if let Some(mark) = routing_mark {
+        use std::os::fd::AsRawFd;
+        meow_common::set_listener_socket_mark(relay.as_raw_fd(), mark).map_err(|e| {
+            io::Error::new(
+                e.kind(),
+                format!("routing-mark {mark}: {e} (SO_MARK needs CAP_NET_ADMIN)"),
+            )
+        })?;
+    }
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    let _ = routing_mark;
     let bnd = relay.local_addr()?;
 
     write_associate_reply(&mut control, bnd).await?;
@@ -266,6 +284,10 @@ fn handle_client_datagram(
         in_name: inbound.in_name.clone(),
         in_port: inbound.in_port,
         in_user: inbound.in_user.clone(),
+        // The named listener's `proxy:`/`rule:` override — stamped onto
+        // the handshake's inbound tag by the caller, carried here so the
+        // association's flows route through it too.
+        special_route: inbound.special_route.clone(),
         ..Default::default()
     };
 
@@ -1159,6 +1181,8 @@ mod tests {
                     None,
                     "socks",
                     addr.port(),
+                    None,
+                    None,
                 )
                 .await;
             });

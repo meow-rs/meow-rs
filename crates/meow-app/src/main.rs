@@ -761,7 +761,8 @@ type EarlyOutboundBinding = Option<std::convert::Infallible>;
 /// before, and until then no global route exists for a socket to loop on.
 #[cfg(feature = "listener-tun")]
 fn preinstall_global_route_binding(raw: &meow_config::raw::RawConfig) -> EarlyOutboundBinding {
-    meow_api::preinstall_global_route_binding(raw).into_binding()
+    meow_api::preinstall_global_route_binding(raw, meow_api::PreinstallScope::Startup)
+        .into_binding()
 }
 
 #[cfg(not(feature = "listener-tun"))]
@@ -789,6 +790,7 @@ fn listener_feature_gate(spec: &meow_config::ListenerSpec) -> Option<&'static st
             (!cfg!(feature = "listener-shadowsocks")).then_some("listener-shadowsocks")
         }
         S::WireGuard(_) => (!cfg!(feature = "listener-wireguard")).then_some("listener-wireguard"),
+        S::Tun(_) => (!cfg!(feature = "listener-tun")).then_some("listener-tun"),
     }
 }
 
@@ -1541,7 +1543,12 @@ async fn run(
     // shared with the traffic ledger's app lookup (issue #974). `-t`
     // validation never reaches here; PUT/PATCH re-assert at commit.
     tunnel.set_process_lookup_mode(config.general.find_process_mode);
-    tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
+    tunnel.update_routing(
+        config.proxies,
+        config.rules,
+        config.sub_rules,
+        config.dialer_registry,
+    );
     tunnel.spawn_background_tasks();
 
     // Spawn periodic health checks for fallback / url-test proxy groups.
@@ -1619,6 +1626,9 @@ async fn run(
         let rule_provider_refresh = Arc::clone(&rule_provider_refresh);
         let proxy_provider_refresh = Arc::clone(&proxy_provider_refresh);
         let provider_dialer_registry = config.provider_dialer_registry.clone();
+        // Refresh never rebinds listeners, so the startup snapshot is the
+        // right dependency set for the prospective-route sweep.
+        let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
             meow_app::subscription_refresh::run_loop(
                 raw_config,
@@ -1630,6 +1640,7 @@ async fn run(
                 provider_dialer_registry,
                 rule_provider_refresh,
                 proxy_provider_refresh,
+                running_listeners,
             )
             .await;
         });
@@ -1655,6 +1666,9 @@ async fn run(
         let proxy_providers = Arc::clone(&proxy_providers);
         let dns_server = Arc::clone(&dns_server_handle);
         let cache_dir = geodata_cache_dir.clone();
+        // Refreshes never rebind listeners — the startup snapshot is the
+        // republish sweep's dependency set, as subscription_refresh's.
+        let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
             meow_app::geodata_fetch::missing_geosite_retry_loop(
                 geodata,
@@ -1662,6 +1676,7 @@ async fn run(
                 raw_config,
                 rule_providers,
                 proxy_providers,
+                running_listeners,
                 dns_server,
                 cache_dir,
             )
@@ -1681,6 +1696,7 @@ async fn run(
         let proxy_providers = Arc::clone(&proxy_providers);
         let dns_server = Arc::clone(&dns_server_handle);
         let cache_dir = geodata_cache_dir;
+        let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
             meow_app::geodata_fetch::auto_update_loop(
                 geodata,
@@ -1689,6 +1705,7 @@ async fn run(
                 raw_config,
                 rule_providers,
                 proxy_providers,
+                running_listeners,
                 dns_server,
                 cache_dir,
             )
@@ -1702,6 +1719,10 @@ async fn run(
     // Suppress unused-variable warnings: sniffer_runtime and auth are
     // consumed only inside feature-gated listener blocks below.
     let _ = (&sniffer_runtime, &auth);
+    // `take()`d by the TUN spawn paths below, which exist only under
+    // `listener-tun`; the not-feature build moves it once at the end.
+    #[cfg(feature = "listener-tun")]
+    let mut early_binding = early_binding;
 
     // Start listeners. Bind before spawning the accept loops so a `port: 0`
     // (ephemeral) listener resolves to its OS-assigned port up front; the
@@ -1711,6 +1732,41 @@ async fn run(
 
     let mut named_listeners = config.listeners.named.clone();
     for nl in &mut named_listeners {
+        // A named `type: tun` owns no socket — skip the bind entirely
+        // (`""` is not a bindable address). It spawns here like every
+        // named inbound, but its startup failures are fatal: the sole
+        // effective TUN cannot be left half-started behind a "running"
+        // banner, and no PUT-path rollback exists for it.
+        if let ListenerSpec::Tun(cfg) = &nl.spec {
+            #[cfg(feature = "listener-tun")]
+            {
+                if let Err(msg) = spawn_named_tun(
+                    &tunnel,
+                    cfg,
+                    &nl.name,
+                    nl.route_override.clone(),
+                    Arc::clone(&sniffer_runtime),
+                    early_binding.take(),
+                )
+                .await
+                {
+                    listener_failed(&nl.name, &format!("TUN failed to start: {msg}"));
+                    return Err(anyhow::anyhow!(
+                        "listener '{}': TUN failed to start: {msg}",
+                        nl.name
+                    ));
+                }
+            }
+            #[cfg(not(feature = "listener-tun"))]
+            {
+                let _ = cfg;
+                tracing::warn!(
+                    "listener '{}': type tun requires feature 'listener-tun'",
+                    nl.name
+                );
+            }
+            continue;
+        }
         let addr = bind_socket_addr(&nl.listen, nl.port)
             .map_err(|e| anyhow::anyhow!("listener '{}': {e}", nl.name))?;
         // Suppress unused-variable warning: addr is consumed only inside
@@ -1727,13 +1783,24 @@ async fn run(
                             continue;
                         }
                     };
+                    // `listeners[].routing-mark` — ingress SO_MARK on the
+                    // listen socket; accepted sockets inherit it.
+                    if !apply_listener_mark(&nl.name, &socket, nl.routing_mark) {
+                        continue;
+                    }
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     let listener = MixedListener::new(tunnel.clone(), bound, nl.name.clone())
                         .with_sniffer(Arc::clone(&sniffer_runtime))
                         .with_auth(Arc::clone(&auth))
+                        .with_lan_acl(Arc::clone(&config.listeners.lan_acl))
                         .with_max_connections(nl.max_connections)
-                        .with_tcp_keepalive(config.listeners.tcp_keepalive);
+                        .with_tcp_keepalive(config.listeners.tcp_keepalive)
+                        .with_route_override(nl.route_override.clone())
+                        // The SOCKS5 UDP-associate relay socket binds per
+                        // association inside the listener — its mark cannot
+                        // come from the listen socket's inheritance.
+                        .with_routing_mark(nl.routing_mark);
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on(socket).await {
                             error!("Listener error: {}", e);
@@ -1763,6 +1830,10 @@ async fn run(
                             continue;
                         }
                     };
+                    // No `routing-mark` here: the parser already warns and
+                    // drops it on `type: tproxy` — marking the transparent
+                    // socket would mark the reply packets the policy rules
+                    // must route back.
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     let listener = TProxyListener::new(
@@ -1777,7 +1848,8 @@ async fn run(
                     .with_firewall(*firewall)
                     .with_udp(*udp, std::time::Duration::from_secs(*udp_timeout))
                     .with_tcp_keepalive(config.listeners.tcp_keepalive)
-                    .with_transparent(*transparent);
+                    .with_transparent(*transparent)
+                    .with_route_override(nl.route_override.clone());
                     // Firewall rules and the UDP TPROXY socket are fallible
                     // setup — run them eagerly so a failure can't drop the
                     // bound TCP socket inside a detached task (issue #641).
@@ -1820,6 +1892,9 @@ async fn run(
                             continue;
                         }
                     };
+                    if !apply_listener_mark(&nl.name, &socket, nl.routing_mark) {
+                        continue;
+                    }
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     let obfs = cfg.simple_obfs.as_ref().map(|o| match o.mode {
@@ -1837,7 +1912,12 @@ async fn run(
                     ) {
                         Ok(l) => l
                             .with_max_connections(nl.max_connections)
-                            .with_tcp_keepalive(config.listeners.tcp_keepalive),
+                            .with_tcp_keepalive(config.listeners.tcp_keepalive)
+                            .with_route_override(nl.route_override.clone())
+                            // The UDP relay socket binds inside the
+                            // listener — the TCP listen socket's mark
+                            // can't reach it.
+                            .with_routing_mark(nl.routing_mark),
                         Err(e) => {
                             listener_failed(&nl.name, &format!("invalid shadowsocks config: {e}"));
                             continue;
@@ -1882,6 +1962,10 @@ async fn run(
                             continue;
                         }
                     };
+                    // No `routing-mark` here either — the parser warns and
+                    // drops it on `type: wireguard`; marking the responder
+                    // socket would mark handshake replies the policy rules
+                    // must route back.
                     let bound = socket.local_addr().unwrap_or(addr);
                     nl.port = bound.port();
                     // meow-listener takes plain ctor args, never a
@@ -1906,7 +1990,8 @@ async fn run(
                     };
                     let listener = WireGuardListener::new(tunnel.clone(), spec, nl.name.clone())
                         .with_max_connections(nl.max_connections)
-                        .with_sniffer(Arc::clone(&sniffer_runtime));
+                        .with_sniffer(Arc::clone(&sniffer_runtime))
+                        .with_route_override(nl.route_override.clone());
                     match listener.spawn(socket) {
                         Ok(guard) => {
                             tokio::spawn(async move {
@@ -1929,6 +2014,9 @@ async fn run(
                     );
                 }
             }
+            // Spawned above the bind (a TUN owns no socket) — this arm
+            // is unreachable, kept only for exhaustiveness.
+            ListenerSpec::Tun(_) => {}
         }
     }
 
@@ -2016,11 +2104,12 @@ async fn run(
                 "meow-tun".to_string(),
             )
             .with_readiness_signal(ready_tx)
-            .with_sniffer(Arc::clone(&sniffer_runtime));
+            .with_sniffer(Arc::clone(&sniffer_runtime))
+            .with_tcp_dns_hijack(config.tun.dns_hijack);
             // The global-route binding installed before the config build
             // moves into the listener, which clears it with its routes —
             // or right away if startup fails (issue #695).
-            if let Some(binding) = early_binding {
+            if let Some(binding) = early_binding.take() {
                 listener = listener.with_outbound_binding(binding);
             }
 
@@ -2045,6 +2134,7 @@ async fn run(
                         &startup_tun,
                         meow_tunnel::TunHandle {
                             task: handle,
+                            owner: meow_tunnel::TunOwner::TopLevel,
                             core_done: Some(core_done),
                             udp_flows,
                         },
@@ -2132,12 +2222,12 @@ fn publish_controller(
 
 /// A listener that did not start: logged, recorded in the logbook, and
 /// skipped — the rest of the engine runs without it.
-#[cfg(any(
-    feature = "listener-mixed",
-    feature = "listener-tproxy",
-    feature = "listener-shadowsocks",
-    feature = "listener-wireguard"
-))]
+#[allow(
+    dead_code,
+    reason = "needed whenever ANY listener feature or the linux mark \
+              path compiles — --no-default-features makes every call site \
+              cfg'd out"
+)]
 fn listener_failed(name: &str, message: &str) {
     error!("listener '{name}': {message}");
     meow_common::logbook::event(
@@ -2147,6 +2237,48 @@ fn listener_failed(name: &str, message: &str) {
     )
     .subject(name)
     .record();
+}
+
+/// `listeners[].routing-mark` — `SO_MARK` on the listener's own socket
+/// (ingress; upstream `InboundOption.RoutingMark`). Linux only — the
+/// config layer already warned and ignored the key elsewhere, so the
+/// non-Linux arm is a silent no-op. A failed `setsockopt` (missing
+/// `CAP_NET_ADMIN`) is a listener startup failure like a bind error: a
+/// silently unmarked socket would evade the policy routing the mark was
+/// declared for. Returns `false` when the listener must be skipped.
+#[cfg(unix)]
+#[allow(
+    dead_code,
+    reason = "every call site sits inside a `listener-*`-gated arm — \
+              --no-default-features compiles them all out"
+)]
+fn apply_listener_mark<F: std::os::fd::AsRawFd>(name: &str, sock: &F, mark: Option<u32>) -> bool {
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    if let Some(mark) = mark {
+        if let Err(e) = meow_common::set_listener_socket_mark(sock.as_raw_fd(), mark) {
+            listener_failed(
+                name,
+                &format!("routing-mark {mark}: {e} (SO_MARK needs CAP_NET_ADMIN)"),
+            );
+            return false;
+        }
+    }
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    let _ = (name, sock, mark);
+    true
+}
+
+/// Windows has no `AsRawFd` (its socket handle type differs); the
+/// `routing-mark` key is Linux-only anyway and already warned off at
+/// parse time.
+#[cfg(not(unix))]
+#[allow(
+    dead_code,
+    reason = "every call site sits inside a `listener-*`-gated arm — \
+              --no-default-features compiles them all out"
+)]
+fn apply_listener_mark<F>(_name: &str, _sock: &F, _mark: Option<u32>) -> bool {
+    true
 }
 
 /// #625: roll the committed `tun.enable` back to false after an initial
@@ -2232,6 +2364,85 @@ async fn publish_tun_if_committed(
         return;
     }
     tunnel.set_tun_handle(tun_handle).await;
+}
+
+/// Spawn a named `listeners: type: tun` device and publish it as the
+/// effective TUN ([`meow_tunnel::TunOwner::Named`]). Unlike the top-level
+/// section's spawn there is no committed-config re-validation and no
+/// `tun.enable` rollback — a named device is a startup-snapshot object no
+/// PUT can restart or roll back, so any failure here is returned to the
+/// caller, which fails startup instead of logging-and-continuing.
+/// `binding` is the early global-route binding installed before the
+/// config build ([`preinstall_global_route_binding`], issue #695) —
+/// adopted by this listener or given up with it on failure.
+#[cfg(feature = "listener-tun")]
+async fn spawn_named_tun(
+    tunnel: &Tunnel,
+    cfg: &meow_config::TunConfig,
+    name: &str,
+    route_override: Option<meow_common::InboundRouteOverride>,
+    sniffer: Arc<SnifferRuntime>,
+    binding: Option<meow_listener::OutboundBinding>,
+) -> Result<(), String> {
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let mut listener = TunListener::new(
+        tunnel.clone(),
+        tun_config_to_listener_config(cfg),
+        name.to_string(),
+    )
+    .with_readiness_signal(ready_tx)
+    .with_sniffer(sniffer)
+    .with_route_override(route_override);
+    if let Some(binding) = binding {
+        listener = listener.with_outbound_binding(binding);
+    }
+    let task_name = name.to_string();
+    let handle = tokio::spawn(async move {
+        if let Err(e) = listener.run().await {
+            error!("TUN listener '{task_name}' error: {e}");
+        }
+    });
+
+    let (core_done, udp_flows) =
+        match tokio::time::timeout(meow_api::TUN_STARTUP_TIMEOUT, ready_rx).await {
+            Ok(Ok(meow_listener::TunReady::Ready {
+                core_done,
+                udp_flows,
+            })) => (core_done, udp_flows),
+            Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
+                handle.abort();
+                let _ = handle.await;
+                return Err(msg);
+            }
+            Ok(Err(_)) => {
+                handle.abort();
+                let _ = handle.await;
+                return Err("TUN readiness signal dropped unexpectedly".into());
+            }
+            Err(_) => {
+                handle.abort();
+                let _ = handle.await;
+                return Err(format!(
+                    "TUN startup timed out after {} s",
+                    meow_api::TUN_STARTUP_TIMEOUT.as_secs()
+                ));
+            }
+        };
+
+    let tun_handle = meow_tunnel::TunHandle {
+        task: handle,
+        owner: meow_tunnel::TunOwner::Named(name.to_string()),
+        core_done: Some(core_done),
+        udp_flows,
+    };
+    if tun_handle.task.is_finished() {
+        // Reported ready, then exited before the handle could publish —
+        // the same dead-handle refusal the top-level publish applies.
+        tunnel.teardown_tun_handle(tun_handle).await;
+        return Err("TUN listener exited after reporting ready".into());
+    }
+    tunnel.set_tun_handle(tun_handle).await;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -2668,6 +2879,8 @@ mod tests {
             port: 23300,
             listen: "0.0.0.0".into(),
             max_connections: 256,
+            route_override: None,
+            routing_mark: None,
         }];
         let err = meow_api::ensure_listeners_supported(&named, without_shadowsocks)
             .expect_err("ss listener must fail on a feature-less build");
@@ -2786,6 +2999,7 @@ mod tests {
                     let _tx = tx;
                     std::future::pending::<()>().await;
                 }),
+                owner: meow_tunnel::TunOwner::TopLevel,
                 core_done: None,
                 udp_flows: Arc::new(AtomicUsize::new(0)),
             };
@@ -2920,6 +3134,7 @@ mod tests {
         fn finished_handle() -> TunHandle {
             TunHandle {
                 task: tokio::spawn(async {}),
+                owner: meow_tunnel::TunOwner::TopLevel,
                 core_done: None,
                 udp_flows: Arc::new(AtomicUsize::new(0)),
             }

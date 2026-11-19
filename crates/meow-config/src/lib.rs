@@ -105,6 +105,11 @@ pub struct Config {
     /// resolve the *current* name map.
     pub provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
     pub rules: Vec<Box<dyn Rule>>,
+    /// The `sub-rules:` blocks `listeners[].rule` selects by name —
+    /// published into the route table in the same snapshot as `rules` so
+    /// a listener's named scan never observes a block and a route that
+    /// disagree.
+    pub sub_rules: sub_rules_parser::SubRuleBlocks,
     pub rule_providers: HashMap<String, Arc<rule_provider::RuleProvider>>,
     /// Providers the load left out leniently. The embedder records them once
     /// it runs this config ([`DroppedProviders::record`]).
@@ -246,6 +251,15 @@ pub enum ListenerSpec {
     /// `listener-wireguard` build feature — the same pattern as
     /// `type: shadowsocks` vs. `listener-shadowsocks`.
     WireGuard(WgListenerConfig),
+    /// Named TUN device inbound (`type: tun`): the entry's flat options
+    /// resolve to the same [`TunConfig`] the top-level `tun:` section
+    /// produces (its own defaults profile — the entry's presence is the
+    /// enabled state, MTU 9000, UDP timeout 300 s, auto-route off). It
+    /// owns no socket port (`NamedListener.port`/`listen` are inert).
+    /// Servability is gated by the `listener-tun` build feature and at
+    /// most one effective TUN may exist: one named entry, or the
+    /// top-level section — never both (spec §3).
+    Tun(TunConfig),
 }
 
 /// Per-listener config for the `shadowsocks` inbound (`ListenerSpec::Shadowsocks`).
@@ -405,6 +419,7 @@ impl ListenerSpec {
             Self::TProxy { .. } => "tproxy",
             Self::Shadowsocks(_) => "shadowsocks",
             Self::WireGuard(_) => "wireguard",
+            Self::Tun(_) => "tun",
         }
     }
 }
@@ -428,12 +443,24 @@ pub struct NamedListener {
     /// `max-connections` field, falling back to the global `max-connections`.
     #[serde(default)]
     pub max_connections: usize,
+    /// `listeners[].proxy`/`listeners[].rule` — the named-listener route
+    /// override stamped onto every flow's `Metadata` (upstream's
+    /// `BaseOption` Additions). `None` on the port shorthands and on
+    /// entries that declare neither key.
+    #[serde(default)]
+    pub route_override: Option<meow_common::InboundRouteOverride>,
+    /// `listeners[].routing-mark` — `SO_MARK` on the listener socket at
+    /// bind; Linux only (warned and ignored elsewhere).
+    #[serde(default)]
+    pub routing_mark: Option<u32>,
 }
 
 /// Parsed + validated `tun:` section (issue #326). Consumed by the app
 /// layer, which maps it onto `meow_listener::TunListenerConfig` when the
-/// `listener-tun` feature is compiled in.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `listener-tun` feature is compiled in. A named `listeners:`
+/// `type: tun` entry resolves to the same type ([`ListenerSpec::Tun`])
+/// — under its own defaults profile, never sharing the top-level ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TunConfig {
     pub enable: bool,
     /// Device name; `None` = platform default.
@@ -472,7 +499,7 @@ pub struct TunConfig {
 /// unset) keeps the userspace lwIP stack. Under `system` UDP is handled
 /// in the pump (UDP fragments and ICMP still go to lwIP; fragmented TCP
 /// is dropped).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TunStack {
     #[default]
     Lwip,
@@ -480,7 +507,7 @@ pub enum TunStack {
 }
 
 /// Scope of the routes `tun.auto-route` installs (#375).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TunRouteMode {
     /// `auto-route: fake-ip`: route only the fake-IP range into the
     /// device. Loop-free by construction; IP-literal traffic is not
@@ -638,23 +665,23 @@ pub fn parse_tun_config(
         ));
     }
 
-    let inet4_address = match first_cidr("inet4-address", "IPv4", r.inet4_address.as_ref())? {
+    let inet4_address = match first_cidr("tun.inet4-address", "IPv4", r.inet4_address.as_ref())? {
         Some(s) => s
             .parse::<ipnet::Ipv4Net>()
             .map_err(|e| anyhow::anyhow!("tun.inet4-address: invalid CIDR '{s}': {e}"))?,
         None => default_tun_inet4_address(fake_ip_range),
     };
 
-    // Absent: on. An empty list turns it off. Any usable entry hijacks
-    // every UDP :53 flow.
+    // Absent: on. An empty list turns it off. Only the exact wildcard
+    // :53 forms enable the UDP hijack.
     let mut dns_hijack = r.dns_hijack.is_none();
     for entry in r.dns_hijack.as_deref().unwrap_or(&[]) {
-        let port = entry.rsplit(':').next().and_then(|p| p.parse::<u16>().ok());
-        match port {
-            Some(53) => dns_hijack = true,
-            _ => warn!(
-                "tun.dns-hijack: entry '{entry}' is not a :53 target; meow-rs only hijacks \
-                 UDP port 53 — entry ignored"
+        match dns_hijack_entry(entry) {
+            true => dns_hijack = true,
+            false => warn!(
+                "tun.dns-hijack: entry '{entry}' is not a wildcard UDP :53 target \
+                 {DNS_HIJACK_FORMS}; meow-rs hijacks UDP/53 only — entry ignored",
+                DNS_HIJACK_FORMS = DNS_HIJACK_FORMS
             ),
         }
     }
@@ -698,7 +725,7 @@ pub fn parse_tun_config(
     // IPv6 routes to send into the device — elsewhere an address on the
     // device would capture nothing, so it is normalised out for the same
     // restart-diff reason as `outbound-interface` above.
-    let inet6_address = parse_inet6_address(r.inet6_address.as_ref())?;
+    let inet6_address = parse_inet6_address("tun.inet6-address", r.inet6_address.as_ref())?;
     if inet6_address.is_some() && !global {
         warn!(
             "tun.inet6-address: only used when auto-route captures all traffic \
@@ -752,7 +779,213 @@ fn parse_tun_stack(raw: Option<&serde_json::Value>) -> TunStack {
     }
 }
 
-/// The CIDR string of a `tun.inet{4,6}-address`: a string or mihomo's list
+/// `listeners[]` `type: tun` defaults — the named profile, deliberately
+/// distinct from the top-level section's (upstream `NewTun`/`sing_tun`
+/// supplies these): the entry's presence is the enabled state, MTU 9000,
+/// UDP idle timeout 300 s, `auto-route` OFF. On this path an explicit
+/// `0` for `mtu`/`udp-timeout` also means "default" (upstream fills the
+/// zero with the fallback).
+const NAMED_TUN_MTU: u16 = 9000;
+const NAMED_TUN_UDP_TIMEOUT_SECS: u64 = 300;
+
+/// Parse and validate a `listeners:` `type: tun` entry — the flat
+/// `TunOption` shape, never a nested `tun:` map. Shares the top-level
+/// parser's normalization (same address forms, fake-IP-derived default
+/// address, global-only IPv6, MTU floor, duration ceiling) but applies
+/// the named defaults profile (`NAMED_TUN_MTU`,
+/// `NAMED_TUN_UDP_TIMEOUT_SECS`, auto-route off, enabled by presence).
+/// `global_max_connections`/`fake_ip_range` are the same inherited
+/// inputs `parse_tun_config` takes.
+///
+/// Unlike the top-level parser this errors on unknown `stack` spellings —
+/// upstream `-t` rejects an invalid flat `stack` (it only tolerates one
+/// under the ignored nested `tun:` map).
+pub fn parse_named_tun_config(
+    raw_l: &raw::RawListener,
+    global_max_connections: usize,
+    fake_ip_range: Option<&str>,
+) -> Result<TunConfig, anyhow::Error> {
+    let name = &raw_l.name;
+    // Warn on the upstream keys meow does not implement (Class B per
+    // ADR-0002) — `auto-detect-interface` gets its specific reason: it
+    // never controlled the outbound-interface binding meow installs for
+    // loop protection under global route scope.
+    if raw_l.auto_detect_interface.is_some() {
+        warn!(
+            "listeners[{name}].auto-detect-interface: meow's loop-protection \
+             outbound-interface binding is not governed by this flag — ignored"
+        );
+    }
+    for (key, val) in [
+        ("dns-mode", &raw_l.dns_mode),
+        ("strict-route", &raw_l.strict_route),
+        ("auto-redirect", &raw_l.auto_redirect),
+        ("endpoint-independent-nat", &raw_l.endpoint_independent_nat),
+        ("mtu-v6", &raw_l.mtu_v6),
+        ("route-address", &raw_l.route_address),
+        ("route-exclude-address", &raw_l.route_exclude_address),
+        ("include-uid", &raw_l.include_uid),
+        ("exclude-uid", &raw_l.exclude_uid),
+        ("gso", &raw_l.gso),
+        ("file-descriptor", &raw_l.file_descriptor),
+    ] {
+        if val.is_some() {
+            warn!(
+                "listeners[{name}].{key}: field is not supported in meow-rs and will \
+                 be ignored; remove it to suppress this warning"
+            );
+        }
+    }
+
+    // Explicit `0` = the named default on this path (upstream fills a
+    // zero with the fallback); below the IPv6 floor is a hard error.
+    let mtu = raw_l.mtu.unwrap_or(0);
+    let mtu = if mtu == 0 { NAMED_TUN_MTU } else { mtu };
+    if mtu < TUN_MIN_MTU {
+        return Err(anyhow::anyhow!(
+            "listeners[{name}].mtu: {mtu} is below the minimum {TUN_MIN_MTU} \
+             required by the userspace stack"
+        ));
+    }
+
+    let udp_timeout = std::time::Duration::from_secs(match raw_l.udp_timeout {
+        // `0` = the 300 s named default here (the tproxy/wireguard
+        // surfaces keep their `0`-is-an-error contract).
+        Some(0) | None => NAMED_TUN_UDP_TIMEOUT_SECS,
+        Some(secs) if secs > meow_common::MAX_DURATION_SECS => {
+            return Err(anyhow::anyhow!(
+                "listeners[{name}].udp-timeout: {secs}s exceeds the {}s ceiling",
+                meow_common::MAX_DURATION_SECS
+            ));
+        }
+        Some(secs) => secs,
+    });
+
+    let err_key = format!("listeners[{name}].auto-route");
+    let (auto_route, route_mode) =
+        parse_auto_route_value(raw_l.auto_route.as_ref(), false, &err_key)?;
+    let global = auto_route && route_mode == TunRouteMode::Global;
+
+    let outbound_interface = raw_l.outbound_interface.clone().filter(|s| !s.is_empty());
+    if outbound_interface.is_some() && !global {
+        warn!(
+            "listeners[{name}].outbound-interface: only used when auto-route \
+             captures all traffic ('auto-route: true' or 'global'); ignored"
+        );
+    }
+    let outbound_interface = outbound_interface.filter(|_| global);
+
+    // Absent: on. An empty list turns it off. Only the exact wildcard
+    // :53 forms enable the UDP hijack — a `tcp:` target (the pump has no
+    // TCP/53 diversion), a specific address, or any other shape warns and
+    // is ignored rather than broadening what the device diverts.
+    let mut dns_hijack = raw_l.dns_hijack.is_none();
+    for entry in raw_l.dns_hijack.as_deref().unwrap_or(&[]) {
+        match dns_hijack_entry(entry) {
+            true => dns_hijack = true,
+            false => warn!(
+                "listeners[{name}].dns-hijack: entry '{entry}' is not a wildcard \
+                 UDP :53 target {DNS_HIJACK_FORMS}; meow-rs hijacks UDP/53 only — \
+                 entry ignored",
+                DNS_HIJACK_FORMS = DNS_HIJACK_FORMS
+            ),
+        }
+    }
+
+    let key4 = format!("listeners[{name}].inet4-address");
+    let inet4_address = match first_cidr(&key4, "IPv4", raw_l.inet4_address.as_ref())? {
+        Some(s) => s
+            .parse::<ipnet::Ipv4Net>()
+            .map_err(|e| anyhow::anyhow!("{key4}: invalid CIDR '{s}': {e}"))?,
+        // Deliberate meow behaviour: the fake-IP-range-derived /30, the
+        // same default the top-level section uses.
+        None => default_tun_inet4_address(fake_ip_range),
+    };
+    // IPv6 is honoured only in global route scope, same as the top-level
+    // section — elsewhere it is normalised out so nothing capture-less
+    // sits on the device.
+    let key6 = format!("listeners[{name}].inet6-address");
+    let inet6_address = parse_inet6_address(&key6, raw_l.inet6_address.as_ref())?;
+    if inet6_address.is_some() && !global {
+        warn!(
+            "listeners[{name}].inet6-address: only used when auto-route \
+             captures all traffic ('auto-route: true' or 'global'); ignored \
+             (the device stays IPv4-only)"
+        );
+    }
+    let inet6_address = inet6_address.filter(|_| global);
+
+    Ok(TunConfig {
+        enable: true,
+        device: raw_l.device.clone().filter(|s| !s.is_empty()),
+        mtu,
+        inet4_address,
+        inet6_address,
+        auto_route,
+        route_mode,
+        outbound_interface,
+        dns_hijack,
+        udp_timeout,
+        max_connections: raw_l.max_connections.unwrap_or(global_max_connections),
+        stack: parse_named_tun_stack(name, raw_l.stack.as_ref())?,
+    })
+}
+
+/// `listeners[].stack` for `type: tun` — like `parse_tun_stack` but
+/// strict: `system`/`mixed` select the kernel TCP path, `mips`/`gvisor`
+/// fold to lwIP with a warning (upstream names; meow has no such stack),
+/// `lwip`/empty select lwIP, and every other value is a hard error —
+/// upstream `-t` rejects an invalid flat `stack`.
+fn parse_named_tun_stack(
+    name: &str,
+    raw: Option<&serde_json::Value>,
+) -> Result<TunStack, anyhow::Error> {
+    let Some(value) = raw else {
+        return Ok(TunStack::Lwip);
+    };
+    match value.as_str().map(str::to_ascii_lowercase).as_deref() {
+        Some("system") => Ok(TunStack::System),
+        Some("mixed") => {
+            warn!(
+                "listeners[{name}].stack: mixed is system here — kernel TCP, \
+                 and UDP parsed in the pump rather than by a userspace stack"
+            );
+            Ok(TunStack::System)
+        }
+        Some("gvisor") => {
+            warn!(
+                "listeners[{name}].stack: gvisor is not available; using the \
+                 userspace (lwip) stack"
+            );
+            Ok(TunStack::Lwip)
+        }
+        Some("mips") => {
+            warn!(
+                "listeners[{name}].stack: mips (mihomo's own stack) is not \
+                 available; using the userspace (lwip) stack"
+            );
+            Ok(TunStack::Lwip)
+        }
+        Some("lwip" | "") => Ok(TunStack::Lwip),
+        _ => Err(anyhow::anyhow!(
+            "listeners[{name}].stack: unknown value {value} (expected \
+             system, mixed, gvisor, mips, or lwip)"
+        )),
+    }
+}
+
+/// The `dns-hijack` targets meow admits — the wildcard UDP/53 spellings
+/// only. `tcp:`-schemed targets name a TCP diversion meow does not
+/// implement; a specific host address or another port is outside the
+/// hijack's "every UDP :53 flow" contract.
+const DNS_HIJACK_FORMS: &str = "(0.0.0.0:53, any:53, *:53, [::]:53)";
+
+/// Whether `entry` is one of [`DNS_HIJACK_FORMS`]' exact spellings.
+fn dns_hijack_entry(entry: &str) -> bool {
+    matches!(entry, "0.0.0.0:53" | "any:53" | "*:53" | "[::]:53")
+}
+
+/// The CIDR string of an `inet{4,6}-address`: a string or mihomo's list
 /// form (`[]netip.Prefix`), of which the first entry is used — with a
 /// warning when there are more — since the device takes a single address.
 /// `''` and `[]` are "unset". A `Value::Null` is an error, not unset:
@@ -760,7 +993,9 @@ fn parse_tun_stack(raw: Option<&serde_json::Value>) -> TunStack {
 /// so only a non-finite float (`.nan`, `.inf`, `1e999`) — which
 /// `serde_json::Value` maps to `Null` — reaches it, and those were a hard
 /// error when `inet4-address` was `Option<String>` (the spelling reached
-/// the CIDR parse as text).
+/// the CIDR parse as text). `key` is the fully qualified key name
+/// (`tun.inet4-address`, `listeners[name].inet4-address`, …) used in
+/// diagnostics.
 fn first_cidr<'a>(
     key: &str,
     family: &str,
@@ -770,7 +1005,7 @@ fn first_cidr<'a>(
         None => return Ok(None),
         Some(serde_json::Value::Null) => {
             return Err(anyhow::anyhow!(
-                "tun.{key}: expected a CIDR string or a list of them, got a \
+                "{key}: expected a CIDR string or a list of them, got a \
                  non-finite number (e.g. .nan, .inf)"
             ));
         }
@@ -778,7 +1013,7 @@ fn first_cidr<'a>(
         Some(serde_json::Value::Array(entries)) => {
             if entries.len() > 1 {
                 warn!(
-                    "tun.{key}: {} entries given; meow-rs assigns one {family} \
+                    "{key}: {} entries given; meow-rs assigns one {family} \
                      address to the device — only the first is used",
                     entries.len()
                 );
@@ -788,14 +1023,14 @@ fn first_cidr<'a>(
                 Some(serde_json::Value::String(s)) => s.as_str(),
                 Some(other) => {
                     return Err(anyhow::anyhow!(
-                        "tun.{key}: expected a CIDR string, got {other:?}"
+                        "{key}: expected a CIDR string, got {other:?}"
                     ));
                 }
             }
         }
         Some(other) => {
             return Err(anyhow::anyhow!(
-                "tun.{key}: expected a CIDR string or a list of them, got {other:?}"
+                "{key}: expected a CIDR string or a list of them, got {other:?}"
             ));
         }
     };
@@ -803,33 +1038,42 @@ fn first_cidr<'a>(
 }
 
 fn parse_inet6_address(
+    key: &str,
     raw: Option<&serde_json::Value>,
 ) -> Result<Option<ipnet::Ipv6Net>, anyhow::Error> {
-    let Some(cidr) = first_cidr("inet6-address", "IPv6", raw)? else {
+    let Some(cidr) = first_cidr(key, "IPv6", raw)? else {
         return Ok(None);
     };
     cidr.parse::<ipnet::Ipv6Net>()
         .map(Some)
-        .map_err(|e| anyhow::anyhow!("tun.inet6-address: invalid CIDR '{cidr}': {e}"))
+        .map_err(|e| anyhow::anyhow!("{key}: invalid CIDR '{cidr}': {e}"))
 }
 
 /// `auto-route` (#375): mihomo boolean, or a mode string selecting what
-/// gets routed. `true` (and unset) captures all traffic where that is
-/// supported ([`TunRouteMode::default`]); `fake-ip` opts into the narrower
-/// loop-free scope, and `global` names the full one explicitly. Shared by
-/// [`parse_tun_config`] and [`global_route_outbound_interface`] so the two
-/// can never disagree on what selects global scope.
-fn parse_auto_route(r: &raw::RawTun) -> Result<(bool, TunRouteMode), anyhow::Error> {
+/// gets routed. `true` captures all traffic where that is supported
+/// ([`TunRouteMode::default`]); `fake-ip` opts into the narrower
+/// loop-free scope, and `global` names the full one explicitly.
+/// `default_on` is the surface's absent-value policy: `true` for the
+/// top-level `tun:` section, `false` for a named `type: tun` entry.
+/// Shared by [`parse_tun_config`], [`parse_named_tun_config`],
+/// [`global_route_outbound_interface`] and
+/// [`named_tun_global_route_interface`] so the four can never disagree on
+/// what selects global scope.
+fn parse_auto_route_value(
+    value: Option<&raw::RawAutoRoute>,
+    default_on: bool,
+    err_key: &str,
+) -> Result<(bool, TunRouteMode), anyhow::Error> {
     let defaults = TunConfig::default();
-    Ok(match r.auto_route.as_ref() {
-        None => (defaults.auto_route, defaults.route_mode),
+    Ok(match value {
+        None => (default_on, defaults.route_mode),
         Some(raw::RawAutoRoute::Enabled(on)) => (*on, defaults.route_mode),
         Some(raw::RawAutoRoute::Mode(s)) => match s.as_str() {
             "fake-ip" => (true, TunRouteMode::FakeIp),
             "global" => (true, TunRouteMode::Global),
             other => {
                 return Err(anyhow::anyhow!(
-                    "tun.auto-route: unknown value '{other}' (expected true, false, \
+                    "{err_key}: unknown value '{other}' (expected true, false, \
                      fake-ip, or global)"
                 ));
             }
@@ -837,9 +1081,42 @@ fn parse_auto_route(r: &raw::RawTun) -> Result<(bool, TunRouteMode), anyhow::Err
     })
 }
 
+fn parse_auto_route(r: &raw::RawTun) -> Result<(bool, TunRouteMode), anyhow::Error> {
+    parse_auto_route_value(
+        r.auto_route.as_ref(),
+        TunConfig::default().auto_route,
+        "tun.auto-route",
+    )
+}
+
 /// `tun.outbound-interface` with the empty string normalised to "unset".
 fn raw_outbound_interface(r: &raw::RawTun) -> Option<String> {
     r.outbound_interface.clone().filter(|s| !s.is_empty())
+}
+
+/// Whether a `listeners:` `type: tun` entry selects global route scope,
+/// and if so its configured `outbound-interface` (`Some(None)` =
+/// auto-detect). `None` when the entry is absent, its `auto-route` is
+/// unset/`false`/fake-IP, or it fails [`parse_named_tun_config`]'s
+/// mode check.
+///
+/// Side-effect free, like [`global_route_outbound_interface`]: the binary
+/// calls it on the raw document *before* [`build_config`] so a named
+/// global-route TUN gets the same pre-first-dial outbound-interface
+/// binding the top-level section does (issue #695 — the sole TUN must
+/// be selected before the first bootstrap dial).
+pub fn named_tun_global_route_interface(raw: &raw::RawConfig) -> Option<Option<String>> {
+    let l = raw
+        .listeners
+        .as_deref()?
+        .iter()
+        .find(|l| l.listener_type.eq_ignore_ascii_case("tun"))?;
+    match parse_auto_route_value(l.auto_route.as_ref(), false, "") {
+        Ok((true, TunRouteMode::Global)) => {
+            Some(l.outbound_interface.clone().filter(|s| !s.is_empty()))
+        }
+        _ => None,
+    }
 }
 
 /// Whether `raw` selects an enabled TUN in global route scope, and if so
@@ -874,6 +1151,12 @@ pub struct ListenerConfig {
     /// [`meow_common::TcpKeepaliveConfig`]). Engine-wide: per-listener
     /// overrides are deliberately not offered.
     pub tcp_keepalive: meow_common::TcpKeepaliveConfig,
+    /// `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound TCP
+    /// ACL the mixed/HTTP/SOCKS accept loops check the remote IP against
+    /// (upstream's `ipfilter` gate). A startup snapshot, deliberately
+    /// not hot-applied by `PATCH`/`PUT` — same lifecycle as the
+    /// listener auth store it guards alongside.
+    pub lan_acl: std::sync::Arc<meow_common::LanAcl>,
     /// All active listeners (shorthand + named), deduplicated and validated.
     pub named: Vec<NamedListener>,
 }
@@ -1457,6 +1740,10 @@ mod save_scratch_tests {
 pub struct RebuildResult {
     pub proxies: HashMap<SmolStr, Arc<dyn Proxy>>,
     pub rules: Vec<Box<dyn Rule>>,
+    /// The `sub-rules:` blocks this build parsed — passed through to
+    /// `Tunnel::update_routing`/`reload_routing` so a listener's `rule:`
+    /// override publishes in the same route snapshot as `rules`.
+    pub sub_rules: sub_rules_parser::SubRuleBlocks,
     pub dialer_registry: meow_proxy::dialer::ProxyRegistry,
     /// The rule-provider set parsed for this generation — shared by the
     /// rules, any DNS `rule-set:` policy matchers, and (once the caller
@@ -3495,6 +3782,11 @@ fn rebuild_from_raw_impl(
         }
     }
 
+    // `listeners[].proxy` forced targets resolve against this same map —
+    // validating here makes `-t`, startup and every rebuild-driven
+    // mutation reject the same dangling name identically.
+    validate_listener_proxy_targets(raw, &proxies, &candidate_providers)?;
+
     // The provider set is returned, not swapped: the committing caller
     // publishes it into the live registry only after every fallible check
     // has passed, so a rejected candidate never leaves its fetch contexts
@@ -3502,6 +3794,7 @@ fn rebuild_from_raw_impl(
     Ok(RebuildResult {
         proxies,
         rules,
+        sub_rules,
         dialer_registry: registry.clone(),
         rule_providers,
         proxy_providers: candidate_providers,
@@ -4847,7 +5140,7 @@ fn parse_listener_spec(
         })),
         "wireguard" => Ok(ListenerSpec::WireGuard(build_wg_listener_spec(raw_l)?)),
         other => anyhow::bail!(
-            "unknown listener type '{other}'; expected mixed, http, socks, socks5, tproxy, redir, shadowsocks, or wireguard"
+            "unknown listener type '{other}'; expected mixed, http, socks, socks5, tproxy, redir, shadowsocks, wireguard, or tun"
         ),
     }
 }
@@ -5226,6 +5519,102 @@ pub fn resolve_named_listeners(raw: &raw::RawConfig) -> Result<Vec<NamedListener
     build_named_listeners(raw, &bind_addr, global_tproxy_sni)
 }
 
+/// Why a `listeners[].proxy` name cannot force a route in this rebuilt
+/// map — `None` when it resolves. Built-ins count the way
+/// `resolve_listener_proxy` sees them: DIRECT/REJECT/PASS/COMPATIBLE and
+/// the auto-created GLOBAL are all ordinary map entries. A proxy-provider
+/// name is rejected explicitly: a provider feeds groups and is not a
+/// target — naming it would check against nothing and fail closed per
+/// flow. Shared by the build admission below and the API's prospective
+/// route guard so every publication path diagnoses the same way.
+pub fn listener_proxy_target_err(
+    name: &str,
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    proxy_providers: &HashMap<String, Arc<ProxyProvider>>,
+) -> Option<String> {
+    if proxy_providers.contains_key(name) {
+        return Some(format!(
+            "'{name}' is a proxy-provider — providers feed groups and are \
+             not forced-route targets"
+        ));
+    }
+    (!proxies.contains_key(name))
+        .then(|| format!("'{name}' does not name a built proxy or proxy group"))
+}
+
+/// Admission check for `listeners[].proxy`: every forced target must
+/// name a proxy or group in the rebuilt map (`rule:` selects a
+/// `sub-rules:` block instead — `build_named_listeners` already gates
+/// that name against `raw.sub_rules`). Runs inside every
+/// `rebuild_from_raw_*` pass so `-t`, startup, `PUT /configs` and every
+/// warm mutation reject the same dangling reference with the same error
+/// instead of committing a document the inbound would only fail closed
+/// on per flow.
+pub fn validate_listener_proxy_targets(
+    raw: &raw::RawConfig,
+    proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
+    proxy_providers: &HashMap<String, Arc<ProxyProvider>>,
+) -> Result<(), anyhow::Error> {
+    for l in raw.listeners.as_deref().unwrap_or(&[]) {
+        let Some(name) = l.proxy.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if let Some(why) = listener_proxy_target_err(name, proxies, proxy_providers) {
+            anyhow::bail!("listeners[{}].proxy: {why}", l.name);
+        }
+    }
+    Ok(())
+}
+
+/// The document-shape half of listener-proxy admission: a forced target
+/// must name something the document itself declares — a `proxies:` entry,
+/// a `proxy-groups:` entry, or a built-in the route table always carries.
+/// Provider members are not registry keys, so a name outside the declared
+/// set can never resolve; that defect is in the document, not the build —
+/// `PUT /configs` refuses it even when `force` would persist a declared
+/// name that merely failed to build. Returns the first offending
+/// listener's message.
+pub fn listener_proxy_target_shape_err(raw: &raw::RawConfig) -> Option<String> {
+    for l in raw.listeners.as_deref().unwrap_or(&[]) {
+        let Some(name) = l.proxy.as_deref().filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        if raw
+            .proxy_providers
+            .as_ref()
+            .is_some_and(|pp| pp.contains_key(name))
+        {
+            return Some(format!(
+                "listeners[{}].proxy: '{name}' is a proxy-provider — providers \
+                 feed groups and are not forced-route targets",
+                l.name
+            ));
+        }
+        let declared = raw
+            .proxies
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .any(|p| p.get("name").and_then(serde_json::Value::as_str) == Some(name))
+            || raw
+                .proxy_groups
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|g| g.name == name)
+            || BUILTIN_ADAPTER_NAMES.contains(&name)
+            || name == "GLOBAL";
+        if !declared {
+            return Some(format!(
+                "listeners[{}].proxy: '{name}' names no declared proxy, \
+                 proxy group, or built-in",
+                l.name
+            ));
+        }
+    }
+    None
+}
+
 /// Resolve `tcp-keepalive*` into the [`meow_common::TcpKeepaliveConfig`]
 /// every inbound listener applies to its accepted sockets, enforcing
 /// `build_config`'s semantics: all three knobs are bounded at the limits
@@ -5329,6 +5718,79 @@ pub fn resolve_tcp_keepalive(
     Ok(config)
 }
 
+/// `lan-allowed-ips`/`lan-disallowed-ips` nested under a `listeners:`
+/// entry would land in its `extra` map and silently do nothing — an
+/// access guard that never engages is worse than none, so misplacement
+/// is a hard error pointing at the top level. Shared by
+/// `build_named_listeners` (boot/`-t`/`PUT`) and [`resolve_lan_acl`]
+/// (which `PUT /configs` additionally gates on under `force`).
+fn check_listener_acl_placement(l: &raw::RawListener) -> Result<(), anyhow::Error> {
+    for key in ["lan-allowed-ips", "lan-disallowed-ips"] {
+        if l.extra.contains_key(key) {
+            anyhow::bail!(
+                "listeners[{}].{key}: the LAN ACL keys are top-level only — \
+                 move '{key}' to the config root",
+                l.name
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `<ip>/<prefix>` with host bits accepted and normalized — the
+/// `lan-*-ips` contract (mihomo's `netip.Prefix` takes host bits; bare
+/// IPs and malformed prefixes are rejected).
+fn parse_lan_cidr(s: &str) -> Result<ipnet::IpNet, anyhow::Error> {
+    let (addr, plen) = s
+        .split_once('/')
+        .ok_or_else(|| anyhow::anyhow!("'{s}' is not a CIDR (expected 'addr/prefix')"))?;
+    let addr: std::net::IpAddr = addr
+        .parse()
+        .map_err(|e| anyhow::anyhow!("'{s}': bad address ({e})"))?;
+    let plen: u8 = plen
+        .parse()
+        .map_err(|_| anyhow::anyhow!("'{s}': bad prefix length '{plen}'"))?;
+    ipnet::IpNet::new(addr, plen)
+        .map(|n| n.trunc())
+        .map_err(|e| anyhow::anyhow!("'{s}': {e}"))
+}
+
+/// Resolve `lan-allowed-ips`/`lan-disallowed-ips` into the shared
+/// immutable [`meow_common::LanAcl`] the mixed/HTTP/SOCKS TCP accept
+/// loops consult (mihomo's `adapter/inbound/ipfilter`): admit = at
+/// least one allow match AND no deny match. An omitted allow list
+/// defaults to `0.0.0.0/0` + `::/0`; explicit `[]` admits nobody on the
+/// gated path. The deny list defaults to empty. Errors name the key
+/// and the offending element index.
+///
+/// `PUT /configs` calls this for validation only — the ACL is a startup
+/// snapshot like `listeners:`, never hot-applied — so a committed
+/// document cannot carry a value the next boot's `build_config` would
+/// hard-error on.
+pub fn resolve_lan_acl(raw: &raw::RawConfig) -> Result<meow_common::LanAcl, anyhow::Error> {
+    for l in raw.listeners.iter().flatten() {
+        check_listener_acl_placement(l)?;
+    }
+    let parse_list =
+        |key: &str, entries: Option<&[String]>| -> Result<Vec<ipnet::IpNet>, anyhow::Error> {
+            entries
+                .unwrap_or(&[])
+                .iter()
+                .enumerate()
+                .map(|(i, s)| parse_lan_cidr(s).map_err(|e| anyhow::anyhow!("{key}[{i}]: {e}")))
+                .collect()
+        };
+    let allowed = match raw.lan_allowed_ips.as_deref() {
+        None => vec![
+            "0.0.0.0/0".parse().expect("static CIDR"),
+            "::/0".parse().expect("static CIDR"),
+        ],
+        Some(list) => parse_list("lan-allowed-ips", Some(list))?,
+    };
+    let denied = parse_list("lan-disallowed-ips", raw.lan_disallowed_ips.as_deref())?;
+    Ok(meow_common::LanAcl::new(allowed, denied))
+}
+
 /// Resolve `tcp-idle-timeout` into the whole-connection relay idle bound,
 /// enforcing `build_config`'s semantics: `0` disables the bound entirely,
 /// absent also disables it (preserving pre-894 behaviour — no idle bound
@@ -5378,7 +5840,9 @@ fn build_named_listeners(
                    spec: ListenerSpec,
                    port: u16,
                    listen: &str,
-                   max_connections: usize|
+                   max_connections: usize,
+                   route_override: Option<meow_common::InboundRouteOverride>,
+                   routing_mark: Option<u32>|
      -> Result<(), anyhow::Error> {
         validate_connection_limit(max_connections)
             .map_err(|e| anyhow::anyhow!("listener '{name}': {e}"))?;
@@ -5403,6 +5867,8 @@ fn build_named_listeners(
             port,
             listen: listen.to_string(),
             max_connections,
+            route_override,
+            routing_mark,
         });
         Ok(())
     };
@@ -5418,6 +5884,8 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
         )?;
     }
     if let Some(port) = raw.socks_port.filter(|p| *p != 0) {
@@ -5427,6 +5895,8 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
         )?;
     }
     if let Some(port) = raw.port.filter(|p| *p != 0) {
@@ -5436,6 +5906,8 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
         )?;
     }
     if raw.firewall.is_some() {
@@ -5473,6 +5945,8 @@ fn build_named_listeners(
             port,
             default_bind,
             global_max_conns,
+            None,
+            None,
         )?;
     }
     if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
@@ -5493,14 +5967,114 @@ fn build_named_listeners(
             port,
             "127.0.0.1",
             global_max_conns,
+            None,
+            None,
         )?;
     }
 
     // Explicit `listeners:` entries
+    let mut named_tun_seen: Option<String> = None;
     for raw_l in raw.listeners.as_deref().unwrap_or(&[]) {
         // `type: redir` lowers to a `TProxy` spec, which erases its origin —
         // the listen-default and warn-dedupe branches below still need it.
         let is_redir = raw_l.listener_type.eq_ignore_ascii_case("redir");
+        // `lan-*-ips` nested under a listener would land in `extra` as a
+        // silently-dead access guard — hard error before `warn_extra`
+        // can mislabel them unrecognized.
+        check_listener_acl_placement(raw_l)?;
+        // `type: tun` — a named TUN device, not a socket listener: it owns
+        // no port/listen and stays out of the socket-port registry, but it
+        // does share the name-uniqueness check (upstream `parseListeners`
+        // rejects duplicate names). meow admits ONE effective TUN — a
+        // named entry, or an enabled top-level `tun:` — because the single
+        // handle, the routes, the outbound binding, DNS hijack and the
+        // lwIP generation are not isolated for concurrent devices. The
+        // options are flat on the entry (upstream `TunOption`); a nested
+        // `tun:` map, `enable`, `listen` or `port` are shape errors.
+        if raw_l.listener_type.eq_ignore_ascii_case("tun") {
+            if raw.tun.as_ref().is_some_and(|t| t.enable) {
+                anyhow::bail!(
+                    "listeners[{}]: `type: tun` cannot coexist with `tun.enable: true` — \
+                     meow-rs runs one effective TUN; disable the top-level section \
+                     or remove this listener",
+                    raw_l.name
+                );
+            }
+            if let Some(first) = named_tun_seen.replace(raw_l.name.clone()) {
+                anyhow::bail!(
+                    "listeners[{}]: second named `type: tun` listener ('{first}' \
+                     already declares one) — meow-rs runs one effective TUN",
+                    raw_l.name
+                );
+            }
+            for (key, present) in [
+                ("enable", raw_l.extra.contains_key("enable")),
+                ("tun", raw_l.extra.contains_key("tun")),
+                ("listen", raw_l.listen.is_some()),
+                ("port", raw_l.port.is_some()),
+            ] {
+                if present {
+                    anyhow::bail!(
+                        "listeners[{}].{key}: a named `type: tun` takes its options \
+                         flat on the entry — `{key}` has no meaning here (the \
+                         entry itself is the enabled device; drop it, or use the \
+                         top-level `tun:` section instead)",
+                        raw_l.name
+                    );
+                }
+            }
+            validation::warn_extra(&format!("listener '{}'", raw_l.name), &raw_l.extra);
+            // Keys meaningful only on socket listener types.
+            for (key, set) in [
+                ("firewall", raw_l.firewall.is_some()),
+                ("tproxy-sni", raw_l.tproxy_sni.is_some()),
+                ("transparent", raw_l.transparent.is_some()),
+                ("udp", raw_l.udp.is_some()),
+                ("cipher", raw_l.cipher.is_some()),
+                ("password", raw_l.password.is_some()),
+                ("private-key", raw_l.private_key.is_some()),
+                ("peers", raw_l.peers.is_some()),
+                // No inbound socket exists to mark — the ingress
+                // `routing-mark` contract does not reach a TUN device.
+                ("routing-mark", raw_l.routing_mark.is_some()),
+            ] {
+                if set {
+                    warn!(
+                        "listeners[{}].{key}: not meaningful on `type: tun`, ignored; \
+                         remove it to suppress this warning",
+                        raw_l.name
+                    );
+                }
+            }
+            // Same `sub-rules:` selection contract as the socket types.
+            if let Some(name) = raw_l.rule.as_deref().filter(|s| !s.is_empty()) {
+                let defined = raw.sub_rules.as_ref().is_some_and(|m| m.contains_key(name));
+                if !defined {
+                    anyhow::bail!(
+                        "listeners[{}].rule: '{name}' references undefined sub-rules block",
+                        raw_l.name
+                    );
+                }
+            }
+            let route_override = meow_common::InboundRouteOverride::new(
+                raw_l.proxy.as_deref(),
+                raw_l.rule.as_deref(),
+            );
+            let tun = parse_named_tun_config(raw_l, global_max_conns, raw.fake_ip_range())?;
+            add(
+                &raw_l.name,
+                ListenerSpec::Tun(tun),
+                // No socket port exists — `0`/"" keep the entry inert for
+                // the port registry (`0` never registers) and `GET
+                // /listeners` (which reports name/type only for it).
+                0,
+                "",
+                raw_l.max_connections.unwrap_or(global_max_conns),
+                route_override,
+                None,
+            )?;
+            continue;
+        }
         let spec = parse_listener_spec(raw_l, global_tproxy_sni, sniffer_declared)?;
         // `type: wireguard` entries already warned their extra keys inside
         // `build_wg_listener_spec` (peer extras too); on every other type the
@@ -5564,8 +6138,10 @@ fn build_named_listeners(
                 raw_l.name
             );
         }
-        // WireGuard-only fields set on another listener type warn — the
-        // same shape as the `firewall`/`tproxy-sni` checks above.
+        // WireGuard/TUN-only fields set on another listener type warn —
+        // the same shape as the `firewall`/`tproxy-sni` checks above
+        // (`type: tun` consumed them in its own arm above and never
+        // reaches here).
         for (key, set) in [
             ("private-key", raw_l.private_key.is_some()),
             ("mtu", raw_l.mtu.is_some()),
@@ -5573,7 +6149,47 @@ fn build_named_listeners(
         ] {
             if set && !matches!(spec, ListenerSpec::WireGuard(_)) {
                 warn!(
-                    "listeners[{}].{key}: only meaningful on `type: wireguard`, ignored; \
+                    "listeners[{}].{key}: only meaningful on `type: wireguard`/`tun`, ignored; \
+                     remove it to suppress this warning",
+                    raw_l.name
+                );
+            }
+        }
+        // Named-TUN-only fields set on another listener type warn —
+        // same shape as the wireguard-field check above.
+        for (key, set) in [
+            ("device", raw_l.device.is_some()),
+            ("stack", raw_l.stack.is_some()),
+            ("dns-hijack", raw_l.dns_hijack.is_some()),
+            ("auto-route", raw_l.auto_route.is_some()),
+            ("outbound-interface", raw_l.outbound_interface.is_some()),
+            ("inet4-address", raw_l.inet4_address.is_some()),
+            ("inet6-address", raw_l.inet6_address.is_some()),
+            ("dns-mode", raw_l.dns_mode.is_some()),
+            ("strict-route", raw_l.strict_route.is_some()),
+            (
+                "auto-detect-interface",
+                raw_l.auto_detect_interface.is_some(),
+            ),
+            ("auto-redirect", raw_l.auto_redirect.is_some()),
+            (
+                "endpoint-independent-nat",
+                raw_l.endpoint_independent_nat.is_some(),
+            ),
+            ("mtu-v6", raw_l.mtu_v6.is_some()),
+            ("route-address", raw_l.route_address.is_some()),
+            (
+                "route-exclude-address",
+                raw_l.route_exclude_address.is_some(),
+            ),
+            ("include-uid", raw_l.include_uid.is_some()),
+            ("exclude-uid", raw_l.exclude_uid.is_some()),
+            ("gso", raw_l.gso.is_some()),
+            ("file-descriptor", raw_l.file_descriptor.is_some()),
+        ] {
+            if set {
+                warn!(
+                    "listeners[{}].{key}: only meaningful on `type: tun`, ignored; \
                      remove it to suppress this warning",
                     raw_l.name
                 );
@@ -5640,8 +6256,72 @@ fn build_named_listeners(
                 );
             }
         }
+        // `listeners[].rule` selects a `sub-rules:` block BY NAME — not a
+        // rule-provider and not an `IN-NAME` rule (upstream
+        // `WithSpecialRules`). Requiring the block in this same document
+        // is the `SUB-RULE,…` hard-error contract (Class A per ADR-0002);
+        // a block a later PUT removes fails closed in the resolver.
+        if let Some(name) = raw_l.rule.as_deref().filter(|s| !s.is_empty()) {
+            let defined = raw.sub_rules.as_ref().is_some_and(|m| m.contains_key(name));
+            if !defined {
+                anyhow::bail!(
+                    "listeners[{}].rule: '{name}' references undefined sub-rules block",
+                    raw_l.name
+                );
+            }
+        }
+        let route_override =
+            meow_common::InboundRouteOverride::new(raw_l.proxy.as_deref(), raw_l.rule.as_deref());
+        // `listeners[].routing-mark` marks the LISTENER socket at bind
+        // (ingress SO_MARK, upstream `InboundOption.RoutingMark`) —
+        // Linux-only; the top-level `routing-mark` outbound key is a
+        // different consumer and is not altered. `0` normalizes to
+        // "unset" like the top-level key — a literal mark-0 `setsockopt`
+        // would tag the socket 0, the firewall-exempt wildcard.
+        // TPROXY (`redir` lowers to it) and WireGuard have no ingress
+        // mark contract — steered/responder sockets are not marked, so
+        // the key warns and ignores there.
+        let routing_mark = match spec {
+            ListenerSpec::TProxy { .. } | ListenerSpec::WireGuard(_) => {
+                if raw_l.routing_mark.is_some() {
+                    warn!(
+                        "listeners[{}].routing-mark: has no effect on `type: {}` — \
+                         only socket listeners with a client-facing bind honour it \
+                         (mixed/socks5/http/shadowsocks); ignored",
+                        raw_l.name,
+                        if is_redir {
+                            "redir"
+                        } else {
+                            raw_l.listener_type.as_str()
+                        }
+                    );
+                }
+                None
+            }
+            _ => raw_l.routing_mark.filter(|m| *m != 0),
+        };
+        // Same predicate the mark impls use (`SO_MARK` is set only under
+        // `all(linux, not(ohos))`): OHOS reports `target_os = "linux"` but
+        // its impl is cfg'd out, so a plain `not(linux)` guard would let an
+        // OHOS mark pass silently instead of warning like other platforms.
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+        if routing_mark.is_some() {
+            warn!(
+                "listeners[{}].routing-mark: SO_MARK is Linux-only — ignored \
+                 on this platform; remove it to suppress this warning",
+                raw_l.name
+            );
+        }
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
-        add(&raw_l.name, spec, port, &listen, max_connections)?;
+        add(
+            &raw_l.name,
+            spec,
+            port,
+            &listen,
+            max_connections,
+            route_override,
+            routing_mark,
+        )?;
     }
 
     Ok(result)
@@ -5908,7 +6588,7 @@ async fn build_config_inner(
     )
     .await?;
 
-    let (proxies, rules, _) = {
+    let (proxies, rules, sub_rules, _) = {
         let res = rebuild_from_raw_impl_async(
             raw.clone(),
             cache_dir_buf.clone(),
@@ -5925,7 +6605,7 @@ async fn build_config_inner(
             Some(rule_providers.clone()),
         )
         .await?;
-        (res.proxies, res.rules, res.dialer_registry)
+        (res.proxies, res.rules, res.sub_rules, res.dialer_registry)
     };
 
     // Listener config
@@ -5940,6 +6620,11 @@ async fn build_config_inner(
     // persistence on so a committed document cannot fail this boot path.
     let tcp_keepalive = resolve_tcp_keepalive(&raw)?;
 
+    // `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound TCP ACL.
+    // Startup-only like `listeners:` (upstream live-patches the prefix
+    // lists; meow deliberately matches its listener-auth lifecycle).
+    let lan_acl = Arc::new(resolve_lan_acl(&raw)?);
+
     let listeners = ListenerConfig {
         mixed_port: raw.mixed_port,
         socks_port: raw.socks_port,
@@ -5953,6 +6638,7 @@ async fn build_config_inner(
         // `FirewallGuard::setup`, which filters again defensively).
         routing_mark: raw.routing_mark.filter(|m| *m != 0),
         tcp_keepalive,
+        lan_acl,
         named: named_listeners,
     };
 
@@ -6011,6 +6697,7 @@ async fn build_config_inner(
         proxy_providers,
         provider_dialer_registry,
         rules,
+        sub_rules,
         rule_providers,
         dropped_providers,
         dialer_registry,
@@ -11047,5 +11734,149 @@ mod connection_limit_tests {
             parse_tun_config(None, None, None).unwrap().max_connections,
             256
         );
+    }
+}
+
+#[cfg(test)]
+mod listener_surface_tests {
+    use super::*;
+
+    fn proxies_with_direct() -> HashMap<SmolStr, Arc<dyn Proxy>> {
+        HashMap::from([(
+            SmolStr::from("DIRECT"),
+            Arc::new(proxy_parser::WrappedProxy::new(Box::new(
+                meow_proxy::DirectAdapter::new(),
+            ))) as Arc<dyn Proxy>,
+        )])
+    }
+
+    #[test]
+    fn routing_mark_zero_normalizes_to_unset() {
+        // `0` is the firewall-exempt wildcard, not a real mark — it must
+        // never reach `setsockopt`.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    routing-mark: 0\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        assert_eq!(listeners[0].routing_mark, None);
+    }
+
+    #[test]
+    fn routing_mark_drops_on_transparent_and_responder_listeners() {
+        // Marking a TPROXY/WireGuard socket would tag the steered reply
+        // packets the policy rules must route back — the key is ignored
+        // there even when nonzero.
+        for ty in ["tproxy", "redir"] {
+            let raw: raw::RawConfig = crate::parse_raw_yaml(&format!(
+                "listeners:\n  - name: t\n    type: {ty}\n    port: 0\n    routing-mark: 7\n"
+            ))
+            .unwrap();
+            let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+            assert_eq!(listeners[0].routing_mark, None, "{ty}");
+        }
+        // WireGuard responder: same drop arm, a real key pair is needed to
+        // reach the mark resolution (RFC 7748 Alice scalar + Bob public).
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: w\n    type: wireguard\n    port: 0\n    routing-mark: 7\n    private-key: \"dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=\"\n    peers:\n      - public-key: \"3p7bfXt9wbTTW2HC7OQ1Nz+DQ8hbeGdNrfx+FG+IK08=\"\n        allowed-ips: [10.0.0.0/8]\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        assert_eq!(listeners[0].routing_mark, None, "wireguard");
+    }
+
+    #[test]
+    fn routing_mark_survives_on_socket_listeners() {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    routing-mark: 7\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        assert_eq!(listeners[0].routing_mark, Some(7));
+    }
+
+    #[test]
+    fn routing_mark_negative_is_a_parse_error() {
+        // Upstream rejected nonnumeric marks; a negative one is no "unset"
+        // spelling and must not coerce — u32 decode fails outright.
+        let err = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    routing-mark: -1\n",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("routing-mark"), "{err}");
+    }
+
+    /// Admission accepts the references the listener surface supports: a
+    /// `proxy:` naming a rebuilt group and a `rule:` naming a `sub-rules:`
+    /// block — the pair a `-t`/startup/PUT pass must let through
+    /// (spec §2).
+    #[test]
+    fn listener_group_and_block_references_admit() {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "proxy-groups:\n  - name: pick\n    type: select\n    proxies: [DIRECT]\nsub-rules:\n  side:\n    - DOMAIN,example.com,DIRECT\nlisteners:\n  - name: m\n    type: mixed\n    port: 0\n    proxy: pick\n    rule: side\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        let over = listeners[0].route_override.as_ref().unwrap();
+        assert_eq!(over.proxy.as_deref(), Some("pick"));
+        assert_eq!(over.rule.as_deref(), Some("side"));
+        // The map-level gate admits the same pair — no false positive
+        // from validating `proxy` against leaf names only.
+        let built = rebuild_from_raw(&raw).unwrap();
+        validate_listener_proxy_targets(&raw, &built.proxies, &built.proxy_providers).unwrap();
+    }
+
+    #[test]
+    fn listener_proxy_target_err_names_only_built_targets() {
+        let proxies = proxies_with_direct();
+        let dir = tempfile::tempdir().unwrap();
+        let raw_def: raw::RawProxyProvider =
+            serde_saphyr::from_str("type: file\npath: p.yaml\n").unwrap();
+        let provider = ProxyProvider::new(
+            "feed",
+            &raw_def,
+            Some(dir.path()),
+            false,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        let providers: HashMap<String, Arc<ProxyProvider>> =
+            HashMap::from([("feed".to_string(), Arc::new(provider))]);
+        // A missing name and a provider name fail; a built adapter passes.
+        assert!(listener_proxy_target_err("ghost", &proxies, &providers).is_some());
+        let err = listener_proxy_target_err("feed", &proxies, &providers).unwrap();
+        assert!(err.contains("proxy-provider"), "{err}");
+        assert!(listener_proxy_target_err("DIRECT", &proxies, &providers).is_none());
+    }
+
+    /// The PUT `force`-floor half: an undeclared name or a provider name
+    /// fails at the document level, while every *declared* name — leaf,
+    /// group, built-in, auto GLOBAL — is admitted so a name that merely
+    /// fails to build stays force-degradable (environment, not shape).
+    #[test]
+    fn listener_proxy_target_shape_err_gates_undeclared_names() {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "proxies:\n  - {name: leaf, type: direct}\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [leaf]\nproxy-providers:\n  feed:\n    type: file\n    path: p.yaml\nlisteners:\n  - name: bad\n    type: mixed\n    port: 0\n    proxy: ghost\n  - name: worse\n    type: mixed\n    port: 0\n    proxy: feed\n",
+        )
+        .unwrap();
+        for (decl, want) in [
+            ("ghost", true),
+            ("feed", true),
+            ("leaf", false),
+            ("g", false),
+            ("DIRECT", false),
+            ("GLOBAL", false),
+        ] {
+            let mut probe = raw.clone();
+            probe.listeners.as_mut().unwrap()[0].proxy = Some(decl.to_string());
+            probe.listeners.as_mut().unwrap()[1].proxy = None;
+            assert_eq!(
+                listener_proxy_target_shape_err(&probe).is_some(),
+                want,
+                "{decl}"
+            );
+        }
     }
 }

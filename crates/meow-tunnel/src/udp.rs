@@ -563,6 +563,7 @@ mod tests {
             proxies.clone(),
             vec![Box::new(meow_rules::final_rule::FinalRule::new("Proxy"))],
             Default::default(),
+            Default::default(),
         );
         let stats = tunnel.statistics();
 
@@ -1209,6 +1210,7 @@ mod tests {
                 Box::new(DemandProcess),
                 Box::new(meow_rules::final_rule::FinalRule::new("DIRECT")),
             ],
+            Default::default(),
             res.dialer_registry,
         );
         tunnel.set_mode(TunnelMode::Rule);

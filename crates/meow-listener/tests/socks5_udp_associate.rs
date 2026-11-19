@@ -75,6 +75,8 @@ async fn socks5_udp_associate_relays_to_echo_server() {
             None,
             "socks-in",
             ctrl_addr.port(),
+            None,
+            None,
         )
         .await;
     });

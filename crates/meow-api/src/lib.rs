@@ -127,6 +127,24 @@ impl PreinstalledBinding {
     }
 }
 
+/// When [`preinstall_global_route_binding`] runs — which arm of `raw` may
+/// select the binding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PreinstallScope {
+    /// Process startup: the sole effective TUN may come from the `tun:`
+    /// section or a named `listeners: type: tun` entry — both are
+    /// consulted, `tun:` first
+    /// ([`meow_config::named_tun_global_route_interface`]).
+    Startup,
+    /// A live-config mutation (PUT/PATCH and every candidate commit): only
+    /// the `tun:` section may install. A staged named entry takes effect on
+    /// the next boot — installing its interface now would retarget live
+    /// egress for a device that does not run (and may never run). And
+    /// while a named TUN owns the running slot, no mutation may displace
+    /// its binding at all.
+    Mutation { named_tun_running: bool },
+}
+
 /// Install the `tun.auto-route: global` outbound-interface binding for `raw`
 /// before anything dials on its behalf (issue #695).
 ///
@@ -150,17 +168,32 @@ impl PreinstalledBinding {
 /// listener's binding is back in effect; if it commits a restart, the old
 /// listener's teardown does not disturb this one.
 ///
-/// A no-op (default value) unless `raw` selects an enabled TUN in global
-/// route scope (`auto-route` unset, `true` or `global`) — TUN-off,
-/// fake-IP-scope and `auto-route: false` configs are untouched. An install failure is not fatal here: the
-/// listener retries before it touches any route and fails closed with the
-/// same error, exactly as before, and until then no global route exists for
-/// a socket to loop on. API callers must hold the `CONFIG_MUTATION` lane
-/// (the registry's before/after comparison and the install must not
-/// interleave with a sibling mutation's).
+/// A no-op (default value) unless `raw` and `scope` select an enabled TUN
+/// in global route scope (`auto-route` unset, `true` or `global`) —
+/// TUN-off, fake-IP-scope and `auto-route: false` configs are untouched.
+/// An install failure is not fatal here: the listener retries before it
+/// touches any route and fails closed with the same error, exactly as
+/// before, and until then no global route exists for a socket to loop on.
+/// API callers must hold the `CONFIG_MUTATION` lane (the registry's
+/// before/after comparison and the install must not interleave with a
+/// sibling mutation's).
 #[cfg(feature = "listener-tun")]
-pub fn preinstall_global_route_binding(raw: &RawConfig) -> PreinstalledBinding {
-    let Some(iface) = meow_config::global_route_outbound_interface(raw.tun.as_ref()) else {
+pub fn preinstall_global_route_binding(
+    raw: &RawConfig,
+    scope: PreinstallScope,
+) -> PreinstalledBinding {
+    let iface = match scope {
+        PreinstallScope::Startup => meow_config::global_route_outbound_interface(raw.tun.as_ref())
+            .or_else(|| meow_config::named_tun_global_route_interface(raw)),
+        PreinstallScope::Mutation {
+            named_tun_running: false,
+        } => meow_config::global_route_outbound_interface(raw.tun.as_ref()),
+        // A running named TUN owns its binding until restart.
+        PreinstallScope::Mutation {
+            named_tun_running: true,
+        } => None,
+    };
+    let Some(iface) = iface else {
         return PreinstalledBinding::default();
     };
     let previous = meow_common::outbound_interface();
@@ -182,7 +215,10 @@ pub fn preinstall_global_route_binding(raw: &RawConfig) -> PreinstalledBinding {
 /// Without the `listener-tun` feature no TUN can run, so there is never a
 /// global-route binding to install.
 #[cfg(not(feature = "listener-tun"))]
-pub fn preinstall_global_route_binding(_raw: &RawConfig) -> PreinstalledBinding {
+pub fn preinstall_global_route_binding(
+    _raw: &RawConfig,
+    _scope: PreinstallScope,
+) -> PreinstalledBinding {
     PreinstalledBinding::default()
 }
 

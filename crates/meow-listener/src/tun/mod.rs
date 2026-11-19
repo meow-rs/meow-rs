@@ -385,6 +385,15 @@ pub struct TunListener {
     /// The top-level `sniffer:` (TLS SNI / HTTP Host), as mihomo applies it
     /// to TUN flows too.
     sniffer: Option<Arc<crate::sniffer::SnifferRuntime>>,
+    /// `proxy`/`rule` override a `listeners: type: tun` entry declares —
+    /// stamped onto every flow's metadata before routing (upstream's
+    /// `Additions` shape). `None` on the top-level `tun:` device.
+    route_override: Option<meow_common::InboundRouteOverride>,
+    /// Divert TCP :53 flows into the in-process DNS service — part of the
+    /// top-level `tun:` section's `dns-hijack` contract (docs/tun.md), not
+    /// the named `type: tun` entry's: a named entry's `dns-hijack` admits
+    /// wildcard UDP targets only, so this stays `false` on that path.
+    tcp_dns_hijack: bool,
 }
 
 impl TunListener {
@@ -396,7 +405,24 @@ impl TunListener {
             ready: None,
             outbound_binding: None,
             sniffer: None,
+            route_override: None,
+            tcp_dns_hijack: false,
         }
+    }
+
+    /// Stamp the named entry's `proxy`/`rule` override onto each flow
+    /// (`InboundRouteOverride::apply`), as every socket listener does.
+    pub fn with_route_override(mut self, ov: Option<meow_common::InboundRouteOverride>) -> Self {
+        self.route_override = ov;
+        self
+    }
+
+    /// Whether this device also diverts TCP :53 into the DNS service —
+    /// the top-level `tun:` spawn paths pass their `dns_hijack` here; the
+    /// named `type: tun` path never calls it (UDP-only contract).
+    pub fn with_tcp_dns_hijack(mut self, on: bool) -> Self {
+        self.tcp_dns_hijack = on;
+        self
     }
 
     /// Name TCP flows with the configured sniffer (ignored when disabled).
@@ -909,7 +935,7 @@ impl TunListener {
         // Built before the pumps so the first SYN is already translated.
         let system = if cfg.stack == TunStack::System {
             if cfg!(target_os = "linux") {
-                match system::SystemStack::bind(tun_net, used_addr, used_addr6, cfg.dns_hijack)
+                match system::SystemStack::bind(tun_net, used_addr, used_addr6, self.tcp_dns_hijack)
                     .await
                 {
                     Ok(sys) => Some(sys),
@@ -982,6 +1008,7 @@ impl TunListener {
             tun_net,
             std::sync::Arc::clone(&udp_flows),
             self.sniffer.clone(),
+            self.route_override.clone(),
         ));
         if let Some(socket) = lwip_udp {
             tasks.spawn(udp::run_udp(
@@ -993,6 +1020,7 @@ impl TunListener {
                 tun_net,
                 std::sync::Arc::clone(&udp_flows),
                 self.sniffer.clone(),
+                self.route_override.clone(),
             ));
         }
 
@@ -1070,18 +1098,20 @@ impl TunListener {
                     ));
                     match accepted {
                         Some(((stream, src, dst), permit)) => {
-                            // Same loop guard as the UDP path: a dial to the
-                            // TUN's own subnet routes back into the device.
-                            if tcp_loop_guard(dst, cfg.dns_hijack, tun_net) {
+                            // A dial to the TUN's own subnet routes back into
+                            // the device — except TCP :53 when the top-level
+                            // DNS diversion is on.
+                            if tcp_loop_guard(dst, self.tcp_dns_hijack, tun_net) {
                                 debug!("tun TCP: dropping non-routable dst {dst} (from {src})");
                                 drop(stream);
                                 continue;
                             }
-                            let dns_hijack = cfg.dns_hijack;
+                            let tcp_dns_hijack = self.tcp_dns_hijack;
                             let dns_budget = Arc::clone(&tcp_dns_budget);
                             let tunnel = self.tunnel.clone();
                             let name = self.name.clone();
                             let sniffer = self.sniffer.clone();
+                            let route_override = self.route_override.clone();
                             tasks.spawn(async move {
                                 let _permit = permit;
                                 // lwIP only delivers this stream after the
@@ -1108,7 +1138,7 @@ impl TunListener {
                                         return;
                                     }
                                 };
-                                if dns_hijack && dst.port() == 53 {
+                                if tcp_dns_hijack && dst.port() == 53 {
                                     let stream = TunTcpConn {
                                         prefix,
                                         pos: 0,
@@ -1132,6 +1162,7 @@ impl TunListener {
                                         dst,
                                         &name,
                                         sniffer.as_deref(),
+                                        route_override.as_ref(),
                                     )
                                     .await;
                                 }
@@ -1159,12 +1190,13 @@ impl TunListener {
                             dst,
                             guard,
                         } = accepted;
-                        if tcp_loop_guard(dst, cfg.dns_hijack, tun_net) { continue; }
-                        let dns_hijack = cfg.dns_hijack;
+                        if tcp_loop_guard(dst, self.tcp_dns_hijack, tun_net) { continue; }
+                        let tcp_dns_hijack = self.tcp_dns_hijack;
                         let dns_budget = Arc::clone(&tcp_dns_budget);
                         let tunnel = self.tunnel.clone();
                         let name = self.name.clone();
                         let sniffer = self.sniffer.clone();
+                        let route_override = self.route_override.clone();
                         tasks.spawn(async move {
                             let _guard = guard;
                             // The same post-handshake window as the lwIP
@@ -1187,7 +1219,7 @@ impl TunListener {
                                 Ok(Ok(_)) | Err(_) => {}
                             }
                             let _permit = permit;
-                            if dns_hijack && dst.port() == 53 {
+                            if tcp_dns_hijack && dst.port() == 53 {
                                 if let Err(e) = meow_dns::server::serve_tcp_stream(
                                     stream,
                                     tunnel.resolver_slot(),
@@ -1209,6 +1241,9 @@ impl TunListener {
                                 in_name: name.as_str().into(),
                                 ..Default::default()
                             };
+                            if let Some(ov) = route_override {
+                                ov.apply(&mut metadata);
+                            }
                             if let Some(rt) = sniffer.as_deref() {
                                 crate::sniffer::prefill_host(
                                     &tunnel.inner().resolver(),
@@ -1537,10 +1572,17 @@ fn pump_error(direction: &str, joined: Result<io::Result<()>, tokio::task::JoinE
 }
 
 // Intercept DNS to the TUN address before rejecting subnet loopback traffic.
-fn tcp_loop_guard(dst: SocketAddr, dns_hijack: bool, nets: udp::TunNets) -> bool {
-    !(dns_hijack && dst.port() == 53) && udp::is_looping_dst(dst.ip(), nets)
+// `tcp_dns` is the top-level device's TCP :53 diversion only — a named
+// `type: tun` entry keeps the UDP-only hijack contract and drops a :53
+// subnet dial like any other port.
+fn tcp_loop_guard(dst: SocketAddr, tcp_dns: bool, nets: udp::TunNets) -> bool {
+    !(tcp_dns && dst.port() == 53) && udp::is_looping_dst(dst.ip(), nets)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the listener's TCP knobs, passed once per accepted flow"
+)]
 async fn handle_tcp_flow(
     tunnel: Tunnel,
     tcp: lwip::TcpStream,
@@ -1549,6 +1591,7 @@ async fn handle_tcp_flow(
     dst: SocketAddr, // original destination
     in_name: &str,
     sniffer: Option<&crate::sniffer::SnifferRuntime>,
+    route_override: Option<&meow_common::InboundRouteOverride>,
 ) {
     let mut metadata = Metadata {
         network: Network::Tcp,
@@ -1560,6 +1603,11 @@ async fn handle_tcp_flow(
         in_name: in_name.into(),
         ..Default::default()
     };
+    // The named entry's `proxy`/`rule` override stamps before sniffing
+    // and routing, as on every socket listener (upstream's `Additions`).
+    if let Some(ov) = route_override {
+        ov.apply(&mut metadata);
+    }
     let mut tcp = tcp;
     let mut prefix = prefix;
     if let Some(rt) = sniffer {
@@ -1835,6 +1883,9 @@ mod tests {
 
     #[test]
     fn tcp_dns_hijack_precedes_subnet_loop_guard() {
+        // On the top-level device the TCP :53 diversion must see a dial
+        // at the TUN's own subnet address before the loop guard drops it;
+        // a named device (tcp_dns off) drops it like any other port.
         let nets = super::udp::TunNets {
             v4: "172.19.0.1/30".parse().unwrap(),
             v6: Some("fd00::1/126".parse().unwrap()),

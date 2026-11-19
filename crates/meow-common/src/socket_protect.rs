@@ -581,6 +581,35 @@ pub fn routing_mark() -> u32 {
     }
 }
 
+/// `listeners[].routing-mark` — `SO_MARK` stamped on the *listener's own*
+/// socket at bind (upstream `InboundOption.RoutingMark`, an ingress-side
+/// mark: a TCP listen socket's mark is inherited by every accepted
+/// socket, a UDP socket's datagrams carry it). Deliberately separate
+/// from the top-level `routing-mark` handled above, which marks OUTBOUND
+/// dials and feeds the TProxy firewall exemption — this one never
+/// touches `ROUTING_MARK`.
+///
+/// Linux only; callers warn and skip elsewhere. `CAP_NET_ADMIN` is
+/// required, same as the outbound mark.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+pub fn set_listener_socket_mark(fd: std::os::fd::RawFd, mark: u32) -> std::io::Result<()> {
+    // SAFETY: `fd` is owned by the caller for the call's duration and
+    // `mark` is a live `u32` of the size `SO_MARK` expects.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_MARK,
+            std::ptr::addr_of!(mark).cast(),
+            std::mem::size_of::<u32>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// mihomo's top-level `interface-name` (issue #974): every outbound socket
 /// meow opens binds to this interface unless the node's own
 /// `interface-name` overrides it — and unless the socket's peer is

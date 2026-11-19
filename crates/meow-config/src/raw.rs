@@ -73,6 +73,46 @@ where
     deserializer.deserialize_any(StringOrSeq)
 }
 
+/// `lan-allowed-ips`/`lan-disallowed-ips`: a list of CIDR strings, and
+/// nothing else. Absence (`#[serde(default)]` → `None`) is the
+/// allow-all/empty-deny default; explicit `null` or a non-list value is
+/// a hard parse error — silently mapping a malformed allow policy to
+/// the allow-all default would widen the ACL beyond what the operator
+/// wrote, while `Some([])` must stay distinguishable ("admit nobody").
+fn deserialize_lan_acl<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct LanAclList;
+
+    impl<'de> Visitor<'de> for LanAclList {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a list of CIDR strings")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Err(E::custom(
+                "lan-*-ips must be a list of CIDRs, not null; remove the key or supply []",
+            ))
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            self.visit_none()
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            Vec::<String>::deserialize(d).map(Some)
+        }
+    }
+
+    deserializer.deserialize_option(LanAclList)
+}
+
 /// `expected-status` accepts either a bare integer (`204`) or a string
 /// (`"204"`, `"200-299"`, `"200,204"`). The docs and upstream mihomo both
 /// allow the unquoted integer form; normalize it to the string form the
@@ -509,6 +549,26 @@ pub struct RawConfig {
     pub listeners: Option<Vec<RawListener>>,
     pub authentication: Option<Vec<String>>,
     pub skip_auth_prefixes: Option<Vec<String>>,
+    /// mihomo's top-level `lan-allowed-ips`: CIDRs the mixed/HTTP/SOCKS
+    /// TCP accept loops admit remote addresses from. `None` = omitted →
+    /// the allow-all default; `Some([])` admits nobody. Explicit `null`
+    /// or a non-list value is a parse error — see `deserialize_lan_acl`.
+    /// `skip_serializing_if` keeps a PUT-saved document free of
+    /// `lan-allowed-ips: null`, which would not re-parse.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lan_acl",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lan_allowed_ips: Option<Vec<String>>,
+    /// mihomo's top-level `lan-disallowed-ips`: deny CIDRs checked before
+    /// the allow list. Same presence/null contract as `lan_allowed_ips`.
+    #[serde(
+        default,
+        deserialize_with = "deserialize_lan_acl",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub lan_disallowed_ips: Option<Vec<String>>,
     pub geodata: Option<RawGeoDataConfig>,
     /// Top-level `geox-url:` — mihomo's flat download-URL alias. Merged
     /// into [`GeoDataConfig`](crate::GeoDataConfig) by
@@ -745,8 +805,10 @@ pub struct RawListener {
     /// an external system — no nft/pfctl invocation, no bypass-IP
     /// collection, no cleanup on exit (issue #563).
     pub firewall: Option<bool>,
-    /// `tproxy`/`wireguard` listeners: UDP flow idle timeout in seconds
-    /// (default 60, issue #564). `0` is a config error. The companion `udp`
+    /// `tproxy`/`wireguard`/`tun` listeners: UDP flow idle timeout in
+    /// seconds (default 60 on tproxy/wireguard, 300 on `type: tun`,
+    /// issue #564). `0` is a config error on tproxy/wireguard but means
+    /// "default" on the named-TUN path. The companion `udp`
     /// key itself lives in the shadowsocks field block below — one raw key,
     /// two consumers: for tproxy `udp` defaults to `false` and requires
     /// `firewall: false` (meow does not manage UDP gateway rules); for
@@ -755,6 +817,23 @@ pub struct RawListener {
     /// Per-listener override of the global `max-connections` cap. `0`
     /// disables the cap for this listener.
     pub max_connections: Option<usize>,
+
+    // ── named-routing overrides (upstream `BaseOption` Additions) ──
+    /// `proxy:` — force every flow through this proxy/group name,
+    /// bypassing mode dispatch and rule matching entirely. Resolved per
+    /// flow against the live route table (a group keeps its current
+    /// membership); a missing target fails closed.
+    pub proxy: Option<String>,
+    /// `rule:` — the name of a `sub-rules:` block scanned *instead of*
+    /// the top-level rule list for this listener's flows (upstream
+    /// `SpecialRules`). NOT a rule-provider and not an `IN-NAME` rule —
+    /// the block is selected by name.
+    pub rule: Option<String>,
+    /// `routing-mark:` — `SO_MARK` stamped on this listener's socket at
+    /// bind (ingress; Linux only — warned about and ignored elsewhere).
+    /// Distinct from the top-level `routing-mark`, which marks outbound
+    /// dials and feeds the tproxy firewall exemption.
+    pub routing_mark: Option<u32>,
 
     // ── shadowsocks-listener fields (only meaningful when `type: shadowsocks`) ──
     pub cipher: Option<String>,
@@ -771,10 +850,55 @@ pub struct RawListener {
     /// Listener static private key, base64 decoding to exactly 32 bytes
     /// (required for `type: wireguard`).
     pub private_key: Option<String>,
-    /// Outer (wire) MTU; default 1420, accepted range `640..=9000`.
+    /// `wireguard`: outer (wire) MTU, default 1420, range `640..=9000`.
+    /// `type: tun` shares the field: device MTU, named default 9000,
+    /// `0` meaning "default".
     pub mtu: Option<u16>,
     /// Static peer table; required and non-empty for `type: wireguard`.
     pub peers: Option<Vec<RawWgPeer>>,
+
+    // ── named-TUN fields (only meaningful when `type: tun`) ──
+    // Upstream decodes these FLAT on the listener entry (`TunOption`
+    // embedding `BaseOption`) — there is no nested `tun:` map and no
+    // `enable` (the entry's presence is its enabled state). `mtu`,
+    // `udp-timeout` and `max-connections` above are shared with the
+    // wireguard/tproxy consumers; everything TUN-only lives here.
+    /// Device name; absent = platform-chosen (like `tun.device`).
+    pub device: Option<String>,
+    /// Stack selector — free-form like `RawTun::stack`: `system`/`mixed`
+    /// pick the kernel TCP path, `lwip` (meow extension) and the upstream
+    /// `mips`/`gvisor` spellings stay on lwIP (the latter two warn);
+    /// any other value is a hard error on the named path.
+    pub stack: Option<serde_json::Value>,
+    /// DNS-hijack targets; `[]` turns hijacking off, a `:53` target
+    /// (`any:53`, `0.0.0.0:53`) keeps it on, other entries warn+ignore.
+    pub dns_hijack: Option<Vec<String>>,
+    /// `auto-route` — the named default is OFF, unlike the top-level
+    /// `tun:` section; same bool-or-mode-string shape as `RawAutoRoute`.
+    pub auto_route: Option<RawAutoRoute>,
+    /// Physical-interface binding under `auto-route: global`
+    /// (loop avoidance); ignored elsewhere.
+    pub outbound_interface: Option<String>,
+    /// Device IPv4/IPv6 addresses — a string or mihomo's list form
+    /// (first entry used); the IPv4 default derives from
+    /// `dns.fake-ip-range` like the top-level section.
+    pub inet4_address: Option<serde_json::Value>,
+    pub inet6_address: Option<serde_json::Value>,
+    // Recognized-but-unsupported named-TUN keys — modeled so their
+    // presence produces a specific warn (ADR-0002) instead of landing in
+    // `extra` as unknown.
+    pub dns_mode: Option<serde_json::Value>,
+    pub strict_route: Option<serde_json::Value>,
+    pub auto_detect_interface: Option<serde_json::Value>,
+    pub auto_redirect: Option<serde_json::Value>,
+    pub endpoint_independent_nat: Option<serde_json::Value>,
+    pub mtu_v6: Option<serde_json::Value>,
+    pub route_address: Option<serde_json::Value>,
+    pub route_exclude_address: Option<serde_json::Value>,
+    pub include_uid: Option<serde_json::Value>,
+    pub exclude_uid: Option<serde_json::Value>,
+    pub gso: Option<serde_json::Value>,
+    pub file_descriptor: Option<serde_json::Value>,
 
     // ── upstream sub-options not yet supported by meow-rs ──
     // Captured as opaque `Value`s so their mere presence can be warned about

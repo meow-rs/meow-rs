@@ -317,6 +317,9 @@ pub(super) struct WgActor {
 
     inner: Arc<TunnelInner>,
     sniffer: Option<Arc<SnifferRuntime>>,
+    /// Shared `proxy:`/`rule:` override stamped onto inner TCP/UDP
+    /// metadata (Arc bump per flow/task).
+    route_override: Option<Arc<meow_common::InboundRouteOverride>>,
     main_rt: tokio::runtime::Handle,
 }
 
@@ -338,6 +341,7 @@ impl WgActor {
             name,
             max_connections,
             sniffer,
+            route_override,
         } = listener;
 
         let table = PeerTable::new(&cfg).map_err(io::Error::other)?;
@@ -421,6 +425,7 @@ impl WgActor {
             inject_tx,
             inner: Arc::clone(tunnel.inner()),
             sniffer,
+            route_override,
             main_rt,
             name,
             endpoint,
@@ -1131,6 +1136,7 @@ impl WgActor {
             udp_timeout: self.udp_timeout,
             inner_mtu: self.inner_mtu,
             inject_tx: self.inject_tx.clone(),
+            route_override: self.route_override.clone(),
         };
         // Routing tasks run on the main runtime — the actor's
         // current-thread rt only ever polls the wire loop. `spawn`
@@ -1790,6 +1796,7 @@ impl WgActor {
         let sniffer = self.sniffer.clone();
         let in_name: Arc<str> = self.name.clone().into();
         let in_port = self.bound_port;
+        let route_override = self.route_override.clone();
         // Same `spawn`-on-shutdown note as `inner_udp`: a mid-teardown
         // `main_rt` panics the actor thread — teardown noise, not a
         // correctness hole.
@@ -1820,6 +1827,10 @@ impl WgActor {
                 in_port,
                 ..Default::default()
             };
+            // The named listener's `proxy:`/`rule:` override stamps before
+            // the sniff and the route scan (upstream Additions order) —
+            // shared, not cloned: the task's Arc is dead after this point.
+            metadata.special_route = route_override;
             let mut prefix = prefix;
             if let Some(rt) = &sniffer {
                 crate::sniffer::prefill_host(&inner.resolver(), &mut metadata);

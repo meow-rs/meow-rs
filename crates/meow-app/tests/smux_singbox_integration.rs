@@ -203,7 +203,12 @@ rules:
         .expect("parse smux e2e config");
     let tunnel = meow_tunnel::Tunnel::new(std::sync::Arc::clone(&config.dns.resolver));
     tunnel.set_mode(config.general.mode);
-    tunnel.update_routing(config.proxies, config.rules, config.dialer_registry);
+    tunnel.update_routing(
+        config.proxies,
+        config.rules,
+        config.sub_rules,
+        config.dialer_registry,
+    );
     tunnel.spawn_background_tasks();
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -212,6 +212,8 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             port: 7894,
             listen: "127.0.0.1".into(),
             max_connections: 256,
+            route_override: None,
+            routing_mark: None,
         },
         NamedListener {
             name: "mixed".into(),
@@ -219,6 +221,8 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
             port: 7890,
             listen: "127.0.0.1".into(),
             max_connections: 256,
+            route_override: None,
+            routing_mark: None,
         },
     ];
 
@@ -5403,9 +5407,12 @@ async fn get_connection_by_id_returns_notes_live_and_after_close() {
     let state = test_state_default();
     let rule =
         meow_rules::parse_rule("MATCH,DIRECT", &meow_rules::ParserContext::default()).unwrap();
-    state
-        .tunnel
-        .update_routing(HashMap::new(), vec![rule], Default::default());
+    state.tunnel.update_routing(
+        HashMap::new(),
+        vec![rule],
+        HashMap::new(),
+        Default::default(),
+    );
     state.tunnel.set_connection_notes(true);
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -7533,6 +7540,15 @@ async fn put_configs_fetches_rule_provider_payload_once() {
 /// so post-state alone can't distinguish a no-op from a working
 /// restart under a privileged listener-tun build).
 fn fake_tun_handle() -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBool>) {
+    let (handle, flag) = fake_tun_handle_owned(meow_tunnel::TunOwner::TopLevel);
+    (handle, flag)
+}
+
+/// [`fake_tun_handle`] with an explicit [`TunOwner`] — named-owner
+/// variants pin the top-level reconcile off the slot (spec §3).
+fn fake_tun_handle_owned(
+    owner: meow_tunnel::TunOwner,
+) -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBool>) {
     struct Flag(Arc<std::sync::atomic::AtomicBool>);
     impl Drop for Flag {
         fn drop(&mut self) {
@@ -7548,6 +7564,7 @@ fn fake_tun_handle() -> (meow_tunnel::TunHandle, Arc<std::sync::atomic::AtomicBo
                 std::future::pending::<()>().await;
             }
         }),
+        owner,
         core_done: None,
         udp_flows: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
     };
@@ -8049,6 +8066,115 @@ async fn put_configs_invalid_listeners_rejected_before_commit() {
         state.raw_config.read().listeners.is_none(),
         "the invalid section must not have been committed"
     );
+}
+
+/// `lan-allowed-ips`/`lan-disallowed-ips` are hard admission errors even
+/// under `?force=true`: a malformed CIDR or a `listeners:`-nested key is
+/// a 400 that commits nothing, since persisting a broken access policy
+/// would leave the next boot's guarded listeners enforcing the wrong
+/// (or no) ACL. A valid PUT commits the raw fields for the next boot
+/// without hot-applying anything.
+#[tokio::test]
+async fn put_configs_lan_acl_rejected_before_commit() {
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+
+    for (yaml, force) in [
+        ("lan-allowed-ips: [10.0.0.1]\n", ""), // bare IP, not a CIDR
+        ("lan-allowed-ips: [10.0.0.1]\n", "?force=true"),
+        ("lan-disallowed-ips: bogus\n", "?force=true"),
+        (
+            concat!(
+                "lan-allowed-ips: [10.0.0.0/8]\n",
+                "listeners:\n",
+                "  - name: lan\n",
+                "    type: http\n",
+                "    port: 8081\n",
+                "    lan-disallowed-ips: [10.9.0.0/16]\n", // misplaced
+            ),
+            "?force=true",
+        ),
+    ] {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(format!("/configs{force}"))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{yaml} (force={force}) must be rejected"
+        );
+        assert!(
+            state.raw_config.read().lan_allowed_ips.is_none(),
+            "the rejected ACL must not have been committed"
+        );
+    }
+
+    // A valid ACL commits verbatim — for the next boot only; nothing
+    // about the running listeners changes.
+    let yaml = "lan-allowed-ips: [10.0.0.0/8, fd00::/8]\nlan-disallowed-ips: [10.9.0.0/16]\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    {
+        let raw = state.raw_config.read();
+        assert_eq!(
+            raw.lan_allowed_ips.as_deref(),
+            Some(&["10.0.0.0/8".to_string(), "fd00::/8".to_string()][..])
+        );
+        assert_eq!(
+            raw.lan_disallowed_ips.as_deref(),
+            Some(&["10.9.0.0/16".to_string()][..])
+        );
+    }
+
+    // PATCH is not an ACL surface (the ACL is a startup snapshot): the
+    // keys are simply not modeled by the patch schema, so this is a
+    // no-op that leaves the committed document alone.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PATCH")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"lan-allowed-ips": ["1.2.3.0/24"]}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    {
+        let raw = state.raw_config.read();
+        assert_eq!(
+            raw.lan_allowed_ips.as_deref(),
+            Some(&["10.0.0.0/8".to_string(), "fd00::/8".to_string()][..]),
+            "PATCH must not touch the committed ACL"
+        );
+    }
 }
 
 /// mihomo spells the named SOCKS inbound `type: socks` — a full PUT must
@@ -8811,6 +8937,29 @@ async fn put_configs_tun_fake_ip_change_restarts_listener() {
         "stop_tun must have reaped the listener slot, not just the flag"
     );
     assert!(state.tunnel.resolver().fake_ip_v4_net().is_some());
+
+    // Restore a dns-free config so the process-global host-resolver hook
+    // installed above does not leak into other tests in this binary.
+    let restore =
+        base64::engine::general_purpose::STANDARD.encode("mode: rule\nrules:\n  - MATCH,DIRECT\n");
+    let restore_resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": restore}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        restore_resp.status(),
+        StatusCode::NO_CONTENT,
+        "restore PUT must succeed so the host-resolver hook is cleared"
+    );
 }
 
 /// `PATCH /configs` with `body`, as a GUI's TUN switch sends it.
@@ -10588,4 +10737,418 @@ fn put_configs_warns_on_unknown_keys() {
         logs.contains("unknown keys in top-level config: api-bogus-key"),
         "PUT rebuild must re-emit the unknown-key warn: {logs}"
     );
+}
+
+// ─── Named `type: tun` listeners (spec §3) ─────────────────────────────
+
+/// PUT a base64 YAML payload into `/configs`; `query` carries `?force`
+/// & friends.
+async fn put_configs_payload(
+    state: &Arc<AppState>,
+    yaml: &str,
+    query: &str,
+) -> axum::response::Response {
+    use base64::Engine as _;
+    let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+    create_router(Arc::clone(state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri(format!("/configs{query}"))
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+}
+
+/// Store a stand-in *named* `type: tun` device in the slot — the owner
+/// the startup path publishes (`spec §3`); the pending task is what
+/// owner-aware paths must not reap.
+async fn install_named_tun(
+    state: &Arc<AppState>,
+    name: &str,
+) -> Arc<std::sync::atomic::AtomicBool> {
+    let (handle, stopped) = fake_tun_handle_owned(meow_tunnel::TunOwner::Named(name.to_string()));
+    state.tunnel.set_tun_handle(handle).await;
+    stopped
+}
+
+/// A `tun.enable` candidate must never pass admission while a named
+/// `type: tun` device holds the slot — and the named device stays up.
+#[tokio::test]
+async fn put_configs_tun_enable_while_named_tun_owns_slot_rejected() {
+    let state = test_state(test_raw_config());
+    let stopped = install_named_tun(&state, "edge-tun").await;
+    // The request even *removes* the listeners section — the slot stays
+    // owned until a restart, so the enable still rejects.
+    for query in ["", "?force=true"] {
+        let resp = put_configs_payload(
+            &state,
+            "tun:\n  enable: true\nrules:\n  - MATCH,DIRECT\n",
+            query,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {query}");
+        assert!(
+            body_json(resp).await["message"]
+                .as_str()
+                .unwrap()
+                .contains("edge-tun"),
+            "the error must name the owning listener, query {query}"
+        );
+    }
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the named device must keep running"
+    );
+    assert!(state.tunnel.has_tun());
+    assert!(
+        !state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.enable),
+        "nothing may persist"
+    );
+}
+
+/// Same contract when the enable arrives inside a doc that *declares* a
+/// named TUN: refused before binding/mutation/persist, `force` included
+/// (the listeners-gate bail alone would be force-degradable).
+#[tokio::test]
+async fn put_configs_tun_enable_with_named_tun_entry_rejected() {
+    let state = test_state(test_raw_config());
+    for query in ["", "?force=true"] {
+        let resp = put_configs_payload(
+            &state,
+            "tun:\n  enable: true\nlisteners:\n  - name: n-tun\n    type: tun\nrules:\n  - MATCH,DIRECT\n",
+            query,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {query}");
+        assert!(
+            body_json(resp).await["message"]
+                .as_str()
+                .unwrap()
+                .contains("tun.enable"),
+            "the error must explain the one-effective-TUN rule, query {query}"
+        );
+    }
+    assert!(
+        !state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.enable),
+        "nothing may persist"
+    );
+}
+
+/// PATCHing `tun.enable` on is refused while a named device owns the
+/// slot or the committed document still stages a named entry — a PATCH
+/// cannot drop `listeners:`.
+#[tokio::test]
+async fn patch_configs_tun_enable_while_named_tun_rejected() {
+    // (a) slot owned by a live named device
+    let state = test_state(test_raw_config());
+    let stopped = install_named_tun(&state, "edge-tun").await;
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"enable": true}})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(!stopped.load(Ordering::SeqCst));
+
+    // (b) no live device, but the committed document stages a named TUN
+    let mut raw = test_raw_config();
+    raw.listeners = Some(vec![
+        serde_saphyr::from_str("name: n-tun\ntype: tun").unwrap()
+    ]);
+    let state = test_state(raw);
+    let resp = patch_configs(&state, serde_json::json!({"tun": {"enable": true}})).await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !state
+            .raw_config
+            .read()
+            .tun
+            .as_ref()
+            .is_some_and(|t| t.enable),
+        "nothing may persist"
+    );
+}
+
+/// The allowed shape: a PUT that disables the running top-level TUN and
+/// stages a named `type: tun` entry — the former may stop, the named
+/// device starts only at next boot.
+#[tokio::test]
+async fn put_configs_tun_disable_plus_named_tun_staged_ok() {
+    let mut raw = test_raw_config();
+    raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
+    let state = test_state(raw);
+    let (handle, stopped) = fake_tun_handle();
+    state.tunnel.set_tun_handle(handle).await;
+
+    let resp = put_configs_payload(
+        &state,
+        "tun:\n  enable: false\nlisteners:\n  - name: n-tun\n    type: tun\nrules:\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(
+        stopped.load(Ordering::SeqCst),
+        "the running top-level device may stop"
+    );
+    assert!(
+        !state.tunnel.has_tun(),
+        "the staged named TUN must not start — next boot only"
+    );
+    let committed = state.raw_config.read().clone();
+    assert!(
+        committed
+            .listeners
+            .as_deref()
+            .unwrap()
+            .iter()
+            .any(|l| l.listener_type == "tun"),
+        "the named entry persists for next boot"
+    );
+}
+
+/// `GET /configs` `tun-enable` reports the top-level section's device
+/// only — a live named device does not read as `tun.enable`.
+#[tokio::test]
+async fn get_configs_tun_enable_ignores_named_tun() {
+    let state = test_state(test_raw_config());
+    install_named_tun(&state, "edge-tun").await;
+    let json = get_configs_json(&state).await;
+    assert_eq!(json["tun-enable"], serde_json::json!(false));
+    assert_eq!(json["tun"]["enable"], serde_json::json!(false));
+}
+
+/// A resolver rebuild that would move the fake-IP pool while a named
+/// `type: tun` device runs is refused wholesale; an unrelated resolver
+/// change keeps the device alive.
+#[tokio::test]
+async fn put_configs_fake_ip_move_while_named_tun_runs_rejected() {
+    let mut raw = test_raw_config();
+    raw.dns = Some(
+        serde_saphyr::from_str(
+            "enable: true\nenhanced-mode: fake-ip\nfake-ip-range: 198.18.0.0/16\nnameserver: [1.1.1.1]",
+        )
+        .unwrap(),
+    );
+    let state = test_state(raw);
+    let stopped = install_named_tun(&state, "edge-tun").await;
+    // Give the tunnel a resolver generation carrying the committed
+    // fake-IP pool (the startup would have built it the same way).
+    {
+        let committed = state.raw_config.read().clone();
+        let dns = meow_config::parse_dns_from_raw(
+            &committed,
+            None,
+            &Default::default(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dns builds");
+        state.tunnel.set_resolver(Arc::clone(&dns.resolver));
+    }
+    let pool_before = state.tunnel.resolver().fake_ip_v4_net();
+    assert!(pool_before.is_some(), "the pin needs a live pool");
+
+    // Moving `fake-ip-range` → refused, device untouched.
+    let resp = put_configs_payload(
+        &state,
+        "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 28.0.0.0/8\n  nameserver: [1.1.1.1]\nrules:\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        !stopped.load(Ordering::SeqCst),
+        "the named device must keep running"
+    );
+    assert_eq!(
+        state.tunnel.resolver().fake_ip_v4_net(),
+        pool_before,
+        "the rejected pool must never publish"
+    );
+
+    // An unrelated resolver change (nameserver swap, same pool) → the
+    // device is not pinned against it.
+    let resp = put_configs_payload(
+        &state,
+        "dns:\n  enable: true\n  enhanced-mode: fake-ip\n  fake-ip-range: 198.18.0.0/16\n  nameserver: [9.9.9.9]\nrules:\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(state.tunnel.resolver().fake_ip_v4_net(), pool_before);
+    assert!(!stopped.load(Ordering::SeqCst));
+}
+
+/// `GET /listeners` reports a `type: tun` entry's name and type without
+/// port/listen — it owns no socket.
+#[tokio::test]
+async fn get_listeners_named_tun_reports_no_socket() {
+    use meow_config::{ListenerSpec, NamedListener};
+    let mut state = test_state(test_raw_config());
+    Arc::get_mut(&mut state)
+        .unwrap()
+        .listeners
+        .push(NamedListener {
+            name: "edge-tun".into(),
+            spec: ListenerSpec::Tun(meow_config::TunConfig::default()),
+            port: 0,
+            listen: String::new(),
+            max_connections: 256,
+            route_override: None,
+            routing_mark: None,
+        });
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/listeners")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let items = body_json(resp).await;
+    assert_eq!(items[0]["name"], serde_json::json!("edge-tun"));
+    assert_eq!(items[0]["type"], serde_json::json!("tun"));
+    assert!(
+        items[0].get("port").is_none() && items[0].get("listen").is_none(),
+        "a TUN owns no socket endpoint: {items}"
+    );
+}
+
+/// A PUT that drops a still-running listener's forced proxy must be
+/// refused even though the candidate also removes the listener — the
+/// running inbound keeps its `proxy:` reference across the route swap
+/// and would strand on the missing name. `?force` cannot push past it.
+#[tokio::test]
+async fn put_configs_refuses_dropping_running_listener_dependency() {
+    use base64::Engine as _;
+    use meow_config::{ListenerSpec, NamedListener};
+
+    let raw: RawConfig = meow_config::parse_raw_yaml(concat!(
+        "listeners:\n",
+        "  - name: edge\n",
+        "    type: mixed\n",
+        "    port: 0\n",
+        "    proxy: sel\n",
+        "proxy-groups:\n",
+        "  - name: sel\n",
+        "    type: select\n",
+        "    proxies: [DIRECT]\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    ))
+    .unwrap();
+    let mut state = test_state(raw);
+    Arc::get_mut(&mut state).unwrap().listeners = vec![NamedListener {
+        name: "edge".into(),
+        spec: ListenerSpec::Mixed,
+        port: 0,
+        listen: "127.0.0.1".into(),
+        max_connections: 256,
+        route_override: meow_common::InboundRouteOverride::new(Some("sel"), None),
+        routing_mark: None,
+    }];
+
+    // The candidate removes the listener AND its forced group — the
+    // running inbound still holds `proxy: sel`.
+    let payload =
+        base64::engine::general_purpose::STANDARD.encode("mode: rule\nrules:\n  - MATCH,DIRECT\n");
+    for uri in ["/configs", "/configs?force=true"] {
+        let resp = create_router(Arc::clone(&state))
+            .oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri(uri)
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({"payload": payload}).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{uri} must refuse to strand the running listener's forced proxy"
+        );
+    }
+    // Nothing committed: the group and the listener stay in the document.
+    let committed = state.raw_config.read();
+    assert!(
+        committed
+            .proxy_groups
+            .as_deref()
+            .is_some_and(|g| g.iter().any(|g| g.name == "sel")),
+        "the refused PUT must not persist"
+    );
+    drop(committed);
+    assert!(state.tunnel.route_snapshot().proxies.contains_key("sel"));
+}
+
+/// A `listeners[].proxy` naming nothing the document declares — or a
+/// `proxy-providers:` key — is a document-shape defect: provider members
+/// are not registry keys, so the name can never resolve. `?force` cannot
+/// persist it the way it persists a declared name that merely failed to
+/// build (environment degradation).
+#[tokio::test]
+async fn put_configs_refuses_undeclared_listener_proxy_under_force() {
+    use base64::Engine as _;
+
+    for (decl, needle) in [("ghost", "no declared proxy"), ("feed", "proxy-provider")] {
+        let raw: RawConfig = meow_config::parse_raw_yaml("rules:\n  - MATCH,DIRECT\n").unwrap();
+        let state = test_state(raw);
+        let yaml = format!(
+            "proxy-providers:\n  feed:\n    type: file\n    path: p.yaml\nlisteners:\n  - name: edge\n    type: mixed\n    port: 0\n    proxy: {decl}\nrules:\n  - MATCH,DIRECT\n"
+        );
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        for uri in ["/configs", "/configs?force=true"] {
+            let resp = create_router(Arc::clone(&state))
+                .oneshot(
+                    Request::builder()
+                        .method("PUT")
+                        .uri(uri)
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(
+                            serde_json::json!({"payload": payload}).to_string(),
+                        ))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "{uri} with proxy: {decl} must be refused"
+            );
+            let body = axum::body::to_bytes(resp.into_body(), 8192).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert!(
+                body["message"].as_str().is_some_and(|m| m.contains(needle)),
+                "{uri} with proxy: {decl} must explain the refusal: {body}"
+            );
+        }
+        assert!(
+            state.raw_config.read().listeners.is_none(),
+            "the refused PUT must not persist ({decl})"
+        );
+    }
 }

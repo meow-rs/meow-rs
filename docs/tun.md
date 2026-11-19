@@ -579,6 +579,53 @@ install nothing. A pre-install failure is not fatal — it is logged at
 debug and the listener retries before installing routes, failing closed as
 at startup.
 
+## Named `listeners:` `type: tun` entries
+
+A TUN device can also be declared as a named listener — mihomo's newer
+form, where the `TunOption` fields sit **flat** on the entry:
+
+```yaml
+listeners:
+  - name: edge
+    type: tun
+    device: meow0
+    mtu: 9000
+    auto-route: global
+    outbound-interface: en0
+    dns-hijack: [any:53]
+    proxy: Proxy          # optional per-listener route override
+```
+
+Differences from the top-level `tun:` section:
+
+- **The entry's presence is the enabled state** — there is no `enable`
+  key. `enable`, a nested `tun:` block, `port`, and `listen` (a TUN owns
+  no socket) are hard parse errors pointing at the flat form. Socket-only
+  listener keys (`firewall`, `udp`, `cipher`, `routing-mark`, …) warn and
+  are ignored.
+- **Named defaults profile** — tuned for the `listeners:` surface, not
+  inherited from `tun:`: `mtu` `9000`, `udp-timeout` `300`, `auto-route`
+  off, `dns-hijack` on. An explicit `0` on `mtu`/`udp-timeout` means
+  "default", same as the section. Stack spellings are stricter than the
+  section's: `system`/`mixed` → `system`, `gvisor`/`mips` → `lwip` (with a
+  warning), `lwip` accepted, anything else a hard error.
+- **One effective TUN** — a named entry alongside `tun: enable: true`,
+  or a second `type: tun` entry, is a hard parse error. A *disabled*
+  top-level section alongside a named entry is fine.
+- **Startup-only** — the device is created at boot, before the first
+  outbound dial (global scope binds `outbound-interface` early exactly
+  like the section does), and a failed spawn is **fatal**: meow exits
+  rather than starting half-configured. `PUT /configs` may stage changes
+  for the next boot but never spawns or stops a named device, and a
+  `tun.enable` patch/PUT is refused with 400 while a named device holds
+  the slot — as is a resolver change that would move the fake-IP pool the
+  running device was configured from. `GET /configs`'s `tun-enable`
+  reports the top-level section only (a running named device still reads
+  `false`); `GET /listeners` reports the entry's name and type without a
+  port.
+- `proxy:`/`rule:` route overrides apply to every flow the device
+  terminates, on both stacks and for UDP.
+
 ## Relationship to the tproxy inbound
 
 | | tproxy (`tproxy-port`) | tun (`tun:`) |

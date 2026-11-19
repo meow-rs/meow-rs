@@ -1,13 +1,17 @@
-use crate::{ConnType, DnsMode, Network};
+use crate::{ConnType, DnsMode, InboundRouteOverride, Network};
 use serde::{Deserialize, Serialize};
 use smol_str::SmolStr;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
 
 // M2 layout change (ADR-0011 T1/T4/T5):
 //   String fields → SmolStr (inline ≤23 B, heap-backed above that)
 //   Vec<String> geo-IP fields → Vec<SmolStr> (same 24-B struct, cheaper elements)
 //   Option<String> in_user → Option<SmolStr>
+//   special_proxy/special_rules (2 × SmolStr, 48 B on every flow for a
+//   per-listener feature) → special_route: Option<Arc<InboundRouteOverride>>
+//   (8 B, allocated only where a named listener carries the override)
 // Breaking change permitted per ADR-0009 §"Public-API stability stance".
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -64,8 +68,28 @@ pub struct Metadata {
     /// Authenticated username; `None` when auth was skipped or not configured.
     #[serde(rename = "inboundUser", skip_serializing_if = "Option::is_none")]
     pub in_user: Option<SmolStr>,
-    #[serde(rename = "specialProxy")]
-    pub special_proxy: SmolStr,
+    /// `listeners[].proxy` + `listeners[].rule` — a named inbound's
+    /// forced-route override (upstream `SpecialProxy`/`SpecialRules`,
+    /// set by `WithSpecialProxy`/`WithSpecialRules` in
+    /// `BaseOption.Additions`), stamped by
+    /// [`InboundRouteOverride::apply`] where upstream's `Additions`
+    /// execute. One shared pointer so the override costs every
+    /// default-listener flow nothing: `None` unless the listener
+    /// carries an override, and every `Metadata::clone` of a stamped
+    /// flow shares the refcount like `flow_lookup` rather than copying
+    /// the names. Read through [`Self::special_proxy`] /
+    /// [`Self::special_rules`]; [`Self::pure`] drops it.
+    ///
+    /// Internal-only like `internal`: the `rule` half never serializes.
+    /// The `proxy` half keeps mihomo's flat `specialProxy` string on
+    /// the wire — dashboards read it unconditionally.
+    #[serde(
+        rename = "specialProxy",
+        default,
+        serialize_with = "special_proxy_json::serialize",
+        deserialize_with = "special_proxy_json::deserialize"
+    )]
+    pub special_route: Option<Arc<InboundRouteOverride>>,
     /// Marks housekeeping traffic that is not a user connection: health
     /// probes, provider/geodata/subscription fetches, and DNS-via-proxy
     /// exchanges.
@@ -91,7 +115,37 @@ pub struct Metadata {
     /// rather than walking the table twice, and a miss is remembered
     /// too. Runtime-only: not part of the flow's API-visible identity.
     #[serde(skip)]
-    pub flow_lookup: std::sync::Arc<crate::FlowLookup>,
+    pub flow_lookup: Arc<crate::FlowLookup>,
+}
+
+/// The JSON form of [`Metadata::special_route`]: mihomo's flat
+/// `specialProxy` string, always emitted (`""` when unset). Reading
+/// back, a nonempty name repopulates the route's `proxy` slot; the
+/// `rule` half stays empty — it never crosses the wire.
+mod special_proxy_json {
+    use crate::InboundRouteOverride;
+    use serde::{Deserialize, Deserializer, Serializer};
+    use smol_str::SmolStr;
+    use std::sync::Arc;
+
+    pub(super) fn serialize<S: Serializer>(
+        route: &Option<Arc<InboundRouteOverride>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(
+            route
+                .as_ref()
+                .and_then(|r| r.proxy.as_deref())
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Arc<InboundRouteOverride>>, D::Error> {
+        let proxy = SmolStr::deserialize(deserializer)?;
+        Ok(InboundRouteOverride::new(Some(proxy.as_str()), None).map(Arc::new))
+    }
 }
 
 /// The JSON form of [`Metadata::dscp`]: always a number, `0` when the
@@ -135,6 +189,37 @@ impl Metadata {
         std::mem::swap(&mut self.src_geo_ip, &mut self.dst_geo_ip);
     }
 
+    /// The listener `proxy:` override this flow carries (upstream
+    /// `SpecialProxy`), `""` when unset — resolved per flow against the
+    /// live proxy map, before mode dispatch and process lookup.
+    pub fn special_proxy(&self) -> &str {
+        self.special_route
+            .as_ref()
+            .and_then(|r| r.proxy.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// The listener `rule:` override — the `sub-rules:` block name this
+    /// flow scans instead of the top-level rule list (upstream
+    /// `SpecialRules`), `""` when unset.
+    pub fn special_rules(&self) -> &str {
+        self.special_route
+            .as_ref()
+            .and_then(|r| r.rule.as_deref())
+            .unwrap_or_default()
+    }
+
+    /// Stamp `proxy`/`rule` as this flow's listener override, replacing
+    /// whatever it carried — the same normalization
+    /// [`InboundRouteOverride::new`] applies: an empty half means unset,
+    /// and both empty yields `None` (no override, no alloc). Listeners
+    /// stamp through [`InboundRouteOverride::apply`] instead, which
+    /// merges per-field; this setter is the convenience for tests and
+    /// other whole-override writers.
+    pub fn set_special_route(&mut self, proxy: Option<&str>, rule: Option<&str>) {
+        self.special_route = InboundRouteOverride::new(proxy, rule).map(Arc::new);
+    }
+
     /// A *domain-carrying* UDP association request (`dialer-proxy` inner
     /// hops, issue #657): `host` set, `dst_ip` absent.
     ///
@@ -173,9 +258,9 @@ impl Default for Metadata {
             in_name: SmolStr::default(),
             in_port: 0,
             in_user: None,
-            special_proxy: SmolStr::default(),
+            special_route: None,
             internal: false,
-            flow_lookup: std::sync::Arc::default(),
+            flow_lookup: Arc::default(),
         }
     }
 }
@@ -310,11 +395,11 @@ impl Metadata {
             in_name: SmolStr::default(),
             in_port: 0,
             in_user: None,
-            special_proxy: SmolStr::default(),
+            special_route: None,
             internal: self.internal,
             // The tracked copy shares the flow's lookup memo: the ledger
             // reuses an `always` scan (miss included) instead of rescanning.
-            flow_lookup: std::sync::Arc::clone(&self.flow_lookup),
+            flow_lookup: Arc::clone(&self.flow_lookup),
         }
     }
 }

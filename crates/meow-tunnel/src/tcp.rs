@@ -719,13 +719,25 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            tunnel.reload_routing(
+                Default::default(),
+                vec![],
+                Default::default(),
+                None,
+                Default::default()
+            ),
             1
         );
         // Same configuration and mode across multiple reloads: a boolean
         // running flag (or config equality) must not admit the old decision.
         assert_eq!(
-            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            tunnel.reload_routing(
+                Default::default(),
+                vec![],
+                Default::default(),
+                None,
+                Default::default()
+            ),
             0
         );
         assert!(late
@@ -765,7 +777,13 @@ mod tests {
         assert_eq!(tunnel.statistics().snapshot(), (123, 0));
 
         assert_eq!(
-            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            tunnel.reload_routing(
+                Default::default(),
+                vec![],
+                Default::default(),
+                None,
+                Default::default()
+            ),
             1
         );
         assert!(guard
@@ -773,7 +791,13 @@ mod tests {
             .await
             .is_none());
         assert_eq!(
-            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            tunnel.reload_routing(
+                Default::default(),
+                vec![],
+                Default::default(),
+                None,
+                Default::default()
+            ),
             0
         );
     }
@@ -794,7 +818,13 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            tunnel.reload_routing(Default::default(), vec![], None, Default::default()),
+            tunnel.reload_routing(
+                Default::default(),
+                vec![],
+                Default::default(),
+                None,
+                Default::default()
+            ),
             1
         );
         assert!(old.run_until_closed(async { "dial" }).await.is_none());
@@ -847,7 +877,13 @@ mod tests {
                         )
                     });
                     start.wait();
-                    tunnel.reload_routing(Default::default(), vec![], None, Default::default());
+                    tunnel.reload_routing(
+                        Default::default(),
+                        vec![],
+                        Default::default(),
+                        None,
+                        Default::default(),
+                    );
                     registration.join().unwrap()
                 });
                 if let Some(guard) = guard.as_ref() {
@@ -1017,7 +1053,12 @@ mod tests {
 
     fn noted_tunnel(rules: Vec<Box<dyn meow_common::Rule>>) -> crate::Tunnel {
         let tunnel = test_tunnel();
-        tunnel.update_routing(Default::default(), rules, Default::default());
+        tunnel.update_routing(
+            Default::default(),
+            rules,
+            Default::default(),
+            Default::default(),
+        );
         tunnel.set_connection_notes(true);
         tunnel
     }
@@ -1073,6 +1114,7 @@ mod tests {
         tunnel.update_routing(
             Default::default(),
             vec![rule("MATCH,DIRECT")],
+            Default::default(),
             Default::default(),
         );
         let server = echo_server().await;
@@ -1154,6 +1196,7 @@ mod tests {
             Default::default(),
             vec![rule("MATCH,DIRECT")],
             Default::default(),
+            Default::default(),
         );
         let server = echo_server().await;
         let meta = Metadata {
@@ -1219,6 +1262,7 @@ mod tests {
                     rule("MATCH,DIRECT"),
                 ],
                 Default::default(),
+                Default::default(),
             );
             for host in ["cats.invalid", "dogs.invalid"] {
                 let meta = Metadata {
@@ -1265,6 +1309,7 @@ mod tests {
             tunnel.update_routing(
                 proxies,
                 vec![rule("DOMAIN-SUFFIX,cats.invalid,Proxy"), rule("MATCH,Auto")],
+                Default::default(),
                 Default::default(),
             );
             for host in ["cats.invalid", "dogs.invalid"] {
@@ -1335,6 +1380,7 @@ mod tests {
             Default::default(),
             vec![rule("MATCH,DIRECT")],
             Default::default(),
+            Default::default(),
         );
         tunnel.set_connection_notes(true);
         let meta = Metadata {
@@ -1374,6 +1420,7 @@ proxy-groups:
                     rule("DOMAIN,leaf.invalid,JP-01"),
                     Box::new(meow_rules::final_rule::FinalRule::new("Proxy")),
                 ],
+                Default::default(),
                 Default::default(),
             );
             for host in ["group.invalid", "leaf.invalid"] {
@@ -1443,6 +1490,7 @@ proxy-groups:
         tunnel.update_routing(
             proxies.clone(),
             vec![Box::new(meow_rules::final_rule::FinalRule::new("Proxy"))],
+            Default::default(),
             Default::default(),
         );
 

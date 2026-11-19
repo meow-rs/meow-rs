@@ -760,3 +760,32 @@ async fn strict_remote_provider_payload_degrades_at_boot() {
     let _ = child.kill().await;
     server.abort();
 }
+
+/// A `listeners:` `type: tun` entry (spec §3) must validate green under
+/// `-t`: nothing in the flat named form touches a device, routes, or the
+/// network at load. The bad-stack leg proves the entry is actually
+/// checked rather than skipped. Without `listener-tun` the build refuses
+/// the type outright at the feature gate, so the green leg cannot run.
+#[cfg(feature = "listener-tun")]
+#[tokio::test]
+async fn config_test_named_tun_validates_offline() {
+    for (entry, ok) in [
+        ("    type: tun\n", true),
+        ("    type: tun\n    stack: turbo\n", false),
+    ] {
+        let directory = tempfile::tempdir().unwrap();
+        let config = directory.path().join("config.yaml");
+        std::fs::write(
+            &config,
+            format!("listeners:\n  - name: edge\n{entry}rules: ['MATCH,DIRECT']\n"),
+        )
+        .unwrap();
+        let output = run_offline(directory.path(), &config).await;
+        assert_eq!(
+            output.status.success(),
+            ok,
+            "named-tun entry {entry:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}

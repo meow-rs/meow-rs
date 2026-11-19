@@ -1,5 +1,5 @@
 use crate::sniffer::SnifferRuntime;
-use meow_common::{AuthConfig, ConnType, Metadata, Network};
+use meow_common::{AuthConfig, ConnType, InboundRouteOverride, Metadata, Network};
 use meow_tunnel::{route_inbound_tcp, Tunnel};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -19,6 +19,11 @@ const REP_SUCCESS: u8 = 0x00;
 /// RFC 1928 `X'01'` general SOCKS server failure.
 const REP_GENERAL_FAILURE: u8 = 0x01;
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent inbound-scoped value the \
+              handler forwards; bundling them only renames the list"
+)]
 pub async fn handle_socks5(
     tunnel: &Tunnel,
     mut stream: TcpStream,
@@ -27,6 +32,8 @@ pub async fn handle_socks5(
     auth: Option<&AuthConfig>,
     in_name: &str,
     in_port: u16,
+    route_override: Option<&InboundRouteOverride>,
+    routing_mark: Option<u32>,
 ) {
     match handle_socks5_inner(
         tunnel,
@@ -36,6 +43,7 @@ pub async fn handle_socks5(
         auth,
         in_name,
         in_port,
+        route_override,
     )
     .await
     {
@@ -53,12 +61,22 @@ pub async fn handle_socks5(
                 src_addr,
                 requested_ip,
                 requested_port,
-                &Metadata {
-                    in_name: in_name.into(),
-                    in_port,
-                    in_user: in_user.as_deref().map(Into::into),
-                    ..Default::default()
+                &{
+                    // The named listener's `proxy:`/`rule:` override rides
+                    // the inbound tag into every association flow — the
+                    // UDP session metadata clones it below.
+                    let mut inbound = Metadata {
+                        in_name: in_name.into(),
+                        in_port,
+                        in_user: in_user.as_deref().map(Into::into),
+                        ..Default::default()
+                    };
+                    if let Some(ov) = route_override {
+                        ov.apply(&mut inbound);
+                    }
+                    inbound
                 },
+                routing_mark,
             )
             .await
             {
@@ -81,6 +99,11 @@ enum PostHandshake {
     },
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent inbound-scoped value the \
+              handler forwards; bundling them only renames the list"
+)]
 async fn handle_socks5_inner(
     tunnel: &Tunnel,
     stream: &mut TcpStream,
@@ -89,6 +112,7 @@ async fn handle_socks5_inner(
     auth: Option<&AuthConfig>,
     in_name: &str,
     in_port: u16,
+    route_override: Option<&InboundRouteOverride>,
 ) -> Result<PostHandshake, Box<dyn std::error::Error + Send + Sync>> {
     let deadline = tokio::time::Instant::now() + crate::DEFAULT_HANDSHAKE_TIMEOUT;
     // 1. Version/method negotiation
@@ -237,6 +261,11 @@ async fn handle_socks5_inner(
         in_user: in_user.as_deref().map(Into::into),
         ..Default::default()
     };
+    // The named listener's `proxy:`/`rule:` override stamps before the
+    // sniff and the route scan (upstream Additions order).
+    if let Some(ov) = route_override {
+        ov.apply(&mut metadata);
+    }
 
     // Sniff TLS SNI or HTTP Host header from the initial payload bytes.
     if let Some(rt) = sniffer {

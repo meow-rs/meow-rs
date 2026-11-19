@@ -66,6 +66,8 @@ async fn relay_returns_full_server_first_flight() {
             None,
             "in",
             ctrl_addr.port(),
+            None,
+            None,
         )
         .await;
     });

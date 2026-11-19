@@ -1,7 +1,7 @@
 use crate::http_proxy;
 use crate::sniffer::SnifferRuntime;
 use crate::socks5;
-use meow_common::{AuthConfig, TcpKeepaliveConfig};
+use meow_common::{AuthConfig, InboundRouteOverride, LanAcl, TcpKeepaliveConfig};
 use meow_tunnel::Tunnel;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -27,6 +27,20 @@ pub struct MixedListener {
     /// Keepalive posture applied to every accepted socket (see
     /// [`crate::keepalive`]); `enabled: false` writes no sockopts.
     tcp_keepalive: TcpKeepaliveConfig,
+    /// `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound ACL
+    /// checked against the remote IP right after `accept` (upstream's
+    /// `ipfilter` gate). `None` = no ACL configured (e.g. tests that
+    /// build the listener directly).
+    lan_acl: Option<Arc<LanAcl>>,
+    /// `listeners[].proxy`/`rule` — the named-listener route override
+    /// stamped onto every flow's `Metadata` (upstream `BaseOption`
+    /// Additions). `None` = plain routing.
+    route_override: Option<InboundRouteOverride>,
+    /// `listeners[].routing-mark` — carried to the SOCKS5 UDP-associate
+    /// relay socket this listener binds per association (the TCP listen
+    /// socket itself is marked by the caller at bind; accepted sockets
+    /// inherit it, the separately bound UDP relay does not). Linux only.
+    routing_mark: Option<u32>,
 }
 
 impl MixedListener {
@@ -39,6 +53,9 @@ impl MixedListener {
             auth: None,
             max_connections: DEFAULT_MAX_CONNECTIONS,
             tcp_keepalive: TcpKeepaliveConfig::default(),
+            lan_acl: None,
+            route_override: None,
+            routing_mark: None,
         }
     }
 
@@ -68,6 +85,30 @@ impl MixedListener {
         if !auth.credentials.is_empty() {
             self.auth = Some(auth);
         }
+        self
+    }
+
+    /// Install the shared LAN CIDR ACL (top-level
+    /// `lan-allowed-ips`/`lan-disallowed-ips`). Deliberately independent
+    /// of [`Self::with_auth`]: the check runs whether or not the global
+    /// credential store holds any credentials.
+    pub fn with_lan_acl(mut self, acl: Arc<LanAcl>) -> Self {
+        self.lan_acl = Some(acl);
+        self
+    }
+
+    /// Install the named listener's `proxy:`/`rule:` route override —
+    /// stamped onto every accepted flow's `Metadata` before routing.
+    pub fn with_route_override(mut self, ov: Option<InboundRouteOverride>) -> Self {
+        self.route_override = ov;
+        self
+    }
+
+    /// `listeners[].routing-mark` for the UDP-associate relay socket —
+    /// the only socket this listener binds itself (the caller marks the
+    /// TCP listen socket). Linux only; `None` writes no sockopt.
+    pub fn with_routing_mark(mut self, mark: Option<u32>) -> Self {
+        self.routing_mark = mark;
         self
     }
 
@@ -155,6 +196,22 @@ impl MixedListener {
                 }
             };
 
+            // `lan-allowed-ips`/`lan-disallowed-ips` (upstream
+            // `IsRemoteAddrDisAllowed`): the ACL runs inside the accept
+            // loop — before keepalive, sniffing, auth, protocol peek and
+            // the spawn — and only against the real remote IP. A denied
+            // peer gets no protocol response; the socket and permit drop
+            // with the iteration.
+            if let Some(acl) = &self.lan_acl {
+                if !acl.allows(src_addr.ip()) {
+                    debug!(
+                        "Mixed listener '{}' dropped {src_addr}: outside lan-allowed-ips",
+                        self.name
+                    );
+                    continue;
+                }
+            }
+
             // Earliest point in the accepted socket's life: keepalive must
             // be set before protocol peek/handshake/relay so a dead peer is
             // reaped even if the conn stalls mid-handshake.
@@ -165,14 +222,32 @@ impl MixedListener {
             let name = self.name.clone();
             let port = bound_addr.port();
             let auth = self.auth.clone();
+            let route_override = self.route_override.clone();
+            let routing_mark = self.routing_mark;
             tokio::spawn(async move {
-                handle_connection(tunnel, stream, src_addr, sniffer, name, port, auth).await;
+                handle_connection(
+                    tunnel,
+                    stream,
+                    src_addr,
+                    sniffer,
+                    name,
+                    port,
+                    auth,
+                    route_override,
+                    routing_mark,
+                )
+                .await;
                 drop(permit);
             });
         }
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each argument is an independent inbound-scoped value the \
+              handler forwards; bundling them only renames the list"
+)]
 async fn handle_connection(
     tunnel: Tunnel,
     stream: tokio::net::TcpStream,
@@ -181,6 +256,8 @@ async fn handle_connection(
     name: String,
     port: u16,
     auth: Option<Arc<AuthConfig>>,
+    route_override: Option<InboundRouteOverride>,
+    routing_mark: Option<u32>,
 ) {
     // Peek the first byte to determine protocol
     let mut peek = [0u8; 1];
@@ -207,6 +284,8 @@ async fn handle_connection(
             auth.as_deref(),
             &name,
             port,
+            route_override.as_ref(),
+            routing_mark,
         )
         .await;
     } else {
@@ -219,6 +298,7 @@ async fn handle_connection(
             auth.as_deref(),
             &name,
             port,
+            route_override.as_ref(),
         )
         .await;
     }

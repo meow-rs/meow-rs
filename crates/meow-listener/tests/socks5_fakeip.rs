@@ -65,6 +65,8 @@ async fn socks5_connect_to_fake_ip_reverse_maps_and_dials_real_host() {
             None, // no auth
             "test",
             0,
+            None,
+            None,
         )
         .await;
     });

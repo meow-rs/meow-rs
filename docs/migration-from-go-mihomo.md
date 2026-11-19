@@ -48,7 +48,8 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `external-controller` | ✓ | REST API on same port. |
 | `secret` (Bearer auth) | ✓ | Enforced (security fix vs upstream). |
 | `authentication` + `skip-auth-prefixes` | ✓ | Inbound proxy auth (M1.F-3). |
-| `listeners:` named listeners | ✓ | Named listener array (M1.F-1). `type: socks` is accepted as an alias of `type: socks5` (canonical name stays `socks5`); the named-listener `udp` SOCKS option is not ported. |
+| `listeners:` named listeners | ✓ | Named listener array (M1.F-1). `type: socks` is accepted as an alias of `type: socks5` (canonical name stays `socks5`); the named-listener `udp` SOCKS option is not ported. Per-listener `proxy:`/`rule:` route overrides and `routing-mark` are supported (see below). `type: tun` declares a flat-form TUN device (`listeners:`-tuned defaults: `mtu` 9000, `udp-timeout` 300, `auto-route` off; presence is the enabled state — `enable`/nested `tun:`/`port`/`listen` are hard errors; one effective TUN — a named entry plus `tun.enable: true`, or two named entries, fails to parse). Starts at boot only and a failed spawn is fatal; `PUT`/`PATCH` `tun.enable` is refused while a named device runs. Same `listener-tun` feature; see [tun.md](tun.md#named-listeners-type-tun-entries). |
+| `lan-allowed-ips`, `lan-disallowed-ips` | ✓ | CIDR admission on the mixed/HTTP/SOCKS TCP accept loops only — rejected peers drop silently at `accept` before auth or sniffing. Omitted allow list admits all; explicit `[]` admits none. Top-level keys only; nested under `listeners:` they are a hard parse error. Startup-only like the listeners themselves: `PUT /configs` validates and stores for the next boot. |
 | `proxies:` — Shadowsocks | ✓ | Including AEAD 2022 ciphers. |
 | `proxies:` — Trojan | ✓ | TLS + WebSocket transport. |
 | `proxies:` — Direct, Reject | ✓ | Fully supported. |
@@ -159,9 +160,37 @@ security gaps and typo-likely mistakes become hard errors (Class A).
 | `.dat` geosite file in discovery path | Loads (protobuf) | Hard error + conversion hint (`convert-geo`) |
 | `sub-rules:` cycle | May panic or loop | Hard parse error |
 | `sub-rules:` reference to undefined block | Runtime no-match | Hard parse error |
+| `listeners[].rule` naming an undefined `sub-rules:` block | Runtime no-match → DIRECT | Hard parse error naming the listener and block |
+| `listeners[].rule` block missing after a config swap | Falls back to the top-level `rules:` scan | Rejects the flow closed — a vanished override must not silently change egress policy |
+| `listeners[].proxy` naming an absent proxy | Rejects | Rejects (same); resolved live per flow, so groups and `PUT /configs` membership changes are honoured |
+| `lan-allowed-ips` / `lan-disallowed-ips` under `listeners[]` | Accepted as an unknown key, silently inert | Hard parse error pointing at the top level |
+| `lan-allowed-ips` entries | Bare IPs and CIDRs | CIDRs only — `10.0.0.1` is a hard error, `10.0.0.1/32` is the intent |
+| `listeners[].routing-mark` on non-Linux | Warns/ignored | Warns and is ignored (ingress `SO_MARK` on the listener socket — unrelated to the top-level outbound `routing-mark`) |
 | `nameserver-policy` entry with zero valid nameservers | Runtime panic at first query | Hard parse error at load |
 | `IN-TYPE` with unknown protocol name | Silently no-matches all traffic of that type | Hard parse error |
 | Base64 payload with URL-safe alphabet (`-`, `_`) | Accepted in some dashboard versions | 400 with decode-error message |
+
+### Named-listener route overrides
+
+`listeners[].proxy` and `listeners[].rule` are the upstream `specialProxy`
+/`specialRules` inbound options:
+
+- `proxy:` pins every flow of the inbound to that proxy or group,
+  resolved per flow against the live route table before mode dispatch
+  and `find-process-mode` — it wins over `rule:`, `mode: global` and
+  `mode: direct` too. `DIRECT` is unconditional. A name missing from the
+  table, or a UDP flow pinned at a UDP-incapable target, rejects; there
+  is no slide back into the rule scan. Hits account under the
+  `ListenerProxy` bucket, never a fictitious rule hit.
+- `rule:` selects a `sub-rules:` block *of the same document* by name
+  (it is not a `RULE-SET` provider and not an `IN-NAME` rule). In rule
+  mode the block replaces the top-level `rules:` scan for that inbound;
+  exhausting the block — or an empty block — answers DIRECT without
+  consulting the main list. Block matches carry no per-rule hit counters
+  and cannot be disabled through `/rules`.
+- `routing-mark:` sets `SO_MARK` on the listener's own socket at bind
+  (Linux only) — an ingress mark for policy routing, unrelated to the
+  top-level `routing-mark` key that marks outbound sockets.
 
 ---
 
@@ -688,7 +717,7 @@ using them will produce a clear error at startup.
 | Feature | Reason | Alternative |
 |---------|--------|-------------|
 | TUIC, SSH protocols | Protocol scope and dependency budget | Revisit in M2+ if users need them |
-| TUN inbound | L3-device transparent proxy (issue #326) | `tun:` section with the `listener-tun` Cargo feature |
+| TUN inbound | L3-device transparent proxy (issue #326) | `tun:` section or a named `listeners:` `type: tun` entry (flat form, one effective TUN), with the `listener-tun` Cargo feature |
 
 ---
 
