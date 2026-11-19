@@ -3798,13 +3798,19 @@ mod tests {
         assert_eq!(named.process, "curl", "a supplied owner is kept");
         // Every skip is recorded on the flow's memo — unmarked, a later
         // process-demanding slot could rescan what this pass refused
-        // (issue #974).
-        for md in [&internal, &proxied, &named, &no_tuple, &no_port] {
+        // (issue #974). `proxied` is exempt: `special_proxy` resolves the
+        // flow before the lookup path entirely (upstream `resolveMetadata`
+        // returns early), so no rule scan can ever rescan it.
+        for md in [&internal, &named, &no_tuple, &no_port] {
             assert!(
                 md.flow_lookup.process_attempted(),
                 "the skip must be recorded"
             );
         }
+        assert!(
+            !proxied.flow_lookup.process_attempted(),
+            "special_proxy resolves before the lookup, leaving no memo"
+        );
     }
 
     /// `always`: a flow the pre-dispatch skip refused is marked attempted,
