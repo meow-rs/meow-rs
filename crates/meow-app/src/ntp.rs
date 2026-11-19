@@ -680,13 +680,14 @@ mod tests {
 
     /// `set_protocol_offset_ns` is a process global — the supervisor
     /// tests below would clear/publish over each other under parallel
-    /// `cargo test`, so they serialize through this gate.
-    static PUBLISHED_OFFSET_GATE: StdMutex<()> = StdMutex::new(());
+    /// `cargo test`, so they serialize through this gate. It is async so
+    /// the guard can stay held across `.await` — the gate must cover
+    /// shutdown/drop too, which clear the same global the sibling tests
+    /// assert on (issue #974 review).
+    static PUBLISHED_OFFSET_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
-    fn offset_gate() -> std::sync::MutexGuard<'static, ()> {
-        PUBLISHED_OFFSET_GATE
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    async fn offset_gate() -> tokio::sync::MutexGuard<'static, ()> {
+        PUBLISHED_OFFSET_GATE.lock().await
     }
 
     fn test_cfg(server: &str) -> meow_config::NtpConfig {
@@ -727,7 +728,7 @@ mod tests {
     /// worker generation (issue #974 normalization).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_treats_direct_spelling_as_omitted() {
-        let _gate = offset_gate();
+        let _gate = offset_gate().await;
         let sup = supervisor();
         let explicit = meow_config::resolve_ntp(
             &meow_config::parse_raw_yaml(
@@ -752,7 +753,8 @@ mod tests {
             gen,
             "an equal effective config must not bump the worker generation"
         );
-        drop(_gate);
+        // The gate stays held through shutdown — it clears the same
+        // published offset every sibling test asserts on.
         sup.shutdown().await;
     }
 
@@ -762,7 +764,7 @@ mod tests {
     /// dead configuration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reconcile_clears_offset_on_any_change() {
-        let _gate = offset_gate();
+        let _gate = offset_gate().await;
         let sup = supervisor();
         let cfg_a = test_cfg("127.0.0.1");
         let cfg_b = test_cfg("127.0.0.2");
@@ -795,9 +797,7 @@ mod tests {
             published_shift_secs() < 60,
             "disable must clear the published offset"
         );
-        // The std gate must release before any `.await` — the offset
-        // assertions are done, shutdown is plain cleanup.
-        drop(_gate);
+        // Same gate-through-shutdown contract as the sibling test.
         sup.shutdown().await;
     }
 
@@ -805,7 +805,7 @@ mod tests {
     /// no forever-polling task, no stale correction (issue #974).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn drop_aborts_worker_and_clears_offset() {
-        let _gate = offset_gate();
+        let _gate = offset_gate().await;
         let sup = supervisor();
         sup.reconcile(test_cfg("127.0.0.1"));
         assert!(
