@@ -143,8 +143,8 @@ pub fn parse_sub_rule_reference(line: &str) -> Result<Option<SubRuleRef>, String
 
 /// A leaf predicate `(TYPE,payload[,flag…])` — targetless by grammar.
 /// `ty`/`payload` are the canonical type name and first payload field
-/// (geo discovery keys on them); `entry` is the verbatim inner text fed
-/// to the shared leg grammar at [`CondExpr::build`].
+/// (geo discovery keys on them); `entry` is the canonical-type inner
+/// text fed to the shared leg grammar at [`CondExpr::build`].
 #[derive(Debug)]
 pub struct CondLeaf {
     /// Canonical rule-type name (`GEOIP`, `DOMAIN-SUFFIX`, `IP-ASN`, …).
@@ -152,9 +152,10 @@ pub struct CondLeaf {
     /// The leaf's first payload field — `GEOIP,CN` → `CN`,
     /// `GEOSITE,cat@attr` → `cat@attr`, `IP-ASN,1234` → `1234`.
     pub payload: String,
-    /// The verbatim `TYPE,payload[,param…]` text inside the parens —
-    /// built through [`crate::parser::parse_inner_leg`] so flags,
-    /// comma-joins and constructors match a logic leg byte for byte.
+    /// The `TYPE,payload[,param…]` text with the type normalized to
+    /// `ty` — the shared leg grammar's `match` keys on the canonical
+    /// spelling, so a `(domain-suffix,x)` leaf must not reach it
+    /// verbatim; payload and params keep their exact bytes.
     entry: String,
 }
 
@@ -525,7 +526,11 @@ fn parse_cond_leaf(ty: &str, tail: &str, inner: &str) -> Result<CondExpr, String
     Ok(CondExpr::Leaf(CondLeaf {
         ty: ty.to_string(),
         payload: payload.to_string(),
-        entry: inner.to_string(),
+        // Reassemble with the canonical type: `inner`'s head may carry a
+        // spelling the case-sensitive leg match would reject
+        // (`domain-suffix`), while `tail` already holds payload and
+        // params verbatim.
+        entry: format!("{ty},{tail}"),
     }))
 }
 
@@ -771,6 +776,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e.leaves().len(), 5);
+    }
+
+    /// Issue #974 review — `parse_cond` accepts a leaf's non-canonical
+    /// type spelling, so build must feed the *normalized* name to the
+    /// case-sensitive leg grammar: `(domain-suffix,x)` parses like
+    /// `(DOMAIN-SUFFIX,x)` did before the widened leaf set.
+    #[test]
+    fn cond_leaf_build_normalizes_type_spelling() {
+        use crate::parser::ParserContext;
+        let ctx = ParserContext::empty();
+        let empty: crate::parser::RuleSets = Default::default();
+        for text in ["(domain-suffix,a.example)", "(DomainSuffix,a.example)"] {
+            let rule = parse_cond(text)
+                .unwrap_or_else(|e| panic!("{text}: {e}"))
+                .build(&ctx, &empty)
+                .unwrap_or_else(|e| panic!("{text}: build must succeed, got {e}"));
+            let meta = meow_common::Metadata {
+                host: "www.a.example".into(),
+                ..Default::default()
+            };
+            assert!(
+                rule.match_metadata(&meta, &meow_common::RuleMatchHelper),
+                "{text}: the leaf must behave as DOMAIN-SUFFIX"
+            );
+        }
     }
 
     /// Issue #974 review — delimiter bytes are literal in non-regex
