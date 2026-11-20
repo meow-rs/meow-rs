@@ -450,10 +450,15 @@ impl CondParser<'_> {
 /// Split a prefix group's inside text on commas at paren depth 0. Empty
 /// items (`(a),`, `,(a)`, `(a),,(b)`) are an error — a missing operand.
 /// `\`-escaped and `[...]`-class parens inside regex payloads never
-/// count as structural, matching [`matching_paren`].
+/// count as structural, matching [`matching_paren`] — and, like it,
+/// only inside regex-type groups.
 fn split_group_items(inner: &str) -> Result<Vec<&str>, String> {
+    use crate::parser::group_is_regex_payload;
     let mut items = Vec::new();
-    let (mut depth, mut start) = (0i32, 0usize);
+    let mut start = 0usize;
+    // One flag per open group — whether its payload is regex expression
+    // text; the stack's length is the paren depth.
+    let mut stack: Vec<bool> = Vec::new();
     let mut in_class = false;
     let mut escaped = false;
     for (i, b) in inner.bytes().enumerate() {
@@ -461,13 +466,16 @@ fn split_group_items(inner: &str) -> Result<Vec<&str>, String> {
             escaped = false;
             continue;
         }
+        let in_regex = stack.last().copied().unwrap_or(false);
         match b {
-            b'\\' => escaped = true,
-            b'[' if !in_class => in_class = true,
+            b'\\' if in_regex => escaped = true,
+            b'[' if in_regex && !in_class => in_class = true,
             b']' if in_class => in_class = false,
-            b'(' if !in_class => depth += 1,
-            b')' if !in_class => depth -= 1,
-            b',' if depth == 0 && !in_class => {
+            b'(' if !in_class => stack.push(group_is_regex_payload(&inner[i + 1..])),
+            b')' if !in_class => {
+                stack.pop();
+            }
+            b',' if stack.is_empty() && !in_class => {
                 let item = inner[start..i].trim();
                 if item.is_empty() {
                     return Err(format!(
@@ -763,5 +771,30 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e.leaves().len(), 5);
+    }
+
+    /// Issue #974 review — delimiter bytes are literal in non-regex
+    /// payloads: a glob's `[` or a path's `\` must not shadow the
+    /// structural paren closing a plain `(TYPE,…)` group.
+    #[test]
+    fn cond_literal_delimiters_in_plain_payloads() {
+        // The glob `worker[*` carries a literal `[` — the group's `)`
+        // must still close it.
+        let e = parse_cond("(PROCESS-NAME-WILDCARD,worker[*)");
+        assert!(e.is_ok(), "{e:?}");
+        assert_eq!(leaf_ty(&e.unwrap()), Some("PROCESS-NAME-WILDCARD"));
+        // Same inside a prefix group's item list — the comma and the
+        // group's own parens are not class contents.
+        let e = parse_cond("(AND,((PROCESS-NAME-WILDCARD,worker[*),(NETWORK,tcp)))");
+        assert!(e.is_ok(), "{e:?}");
+        // A backslash in a literal payload is just a byte — `\( ` is not
+        // an escape here, so the unbalanced shape must still error.
+        assert!(parse_cond("(PROCESS-PATH-WILDCARD,C:\\dir").is_err());
+        // And inside a regex leaf the same bytes keep their escape/class
+        // meaning — `(DOMAIN-REGEX,a\),b)` stays one group.
+        let e = parse_cond("(DOMAIN-REGEX,a\\),b)");
+        assert!(e.is_ok(), "{e:?}");
+        let e = parse_cond("(DOMAIN-REGEX,x[(]y)");
+        assert!(e.is_ok(), "{e:?}");
     }
 }
