@@ -14,6 +14,10 @@ pub struct FallbackGroup {
     name: SmolStr,
     static_proxies: Vec<Arc<dyn Proxy>>,
     provider_slots: Vec<ProviderSlot>,
+    /// Tri-state like `UrlTestGroup::fixed`: `Some(name)` an explicit pin,
+    /// `Some("")` an explicit unfix or a dead-pin suppression that hides
+    /// the stored pin for this generation, `None` "never set" — the
+    /// store's saved pin then applies lazily.
     fixed: RwLock<Option<SmolStr>>,
     store: Option<SelectorWriter>,
     test_url: String,
@@ -64,6 +68,11 @@ impl FallbackGroup {
         }
     }
 
+    /// Attach the health-check keys and the epoch-fenced persistence
+    /// writer. The saved pin is not copied out here: `effective_fixed`
+    /// asks the store lazily, so the group follows the map the backing's
+    /// `commit` adopts — a build-time snapshot could name whatever the
+    /// file held before adoption refreshed it (issue #974 review).
     #[must_use]
     pub fn with_runtime_options(
         mut self,
@@ -73,12 +82,7 @@ impl FallbackGroup {
     ) -> Self {
         self.test_url = test_url;
         self.expected_status = expected_status;
-        if let Some(store) = store {
-            if let Some(prev) = store.get(&self.name).filter(|v| !v.is_empty()) {
-                *self.fixed.write() = Some(SmolStr::from(prev));
-            }
-            self.store = Some(store);
-        }
+        self.store = store;
         self
     }
 
@@ -107,11 +111,51 @@ impl FallbackGroup {
         None
     }
 
+    /// The pin in force: an explicit `force_set` pick or unfix/dead-pin
+    /// sentinel, else the persisted pin — read lazily so the group sees
+    /// the map the backing serves (including a store pin written between
+    /// the build's open and its commit).
+    fn effective_fixed(&self) -> Option<SmolStr> {
+        match self.fixed.read().clone() {
+            Some(name) if !name.is_empty() => Some(name),
+            Some(_) => None,
+            None => self
+                .store
+                .as_ref()
+                .and_then(|store| store.get(&self.name))
+                .filter(|v| !v.is_empty())
+                .map(SmolStr::from),
+        }
+    }
+
+    /// Write the unfix sentinel only if the stale pin still names
+    /// `name` — an explicit pin is compared directly; a store-sourced
+    /// pin (fixed is `None`) is re-read under the write lock so a pin
+    /// that changed to a different value since `effective_fixed` ran is
+    /// not suppressed along with the dead one.
+    fn suppress_pin_if_still(&self, name: &SmolStr) {
+        let mut pinned = self.fixed.write();
+        let still_stale = match pinned.as_ref() {
+            Some(cur) if !cur.is_empty() => *cur == *name,
+            Some(_) => false,
+            None => {
+                self.store
+                    .as_ref()
+                    .and_then(|store| store.get(&self.name))
+                    .as_deref()
+                    == Some(name.as_str())
+            }
+        };
+        if still_stale {
+            *pinned = Some(SmolStr::default());
+        }
+    }
+
     /// Single-pass scan: returns the first alive proxy, or the first
     /// proxy of any kind if none are alive.  Walks `static_proxies` and
     /// each provider slot directly without building a unified `Vec`.
     fn first_alive(&self) -> Option<Arc<dyn Proxy>> {
-        let fixed_name = { self.fixed.read().clone() };
+        let fixed_name = self.effective_fixed();
         if let Some(name) = fixed_name {
             if let Some(proxy) = self.find_member(&name) {
                 if proxy.alive_for_url(&self.test_url) {
@@ -119,8 +163,10 @@ impl FallbackGroup {
                 }
             }
             // Upstream clears a stale fallback pin in memory when it is
-            // observed dead, but leaves the persistent cache untouched.
-            *self.fixed.write() = None;
+            // observed dead, but leaves the persistent cache untouched —
+            // here the `""` sentinel suppresses this generation's view of
+            // the stored pin without rewriting the file.
+            self.suppress_pin_if_still(&name);
         }
         let mut fallback: Option<Arc<dyn Proxy>> = None;
         for p in &self.static_proxies {
@@ -352,7 +398,10 @@ impl ProxySelection for FallbackGroup {
     }
 
     fn force_set(&self, name: Option<&str>) {
-        *self.fixed.write() = name.map(SmolStr::from);
+        // Same contract as `UrlTestGroup::force_set`: `""` suppresses the
+        // stored pin for this generation; `""` on disk is upstream's
+        // cleared pin.
+        *self.fixed.write() = Some(name.map_or_else(SmolStr::default, SmolStr::from));
         if let Some(store) = &self.store {
             store.set(&self.name, name.unwrap_or(""));
         }
@@ -360,10 +409,8 @@ impl ProxySelection for FallbackGroup {
 
     fn fixed(&self) -> Option<String> {
         Some(
-            self.fixed
-                .read()
-                .as_ref()
-                .map_or_else(String::new, ToString::to_string),
+            self.effective_fixed()
+                .map_or_else(String::new, |n| n.to_string()),
         )
     }
 
@@ -728,6 +775,102 @@ mod tests {
         assert!(
             a_ref.alive(),
             "structural UdpNotSupported errors are exempt from failure tracking"
+        );
+    }
+
+    /// The persisted pin is consulted lazily, like `SelectorGroup`'s — a
+    /// store write between the build's open and the backing's adoption is
+    /// the pin the group serves.
+    #[test]
+    fn persisted_pin_applies_lazily() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::group::selector_store::SelectorStore::open(dir.path().join("s.json"));
+        let g = FallbackGroup::new("fb", vec![MockProxy::new("a"), MockProxy::new("b")])
+            .with_runtime_options(
+                "https://www.gstatic.com/generate_204".to_string(),
+                String::new(),
+                Some(crate::group::selector_store::SelectorWriter::standalone(
+                    Arc::clone(&store),
+                )),
+            );
+
+        store.set("fb", "b");
+        assert_eq!(
+            g.first_alive().unwrap().name(),
+            "b",
+            "a post-build store pin must be honored"
+        );
+        assert_eq!(ProxySelection::fixed(&g).as_deref(), Some("b"));
+    }
+
+    /// A store-sourced pin observed dead is suppressed in memory only —
+    /// the file keeps it (upstream parity). Forgetting the pin reverts
+    /// to declaration order, so a revived first member is picked again
+    /// exactly like the eager-copy clearing was.
+    #[test]
+    fn dead_store_pin_is_suppressed_without_rewriting_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s.json");
+        let store = crate::group::selector_store::SelectorStore::open(path.clone());
+        let a = MockProxy::new("a");
+        let a_ref = Arc::clone(&a);
+        let g = FallbackGroup::new("fb", vec![a, MockProxy::new("b")]).with_runtime_options(
+            "https://www.gstatic.com/generate_204".to_string(),
+            String::new(),
+            Some(crate::group::selector_store::SelectorWriter::standalone(
+                Arc::clone(&store),
+            )),
+        );
+
+        store.set("fb", "a");
+        a_ref.set_alive(false);
+        assert_eq!(g.first_alive().unwrap().name(), "b");
+        assert_eq!(
+            store.get("fb").as_deref(),
+            Some("a"),
+            "a dead store pin is suppressed in memory, never rewritten"
+        );
+
+        a_ref.set_alive(true);
+        assert_eq!(
+            g.first_alive().unwrap().name(),
+            "a",
+            "with the pin forgotten, declaration order picks the revived member"
+        );
+        let on_disk: std::collections::HashMap<String, String> =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(on_disk.get("fb").map(String::as_str), Some("a"));
+    }
+
+    /// A store pin overwritten between `first_alive`'s read and the
+    /// suppress write keeps its new value — the suppression re-checks
+    /// under the write lock (Codex review).
+    #[test]
+    fn suppress_does_not_clobber_a_newer_store_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::group::selector_store::SelectorStore::open(dir.path().join("s.json"));
+        let a = MockProxy::new("a");
+        let a_ref = Arc::clone(&a);
+        let g = FallbackGroup::new("fb", vec![a, MockProxy::new("b")]).with_runtime_options(
+            "https://www.gstatic.com/generate_204".to_string(),
+            String::new(),
+            Some(crate::group::selector_store::SelectorWriter::standalone(
+                Arc::clone(&store),
+            )),
+        );
+
+        store.set("fb", "a");
+        a_ref.set_alive(false);
+        // `first_alive` reads "a" dead; simulate the pin being replaced
+        // before the suppression lands by re-arming the store with a
+        // live pin and checking the suppress path directly.
+        assert_eq!(g.effective_fixed().as_deref(), Some("a"));
+        store.set("fb", "b");
+        g.suppress_pin_if_still(&smol_str::SmolStr::from("a"));
+        assert_eq!(
+            g.effective_fixed().as_deref(),
+            Some("b"),
+            "a pin that changed to a different value must not be suppressed"
         );
     }
 }

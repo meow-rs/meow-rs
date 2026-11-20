@@ -15,8 +15,11 @@ pub struct UrlTestGroup {
     static_proxies: Vec<Arc<dyn Proxy>>,
     provider_slots: Vec<ProviderSlot>,
     tolerance: u16,
-    /// User-fixed member. This is independent from `fastest`, which remains
-    /// the automatic URL-test incumbent.
+    /// User-fixed member — tri-state: `Some(name)` an explicit pin,
+    /// `Some("")` an explicit unfix that suppresses any persisted pin,
+    /// `None` "never set", for which the store's saved pin applies
+    /// lazily. Independent from `fastest`, which remains the automatic
+    /// URL-test incumbent.
     fixed: RwLock<Option<SmolStr>>,
     store: Option<SelectorWriter>,
     test_url: String,
@@ -76,6 +79,11 @@ impl UrlTestGroup {
         }
     }
 
+    /// Attach the health-check keys and the epoch-fenced persistence
+    /// writer. The saved pin is not copied out here: `effective_fixed`
+    /// asks the store lazily, so the group follows the map the backing's
+    /// `commit` adopts — a build-time snapshot could name whatever the
+    /// file held before adoption refreshed it (issue #974 review).
     #[must_use]
     pub fn with_runtime_options(
         mut self,
@@ -85,12 +93,7 @@ impl UrlTestGroup {
     ) -> Self {
         self.test_url = test_url;
         self.expected_status = expected_status;
-        if let Some(store) = store {
-            if let Some(prev) = store.get(&self.name).filter(|v| !v.is_empty()) {
-                *self.fixed.write() = Some(SmolStr::from(prev));
-            }
-            self.store = Some(store);
-        }
+        self.store = store;
         self
     }
 
@@ -110,8 +113,27 @@ impl UrlTestGroup {
             })
     }
 
+    /// The pin in force: an explicit `force_set` pick or unfix sentinel,
+    /// else the persisted pin — read lazily so a group always sees the
+    /// map the backing serves (including a store pin written between the
+    /// build's open and its commit).
+    fn effective_fixed(&self) -> Option<SmolStr> {
+        match self.fixed.read().clone() {
+            Some(name) if !name.is_empty() => Some(name),
+            // `Some("")`: an explicit unfix — suppresses the stored pin
+            // for this generation without rewriting the file.
+            Some(_) => None,
+            None => self
+                .store
+                .as_ref()
+                .and_then(|store| store.get(&self.name))
+                .filter(|v| !v.is_empty())
+                .map(SmolStr::from),
+        }
+    }
+
     fn fixed_proxy_if_alive(&self) -> Option<Arc<dyn Proxy>> {
-        let name = self.fixed.read().clone()?;
+        let name = self.effective_fixed()?;
         for p in &self.static_proxies {
             if p.name() == name && p.alive_for_url(&self.test_url) {
                 return Some(Arc::clone(p));
@@ -470,7 +492,11 @@ impl ProxySelection for UrlTestGroup {
     }
 
     fn force_set(&self, name: Option<&str>) {
-        *self.fixed.write() = name.map(SmolStr::from);
+        // An unfix writes the empty sentinel so the stored pin stays
+        // suppressed for this generation even if the store write is
+        // fenced out; `""` on disk is the same cleared pin upstream
+        // persists.
+        *self.fixed.write() = Some(name.map_or_else(SmolStr::default, SmolStr::from));
         if let Some(store) = &self.store {
             store.set(&self.name, name.unwrap_or(""));
         }
@@ -478,10 +504,8 @@ impl ProxySelection for UrlTestGroup {
 
     fn fixed(&self) -> Option<String> {
         Some(
-            self.fixed
-                .read()
-                .as_ref()
-                .map_or_else(String::new, ToString::to_string),
+            self.effective_fixed()
+                .map_or_else(String::new, |n| n.to_string()),
         )
     }
 
@@ -818,6 +842,65 @@ mod tests {
         assert!(
             g.is_dialer_proxy_non_transparent(),
             "the fail-closed verdict must follow the same pick support_udp consults"
+        );
+    }
+
+    /// The persisted pin is consulted lazily, like `SelectorGroup`'s: a
+    /// store write that lands after the group is built — the window
+    /// between a candidate's open and the backing's adoption — is the
+    /// pin the group serves.
+    #[test]
+    fn persisted_pin_applies_lazily() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::group::selector_store::SelectorStore::open(dir.path().join("s.json"));
+        let a = MockProxy::new("a");
+        let b = MockProxy::new("b");
+        a.set_delay(10); // fastest-by-delay would be a without the pin
+        b.set_delay(20);
+        let g = UrlTestGroup::new("ut", vec![a, b], 0).with_runtime_options(
+            "https://www.gstatic.com/generate_204".to_string(),
+            String::new(),
+            Some(crate::group::selector_store::SelectorWriter::standalone(
+                Arc::clone(&store),
+            )),
+        );
+
+        store.set("ut", "b");
+        assert_eq!(pick(&g), "b", "a post-build store pin must be honored");
+        assert_eq!(ProxySelection::fixed(&g).as_deref(), Some("b"));
+
+        store.set("ut", "a");
+        assert_eq!(pick(&g), "a", "the group follows the live map");
+    }
+
+    /// An explicit unfix writes `""` to the store AND suppresses the pin
+    /// in memory, so a pin that lingers (or reappears) in the map cannot
+    /// resurrect against this generation.
+    #[test]
+    fn unfix_suppresses_the_persisted_pin() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::group::selector_store::SelectorStore::open(dir.path().join("s.json"));
+        let a = MockProxy::new("a");
+        let b = MockProxy::new("b");
+        a.set_delay(10);
+        b.set_delay(20);
+        let g = UrlTestGroup::new("ut", vec![a, b], 0).with_runtime_options(
+            "https://www.gstatic.com/generate_204".to_string(),
+            String::new(),
+            Some(crate::group::selector_store::SelectorWriter::standalone(
+                Arc::clone(&store),
+            )),
+        );
+
+        store.set("ut", "b");
+        assert_eq!(pick(&g), "b");
+        ProxySelection::force_set(&g, None);
+        assert_eq!(pick(&g), "a", "unfix must return to the fastest pick");
+        assert_eq!(ProxySelection::fixed(&g).as_deref(), Some(""));
+        assert_eq!(
+            store.get("ut").as_deref(),
+            Some(""),
+            "the cleared pin is what upstream persists"
         );
     }
 }
