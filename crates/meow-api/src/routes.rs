@@ -212,27 +212,32 @@ fn standalone_listen_collides_with_tun_local_dns(listen: std::net::SocketAddr) -
 /// `local_dns::bind` then hits `EADDRINUSE`: the rollback turns
 /// `tun.enable` off while the committed document still drops
 /// `dns.listen`, stranding both listeners on a single PUT (Codex
-/// review). `windows_local_dns` carries
+/// review). A `Bound` plan retires the same socket at the same point —
+/// the replacement was bound elsewhere pre-commit — so a move off `:53`
+/// needs the identical handoff. `Keep`/`BindFailed` keep the old
+/// listener serving and never hand off. `windows_local_dns` carries
 /// `cfg!(target_os = "windows") && tun_wants_local_dns_bind` from the
 /// call site — kept a parameter so the decision matrix is testable on
 /// every target.
-fn dns_remove_conflicts_with_tun_bind(
+fn dns_retire_conflicts_with_tun_bind(
     dns_plan: &Option<DnsListenPlan>,
     tun_will_spawn: bool,
     windows_local_dns: bool,
     held_listen: Option<std::net::SocketAddr>,
 ) -> bool {
-    matches!(dns_plan, Some(DnsListenPlan::Remove))
-        && tun_will_spawn
+    matches!(
+        dns_plan,
+        Some(DnsListenPlan::Remove | DnsListenPlan::Bound(..))
+    ) && tun_will_spawn
         && windows_local_dns
         && held_listen.is_some_and(standalone_listen_collides_with_tun_local_dns)
 }
 
 /// Retire the held standalone `dns.listen` handle and await its socket's
 /// release — the handoff a TUN spawn's loopback `:53` bind needs before
-/// it runs. After it returns, `install_dns_publish`'s `Remove` arm takes
-/// a `None` handle: no second teardown, and the resolver-slot install
-/// still runs.
+/// it runs. After it returns, `install_dns_publish`'s `Remove`/`Bound`
+/// arms take/replace a `None` handle: no second teardown, and the
+/// resolver-slot install still runs.
 async fn release_standalone_dns_for_tun(dns_server: &RwLock<Option<DnsServerHandle>>) {
     if let Some(old) = dns_server.write().take() {
         retire_dns_listener(old);
@@ -4527,15 +4532,18 @@ async fn swap_config_and_reconcile_tun(
     // shape calls `local_dns::bind` claims `127.0.0.1:53`/`[::1]:53`
     // first and fails `EADDRINUSE`; the rollback then turns `tun.enable`
     // off while the document still drops `dns.listen` — neither
-    // listener. Retire + drain the held socket BEFORE the spawn when
-    // the sets collide, so the one PUT hands the port over. On every
-    // other target `local_dns::bind` is compiled out — the netstack
-    // answers `:53` internally — so nothing collides.
+    // listener. A `Bound` plan (a `dns.listen` move — the replacement is
+    // already bound to its new addr) retires the old socket at the same
+    // point, so it needs the identical release. Retire + drain the held
+    // socket BEFORE the spawn when the sets collide, so the one PUT
+    // hands the port over. On every other target `local_dns::bind` is
+    // compiled out — the netstack answers `:53` internally — so nothing
+    // collides.
     let tun_will_spawn = new_enable && (!old_enable || fake_ip_changed || tun_changed);
     let windows_local_dns =
         cfg!(target_os = "windows") && tun_wants_local_dns_bind(&candidate, &setup_resolver);
     let held_listen = state.dns_server.read().as_ref().map(|h| h.listen);
-    if dns_remove_conflicts_with_tun_bind(&dns_plan, tun_will_spawn, windows_local_dns, held_listen)
+    if dns_retire_conflicts_with_tun_bind(&dns_plan, tun_will_spawn, windows_local_dns, held_listen)
     {
         release_standalone_dns_for_tun(&state.dns_server).await;
     }
@@ -7369,16 +7377,17 @@ mod dns_tun_handoff_tests {
     }
 
     /// The early drain fires only when every arm of the handoff holds:
-    /// the plan removes the standalone listener, a TUN spawn is queued,
-    /// the spawn's shape binds loopback DNS (Windows + hijack + auto-route
-    /// + fake-IP gateway), and the held socket collides.
+    /// the plan retires the standalone listener (`Remove` or `Bound`),
+    /// a TUN spawn is queued, the spawn's shape binds loopback DNS
+    /// (Windows + hijack + auto-route + fake-IP gateway), and the held
+    /// socket collides.
     #[test]
-    fn dns_remove_conflict_requires_the_full_handoff_shape() {
+    fn dns_retire_conflict_requires_the_full_handoff_shape() {
         let remove = Some(DnsListenPlan::Remove);
         let loopback53: SocketAddr = "127.0.0.1:53".parse().unwrap();
         let other: SocketAddr = "127.0.0.1:5353".parse().unwrap();
 
-        assert!(dns_remove_conflicts_with_tun_bind(
+        assert!(dns_retire_conflicts_with_tun_bind(
             &remove,
             true,
             true,
@@ -7391,32 +7400,62 @@ mod dns_tun_handoff_tests {
             &None,
         ] {
             assert!(
-                !dns_remove_conflicts_with_tun_bind(plan, true, true, Some(loopback53)),
-                "non-Remove plan must never hand off"
+                !dns_retire_conflicts_with_tun_bind(plan, true, true, Some(loopback53)),
+                "non-retiring plan must never hand off"
             );
         }
         // No queued spawn, no Windows hijack shape, or no colliding
         // socket each leave the standalone listener to the commit arm.
-        assert!(!dns_remove_conflicts_with_tun_bind(
+        assert!(!dns_retire_conflicts_with_tun_bind(
             &remove,
             false,
             true,
             Some(loopback53)
         ));
-        assert!(!dns_remove_conflicts_with_tun_bind(
+        assert!(!dns_retire_conflicts_with_tun_bind(
             &remove,
             true,
             false,
             Some(loopback53)
         ));
-        assert!(!dns_remove_conflicts_with_tun_bind(
+        assert!(!dns_retire_conflicts_with_tun_bind(
             &remove, true, true, None
         ));
-        assert!(!dns_remove_conflicts_with_tun_bind(
+        assert!(!dns_retire_conflicts_with_tun_bind(
             &remove,
             true,
             true,
             Some(other)
+        ));
+    }
+
+    /// A `dns.listen` move produces a `Bound` plan whose replacement
+    /// socket is already bound elsewhere — the retiring old socket still
+    /// collides with the TUN spawn's `:53` claim until the commit arm
+    /// runs, so the handoff must drain it exactly like `Remove`.
+    #[tokio::test]
+    async fn dns_bound_plan_hands_off_like_remove() {
+        let _gate = HANDOFF_GATE.lock().await;
+        let loopback53: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let resolver = test_resolver();
+        let bound = meow_dns::DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap())
+            .bind()
+            .await
+            .expect("replacement bind");
+        let slot = bound.resolver_slot();
+        let bound_plan = Some(DnsListenPlan::Bound(bound, slot));
+
+        assert!(dns_retire_conflicts_with_tun_bind(
+            &bound_plan,
+            true,
+            true,
+            Some(loopback53)
+        ));
+        assert!(!dns_retire_conflicts_with_tun_bind(
+            &bound_plan,
+            true,
+            true,
+            Some("127.0.0.1:5353".parse().unwrap())
         ));
     }
 
