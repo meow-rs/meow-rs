@@ -258,19 +258,57 @@ async fn poll_once(
                     format!("ntp.dialer-proxy '{name}' is no longer in the route table"),
                 )
             })?;
-            let conn = ProxyDialer::new(proxy)
-                .dial_udp_conn(target.clone(), true)
-                .await
-                .map_err(|e| {
-                    std::io::Error::new(
-                        e.kind(),
-                        format!(
-                            "ntp.dialer-proxy '{name}' cannot carry UDP to the NTP server \
-                             ({e}) — point at a UDP-capable front or use a literal server \
-                             with direct egress"
-                        ),
-                    )
-                })?;
+            let dialer = ProxyDialer::new(proxy);
+            // A front that cannot carry a domain target refuses
+            // `Unsupported` (e.g. WireGuard, whose smoltcp sockets take
+            // literal endpoints only) — the dialer contract's fallback is
+            // to resolve `host` with our view and redial each literal
+            // candidate through the SAME front, exactly like
+            // `bind_via_dialer`/`dial_udp_via_front` do. The effective
+            // target then becomes the literal — its full IP+port filter
+            // applies to the reply peer.
+            let (conn, target) = match dialer.dial_udp_conn(target.clone(), true).await {
+                Ok(conn) => (conn, target),
+                Err(e) if e.kind() == std::io::ErrorKind::Unsupported => {
+                    let UdpTarget::Name { host, port } = &target else {
+                        return Err(dial_err(name, &e));
+                    };
+                    let mut last_err: Option<std::io::Error> = None;
+                    let mut bound = None;
+                    for addr in meow_common::resolve_host_all(host, *port)
+                        .await
+                        .map_err(|e| {
+                            std::io::Error::new(
+                                e.kind(),
+                                format!("ntp.dialer-proxy '{name}': lookup {host}:{port}: {e}"),
+                            )
+                        })?
+                    {
+                        let literal = UdpTarget::Addr(addr);
+                        match dialer.dial_udp_conn(literal.clone(), true).await {
+                            Ok(conn) => {
+                                bound = Some((conn, literal));
+                                break;
+                            }
+                            // A second `Unsupported` on the literal is a
+                            // capability refusal — every candidate fails
+                            // the same way.
+                            Err(e2) if e2.kind() == std::io::ErrorKind::Unsupported => {
+                                last_err = Some(e2);
+                                break;
+                            }
+                            Err(e2) => {
+                                last_err = meow_common::MeowError::prefer_errno_io(last_err, e2);
+                            }
+                        }
+                    }
+                    match bound {
+                        Some(v) => v,
+                        None => return Err(dial_err(name, &last_err.unwrap_or(e))),
+                    }
+                }
+                Err(e) => return Err(dial_err(name, &e)),
+            };
             let (offset, result) = exchange(&*conn, &target).await;
             drop(route);
             return result.map(|_| offset);
@@ -278,6 +316,20 @@ async fn poll_once(
     };
     let (offset, result) = exchange(&*conn, &target).await;
     result.map(|_| offset)
+}
+
+/// The dial failure text every `ntp.dialer-proxy` error flattens to —
+/// carried over `e`'s kind so a local errno classification (issue #668)
+/// still reaches the caller.
+fn dial_err(name: &str, e: &std::io::Error) -> std::io::Error {
+    std::io::Error::new(
+        e.kind(),
+        format!(
+            "ntp.dialer-proxy '{name}' cannot carry UDP to the NTP server \
+             ({e}) — point at a UDP-capable front or use a literal server \
+             with direct egress"
+        ),
+    )
 }
 
 /// Run one request/reply on `conn`. Returns `(offset_ns, result)` — the
@@ -915,6 +967,138 @@ mod tests {
         assert!(
             published_shift_secs() < 60,
             "drop must clear the published offset"
+        );
+    }
+
+    /// A front speaking the WireGuard UDP contract: a domain-only
+    /// association target (`dst_ip` absent) refuses `NotSupported` —
+    /// smoltcp sockets take literal endpoints only — while a literal
+    /// target returns a scripted conn whose replies come *from* the
+    /// dialed literal, the shape a real UDP relay produces. `seen`
+    /// records the `(dst_ip, dst_port)` each attempt carried so the test
+    /// proves the fallback resolved the name and redialed a literal
+    /// through the SAME front.
+    struct LiteralOnlyFront {
+        seen: StdMutex<Vec<(Option<std::net::IpAddr>, u16)>>,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for LiteralOnlyFront {
+        fn name(&self) -> &str {
+            "front"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(
+            &self,
+            _m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            unimplemented!("no tcp")
+        }
+        async fn dial_udp(
+            &self,
+            m: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            self.seen.lock().unwrap().push((m.dst_ip, m.dst_port));
+            if m.domain_udp_target().is_some() {
+                return Err(meow_common::MeowError::NotSupported(
+                    "front carries literal UDP endpoints only".into(),
+                ));
+            }
+            let mut conn = ScriptedConn::new(2_000_000_000);
+            conn.from = SocketAddr::new(m.dst_ip.unwrap(), m.dst_port);
+            Ok(Box::new(conn))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for LiteralOnlyFront {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// `ntp.dialer-proxy` at a front that cannot express a domain UDP
+    /// target must not strand polling: `poll_once` resolves the name
+    /// with the local view, redials the literal candidates through the
+    /// same front, and validates the reply against the literal (the
+    /// `Addr` arm of `src_matches`, not the port-only `Name` arm).
+    /// `localhost` resolves through the system path without a network.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn poll_redials_literal_through_name_refusing_front() {
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec!["8.8.8.8:53".parse().unwrap()],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        ));
+        let tunnel = meow_tunnel::Tunnel::new(resolver);
+        let front = Arc::new(LiteralOnlyFront {
+            seen: StdMutex::new(Vec::new()),
+            health: meow_common::ProxyHealth::new(),
+        });
+        tunnel.update_proxies(
+            std::collections::HashMap::from([(
+                smol_str::SmolStr::from("front"),
+                Arc::clone(&front) as Arc<dyn meow_common::Proxy>,
+            )]),
+            Default::default(),
+        );
+        let cfg = meow_config::NtpConfig {
+            enable: true,
+            server: "localhost".into(),
+            port: 123,
+            interval_minutes: 525_600,
+            dialer_proxy: Some("front".into()),
+        };
+
+        let offset = poll_once(&cfg, &tunnel.weak_inner())
+            .await
+            .expect("a domain target refused by the front must fall back to literal dials");
+        assert!(
+            (offset - 2_000_000_000).abs() < 500_000_000,
+            "offset {offset} not near the scripted +2 s"
+        );
+
+        let seen = front.seen.lock().unwrap();
+        assert_eq!(
+            seen.len(),
+            2,
+            "expected the refused Name dial plus one literal redial, got {seen:?}"
+        );
+        assert_eq!(
+            seen[0],
+            (None, 123),
+            "the first attempt must carry the domain target the front refuses"
+        );
+        assert!(
+            seen[1].0.is_some_and(|ip| ip.is_loopback()) && seen[1].1 == 123,
+            "the fallback must redial a resolved loopback literal, got {:?}",
+            seen[1]
         );
     }
 }
