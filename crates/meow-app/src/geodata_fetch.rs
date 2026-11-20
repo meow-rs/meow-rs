@@ -609,6 +609,7 @@ mod tests {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 task: tokio::spawn(std::future::pending::<()>()),
                 resolver_slot: Arc::clone(&slot),
+                socket: None,
             })));
 
         // Production callers hold the lane; the debug_assert in

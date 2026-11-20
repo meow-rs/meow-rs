@@ -5846,17 +5846,26 @@ pub(crate) fn check_ntp_dialer_target(
 /// anything else would commit a document the next startup's built-map
 /// check hard-fails — including a same-name node whose unknown `type:`
 /// the lenient build drops. `use:`-only provider names fail here the
-/// same way they fail there.
+/// same way they fail there — and only a *buildable* provider counts as
+/// supplying members, since `materialize_proxy_providers` warn-drops a
+/// def it cannot construct.
+///
+/// `cache_dir` is the provider-cache directory the rebuild would use —
+/// safe-path containment inside it is part of buildability. The check
+/// runs the real provider constructor, which canonicalizes paths on
+/// disk: callers must not hold the raw write guard and should dispatch
+/// it off the async lane.
 pub fn check_ntp_dialer_target_declared(
     cfg: &NtpConfig,
     raw: &raw::RawConfig,
+    cache_dir: Option<&Path>,
 ) -> Result<(), anyhow::Error> {
     check_ntp_dialer_target_impl(cfg, |name| {
         // The transports the built map always carries are spelled out —
         // there is no map to consult here.
         matches!(name, "DIRECT" | "COMPATIBLE" | "GLOBAL")
             || declared_leaf_binding(name, raw) == Some(false)
-            || declared_group_lands(name, raw)
+            || declared_group_lands(name, raw, cache_dir)
     })
 }
 
@@ -5956,7 +5965,12 @@ fn declared_leaf_binding(name: &str, raw: &raw::RawConfig) -> Option<bool> {
 /// every landed leaf, and every group that already landed — computed as
 /// a fixpoint over the declared groups, since a group member that names
 /// a later group resolves once that group lands.
-fn declared_group_lands(name: &str, raw: &raw::RawConfig) -> bool {
+///
+/// `cache_dir` must be the provider-cache directory the rebuild would
+/// use: it feeds [`declared_provider_buildable`]'s safe-path mirror, and
+/// that constructor's canonicalize touches the filesystem — keep this
+/// off the raw write guard and off the async lane.
+fn declared_group_lands(name: &str, raw: &raw::RawConfig, cache_dir: Option<&Path>) -> bool {
     let Some(groups) = raw.proxy_groups.as_ref() else {
         return false;
     };
@@ -5979,10 +5993,22 @@ fn declared_group_lands(name: &str, raw: &raw::RawConfig) -> bool {
             landed_leaves += 1;
         }
     }
+    // Only a provider that would construct supplies member slots —
+    // `materialize_proxy_providers` warn-drops a def that fails
+    // `ProxyProvider::new_with_client_fingerprint` (an `http` provider
+    // without `url`, a `file` one without `path` or whose `path` escapes
+    // the cache dir, an unknown `type`), and the real build wires slots
+    // from its materialized map, not the declared one (Codex review:
+    // declared membership counted slots the construction drops).
     let providers: std::collections::HashSet<&str> = raw
         .proxy_providers
         .as_ref()
-        .map(|defs| defs.keys().map(String::as_str).collect())
+        .map(|defs| {
+            defs.iter()
+                .filter(|(name, def)| declared_provider_buildable(name, def, raw, cache_dir))
+                .map(|(name, _)| name.as_str())
+                .collect()
+        })
         .unwrap_or_default();
     let mut landed: std::collections::HashSet<&str> = std::collections::HashSet::new();
     loop {
@@ -6000,6 +6026,32 @@ fn declared_group_lands(name: &str, raw: &raw::RawConfig) -> bool {
             return landed.contains(name);
         }
     }
+}
+
+/// Whether the declared `proxy-providers:` def would construct — the
+/// exact gate `materialize_proxy_providers` applies when it decides
+/// whether a name enters the built map (`use:`/`include-all` wire slots
+/// against that map). Runs the real constructor with a throwaway dialer
+/// registry and the same `ipv6`/`strict`/fingerprint resolution the
+/// rebuild applies — including safe-path containment, which reads the
+/// filesystem, so callers must stay off the write guard and dispatch to
+/// the blocking pool.
+fn declared_provider_buildable(
+    name: &str,
+    def: &raw::RawProxyProvider,
+    raw: &raw::RawConfig,
+    cache_dir: Option<&Path>,
+) -> bool {
+    proxy_provider::ProxyProvider::new_with_client_fingerprint(
+        name,
+        def,
+        cache_dir,
+        effective_ipv6(raw.ipv6),
+        raw.strict.unwrap_or(false),
+        meow_proxy::dialer::ProxyRegistry::default(),
+        raw.global_client_fingerprint.as_deref(),
+    )
+    .is_ok()
 }
 
 /// The kept-verdict of one group parse — see [`declared_group_lands`].

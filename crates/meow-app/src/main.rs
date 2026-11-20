@@ -1589,6 +1589,7 @@ async fn run(
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!("dns.listen {listen_addr}: {e}"))?;
+        let socket = bound.socket_weak();
         let task = tokio::spawn(async move {
             if let Err(e) = bound.run().await {
                 error!("DNS server error: {}", e);
@@ -1598,6 +1599,7 @@ async fn run(
             listen: listen_addr,
             task,
             resolver_slot: slot,
+            socket: Some(socket),
         });
     }
 

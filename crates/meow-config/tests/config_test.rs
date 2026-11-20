@@ -4798,7 +4798,7 @@ mod ntp_resolution {
         let check = |yaml: &str| {
             let raw = meow_config::parse_raw_yaml(yaml).unwrap();
             let ntp = meow_config::resolve_ntp(&raw).unwrap();
-            meow_config::check_ntp_dialer_target_declared(&ntp, &raw)
+            meow_config::check_ntp_dialer_target_declared(&ntp, &raw, None)
         };
         // A declared node with a known `type:` passes.
         assert!(
@@ -4845,6 +4845,54 @@ mod ntp_resolution {
             "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: relay\n    proxies: [DIRECT]\n"
         )
         .is_err());
+        // A group whose only member source is an UNBUILDABLE provider
+        // drops too — `materialize_proxy_providers` warn-drops a def the
+        // constructor refuses, so declared `use:` membership cannot count
+        // it (Codex review: provider-only target floor).
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: http\n"
+        )
+        .is_err());
+        // Same for a `file` provider when no cache dir exists to contain
+        // its path — the constructor refuses it in that posture.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n"
+        )
+        .is_err());
+        // And for an unknown provider `type:`.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: carrier-pigeon\n"
+        )
+        .is_err());
+
+        // A buildable provider DOES land its `use:` slot — the same gate
+        // the build applies, run against a real cache dir.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let check_dir = |yaml: &str| {
+            let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+            let ntp = meow_config::resolve_ntp(&raw).unwrap();
+            meow_config::check_ntp_dialer_target_declared(&ntp, &raw, Some(cache_dir.path()))
+        };
+        assert!(
+            check_dir(
+                "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n"
+            )
+            .is_ok(),
+            "a contained file provider must satisfy the provider-only target"
+        );
+        // The same def with an escaping path is dropped by containment —
+        // the group no longer lands even though `use:` still names it.
+        assert!(check_dir(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: file\n    path: ../outside.yaml\n"
+        )
+        .is_err());
+        // `include-all-providers` wires the same buildable set.
+        assert!(
+            check_dir(
+                "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    include-all-providers: true\nproxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n"
+            )
+            .is_ok()
+        );
         // A member that names a later group resolves once that group
         // lands — the fixpoint mirrors the build's multi-pass settle.
         assert!(check(

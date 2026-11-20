@@ -21,6 +21,7 @@ use meow_tunnel::{TrackedTcp, Tunnel};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
 use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
@@ -134,6 +135,66 @@ pub struct DnsServerHandle {
     /// Slot the serve workers read per query — write the rebuilt resolver
     /// here to hot-swap without rebinding.
     pub resolver_slot: meow_dns::ResolverSlot,
+    /// Weak ref into the serve loop's UDP socket: `upgrade` failing is the
+    /// proof of port release, covering an in-flight reply that holds a
+    /// strong ref briefly past the task's join. `None` for handles whose
+    /// socket never passed through [`meow_dns::BoundDnsServer`].
+    pub socket: Option<std::sync::Weak<tokio::net::UdpSocket>>,
+}
+
+/// A listener [`install_dns_publish`] retired: its task was aborted but
+/// the socket's actual release is only proven by joining the task AND
+/// watching the weak ref die. [`plan_dns_listen`] drains this queue
+/// before attempting any bind, so a remove→re-add at the same address
+/// can never bind over a still-held port (Codex review).
+struct RetiredDnsListener {
+    task: tokio::task::JoinHandle<()>,
+    socket: Option<std::sync::Weak<tokio::net::UdpSocket>>,
+}
+
+/// Retired listeners awaiting teardown proof — process-global like the
+/// sockets themselves (and like [`CONFIG_MUTATION`], the sole lane every
+/// drain and retire runs under). Never held across an `.await`.
+static DNS_RETIRING: parking_lot::Mutex<Vec<RetiredDnsListener>> =
+    parking_lot::Mutex::new(Vec::new());
+
+fn retire_dns_listener(old: DnsServerHandle) {
+    old.task.abort();
+    DNS_RETIRING.lock().push(RetiredDnsListener {
+        task: old.task,
+        socket: old.socket,
+    });
+}
+
+/// Bounded time to wait for a retired listener's serve task to die —
+/// abort lands on the next yield, so this only bounds a wedged runtime.
+const DNS_RETIRE_JOIN_WAIT: Duration = Duration::from_secs(5);
+/// Bounded time to wait out an in-flight reply's upgraded socket ref —
+/// the reply holds it only across a `send_to`, so this is a safety cap,
+/// not a pacing delay.
+const DNS_SOCKET_RELEASE_WAIT: Duration = Duration::from_secs(5);
+
+/// Join every retired listener and wait out its socket's last upgraded
+/// ref — the actual-release barrier `plan_dns_listen` runs before
+/// binding. A retired handle embedders built without a socket probe is
+/// covered by the join alone.
+async fn drain_retired_dns() {
+    let retired = std::mem::take(&mut *DNS_RETIRING.lock());
+    for mut old in retired {
+        let _ = tokio::time::timeout(DNS_RETIRE_JOIN_WAIT, &mut old.task).await;
+        if let Some(socket) = old.socket {
+            let deadline = tokio::time::Instant::now() + DNS_SOCKET_RELEASE_WAIT;
+            while socket.upgrade().is_some() {
+                if tokio::time::timeout_at(deadline, tokio::task::yield_now())
+                    .await
+                    .is_err()
+                {
+                    warn!("retired DNS listener's socket outlived its release bound");
+                    break;
+                }
+            }
+        }
+    }
 }
 
 /// The API server owns one raw/runtime configuration, so all mutation
@@ -1271,11 +1332,13 @@ struct UpdateConfigRequest {
     find_process_mode: Option<meow_common::ProcessLookupMode>,
     /// mihomo's `keep-alive-*` outbound-dial knobs — merged over the
     /// committed document like every field here; absent/null keeps the
-    /// committed value (issue #974).
+    /// committed value (issue #974). Raw `Value` so a malformed number
+    /// (negative, fractional, past u64) reaches the handler's 400 gate
+    /// instead of dying as a 422 extraction failure.
     #[serde(rename = "keep-alive-idle")]
-    keep_alive_idle: Option<u64>,
+    keep_alive_idle: Option<serde_json::Value>,
     #[serde(rename = "keep-alive-interval")]
-    keep_alive_interval: Option<u64>,
+    keep_alive_interval: Option<serde_json::Value>,
     #[serde(rename = "disable-keep-alive")]
     disable_keep_alive: Option<bool>,
     tun: Option<TunFields>,
@@ -1283,7 +1346,7 @@ struct UpdateConfigRequest {
 
 async fn update_configs(
     State(state): State<Arc<AppState>>,
-    Json(body): Json<UpdateConfigRequest>,
+    Json(mut body): Json<UpdateConfigRequest>,
 ) -> Response {
     // Validate every field first so we never partially apply on error.
     let mode = body.mode.map(|s| s.parse::<TunnelMode>());
@@ -1306,7 +1369,7 @@ async fn update_configs(
     // Enter the shared mutation lane before applying anything: a bare
     // `raw_config.write()` here would race a concurrent PUT /configs,
     // whose candidate swap would clobber the patched fields (issue #514).
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     // The routing-mark refusal gate runs before ANY mutation below —
     // under pinned managed tproxy rules a change rejects the whole PATCH
     // rather than partially apply it (same refusal `PUT /configs`
@@ -1325,16 +1388,34 @@ async fn update_configs(
     // `keep-alive-*` patch: merge the supplied fields over the committed
     // document and validate the COMPLETE result before anything below is
     // applied — a bad merged posture rejects the whole PATCH, like the
-    // `global-ua` gate above (issue #974).
-    let keepalive_supplied = body.keep_alive_idle.is_some()
-        || body.keep_alive_interval.is_some()
+    // `global-ua` gate above (issue #974). The numeric fields arrive as
+    // raw `Value`s: a non-`u64` number (negative, fractional, oversized)
+    // or non-number is a shape defect — 400, the verdict every other bad
+    // field in this PATCH gets, not a 422 extraction failure (Codex
+    // review).
+    let keep_alive_idle = match body.keep_alive_idle.take() {
+        Some(v) => match v.as_u64() {
+            Some(v) => Some(v),
+            None => return msg_err(StatusCode::BAD_REQUEST, "Body invalid"),
+        },
+        None => None,
+    };
+    let keep_alive_interval = match body.keep_alive_interval.take() {
+        Some(v) => match v.as_u64() {
+            Some(v) => Some(v),
+            None => return msg_err(StatusCode::BAD_REQUEST, "Body invalid"),
+        },
+        None => None,
+    };
+    let keepalive_supplied = keep_alive_idle.is_some()
+        || keep_alive_interval.is_some()
         || body.disable_keep_alive.is_some();
     let keepalive = if keepalive_supplied {
         let mut candidate = state.raw_config.read().clone();
-        if let Some(v) = body.keep_alive_idle {
+        if let Some(v) = keep_alive_idle {
             candidate.keep_alive_idle = Some(v);
         }
-        if let Some(v) = body.keep_alive_interval {
+        if let Some(v) = keep_alive_interval {
             candidate.keep_alive_interval = Some(v);
         }
         if let Some(v) = body.disable_keep_alive {
@@ -1414,11 +1495,25 @@ async fn update_configs(
             (raw.tun.as_ref() != Some(&tun)).then_some(tun)
         }
     };
+    // The remaining writes share one commit shape — packaged so the TUN
+    // arm can carry the identical tail inside the owned task.
+    let tail = PatchTail {
+        mode: mode.and_then(Result::ok),
+        log_level: body.log_level.take(),
+        routing_mark: body.routing_mark,
+        interface_name: body.interface_name.take(),
+        global_ua: body.global_ua.take(),
+        tcp_concurrent: body.tcp_concurrent,
+        find_process_mode: body.find_process_mode,
+        keepalive,
+    };
     // Apply the fallible sides first — committing mode before a failed
     // step would partially apply the PATCH (issue #514). TUN goes first:
     // it is the step that fails in practice (a device the process may not
     // create), so such a PATCH leaves mode and log level as they were. The
-    // TUN change runs the reload path's reconcile, rollback included.
+    // TUN change runs the reload path's reconcile, rollback included —
+    // the whole arm rides `run_owned_mutation` so a cancelled request
+    // cannot interrupt stop → spawn → commit → tail-write partway.
     if let Some(tun) = tun {
         let prior = state.raw_config.read().clone();
         let mut candidate = prior.clone();
@@ -1426,44 +1521,31 @@ async fn update_configs(
         // Carry a patched routing-mark through the same commit path
         // (`set_routing_mark` inside the swap applies it; the write below
         // re-asserts it so a mark-only PATCH also lands).
-        if body.routing_mark.is_some() {
-            candidate.routing_mark = body.routing_mark;
+        if tail.routing_mark.is_some() {
+            candidate.routing_mark = tail.routing_mark;
         }
         // `interface-name` and `global-ua` ride the same commit
         // (issue #974). `tcp-concurrent` does too — the swap installs it
         // with the rest of the process-globals.
-        if body.interface_name.is_some() {
-            candidate.interface_name = body.interface_name.clone();
+        if tail.interface_name.is_some() {
+            candidate.interface_name = tail.interface_name.clone();
         }
-        if body.global_ua.is_some() {
-            candidate.global_ua = body.global_ua.clone();
+        if tail.global_ua.is_some() {
+            candidate.global_ua = tail.global_ua.clone();
         }
-        if body.tcp_concurrent.is_some() {
-            candidate.tcp_concurrent = body.tcp_concurrent;
+        if tail.tcp_concurrent.is_some() {
+            candidate.tcp_concurrent = tail.tcp_concurrent;
         }
-        if body.find_process_mode.is_some() {
-            candidate.find_process_mode = body.find_process_mode;
+        if tail.find_process_mode.is_some() {
+            candidate.find_process_mode = tail.find_process_mode;
         }
         // The keepalive patch rides the same commit — the swap installs
         // the merged posture with the rest of the process-globals.
-        if let Some((ref merged, _)) = keepalive {
+        if let Some((ref merged, _)) = tail.keepalive {
             candidate.keep_alive_idle = merged.keep_alive_idle;
             candidate.keep_alive_interval = merged.keep_alive_interval;
             candidate.disable_keep_alive = merged.disable_keep_alive;
         }
-        // The swap commits the riding live globals and the raw before its
-        // fallible TUN reconcile — snapshot both so a failed spawn leaves
-        // the PATCH as it found them (`tun.enable`'s own rollback below
-        // stands; the pre-installed binding reverts on drop).
-        let live = (
-            meow_proxy::health::unified_delay(),
-            meow_common::routing_mark(),
-            meow_common::global_interface_name(),
-            meow_common::global_ua(),
-            meow_common::dial::tcp_concurrent(),
-            state.tunnel.process_lookup_mode(),
-            meow_common::outbound_tcp_keepalive(),
-        );
         let preinstalled = preinstall_global_route_binding(
             &candidate,
             PreinstallScope::Mutation {
@@ -1474,38 +1556,56 @@ async fn update_configs(
             },
         );
         // No routing publish runs here, so tracked TCP predating a
-        // pre-installed global-route binding is still live.
-        if let Err(e) = swap_config_and_reconcile_tun(
-            &state,
-            candidate,
-            PendingPublish::default(),
-            state.tunnel.resolver(),
-            preinstalled,
-            TrackedTcp::Cancel,
-        )
-        .await
-        .tun
-        {
-            meow_proxy::health::set_unified_delay(live.0);
-            meow_common::set_routing_mark(Some(live.1));
-            meow_common::set_global_interface_name(live.2.as_deref());
-            meow_common::set_global_ua(live.3.as_deref());
-            meow_common::dial::set_tcp_concurrent(live.4);
-            state.tunnel.set_process_lookup_mode(live.5);
-            meow_common::set_outbound_tcp_keepalive(live.6);
-            let mut raw = state.raw_config.write();
-            let tun_left = raw.tun.take();
-            *raw = prior;
-            raw.tun = tun_left;
-            drop(raw);
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "message": e })),
+        // pre-installed global-route binding is still live. The rollback
+        // document is the pre-patch one: a failed spawn commits it with
+        // `tun.enable` rolled back, so the candidate's riding fields and
+        // keepalive posture never publish at all (issue #974).
+        let (lane, response) = run_owned_mutation(&state, mutation, |state| async move {
+            let receipt = swap_config_and_reconcile_tun(
+                &state,
+                candidate,
+                PendingPublish::default(),
+                state.tunnel.resolver(),
+                preinstalled,
+                TrackedTcp::Cancel,
+                Some(prior),
             )
-                .into_response();
-        }
+            .await;
+            if let Err(e) = receipt.tun {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "message": e })),
+                )
+                    .into_response();
+            }
+            finish_patch_writes(&state, tail)
+        })
+        .await;
+        let _mutation = lane;
+        return response;
     }
-    if let Some(level) = body.log_level.as_deref() {
+    finish_patch_writes(&state, tail)
+}
+
+/// The PATCH fields a candidate with a `tun:` patch rides through the
+/// swap's commit — and the plain-commit writes below — so both paths
+/// land the same set of knobs.
+struct PatchTail {
+    mode: Option<TunnelMode>,
+    log_level: Option<String>,
+    routing_mark: Option<u32>,
+    interface_name: Option<String>,
+    global_ua: Option<String>,
+    tcp_concurrent: Option<bool>,
+    find_process_mode: Option<meow_common::ProcessLookupMode>,
+    keepalive: Option<(RawConfig, meow_common::OutboundTcpKeepalive)>,
+}
+
+/// Write `tail`'s fields into the committed document and the live
+/// process-globals — the PATCH's own commit point, run after every
+/// fallible step (the TUN reconcile, when present, already landed).
+fn finish_patch_writes(state: &AppState, tail: PatchTail) -> Response {
+    if let Some(level) = tail.log_level.as_deref() {
         if let Err(e) = crate::log_stream::reload_log_level(level) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1515,15 +1615,15 @@ async fn update_configs(
         }
     }
     let mut raw = state.raw_config.write();
-    if let Some(Ok(parsed_mode)) = mode {
+    if let Some(parsed_mode) = tail.mode {
         state.tunnel.set_mode(parsed_mode);
         raw.mode = Some(parsed_mode.to_string());
         info!("Mode changed to {}", parsed_mode);
     }
-    if let Some(level) = body.log_level {
+    if let Some(level) = tail.log_level {
         raw.log_level = Some(level);
     }
-    if let Some(mark) = body.routing_mark {
+    if let Some(mark) = tail.routing_mark {
         // Commit point: the refusal gate passed before any mutation above.
         // `set_routing_mark` treats `Some(0)` as unset, like PUT's
         // `routing-mark: 0`.
@@ -1531,7 +1631,7 @@ async fn update_configs(
         raw.routing_mark = Some(mark);
         info!("routing-mark changed to {mark}");
     }
-    if let Some(name) = body.interface_name {
+    if let Some(name) = tail.interface_name {
         // The setter normalizes the same way as the node parser (issue
         // #974): trimmed, empty meaning unset — so `interface-name: ""`
         // clears.
@@ -1540,14 +1640,14 @@ async fn update_configs(
         info!("interface-name changed to {trimmed}");
         raw.interface_name = Some(name);
     }
-    if let Some(ua) = body.global_ua {
+    if let Some(ua) = tail.global_ua {
         // Already validated above; the setter re-trims, and `""` clears
         // to the default `clash.meta/<version>` UA (issue #974).
         meow_common::set_global_ua(Some(ua.trim()));
         info!("global-ua changed to {}", ua.trim());
         raw.global_ua = Some(ua);
     }
-    if let Some(concurrent) = body.tcp_concurrent {
+    if let Some(concurrent) = tail.tcp_concurrent {
         // Dial policy is a live process-global like `global-ua`: commit
         // here after every fallible step above. A riding `tun:` patch
         // already installed the same value through the swap's commit;
@@ -1556,7 +1656,7 @@ async fn update_configs(
         info!("tcp-concurrent changed to {concurrent}");
         raw.tcp_concurrent = Some(concurrent);
     }
-    if let Some(mode) = body.find_process_mode {
+    if let Some(mode) = tail.find_process_mode {
         // The tunnel's live policy — the traffic ledger shares the cell,
         // so queued app lookups recheck it too (issue #974). Same
         // idempotent re-assertion as `tcp-concurrent` when a `tun:` patch
@@ -1565,7 +1665,7 @@ async fn update_configs(
         info!("find-process-mode changed to {mode}");
         raw.find_process_mode = Some(mode);
     }
-    if let Some((merged, ka)) = keepalive {
+    if let Some((merged, ka)) = tail.keepalive {
         // Commit point after every fallible step above: install the
         // merged policy and echo the merged fields into the document —
         // an omitted key keeps its committed value. Idempotent when a
@@ -2164,11 +2264,18 @@ async fn apply_raw_to_tunnel(
 /// is covered the same way as on the cold path.
 ///
 /// `change` is recorded in the logbook once the candidate is committed.
+/// The candidate build (`apply_raw_to_tunnel`) still runs request-side
+/// so a cancelled caller leaves zero change; everything from the swap on
+/// — the TUN transition, the synchronous publish, the keepalive
+/// re-assert — runs inside [`run_owned_mutation`], which holds the lane
+/// continuously until the whole commit has landed. The lane is returned
+/// so the caller keeps its critical section.
 async fn commit_raw_candidate(
-    state: &AppState,
+    state: &Arc<AppState>,
     candidate: RawConfig,
     change: impl Into<Option<logbook::Event>>,
-) -> Result<(), (StatusCode, String)> {
+    lane: tokio::sync::MutexGuard<'static, ()>,
+) -> Result<tokio::sync::MutexGuard<'static, ()>, (StatusCode, String)> {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
@@ -2228,22 +2335,25 @@ async fn commit_raw_candidate(
     // tracked TCP: a flush must cancel the flows that predate the binding.
     // A TUN restart that fails is rolled back and recorded there; the edit
     // itself is committed.
-    let _ = swap_config_and_reconcile_tun(
-        state,
-        candidate,
-        publish,
-        prior_resolver,
-        preinstalled,
-        TrackedTcp::Cancel,
-    )
+    let change = change.into();
+    let (lane, _receipt) = run_owned_mutation(state, lane, |state| async move {
+        let receipt = swap_config_and_reconcile_tun(
+            &state,
+            candidate,
+            publish,
+            prior_resolver,
+            preinstalled,
+            TrackedTcp::Cancel,
+            None,
+        )
+        .await;
+        if let Some(change) = change {
+            change.record();
+        }
+        receipt
+    })
     .await;
-    // `swap` already installed the committed posture ahead of its `ntp:`
-    // reconcile; re-assert it at this lane's own commit point.
-    install_committed_keepalive(state);
-    if let Some(change) = change.into() {
-        change.record();
-    }
-    Ok(())
+    Ok(lane)
 }
 
 /// A candidate that enables the top-level `tun:` section collides with a
@@ -2913,6 +3023,11 @@ async fn plan_dns_listen(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
+    // Reap every listener a previous commit retired — task joined AND
+    // socket released — before the keep-check and any bind below. A bind
+    // attempted over a still-held port fails EADDRINUSE and would leave
+    // the committed document's `dns.listen` with no listener.
+    drain_retired_dns().await;
     // Keep-decision: an unchanged listen addr with a live serve task
     // needs nothing but the resolver slot's swap at install.
     {
@@ -2944,9 +3059,11 @@ async fn plan_dns_listen(
 
 /// Apply a [`plan_dns_listen`] outcome plus the resolver-slot installs —
 /// the synchronous half of [`publish_dns`], callable inside the commit
-/// section's write guard. Replaced listeners abort now and join on a
-/// detached task: `abort` is synchronous, so the handle swap can never
-/// leave the slot empty with zero DNS listeners (issue #621).
+/// section's write guard. Replaced listeners abort now and move to
+/// [`DNS_RETIRING`]: `abort` is synchronous, so the handle swap can never
+/// leave the slot empty with zero DNS listeners (issue #621), and the
+/// next `plan_dns_listen` drains the queue for actual socket release
+/// before any same-address bind.
 fn install_dns_publish(
     tunnel: &Tunnel,
     dns_server: &RwLock<Option<DnsServerHandle>>,
@@ -2977,13 +3094,11 @@ fn install_dns_publish(
         DnsListenPlan::Remove => {
             let old = dns_server.write().take();
             if let Some(old) = old {
-                old.task.abort();
-                tokio::spawn(async move {
-                    let _ = old.task.await;
-                });
+                retire_dns_listener(old);
             }
         }
         DnsListenPlan::Bound(bound, slot) => {
+            let socket = bound.socket_weak();
             let task = tokio::spawn(async move {
                 if let Err(e) = bound.run().await {
                     warn!("DNS server error: {e}");
@@ -2993,12 +3108,10 @@ fn install_dns_publish(
                 listen: dns.listen_addr.unwrap(),
                 task,
                 resolver_slot: slot,
+                socket: Some(socket),
             });
             if let Some(old) = old {
-                old.task.abort();
-                tokio::spawn(async move {
-                    let _ = old.task.await;
-                });
+                retire_dns_listener(old);
             }
         }
     }
@@ -3137,7 +3250,7 @@ async fn add_subscription(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let (snapshot, counts) = {
         let mut raw = state.raw_config.read().clone();
 
@@ -3183,7 +3296,7 @@ async fn add_subscription(
         (raw, counts)
     };
     let change = subscription_event(logbook::kind::CONFIG_CHANGE, "Added", &snapshot, &body.name);
-    commit_raw_candidate(&state, snapshot.clone(), change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot.clone(), change, mutation).await?;
 
     // Auto-save so subscription data is cached on disk — skipped (with a
     // warning and `persisted: false`) when the daemon was started via
@@ -3203,7 +3316,7 @@ async fn delete_subscription(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
 
@@ -3230,7 +3343,7 @@ async fn delete_subscription(
         raw
     };
     let change = config_change(format!("Removed subscription '{name}'")).subject(name.as_str());
-    commit_raw_candidate(&state, snapshot.clone(), change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot.clone(), change, mutation).await?;
     persist_candidate(&state, &snapshot, &name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3273,7 +3386,7 @@ async fn refresh_subscription(
         .unwrap_or_default()
         .as_secs() as i64;
 
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let (snapshot, counts) = {
         let mut raw = state.raw_config.read().clone();
 
@@ -3312,7 +3425,7 @@ async fn refresh_subscription(
         (raw, counts)
     };
     let update = subscription_update(&state.raw_config.read(), &snapshot, &name);
-    commit_raw_candidate(&state, snapshot.clone(), update)
+    let _mutation = commit_raw_candidate(&state, snapshot.clone(), update, mutation)
         .await
         .inspect_err(|(_, message)| subscription_failed(&name, message))?;
 
@@ -3415,7 +3528,7 @@ async fn create_proxy_group(
     Json(body): Json<CreateProxyGroupRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let group_name = body.name.clone();
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         if let Some(ref groups) = raw.proxy_groups {
@@ -3437,7 +3550,7 @@ async fn create_proxy_group(
     };
     let change =
         config_change(format!("Created proxy group '{group_name}'")).subject(group_name.as_str());
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(Json(
         serde_json::json!({"message": "group created", "name": group_name}),
     ))
@@ -3448,7 +3561,7 @@ async fn update_proxy_group(
     Path(name): Path<String>,
     Json(body): Json<CreateProxyGroupRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         let group = raw
@@ -3464,7 +3577,7 @@ async fn update_proxy_group(
         raw
     };
     let change = config_change(format!("Changed proxy group '{name}'")).subject(name.as_str());
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3472,7 +3585,7 @@ async fn delete_proxy_group(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         if let Some(ref mut groups) = raw.proxy_groups {
@@ -3498,7 +3611,7 @@ async fn delete_proxy_group(
         raw
     };
     let change = config_change(format!("Deleted proxy group '{name}'")).subject(name.as_str());
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3540,7 +3653,7 @@ async fn replace_rules(
     Json(body): Json<ReplaceRulesRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
     let count = body.rules.len();
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         // Same contract as `append_rule`: a line the reload would warn
@@ -3561,7 +3674,7 @@ async fn replace_rules(
         raw
     };
     let change = config_change(format!("Replaced the rules ({count})")).field("rules", count);
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3575,7 +3688,7 @@ async fn update_rule_at_index(
     State(state): State<Arc<AppState>>,
     Json(body): Json<UpdateRuleRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         // Same contract as `append_rule`: a line the reload would warn
@@ -3598,7 +3711,7 @@ async fn update_rule_at_index(
         raw
     };
     let change = config_change(format!("Changed rule {}", body.index)).field("index", body.index);
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3612,7 +3725,7 @@ async fn append_rule(
     State(state): State<Arc<AppState>>,
     Json(body): Json<AppendRuleRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         // `parse_rules_full` warns and skips a line that fails — an append
@@ -3633,7 +3746,13 @@ async fn append_rule(
         meow_config::subscription::reconcile_contribution_claims(&mut raw);
         raw
     };
-    commit_raw_candidate(&state, snapshot, config_change("Appended a rule".into())).await?;
+    let _mutation = commit_raw_candidate(
+        &state,
+        snapshot,
+        config_change("Appended a rule".into()),
+        mutation,
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3668,7 +3787,7 @@ async fn delete_rule(
     State(state): State<Arc<AppState>>,
     Path(index): Path<usize>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         let rules = raw.rules.get_or_insert_with(Vec::new);
@@ -3680,7 +3799,7 @@ async fn delete_rule(
         raw
     };
     let change = config_change(format!("Deleted rule {index}")).field("index", index);
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -3694,7 +3813,7 @@ async fn reorder_rules(
     State(state): State<Arc<AppState>>,
     Json(body): Json<ReorderRulesRequest>,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     let snapshot = {
         let mut raw = state.raw_config.read().clone();
         let rules = raw.rules.get_or_insert_with(Vec::new);
@@ -3708,7 +3827,7 @@ async fn reorder_rules(
     let change = config_change(format!("Moved rule {} to {}", body.from, body.to))
         .field("from", body.from)
         .field("to", body.to);
-    commit_raw_candidate(&state, snapshot, change).await?;
+    let _mutation = commit_raw_candidate(&state, snapshot, change, mutation).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4019,11 +4138,18 @@ async fn get_chain_health(
 /// adopts it, so it stays in effect from the mutation's first dial through
 /// the listener's lifetime. On any failure it is dropped with the listener,
 /// which hands the binding back to an older live owner or clears it.
+///
+/// `setup_resolver` is the *candidate* generation's resolver — the
+/// device gateway and fake-IP routes must be built from the fake-IP
+/// geometry being committed, not the live resolver the previous
+/// generation still owns (Codex review; the candidate is not published
+/// until the commit section runs).
 #[cfg(feature = "listener-tun")]
 async fn spawn_tun_from_raw(
     tunnel: &Tunnel,
     raw: &RawConfig,
     binding: Option<OutboundBinding>,
+    setup_resolver: Arc<meow_dns::Resolver>,
 ) -> Result<Option<meow_tunnel::TunHandle>, String> {
     let tun_cfg = match meow_config::parse_tun_config(
         raw.tun.as_ref(),
@@ -4046,7 +4172,8 @@ async fn spawn_tun_from_raw(
         "meow-tun".to_string(),
     )
     .with_readiness_signal(ready_tx)
-    .with_tcp_dns_hijack(tun_cfg.dns_hijack);
+    .with_tcp_dns_hijack(tun_cfg.dns_hijack)
+    .with_setup_resolver(Some(setup_resolver));
     // A broken `sniffer:` section is a parse error like `tun:`'s above,
     // not a warn-and-continue — silently spawning a snifferless TUN while
     // the API still reports success hides the defect (review #887).
@@ -4083,12 +4210,16 @@ async fn spawn_tun_from_raw(
                  (check permissions / admin / CAP_NET_ADMIN)"
                 );
                 handle.abort();
+                // Reap so the rollback commits while the device is truly
+                // gone — not merely scheduled to die.
+                let _ = handle.await;
                 return Err(msg);
             }
             Ok(Err(_)) => {
                 // Should not happen with ReadyNotifier, but handle defensively.
                 tracing::error!("TUN listener readiness signal dropped unexpectedly");
                 handle.abort();
+                let _ = handle.await;
                 return Err("TUN listener readiness signal dropped unexpectedly".into());
             }
             Err(_) => {
@@ -4098,6 +4229,7 @@ async fn spawn_tun_from_raw(
                 );
                 tracing::error!("{msg}");
                 handle.abort();
+                let _ = handle.await;
                 return Err(msg);
             }
         };
@@ -4115,6 +4247,7 @@ async fn spawn_tun_from_raw(
     _tunnel: &Tunnel,
     raw: &RawConfig,
     _binding: Option<OutboundBinding>,
+    _setup_resolver: Arc<meow_dns::Resolver>,
 ) -> Result<Option<meow_tunnel::TunHandle>, String> {
     if raw.tun.as_ref().is_some_and(|t| t.enable) {
         // Err (not Ok(None)) so the off→on reconcile path rolls
@@ -4205,6 +4338,31 @@ struct PublishReceipt {
     tun: Result<(), String>,
 }
 
+/// Run `work` to completion detached from the request's cancellation:
+/// the `CONFIG_MUTATION` guard moves into the spawned task, keeps the
+/// lane continuously held for the whole operation, and comes back
+/// through the JoinHandle. Cancelling the handler future can no longer
+/// interrupt a commit halfway — once `work` starts it always lands, and
+/// the keepalive re-assert installs the final committed posture before
+/// the lane lets a sibling in (issue #974, Codex review).
+async fn run_owned_mutation<T, Fut>(
+    state: &Arc<AppState>,
+    lane: tokio::sync::MutexGuard<'static, ()>,
+    work: impl FnOnce(Arc<AppState>) -> Fut + Send + 'static,
+) -> (tokio::sync::MutexGuard<'static, ()>, T)
+where
+    Fut: Future<Output = T> + Send,
+    T: Send + 'static,
+{
+    let state = Arc::clone(state);
+    let task = tokio::spawn(async move {
+        let out = work(Arc::clone(&state)).await;
+        install_committed_keepalive(&state);
+        (lane, out)
+    });
+    task.await.expect("config commit task panicked")
+}
+
 /// `dns`/`prior_resolver` carry the rebuilt DNS runtime and the resolver
 /// generation it replaces — the fake-IP comparison must read its inputs,
 /// not `tunnel.resolver()` (nothing has installed the candidate yet, so
@@ -4221,13 +4379,19 @@ struct PublishReceipt {
 /// `tracked_tcp` says whether the publish payload's routing install
 /// already cancels every tracked TCP flow after the binding was installed
 /// (`reload_routing`), for [`outbound_binding_adopted`]'s flush.
+///
+/// `rollback_doc` is the document to commit when the TUN reconcile fails
+/// — PATCH supplies the pre-patch document so the rejected request
+/// publishes nothing of the candidate's riding fields; `None` (PUT and
+/// warm lanes) keeps the candidate with `tun.enable` rolled back.
 async fn swap_config_and_reconcile_tun(
-    state: &AppState,
+    state: &Arc<AppState>,
     mut candidate: RawConfig,
     publish: PendingPublish,
     prior_resolver: Arc<meow_dns::Resolver>,
     mut preinstalled: PreinstalledBinding,
     tracked_tcp: TrackedTcp,
+    rollback_doc: Option<RawConfig>,
 ) -> PublishReceipt {
     debug_assert!(
         CONFIG_MUTATION.try_lock().is_err(),
@@ -4240,15 +4404,7 @@ async fn swap_config_and_reconcile_tun(
     // every settle is hoisted above the publish so a cancelled request
     // never leaves a committed document whose tail (the keepalive install
     // and `ntp:` reconcile) never ran.
-    let (
-        old_enable,
-        tun_changed,
-        specs,
-        new_log_level,
-        (logbook_enable, ledger),
-        geo_schedule_changed,
-        ntp_resolved,
-    ) = {
+    let (old_enable, tun_changed, specs, new_log_level, logbook_enable, geo_schedule_changed) = {
         let guard = state.raw_config.read();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
@@ -4284,24 +4440,13 @@ async fn swap_config_and_reconcile_tun(
         // that to the operator rather than letting it sit silently stale.
         let geo_schedule_changed = meow_config::geodata::update_schedule(&guard)
             != meow_config::geodata::update_schedule(&candidate);
-        // `ntp:` resolved here but reconciled once the commit below
-        // settles (issue #974 — the worker must never dial through a
-        // half-published commit). The candidate already resolved inside
-        // the rebuild — an error here means a caller skipped its gate.
-        let ntp_resolved = meow_config::resolve_ntp(&candidate);
-        let ledger = candidate.traffic_ledger.as_ref();
-        let ledger = (
-            meow_config::raw::RawTrafficLedger::enabled(ledger),
-            meow_config::raw::RawTrafficLedger::options(ledger),
-        );
         (
             old,
             tun_changed,
             specs,
             new_log_level,
-            (logbook_enable, ledger),
+            logbook_enable,
             geo_schedule_changed,
-            ntp_resolved,
         )
     };
 
@@ -4323,6 +4468,16 @@ async fn swap_config_and_reconcile_tun(
         .dns
         .as_ref()
         .is_some_and(|dns| tun_fake_ip_changed(&prior_resolver, &dns.resolver));
+    // The resolver the (re)spawn derives its device gateway and fake-IP
+    // routes from — the candidate generation, unpublished until the
+    // commit section. Without a DNS publish there is no new resolver
+    // generation, so the live one already is the candidate's (Codex
+    // review: snapshotting `tunnel.resolver()` inside the listener used
+    // the OLD geometry whenever `publish.dns` carried a new pool).
+    let setup_resolver = publish
+        .dns
+        .as_ref()
+        .map_or_else(|| state.tunnel.resolver(), |dns| Arc::clone(&dns.resolver));
 
     // The TUN transition is the last candidate-stage settle: `stop_tun`
     // tears the previous listener down and a (re)spawn brings its device
@@ -4350,7 +4505,14 @@ async fn swap_config_and_reconcile_tun(
             state.tunnel.stop_tun().await;
             let binding = preinstalled.take_binding();
             let adopted = binding.is_some();
-            match spawn_tun_from_raw(&state.tunnel, &candidate, binding).await {
+            match spawn_tun_from_raw(
+                &state.tunnel,
+                &candidate,
+                binding,
+                Arc::clone(&setup_resolver),
+            )
+            .await
+            {
                 Ok(Some(handle)) => {
                     tun_handle = Some(handle);
                     adopted_binding = adopted.then(|| preinstalled.interface_changed());
@@ -4392,7 +4554,14 @@ async fn swap_config_and_reconcile_tun(
         state.tunnel.stop_tun().await;
         let binding = preinstalled.take_binding();
         let adopted = binding.is_some();
-        match spawn_tun_from_raw(&state.tunnel, &candidate, binding).await {
+        match spawn_tun_from_raw(
+            &state.tunnel,
+            &candidate,
+            binding,
+            Arc::clone(&setup_resolver),
+        )
+        .await
+        {
             Ok(Some(handle)) => {
                 tun_handle = Some(handle);
                 adopted_binding = adopted.then(|| preinstalled.interface_changed());
@@ -4430,24 +4599,35 @@ async fn swap_config_and_reconcile_tun(
         Ok(())
     };
 
-    // `keep-alive-*` resolves from the candidate now but installs inside
-    // the commit section only on a clean TUN outcome (issue #974 review):
-    // a PATCH whose spawn failed restores its snapshotted policy instead,
-    // and a socket dialed in the failed-spawn window must not retain a
-    // posture the request rolls back. On the lanes that keep the
-    // committed document on `Err` (PUT/fallback) the call-site
-    // re-assert installs the same posture after this returns.
-    let keepalive = if tun_result.is_ok() {
-        match meow_config::resolve_outbound_tcp_keepalive(&candidate) {
-            Ok(ka) => Some(ka),
-            Err(e) => {
-                warn!("outbound keepalive resolution failed at commit: {e}");
-                None
-            }
-        }
+    // The document the commit actually installs: on a failed TUN
+    // transition it is the caller's rollback document (the pre-patch
+    // one for PATCH — its riding fields never publish at all) or the
+    // candidate with `tun.enable` rolled back (PUT/warm lanes keep the
+    // rest of the committed edit). `keep-alive-*` and `ntp:` resolve
+    // from the same document that lands, so a failed PATCH cannot leak
+    // the rejected posture even transiently (issue #974, Codex review).
+    let final_doc = if tun_result.is_err() {
+        rollback_doc
+            .map(|mut doc| {
+                doc.tun = candidate.tun.take();
+                doc
+            })
+            .unwrap_or(candidate)
     } else {
-        None
+        candidate
     };
+    let keepalive = match meow_config::resolve_outbound_tcp_keepalive(&final_doc) {
+        Ok(ka) => Some(ka),
+        Err(e) => {
+            warn!("outbound keepalive resolution failed at commit: {e}");
+            None
+        }
+    };
+    // `ntp:` resolved against the same final document and reconciled once
+    // the commit below settles (issue #974 — the worker must never dial
+    // through a half-published commit, and the keepalive install above
+    // lands before it).
+    let ntp_resolved = meow_config::resolve_ntp(&final_doc);
 
     // Commit point: a rejected candidate never reaches here. ONE
     // synchronous section inside the write guard — no awaits — installs
@@ -4464,29 +4644,29 @@ async fn swap_config_and_reconcile_tun(
         let mut guard = state.raw_config.write();
         // (mihomo re-applies `routing-mark` on every load); a change
         // under pinned managed rules was refused before this.
-        meow_proxy::health::set_unified_delay(candidate.unified_delay.unwrap_or(false));
-        meow_common::set_routing_mark(candidate.routing_mark);
+        meow_proxy::health::set_unified_delay(final_doc.unified_delay.unwrap_or(false));
+        meow_common::set_routing_mark(final_doc.routing_mark);
         // `interface-name` re-applies on every load the same way
         // (issue #974); the setter normalizes — trimmed, empty meaning
         // unset.
-        meow_common::set_global_interface_name(candidate.interface_name.as_deref());
+        meow_common::set_global_interface_name(final_doc.interface_name.as_deref());
         // `global-ua` likewise re-applies on every committed load — only
         // here, after the candidate passed every gate, so a rejected
         // rebuild never mutates the live override (issue #974).
-        meow_common::set_global_ua(candidate.global_ua.as_deref());
+        meow_common::set_global_ua(final_doc.global_ua.as_deref());
         // `tcp-concurrent` on the same lane: the accepted candidate's
         // value (omission resets to the meow-rs default `true`); candidate
         // fetches ran under the previous live policy — only the next
         // candidate run sees this.
         meow_common::dial::set_tcp_concurrent(meow_config::effective_tcp_concurrent(
-            candidate.tcp_concurrent,
+            final_doc.tcp_concurrent,
         ));
         // `find-process-mode` on the same lane: the accepted candidate's
         // value (omission resets to the upstream default `strict`); flows
         // already mid-resolution keep the mode they read (issue #974).
         state
             .tunnel
-            .set_process_lookup_mode(candidate.find_process_mode.unwrap_or_default());
+            .set_process_lookup_mode(final_doc.find_process_mode.unwrap_or_default());
         if let Some(ka) = keepalive {
             meow_common::set_outbound_tcp_keepalive(ka);
         }
@@ -4583,7 +4763,7 @@ async fn swap_config_and_reconcile_tun(
         // publish; lanes that reach here without one (the verbatim
         // fallback, a knobs-only PATCH) never carry a flag diff, so
         // nothing remains to retire.
-        *guard = candidate;
+        *guard = final_doc;
         // Reconcile health-check tasks with the committed proxy-group
         // section — groups added get a check, removed abort, changed
         // specs respawn (issue #514). Sync; spawns under the lane lock
@@ -4628,11 +4808,23 @@ async fn swap_config_and_reconcile_tun(
     }
 
     // The ledger's sqlite open/close cannot join the synchronous section
-    // — it waits on its database — so it runs detached on the blocking
-    // pool, serialized by the mutation lane it re-acquires, keeping the
-    // commit order of consecutive mutations.
+    // — it waits on its database — so it runs detached, serialized by the
+    // mutation lane it re-acquires. It then re-reads the tuple from the
+    // COMMITTED document rather than applying this spawn's captured one:
+    // a later commit already owns the lane when this job runs, and
+    // applying the earlier tuple would regress the newer generation's
+    // change — commit order is not spawn-completion order (Codex review).
+    let ledger_state = Arc::clone(state);
     tokio::spawn(async move {
         let _lane = CONFIG_MUTATION.lock().await;
+        let ledger = {
+            let guard = ledger_state.raw_config.read();
+            let raw = guard.traffic_ledger.as_ref();
+            (
+                meow_config::raw::RawTrafficLedger::enabled(raw),
+                meow_config::raw::RawTrafficLedger::options(raw),
+            )
+        };
         let _ = tokio::task::spawn_blocking(move || {
             meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
         })
@@ -4786,7 +4978,7 @@ async fn put_configs(
     // fetches, which dominate it. (The warm-path writers — subscription
     // add/refresh — keep resolving before the lane: they never change
     // `tun:`, so the running listener's binding already covers them.)
-    let _mutation = CONFIG_MUTATION.lock().await;
+    let mutation = CONFIG_MUTATION.lock().await;
     // Compare YAML fields to preserve reloads with a startup secret override.
     let secret_changed = {
         let live = state.raw_config.read();
@@ -5098,7 +5290,7 @@ async fn put_configs(
                     lenient.clone(),
                     resolver_slot,
                     providers,
-                    cache_dir,
+                    cache_dir.clone(),
                     state.provider_dialer_registry.clone(),
                     state.tunnel.selection_backing(),
                 )
@@ -5132,7 +5324,7 @@ async fn put_configs(
         // candidate, so a fallback that would *change* an effective
         // profile/NTP/outbound-keepalive knob claims a switch it never
         // earned — reject rather than publish.
-        {
+        let ntp_candidate = {
             let committed = state.raw_config.read();
             let profile_changed = meow_config::resolve_profile(&committed)
                 != meow_config::resolve_profile(&raw_config);
@@ -5172,15 +5364,34 @@ async fn put_configs(
                      apply; fix the defect and retry",
                 );
             }
-            // An unchanged `ntp:` block escapes the diff gate even when
-            // the candidate deleted the dialer target itself — committing
-            // it verbatim would persist a reference the next startup's
-            // built-map check hard-fails. With no built candidate the
-            // name can only be proven against the candidate's own
-            // declared proxies/groups (issue #974 review).
-            if let Ok(ntp) = meow_config::resolve_ntp(&raw_config) {
-                if let Err(e) = meow_config::check_ntp_dialer_target_declared(&ntp, &raw_config) {
+            meow_config::resolve_ntp(&raw_config).ok()
+        };
+        // An unchanged `ntp:` block escapes the diff gate even when
+        // the candidate deleted the dialer target itself — committing
+        // it verbatim would persist a reference the next startup's
+        // built-map check hard-fails. With no built candidate the
+        // name can only be proven against the candidate's own
+        // declared proxies/groups (issue #974 review). The declared
+        // provider mirror canonicalizes safe paths — real filesystem
+        // reads — so it runs on the blocking pool, after the raw read
+        // guard above has dropped.
+        if let Some(ntp) = ntp_candidate {
+            let raw = raw_config.clone();
+            let dir = cache_dir.clone();
+            let checked = tokio::task::spawn_blocking(move || {
+                meow_config::check_ntp_dialer_target_declared(&ntp, &raw, dir.as_deref())
+            })
+            .await;
+            match checked {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
                     return reload_rejected(StatusCode::BAD_REQUEST, &e.to_string());
+                }
+                Err(e) => {
+                    return reload_rejected(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &format!("ntp dialer check failed: {e}"),
+                    );
                 }
             }
         }
@@ -5188,19 +5399,19 @@ async fn put_configs(
         // No `reload_routing` ran, so tracked TCP predating the binding
         // is still live. A TUN that fails to come up is rolled back and
         // recorded there; the document is committed, so the PUT succeeds.
-        let _ = swap_config_and_reconcile_tun(
-            &state,
-            raw_config,
-            PendingPublish::default(),
-            prior_resolver,
-            preinstalled,
-            TrackedTcp::Cancel,
-        )
+        let (_lane, ()) = run_owned_mutation(&state, mutation, |state| async move {
+            let _ = swap_config_and_reconcile_tun(
+                &state,
+                raw_config,
+                PendingPublish::default(),
+                prior_resolver,
+                preinstalled,
+                TrackedTcp::Cancel,
+                None,
+            )
+            .await;
+        })
         .await;
-        // Same committed-document keepalive re-assert as the build path —
-        // the verbatim fallback gated any posture diff out, so this is a
-        // no-op unless a caller skipped its gate.
-        install_committed_keepalive(&state);
         logbook::event(
             logbook::kind::CONFIG_RELOAD,
             Level::Error,
@@ -5430,19 +5641,20 @@ async fn put_configs(
     // TCP flow; any admitted since dialled under the binding. A TUN
     // that fails to come up is rolled back and recorded there; the
     // document is committed, so the PUT succeeds.
-    let receipt = swap_config_and_reconcile_tun(
-        &state,
-        raw_config,
-        publish,
-        prior_resolver,
-        preinstalled,
-        TrackedTcp::AlreadyCancelled,
-    )
+    let (_lane, receipt) = run_owned_mutation(&state, mutation, |state| async move {
+        swap_config_and_reconcile_tun(
+            &state,
+            raw_config,
+            publish,
+            prior_resolver,
+            preinstalled,
+            TrackedTcp::AlreadyCancelled,
+            None,
+        )
+        .await
+    })
     .await;
     let reloaded = reload_succeeded(reload_counts, &forced, receipt.dropped);
-    // `swap` already installed the committed posture ahead of its `ntp:`
-    // reconcile; re-assert it at this lane's own commit point.
-    install_committed_keepalive(&state);
     reloaded.record();
 
     StatusCode::NO_CONTENT.into_response()

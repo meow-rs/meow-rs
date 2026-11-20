@@ -1592,6 +1592,7 @@ async fn put_configs_commits_global_ua_and_client_fingerprint() {
 /// hard-error the next boot. The gate rewrites it to the live override.
 #[tokio::test]
 async fn put_configs_force_invalid_global_ua_commits_live_value() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     // This test installs a live UA — reset it on every exit so later
@@ -1875,6 +1876,7 @@ async fn put_configs_roundtrips_top_level_knobs() {
 /// knob-free document still commits verbatim.
 #[tokio::test]
 async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     // The reconcile spy proves a rejected PUT never feeds the candidate's
     // resolved ntp config to the supervisor.
@@ -1979,6 +1981,7 @@ async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
 /// hard-fails. A target the candidate still declares commits as before.
 #[tokio::test]
 async fn put_configs_force_fallback_rejects_dangling_ntp_target() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     // Committed: ntp enabled through `front`, `front` itself declared.
     let state = test_state(
@@ -2169,6 +2172,7 @@ async fn put_configs_strict_bad_mux_gate_force_drops_node() {
 /// A flag-unchanged candidate still degrades to 204 as before.
 #[tokio::test]
 async fn put_configs_force_broken_dns_gates_store_fake_ip() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     let put = |uri: &'static str, document: &str| {
@@ -2294,6 +2298,69 @@ async fn put_configs_rejects_ntp_dialer_proxy_builtin_policies() {
         StatusCode::NO_CONTENT,
         "DIRECT remains a valid ntp dialer"
     );
+}
+
+/// Codex review: the NTP reconcile must run only after the commit has
+/// installed the keepalive posture — the supervisor's worker dials
+/// through it, so the hook must observe the committed values rather than
+/// the pre-commit ones, on a fresh commit AND on a TUN-failure rollback
+/// that restores the previous document.
+#[tokio::test]
+async fn put_configs_installs_keepalive_before_ntp_reconcile() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    // This test commits a keepalive posture — reset the process global
+    // on every exit path.
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            meow_common::set_outbound_tcp_keepalive(meow_common::OutboundTcpKeepalive::default());
+        }
+    }
+    let _reset = Reset;
+    let observed = Arc::new(std::sync::Mutex::new(Vec::<
+        meow_common::OutboundTcpKeepalive,
+    >::new()));
+    let mut state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    Arc::get_mut(&mut state).unwrap().ntp_reconcile = Some({
+        let observed = Arc::clone(&observed);
+        Arc::new(move |_| {
+            observed
+                .lock()
+                .unwrap()
+                .push(meow_common::outbound_tcp_keepalive());
+        }) as meow_api::routes::NtpReconcile
+    });
+    let put = |yaml: &str| {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    let yaml = "mode: rule\nkeep-alive-idle: 33\nkeep-alive-interval: 7\n\
+                ntp:\n  enable: true\n  dialer-proxy: DIRECT\nrules:\n  - MATCH,DIRECT\n";
+    assert_eq!(put(yaml).await.unwrap().status(), StatusCode::NO_CONTENT);
+    let seen = observed.lock().unwrap().clone();
+    let ka = seen
+        .last()
+        .expect("the commit must have reconciled ntp once");
+    assert_eq!(
+        (ka.idle.as_secs(), ka.interval.as_secs()),
+        (33, 7),
+        "the reconcile hook must already observe the committed keepalive"
+    );
+    drop(seen);
 }
 
 #[tokio::test]
@@ -2552,6 +2619,7 @@ async fn rules_round_trip_keeps_disabled_switch() {
 
 #[tokio::test]
 async fn replace_rules() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -2592,6 +2660,7 @@ async fn replace_rules() {
 
 #[tokio::test]
 async fn update_rule_at_index() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -2635,6 +2704,7 @@ async fn update_rule_out_of_range() {
 
 #[tokio::test]
 async fn delete_rule() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -2674,6 +2744,7 @@ async fn delete_rule_out_of_range() {
 
 #[tokio::test]
 async fn reorder_rules() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -2735,6 +2806,7 @@ async fn get_proxy_groups_empty() {
 
 #[tokio::test]
 async fn create_proxy_group_selector() {
+    let _globals_lane = process_globals_lane().await;
     let state = test_state_default();
     let app = create_router(Arc::clone(&state));
     let resp = app
@@ -2894,6 +2966,7 @@ async fn get_proxy_groups_expands_provider_backed_runtime_members() {
 
 #[tokio::test]
 async fn update_proxy_group() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.proxy_groups = Some(vec![RawProxyGroup {
         name: "G1".into(),
@@ -2945,6 +3018,7 @@ async fn update_proxy_group_not_found() {
 
 #[tokio::test]
 async fn delete_proxy_group() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.proxy_groups = Some(vec![RawProxyGroup {
         name: "ToDelete".into(),
@@ -3167,6 +3241,7 @@ async fn delete_subscription_not_found() {
 /// groups, and rules it never declared must survive.
 #[tokio::test]
 async fn delete_subscription_clears_data() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.subscriptions = Some(vec![RawSubscription {
         name: "delsub".into(),
@@ -3245,6 +3320,7 @@ async fn delete_subscription_clears_data() {
 /// inside the `CONFIG_MUTATION` lane before committing (issue #543).
 #[tokio::test]
 async fn refresh_subscription_deleted_mid_fetch_returns_404() {
+    let _globals_lane = process_globals_lane().await;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -3352,6 +3428,7 @@ async fn refresh_subscription_deleted_mid_fetch_returns_404() {
 /// that hop, and the stored value is exposed by `GET` (issue #625).
 #[tokio::test]
 async fn add_subscription_proxy_resolution() {
+    let _globals_lane = process_globals_lane().await;
     use meow_common::{
         AdapterType, DelayHistory, MeowError, Metadata, ProxyAdapter, ProxyConn, ProxyHealth,
         ProxyPacketConn,
@@ -3546,6 +3623,7 @@ async fn add_subscription_proxy_resolution() {
 /// removes only the tracked contribution.
 #[tokio::test]
 async fn add_subscription_merges_with_local_config() {
+    let _globals_lane = process_globals_lane().await;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -3807,6 +3885,7 @@ async fn save_config_refuses_without_backing_file() {
 /// raw config drops the entry (issue #717).
 #[tokio::test]
 async fn delete_subscription_without_backing_file_skips_persist() {
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.subscriptions = Some(vec![RawSubscription {
         name: "delsub".into(),
@@ -3885,6 +3964,7 @@ async fn spawn_sub_origin(body: &'static str) -> std::net::SocketAddr {
 /// explicit in the API contract (issue #717).
 #[tokio::test]
 async fn add_subscription_without_backing_file_reports_not_persisted() {
+    let _globals_lane = process_globals_lane().await;
     let addr =
         spawn_sub_origin("proxies:\n  - {name: node-1, type: http, server: 127.0.0.1, port: 9}\n")
             .await;
@@ -3917,6 +3997,7 @@ async fn add_subscription_without_backing_file_reports_not_persisted() {
 /// `"persisted": false` contract on this endpoint too (issue #717).
 #[tokio::test]
 async fn refresh_subscription_without_backing_file_reports_not_persisted() {
+    let _globals_lane = process_globals_lane().await;
     let addr =
         spawn_sub_origin("proxies:\n  - {name: node-2, type: http, server: 127.0.0.1, port: 9}\n")
             .await;
@@ -7182,6 +7263,7 @@ async fn put_configs_swaps_running_dns_resolver() {
 
 #[tokio::test]
 async fn put_configs_requires_restart_to_change_the_controller_secret() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
 
     let state = test_state_with_secret("startup-override");
@@ -7536,6 +7618,30 @@ async fn put_configs_group_cycle_rejected() {
     );
 }
 
+/// A port bindable over BOTH UDP and TCP — what `DnsServer::bind` needs.
+/// Windows can exclude a port per protocol (Hyper-V/WINNAT), so either
+/// protocol's allocator can walk into the other's exclusion band;
+/// alternate which one picks the :0 port so both allocators sample
+/// independent counter positions.
+fn dual_proto_port() -> u16 {
+    for attempt in 0..16u32 {
+        if attempt % 2 == 0 {
+            let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let candidate = sock.local_addr().unwrap().port();
+            if std::net::UdpSocket::bind(("127.0.0.1", candidate)).is_ok() {
+                return candidate;
+            }
+        } else {
+            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            let candidate = sock.local_addr().unwrap().port();
+            if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
+                return candidate;
+            }
+        }
+    }
+    panic!("no port bindable over both UDP and TCP after 16 alternating attempts");
+}
+
 /// Issue #514 review: a `dns.listen` change whose new socket FAILS to bind
 /// must keep the old listener alive — the config is already committed, and
 /// dropping the only working DNS server would silently break resolution
@@ -7562,35 +7668,7 @@ async fn put_configs_dns_rebind_failure_keeps_old_listener() {
         )
     };
 
-    // The DNS bind needs UDP *and* TCP on the same port, and Windows can
-    // exclude a port per protocol (Hyper-V/WINNAT) — either protocol's
-    // allocator can walk into the other's exclusion band. Alternate which
-    // protocol picks the :0 port so both allocators sample independent
-    // counter positions (the same mechanism DnsServer::bind() uses).
-    let mut port_a = None;
-    'probe: for attempt in 0..16u32 {
-        if attempt % 2 == 0 {
-            // Even: TCP picks, UDP verifies.
-            let sock = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let candidate = sock.local_addr().unwrap().port();
-            if std::net::UdpSocket::bind(("127.0.0.1", candidate)).is_ok() {
-                drop(sock);
-                port_a = Some(candidate);
-                break 'probe;
-            }
-        } else {
-            // Odd: UDP picks, TCP verifies.
-            let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            let candidate = sock.local_addr().unwrap().port();
-            if std::net::TcpListener::bind(("127.0.0.1", candidate)).is_ok() {
-                drop(sock);
-                port_a = Some(candidate);
-                break 'probe;
-            }
-        }
-    }
-    let port_a =
-        port_a.expect("no port bindable over both UDP and TCP after 16 alternating attempts");
+    let port_a = dual_proto_port();
     let yaml_a = format!(
         "mode: rule\ndns:\n  enable: true\n  listen: 127.0.0.1:{port_a}\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n"
     );
@@ -7625,6 +7703,81 @@ async fn put_configs_dns_rebind_failure_keeps_old_listener() {
     assert!(!h.task.is_finished(), "old listener task must stay alive");
     drop(guard);
     drop(blocker);
+}
+
+/// A `dns.listen` disable → re-enable cycle on the SAME address must
+/// rebind cleanly: a retired listener's task aborts asynchronously and an
+/// in-flight reply can hold the socket briefly past its death, so the
+/// next plan must wait for actual socket release — task joined AND weak
+/// ref dead — before binding, or the re-enable dies on EADDRINUSE
+/// (Codex review).
+#[tokio::test]
+async fn put_configs_dns_disable_reenable_same_addr_rebinds() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(RawConfig {
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    });
+    let put = |yaml: &str| {
+        let payload = base64::engine::general_purpose::STANDARD.encode(yaml);
+        create_router(Arc::clone(&state)).oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({"payload": payload}).to_string(),
+                ))
+                .unwrap(),
+        )
+    };
+
+    let port = dual_proto_port();
+    let yaml_on = format!(
+        "mode: rule\ndns:\n  enable: true\n  listen: 127.0.0.1:{port}\n  nameserver:\n    - 127.0.0.1\nrules:\n  - MATCH,DIRECT\n"
+    );
+    assert_eq!(
+        put(&yaml_on).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        state
+            .dns_server
+            .read()
+            .as_ref()
+            .is_some_and(|h| h.listen.port() == port && !h.task.is_finished()),
+        "first PUT must leave a live listener on port {port}"
+    );
+
+    // Disable: the listener retires — its socket release is proven, not
+    // synchronous.
+    let yaml_off = "mode: rule\nrules:\n  - MATCH,DIRECT\n";
+    assert_eq!(
+        put(yaml_off).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    assert!(
+        state.dns_server.read().is_none(),
+        "disable must retire the listener handle"
+    );
+
+    // Re-enable on the same address: the bind must succeed over the
+    // just-released socket — not race the retired one into EADDRINUSE.
+    assert_eq!(
+        put(&yaml_on).await.unwrap().status(),
+        StatusCode::NO_CONTENT
+    );
+    let guard = state.dns_server.read();
+    let h = guard
+        .as_ref()
+        .expect("the re-enabled listener must be bound");
+    assert_eq!(h.listen.port(), port);
+    assert!(
+        !h.task.is_finished(),
+        "the re-enabled listener must actually serve"
+    );
+    drop(guard);
 }
 
 /// Issue #514 review: `nameserver-policy` `rule-set:` keys must resolve
@@ -9094,6 +9247,7 @@ async fn put_configs_tcp_idle_timeout_hot_applies() {
 /// persisting the invalid value would 400 every later unrelated PATCH.
 #[tokio::test]
 async fn put_configs_force_tcp_idle_timeout_normalizes_commit() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     state
@@ -9182,6 +9336,7 @@ async fn put_configs_force_tcp_idle_timeout_normalizes_commit() {
 /// unconditionally, so it fails the lenient retry too).
 #[tokio::test]
 async fn put_configs_force_early_return_still_normalizes_tcp_idle_timeout() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let state = test_state(test_raw_config());
     state
@@ -9235,6 +9390,7 @@ async fn put_configs_force_early_return_still_normalizes_tcp_idle_timeout() {
 /// `parse_tun_config` at spawn regardless of privileges.
 #[tokio::test]
 async fn put_configs_force_invalid_tun_commits_and_rolls_back() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let mut raw = test_raw_config();
     raw.tun = Some(serde_saphyr::from_str("enable: true\nmtu: 1500").unwrap());
@@ -9783,6 +9939,41 @@ async fn patch_configs_tun_param_change_restarts_running_listener() {
     assert_eq!(tun.mtu, Some(9000));
 }
 
+/// The `keep-alive-*` PATCH fields deserialize as raw `Value` so a number
+/// that is not an unsigned u64 reaches the semantic gate as a 400 — not a
+/// 422 JSON extraction failure (Codex review).
+#[tokio::test]
+async fn patch_configs_rejects_malformed_keepalive_values() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    for (key, value) in [
+        ("keep-alive-idle", serde_json::json!(-1)),
+        ("keep-alive-interval", serde_json::json!(-5)),
+        ("keep-alive-idle", serde_json::json!(1.5)),
+        ("keep-alive-interval", serde_json::json!("30")),
+        // serde_json stores a past-u64 integer as f64 — still not a u64.
+        ("keep-alive-idle", serde_json::json!(1e30)),
+        ("keep-alive-interval", serde_json::json!(true)),
+    ] {
+        let resp = patch_configs(&state, serde_json::json!({key: value})).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "{key}={value} must be a semantic 400, not a 422 extraction failure"
+        );
+    }
+    // A well-formed value still commits — and `null` stays "absent".
+    let resp = patch_configs(&state, serde_json::json!({"keep-alive-idle": 30})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(meow_common::outbound_tcp_keepalive().idle.as_secs(), 30);
+    let resp = patch_configs(&state, serde_json::json!({"keep-alive-idle": null})).await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(meow_common::outbound_tcp_keepalive().idle.as_secs(), 30);
+    // Ordered cleanup under the lane, as the other keepalive tests do.
+    let _lane = meow_api::routes::CONFIG_MUTATION.lock().await;
+    meow_common::set_outbound_tcp_keepalive(meow_common::OutboundTcpKeepalive::default());
+}
+
 /// Keys are merged over the committed section: a key the patch omits, or
 /// sends as `null`, keeps its value.
 #[tokio::test]
@@ -9925,6 +10116,7 @@ async fn put_configs_tun_inet4_address_list_form_reports_the_string_form() {
 /// committed string (invalid CIDR or not) is echoed verbatim as a string.
 #[tokio::test]
 async fn put_configs_force_garbage_inet4_address_never_reports_non_string() {
+    let _globals_lane = process_globals_lane().await;
     use base64::Engine as _;
     let put = |inet4: &str| {
         let yaml = format!(
@@ -10235,6 +10427,7 @@ async fn put_configs_does_not_fetch_remote_providers_in_the_mutation_lane() {
 /// every read filters on this test's subject.
 #[tokio::test]
 async fn logbook_lists_filters_and_clears_entries() {
+    let _globals_lane = process_globals_lane().await;
     use meow_common::logbook;
 
     let state = test_state_default();
@@ -10324,6 +10517,7 @@ async fn logbook_lists_filters_and_clears_entries() {
 /// it is installed, so every read narrows to this test's host.
 #[tokio::test]
 async fn traffic_ledger_groups_drills_and_clears() {
+    let _globals_lane = process_globals_lane().await;
     use meow_common::traffic_ledger;
 
     let state = test_state_default();
@@ -10638,6 +10832,7 @@ async fn proxy_providers_report_subscription_userinfo() {
 /// clears it.
 #[tokio::test]
 async fn proxy_provider_subscription_info_survives_restart_and_follows_fetches() {
+    let _globals_lane = process_globals_lane().await;
     let origin = UserinfoOrigin::spawn(OriginReply {
         status: 200,
         userinfo: Some("upload=1; download=2; total=1000"),
