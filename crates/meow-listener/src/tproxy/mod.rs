@@ -1376,11 +1376,11 @@ mod tests {
         );
     }
 
-    /// Issue #625 review: the strict `resolve_proxy_flow` match requires
-    /// the pre-resolve contract — a fake-IP-rescued flow arrives with
-    /// `dst_ip=None` and a recovered host, so `pre_resolve` must run or the
-    /// IP-CIDR slot can never match and the flow silently falls through to
-    /// `MATCH`. Without the call, this test would observe `MATCH/DIRECT`.
+    /// Issue #625 review: `resolve_proxy_lazy` must satisfy a fake-IP-rescued
+    /// flow's IP demand — it arrives with `dst_ip=None` and a recovered host,
+    /// so the lazy resolver must resolve it or the IP-CIDR slot can never
+    /// match and the flow silently falls through to `MATCH`. Without it this
+    /// test would observe `MATCH/DIRECT`.
     #[tokio::test]
     async fn tcp_flow_pre_resolves_dst_ip_for_ip_rules() {
         use meow_dns::fakeip::{MemoryStore, Pool};

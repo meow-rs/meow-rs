@@ -127,7 +127,8 @@ They are comma-protected like `DOMAIN-REGEX`: everything between the type and th
 last comma field is the pattern, so quantifiers like `{1,3}` and literal commas are
 safe. The `-WILDCARD` types match the whole field against a glob where only `*` and
 `?` are metacharacters (`?` consumes exactly one byte); separators, brackets and
-backslashes stay literal.
+backslashes stay literal. A flow with no process identity never matches any of the
+process rules — not even `*` or `^$`.
 
 ## Inbound & network rules
 
@@ -190,7 +191,7 @@ exclusion mihomo applies inside logic rules — so `(IP-CIDR,10.0.0.0/8)`,
 legal predicates. Flag fields keep their usual meaning (`GEOIP` takes
 `no-resolve`/`src`, a process leaf's glob/regex payload matches like the
 top-level rule of the same name). Leaves compose with mihomo's prefix
-operators — `(AND,(A),(B))`, `(OR,(A),(B))`, `(NOT,(A))` — or with MEOW's
+operators — `(AND,((A),(B)))`, `(OR,((A),(B)))`, `(NOT,((A)))` — or with MEOW's
 infix `&`, `|` and `!` extension (`!` binds tightest, `&` before `|`,
 parentheses override; upstream parses only the prefix forms), e.g.
 `SUB-RULE,((DOMAIN-SUFFIX,example.com)|!(GEOIP,CN)),my-block`.

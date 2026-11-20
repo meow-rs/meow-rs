@@ -139,7 +139,7 @@ byte: `(GEOIP,JP,src)`, `(IP-CIDR,10.0.0.0/8)`, `(DST-PORT,443)`,
 `(PROCESS-NAME,curl)` and `(RULE-SET,my-provider)` are all legal
 predicates. `GEOIP`'s `src` flag selects the source axis and never
 demands resolution. Leaves compose with upstream's prefix operators
-`(AND,(A),(B))`, `(OR,(A),(B))`, `(NOT,(A))` and with MEOW's infix `&`,
+`(AND,((A),(B)))`, `(OR,((A),(B)))`, `(NOT,((A)))` and with MEOW's infix `&`,
 `|` and `!` extension (precedence `!` > `&` > `|`, left-associative,
 parentheses override — upstream parses only the prefix forms). A
 condition leaf that demands a resolved IP reports that demand

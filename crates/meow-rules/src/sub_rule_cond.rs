@@ -546,6 +546,15 @@ mod tests {
     }
 
     #[test]
+    fn parenthesised_block_name_without_comma() {
+        let r = parse_sub_rule_reference("SUB-RULE,(local)")
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.name, "(local)");
+        assert!(r.cond.is_none() && r.fallback.is_none());
+    }
+
+    #[test]
     fn reference_head_rejects() {
         for line in [
             "SUB-RULE,name,junk",
