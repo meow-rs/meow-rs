@@ -212,14 +212,23 @@ impl SubRuleRule {
         // waits — a leading domain member must not pre-empt an IP member
         // that would match post-resolution (#625). Staged members carry
         // their own demand-aware gates and evaluate on position.
-        let ordinary_needs_ip = self.block.iter().any(|member| {
-            member
-                .as_any()
-                .and_then(|any| any.downcast_ref::<SubRuleRule>())
-                .is_none_or(|sub| !sub.is_staged())
-                && !member.never_matches()
-                && member.should_resolve_ip()
-        });
+        //
+        // The gate is a *plain reference* behaviour only: a true
+        // condition enters an ordered block scan where each member's own
+        // demand is consulted at its position (docs/specs/sub-rules.md —
+        // the conditional form reports per-predicate needs "instead of
+        // the push-resolution gate the plain reference keeps"). Applying
+        // it here would force DNS before a deterministic earlier hit,
+        // and drop that hit entirely when resolution is unavailable.
+        let ordinary_needs_ip = self.cond.is_none()
+            && self.block.iter().any(|member| {
+                member
+                    .as_any()
+                    .and_then(|any| any.downcast_ref::<SubRuleRule>())
+                    .is_none_or(|sub| !sub.is_staged())
+                    && !member.never_matches()
+                    && member.should_resolve_ip()
+            });
         for member in self.block.iter() {
             if let Some(sub) = member
                 .as_any()
@@ -1111,6 +1120,60 @@ mod tests {
         assert_eq!(
             sub.match_staged(&resolved, &helper(), &|_: &str| true, &demand),
             StagedVerdict::Matched("INNER")
+        );
+    }
+
+    /// Issue #974 review — the ordinary-section IP gate is a *plain
+    /// reference* behaviour: a true condition enters an ordered block
+    /// scan, so a leading deterministic member must win before a later
+    /// IP-demanding member's need is even consulted — under both an
+    /// actionable gate (no DNS spent) and `MatchDemand::NONE` (the hit
+    /// must not be dropped).
+    #[test]
+    fn cond_true_block_evaluates_ordered_without_aggregate_gate() {
+        let sub = cond_ref(
+            vec![match_rule("DOMAIN-TARGET"), Box::new(NeedsIpRule)],
+            true,
+            None,
+        );
+        let unresolved = Metadata {
+            host: "x.example".into(),
+            ..Default::default()
+        };
+        // Under an empty gate the domain member's hit must stand — the
+        // aggregate gate used to drop the whole block to Miss here.
+        assert_eq!(
+            sub.match_staged(&unresolved, &helper(), &|_: &str| true, &MatchDemand::NONE),
+            StagedVerdict::Matched("DOMAIN-TARGET")
+        );
+        assert_eq!(
+            sub.match_and_resolve(&unresolved, &helper(), &|_: &str| true),
+            Some("DOMAIN-TARGET")
+        );
+        // Under an actionable gate the deterministic member still wins
+        // first — no DNS is spent on the trailing IP member.
+        let demand = MatchDemand {
+            ip: true,
+            process: true,
+        };
+        assert_eq!(
+            sub.match_staged(&unresolved, &helper(), &|_: &str| true, &demand),
+            StagedVerdict::Matched("DOMAIN-TARGET")
+        );
+
+        // Order is still honoured: when the IP member leads, its own
+        // demand is reported at its position.
+        let ip_first = cond_ref(vec![Box::new(NeedsIpRule), match_rule("LATE")], true, None);
+        assert_eq!(
+            ip_first.match_staged(&unresolved, &helper(), &|_: &str| true, &demand),
+            StagedVerdict::Need {
+                ip: true,
+                process: false
+            }
+        );
+        assert_eq!(
+            ip_first.match_staged(&unresolved, &helper(), &|_: &str| true, &MatchDemand::NONE),
+            StagedVerdict::Matched("LATE")
         );
     }
 }
