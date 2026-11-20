@@ -75,7 +75,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `rules:` — PROCESS-NAME-REGEX, PROCESS-PATH-REGEX | ✓ | Case-insensitive search semantics; comma-protected payloads like DOMAIN-REGEX. |
 | `rules:` — PROCESS-NAME-WILDCARD, PROCESS-PATH-WILDCARD | ✓ | Whole-field `*`/`?` glob (`,`-unprotected fixed fields; a fourth field is parsed as upstream params and ignored). |
 | `rules:` — IN-NAME, IN-TYPE, IN-PORT, IN-USER | ✓ | Named listeners and auth metadata are wired. |
-| `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection, including the conditional `SUB-RULE,(<cond>),<name>` form. **Extension:** a fourth field `SUB-RULE,(<cond>),<name>,<target>` applies a fallback target when the entered block exhausts (upstream has no such field); conditions additionally accept infix `&`/`|`/`!`. |
+| `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection, including the conditional `SUB-RULE,(<cond>),<name>` form. Condition leaves accept every rule type except `MATCH`/`SUB-RULE` — upstream's logic-leg exclusion set. **Extensions:** a fourth field `SUB-RULE,(<cond>),<name>,<target>` applies a fallback target when the entered block exhausts (upstream has no such field); conditions additionally accept infix `&`/`|`/`!` (upstream parses only the prefix `AND`/`OR`/`NOT` forms). |
 | `rules:` — AND, OR, NOT | ✓ | Logic composition supported. |
 | `rules:` — MATCH | ✓ | Fully supported. |
 | `rule-providers:` — http | ✓ | With interval refresh (M1.D-5). |

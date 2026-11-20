@@ -131,19 +131,30 @@ through; four-field exhaustion yields `<target>`, which goes through the
 normal outer target checks. The fallback is an adapter name, not a block
 name — cycle detection and undefined-reference validation see only `<name>`.
 
-Condition leaves are whitelisted to `DOMAIN`, `DOMAIN-SUFFIX`,
-`DOMAIN-KEYWORD`, `GEOSITE` and `GEOIP` — anything else (including `MATCH`
-and other process/IP leaf types) is a parse error, and only `GEOIP` accepts
-trailing flags (`no-resolve`, `src` — `src` selects the source axis and
-never demands resolution; `GEOSITE` tolerates a vestigial `no-resolve` like
-the top-level parser). Leaves compose with upstream's prefix operators
-`(AND,(A),(B))`, `(OR,(A),(B))`, `(NOT,(A))` and with the infix operators
-`&`, `|` and `!` (precedence `!` > `&` > `|`, left-associative, parentheses
-override). A condition leaf that demands a resolved IP reports that demand
+A condition leaf is every rule type except `MATCH` and `SUB-RULE` — the
+same exclusion upstream's `payloadToRule` applies to logic legs
+(`rules/logic/logic.go`), and leaves build through the same inner-leg
+grammar so flags, comma-joins and constructors match a logic leg byte for
+byte: `(GEOIP,JP,src)`, `(IP-CIDR,10.0.0.0/8)`, `(DST-PORT,443)`,
+`(PROCESS-NAME,curl)` and `(RULE-SET,my-provider)` are all legal
+predicates. `GEOIP`'s `src` flag selects the source axis and never
+demands resolution. Leaves compose with upstream's prefix operators
+`(AND,(A),(B))`, `(OR,(A),(B))`, `(NOT,(A))` and with MEOW's infix `&`,
+`|` and `!` extension (precedence `!` > `&` > `|`, left-associative,
+parentheses override — upstream parses only the prefix forms). A
+condition leaf that demands a resolved IP reports that demand
 per-predicate — the staged evaluation maps it to the tunnel's
 `NeedsEnrichment` path instead of the push-resolution gate the plain
 reference keeps; an unresolved-but-unavailable demand reads the predicate
-as undecided, never as false.
+as undecided, never as false — `NOT` over an undecidable leaf stays
+undecided rather than flipping to true.
+
+A single comma-free parenthesised field is a block *name*, not a
+condition — `SUB-RULE,(local)` references a block literally named
+`(local)`. Upstream errors on that line either way (its payload wrapper
+would parse `local` as a rule type), so no upstream-compatible config
+changes meaning; the head still cannot carry a fallback
+(`SUB-RULE,(local),x` parses `local` as a condition type and fails).
 
 **Divergences from upstream** (classified per
 [ADR-0002](../adr/0002-upstream-divergence-policy.md)):

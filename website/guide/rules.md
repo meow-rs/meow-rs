@@ -184,13 +184,16 @@ block evaluates in order; exhaustion falls through for the three-field form or
 yields the fourth-field fallback. The fallback goes through normal target
 checks — it is not a block name and does not participate in cycle detection.
 
-Condition leaves are whitelisted to `DOMAIN`, `DOMAIN-SUFFIX`, `DOMAIN-KEYWORD`,
-`GEOSITE` and `GEOIP` — a `GEOIP` leaf keeps its usual `no-resolve`/`src`
-flags and `GEOSITE` tolerates a vestigial `no-resolve`; anything else is a
-parse error. Leaves compose with mihomo's prefix operators —
-`(AND,(A),(B))`, `(OR,(A),(B))`, `(NOT,(A))` — and with the infix operators
-`&`, `|` and `!` (`!` binds tightest, `&` before `|`, parentheses override),
-e.g. `SUB-RULE,((DOMAIN-SUFFIX,example.com)|!(GEOIP,CN)),my-block`.
+A condition leaf is any rule type except `MATCH` and `SUB-RULE` — the same
+exclusion mihomo applies inside logic rules — so `(IP-CIDR,10.0.0.0/8)`,
+`(DST-PORT,443)`, `(PROCESS-NAME,curl)` or `(RULE-SET,my-provider)` are all
+legal predicates. Flag fields keep their usual meaning (`GEOIP` takes
+`no-resolve`/`src`, a process leaf's glob/regex payload matches like the
+top-level rule of the same name). Leaves compose with mihomo's prefix
+operators — `(AND,(A),(B))`, `(OR,(A),(B))`, `(NOT,(A))` — or with MEOW's
+infix `&`, `|` and `!` extension (`!` binds tightest, `&` before `|`,
+parentheses override; upstream parses only the prefix forms), e.g.
+`SUB-RULE,((DOMAIN-SUFFIX,example.com)|!(GEOIP,CN)),my-block`.
 
 ## Logic rules
 
