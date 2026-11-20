@@ -202,7 +202,8 @@ async fn run_worker(
     loop {
         ticker.tick().await;
         for attempt in 1..=MAX_ATTEMPTS {
-            match tokio::time::timeout(ATTEMPT_TIMEOUT, poll_once(&cfg, &tunnel)).await {
+            match tokio::time::timeout(ATTEMPT_TIMEOUT, poll_once(&cfg, &tunnel, attempt - 1)).await
+            {
                 Ok(Ok(offset_ns)) => {
                     // Fence: a worker superseded mid-exchange must not
                     // overwrite its successor's offset. The check and the
@@ -236,13 +237,20 @@ async fn run_worker(
 
 /// One bounded exchange: dial, request, validate, compute the offset.
 /// Returns the offset in nanoseconds (`server - local`).
+///
+/// `rotate_seed` is the attempt index inside one poll batch: locally
+/// resolved candidate lists keep their order across attempts (cached or
+/// repeated upstream answers), so an unseeded walk would pin every retry
+/// on the same dead head — UDP `connect()` binds the first routable
+/// candidate before any packet proves the server alive.
 async fn poll_once(
     cfg: &meow_config::NtpConfig,
     tunnel: &Weak<meow_tunnel::TunnelInner>,
+    rotate_seed: usize,
 ) -> std::io::Result<i64> {
     let target = UdpTarget::named(&cfg.server, cfg.port);
     let conn = match cfg.dialer_proxy.as_deref() {
-        None | Some("DIRECT") => DirectDialer.dial_udp_conn(target.clone(), true).await?,
+        None | Some("DIRECT") => dial_direct_udp(&target, rotate_seed).await?,
         Some(name) => {
             // The live route choice is authoritative at dial time; the
             // snapshot pin is held until I/O completes so the front hop's
@@ -273,38 +281,25 @@ async fn poll_once(
                     let UdpTarget::Name { host, port } = &target else {
                         return Err(dial_err(name, &e));
                     };
-                    let mut last_err: Option<std::io::Error> = None;
-                    let mut bound = None;
-                    for addr in meow_common::resolve_host_all(host, *port)
-                        .await
-                        .map_err(|e| {
-                            std::io::Error::new(
-                                e.kind(),
-                                format!("ntp.dialer-proxy '{name}': lookup {host}:{port}: {e}"),
-                            )
-                        })?
-                    {
-                        let literal = UdpTarget::Addr(addr);
-                        match dialer.dial_udp_conn(literal.clone(), true).await {
-                            Ok(conn) => {
-                                bound = Some((conn, literal));
-                                break;
-                            }
-                            // A second `Unsupported` on the literal is a
-                            // capability refusal — every candidate fails
-                            // the same way.
-                            Err(e2) if e2.kind() == std::io::ErrorKind::Unsupported => {
-                                last_err = Some(e2);
-                                break;
-                            }
-                            Err(e2) => {
-                                last_err = meow_common::MeowError::prefer_errno_io(last_err, e2);
-                            }
-                        }
-                    }
-                    match bound {
-                        Some(v) => v,
-                        None => return Err(dial_err(name, &last_err.unwrap_or(e))),
+                    let candidates =
+                        meow_common::resolve_host_all(host, *port)
+                            .await
+                            .map_err(|e| {
+                                std::io::Error::new(
+                                    e.kind(),
+                                    format!("ntp.dialer-proxy '{name}': lookup {host}:{port}: {e}"),
+                                )
+                            })?;
+                    // `Unsupported` on a literal is ambiguous: a
+                    // UDP-incapable front refuses every candidate the
+                    // same way, but WireGuard also answers it per-family
+                    // ("no IPv6 tunnel address configured") — the next
+                    // literal may dial, so `dial_candidates` keeps
+                    // walking. A total refusal only costs the extra fast
+                    // rejects.
+                    match dial_candidates(&dialer, candidates, rotate_seed).await {
+                        Ok((conn, addr)) => (conn, UdpTarget::Addr(addr)),
+                        Err(e2) => return Err(dial_err(name, &e2)),
                     }
                 }
                 Err(e) => return Err(dial_err(name, &e)),
@@ -316,6 +311,54 @@ async fn poll_once(
     };
     let (offset, result) = exchange(&*conn, &target).await;
     result.map(|_| offset)
+}
+
+/// The direct arm's resolve+dial — what `DirectDialer::dial_udp_conn`
+/// runs internally, but seeded: `resolve_host_all` answers in resolver
+/// order, stable across the poll's attempts, so an unseeded walk binds
+/// the same first candidate every retry (`connect()` succeeds before
+/// any packet proves the server alive). Rotating the start by the
+/// attempt index leads each retry with a different server while the
+/// fall-through still covers every candidate on a dial error (an
+/// unreachable family).
+async fn dial_direct_udp(
+    target: &UdpTarget,
+    rotate_seed: usize,
+) -> std::io::Result<Arc<dyn meow_common::ProxyPacketConn>> {
+    let candidates = match target {
+        UdpTarget::Addr(addr) => vec![*addr],
+        UdpTarget::Name { host, port } => meow_common::resolve_host_all(host, *port).await?,
+    };
+    dial_candidates(&DirectDialer, candidates, rotate_seed)
+        .await
+        .map(|(conn, _)| conn)
+}
+
+/// Dial `candidates` through `dialer`, starting at
+/// `rotate_seed % len` and falling through to the rest — the shared walk
+/// behind the direct path and a named front's literal fallback. The
+/// winning [`SocketAddr`] comes back so the caller can pin the reply
+/// peer to the literal that actually answered (`UdpTarget::Addr`
+/// src-matches IP+port, where a name-bound conn only checks the port).
+async fn dial_candidates(
+    dialer: &dyn TcpDialer,
+    mut candidates: Vec<SocketAddr>,
+    rotate_seed: usize,
+) -> std::io::Result<(Arc<dyn meow_common::ProxyPacketConn>, SocketAddr)> {
+    let n = candidates.len();
+    if n > 0 {
+        candidates.rotate_left(rotate_seed % n);
+    }
+    let mut last_err: Option<std::io::Error> = None;
+    for addr in candidates {
+        match dialer.dial_udp_conn(UdpTarget::Addr(addr), true).await {
+            Ok(conn) => return Ok((conn, addr)),
+            Err(e) => last_err = meow_common::MeowError::prefer_errno_io(last_err, e),
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no UDP dial candidates")
+    }))
 }
 
 /// The dial failure text every `ntp.dialer-proxy` error flattens to —
@@ -767,6 +810,242 @@ mod tests {
         );
     }
 
+    /// The process-global host-resolver hook the candidate-resolution
+    /// tests install — serialized like [`PUBLISHED_OFFSET_GATE`] so no
+    /// sibling resolves through a fixture's answer.
+    static RESOLVER_GATE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// A hook answering every hostname with one fixed candidate list —
+    /// the test's resolver-order view for the rotation assertions.
+    struct FixedAnswers(Vec<std::net::IpAddr>);
+
+    #[async_trait::async_trait]
+    impl meow_common::HostResolver for FixedAnswers {
+        async fn resolve(&self, _host: &str) -> std::io::Result<std::net::IpAddr> {
+            self.0
+                .first()
+                .copied()
+                .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no addresses"))
+        }
+        async fn resolve_all(&self, _host: &str) -> std::io::Result<Vec<std::net::IpAddr>> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Drops the hook on scope exit so a failed assertion cannot leak
+    /// the fixture's answers into siblings.
+    struct ResolverGuard;
+    impl ResolverGuard {
+        fn install(ips: Vec<std::net::IpAddr>) -> Self {
+            meow_common::set_host_resolver(Arc::new(FixedAnswers(ips)));
+            Self
+        }
+    }
+    impl Drop for ResolverGuard {
+        fn drop(&mut self) {
+            meow_common::clear_host_resolver();
+        }
+    }
+
+    /// A leaf front scripted like an IPv4-only WireGuard: a domain
+    /// target and every literal of a family it cannot carry refuse
+    /// `NotSupported` — which `into_io_error` inside
+    /// `ProxyDialer::dial_udp_conn` flattens to the same
+    /// `ErrorKind::Unsupported` for both refusal shapes. `seen` records
+    /// the `dst_ip` of every `dial_udp` (`None` marks the domain target)
+    /// so tests assert dial order.
+    struct FamilyFront {
+        serves: std::collections::HashSet<std::net::IpAddr>,
+        seen: StdMutex<Vec<Option<std::net::IpAddr>>>,
+        health: meow_common::ProxyHealth,
+    }
+
+    impl FamilyFront {
+        fn new(serves: impl IntoIterator<Item = std::net::IpAddr>) -> Arc<Self> {
+            Arc::new(Self {
+                serves: serves.into_iter().collect(),
+                seen: StdMutex::new(Vec::new()),
+                health: meow_common::ProxyHealth::new(),
+            })
+        }
+        fn seen(&self) -> Vec<Option<std::net::IpAddr>> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for FamilyFront {
+        fn name(&self) -> &str {
+            "family-front"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::WireGuard
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(
+            &self,
+            _metadata: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("test front".into()))
+        }
+        async fn dial_udp(
+            &self,
+            metadata: &meow_common::Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            self.seen.lock().unwrap().push(metadata.dst_ip);
+            match metadata.dst_ip {
+                Some(ip) if self.serves.contains(&ip) => {
+                    let mut conn = ScriptedConn::new(0);
+                    conn.from = SocketAddr::new(ip, metadata.dst_port);
+                    Ok(Box::new(conn))
+                }
+                _ => Err(meow_common::MeowError::NotSupported(
+                    "no tunnel address configured for this family".into(),
+                )),
+            }
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for FamilyFront {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// A tunnel whose route table carries `front` as `FRONT`, plus the
+    /// `ntp:` config that dials through it.
+    fn fronted_tunnel(front: Arc<dyn meow_common::Proxy>) -> meow_tunnel::Tunnel {
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec!["8.8.8.8:53".parse().unwrap()],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        ));
+        let tunnel = meow_tunnel::Tunnel::new(resolver);
+        tunnel.update_proxies(
+            std::collections::HashMap::from([("FRONT".into(), front)]),
+            meow_proxy::dialer::ProxyRegistry::default(),
+        );
+        tunnel
+    }
+
+    fn fronted_cfg() -> meow_config::NtpConfig {
+        meow_config::NtpConfig {
+            enable: true,
+            server: "ntp.invalid".into(),
+            port: 123,
+            interval_minutes: 60,
+            dialer_proxy: Some("FRONT".into()),
+        }
+    }
+
+    /// WireGuard refuses a domain UDP target AND a literal of a family
+    /// its tunnel cannot reach with the same `NotSupported` — both land
+    /// on `ErrorKind::Unsupported` past `into_io_error`. An IPv6-first
+    /// resolution on an IPv4-only tunnel must still reach the IPv4
+    /// literal; the walk used to break on the first literal refusal.
+    #[tokio::test]
+    async fn literal_fallback_walks_past_per_family_refusals() {
+        let _gate = RESOLVER_GATE.lock().await;
+        let _resolver =
+            ResolverGuard::install(vec!["::1".parse().unwrap(), "127.0.0.1".parse().unwrap()]);
+        let front = FamilyFront::new(["127.0.0.1".parse().unwrap()]);
+        let tunnel = fronted_tunnel(Arc::clone(&front) as Arc<dyn meow_common::Proxy>);
+        let cfg = fronted_cfg();
+        poll_once(&cfg, &tunnel.weak_inner(), 0)
+            .await
+            .expect("the v4 literal behind the v6 refusal must dial");
+        assert_eq!(
+            front.seen(),
+            vec![
+                None,
+                Some("::1".parse().unwrap()),
+                Some("127.0.0.1".parse().unwrap())
+            ],
+            "name refusal -> v6 literal refusal -> v4 literal dial"
+        );
+    }
+
+    /// One poll batch's retries must not pin the resolver's head:
+    /// `rotate_seed` (the attempt index) starts each retry on a different
+    /// candidate, so a dead first answer is walked away from. Seed 1
+    /// rotates [v6, v4] to [v4, v6] — the front sees only the name
+    /// refusal and the winning v4 literal.
+    #[tokio::test]
+    async fn literal_fallback_rotates_the_first_candidate_per_attempt() {
+        let _gate = RESOLVER_GATE.lock().await;
+        let _resolver =
+            ResolverGuard::install(vec!["::1".parse().unwrap(), "127.0.0.1".parse().unwrap()]);
+        let front = FamilyFront::new(["127.0.0.1".parse().unwrap()]);
+        let tunnel = fronted_tunnel(Arc::clone(&front) as Arc<dyn meow_common::Proxy>);
+        let cfg = fronted_cfg();
+        poll_once(&cfg, &tunnel.weak_inner(), 1)
+            .await
+            .expect("seed 1 leads with the answering literal");
+        assert_eq!(
+            front.seen(),
+            vec![None, Some("127.0.0.1".parse().unwrap())],
+            "the second attempt starts on the second candidate"
+        );
+    }
+
+    /// `dial_candidates` leads with `candidates[seed % len]`, walks the
+    /// rest in order on refusals, and reports the winning literal — the
+    /// shared walk behind the direct arm and the named-front fallback.
+    #[tokio::test]
+    async fn dial_candidates_rotates_walks_and_reports_the_winner() {
+        let a: SocketAddr = "10.0.0.1:123".parse().unwrap();
+        let b: SocketAddr = "10.0.0.2:123".parse().unwrap();
+        let c: SocketAddr = "10.0.0.3:123".parse().unwrap();
+
+        // Only `c` answers: seed 1 leads with `b`, refuses, walks to `c`.
+        let front = FamilyFront::new([c.ip()]);
+        let dialer = ProxyDialer::new(Arc::clone(&front) as Arc<dyn meow_common::Proxy>);
+        let (_, won) = dial_candidates(&dialer, vec![a, b, c], 1)
+            .await
+            .expect("the walk must reach the answering candidate");
+        assert_eq!(won, c, "the caller pins the reply peer on the winner");
+        assert_eq!(
+            front.seen(),
+            vec![Some(b.ip()), Some(c.ip())],
+            "seed 1 leads with the second candidate, then walks in order"
+        );
+
+        // Nothing answers: every candidate is tried exactly once and the
+        // refusals surface as the dial failure, in the same `Unsupported`
+        // class the front returned.
+        let front = FamilyFront::new([]);
+        let dialer = ProxyDialer::new(Arc::clone(&front) as Arc<dyn meow_common::Proxy>);
+        let e = dial_candidates(&dialer, vec![a, b, c], 0)
+            .await
+            .err()
+            .expect("a total refusal surfaces as the dial failure");
+        assert_eq!(e.kind(), std::io::ErrorKind::Unsupported);
+        assert_eq!(front.seen(), vec![Some(a.ip()), Some(b.ip()), Some(c.ip())]);
+    }
+
     /// Era unfold: a seconds value near `now` lands in the same era.
     #[test]
     fn era_unfold_picks_nearest() {
@@ -1076,7 +1355,7 @@ mod tests {
             dialer_proxy: Some("front".into()),
         };
 
-        let offset = poll_once(&cfg, &tunnel.weak_inner())
+        let offset = poll_once(&cfg, &tunnel.weak_inner(), 0)
             .await
             .expect("a domain target refused by the front must fall back to literal dials");
         assert!(
