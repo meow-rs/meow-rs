@@ -89,7 +89,7 @@ impl ProcessPatternRule {
         Ok(Self {
             rule_type,
             axis,
-            matcher: Matcher::Glob(lower_simple(glob).into_bytes()),
+            matcher: Matcher::Glob(lower_simple(glob).into_owned().into_bytes()),
             payload: glob.into(),
             adapter: intern_adapter(adapter),
         })
@@ -121,10 +121,15 @@ fn regexp2_hint(pattern: &str) -> Option<&'static str> {
 /// CJK passthrough). The divergence — full mappings whose first char is
 /// not the simple map (Greek capitals with iota subscripts) — is
 /// unreachable in practice for process names.
-fn lower_simple(text: &str) -> String {
-    text.chars()
-        .flat_map(|c| c.to_lowercase().take(1))
-        .collect()
+fn lower_simple(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.chars().any(|c| c.to_lowercase().next() != Some(c)) {
+        text.chars()
+            .flat_map(|c| c.to_lowercase().take(1))
+            .collect::<String>()
+            .into()
+    } else {
+        text.into()
+    }
 }
 
 /// Iterative two-pointer glob match — `?` consumes exactly one byte,
@@ -134,13 +139,17 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
     let (mut p, mut t) = (0usize, 0usize);
     let (mut star_p, mut star_t) = (usize::MAX, 0usize);
     while t < text.len() {
-        if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
-            p += 1;
-            t += 1;
-        } else if p < pattern.len() && pattern[p] == b'*' {
+        // `*` must be recognised before the literal-equality branch: a
+        // literal star in the text (`*worker` vs `*myworker`) is
+        // consumable by the wildcard, never swallowed as `* == *`
+        // without recording the backtracking point.
+        if p < pattern.len() && pattern[p] == b'*' {
             star_p = p;
             star_t = t;
             p += 1;
+        } else if p < pattern.len() && (pattern[p] == b'?' || pattern[p] == text[t]) {
+            p += 1;
+            t += 1;
         } else if star_p != usize::MAX {
             p = star_p + 1;
             star_t += 1;
@@ -287,6 +296,22 @@ mod tests {
         assert!(!one.match_metadata(&named("café"), &helper()));
         assert!(two.match_metadata(&named("café"), &helper()));
         assert!(one.match_metadata(&named("cafe"), &helper()));
+    }
+
+    #[test]
+    fn glob_star_consumes_literal_star_in_text() {
+        // A pattern `*` is a wildcard even against a text whose next byte
+        // is also `*` — the equality branch must not eat it first.
+        let r =
+            ProcessPatternRule::new_glob(RuleType::ProcessNameWildcard, "*worker", "T").unwrap();
+        assert!(r.match_metadata(&named("*myworker"), &helper()));
+        assert!(r.match_metadata(&named("worker"), &helper()));
+        assert!(!r.match_metadata(&named("*myworkers"), &helper()));
+        // A trailing literal-star comparison still works both ways.
+        let lit =
+            ProcessPatternRule::new_glob(RuleType::ProcessNameWildcard, "work*", "T").unwrap();
+        assert!(lit.match_metadata(&named("work*"), &helper()));
+        assert!(lit.match_metadata(&named("worker"), &helper()));
     }
 
     #[test]
