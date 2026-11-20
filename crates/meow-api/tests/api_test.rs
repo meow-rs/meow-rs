@@ -2186,6 +2186,10 @@ async fn put_configs_force_fallback_gates_sub_rules_shape() {
 /// than a phantom undefined block.
 #[tokio::test]
 async fn append_sub_rule_lines_dry_parse() {
+    // Every accepted append commits a raw candidate, and the commit
+    // re-asserts the process-wide knobs — the lane keeps a sibling
+    // config test's commit-and-assert window intact.
+    let _globals_lane = process_globals_lane().await;
     let mut raw = test_raw_config();
     raw.sub_rules = Some(std::collections::HashMap::from([(
         "blk".to_string(),
