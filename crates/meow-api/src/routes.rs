@@ -4880,28 +4880,24 @@ async fn swap_config_and_reconcile_tun(
     }
 
     // The ledger's sqlite open/close cannot join the synchronous section
-    // — it waits on its database — so it runs detached, serialized by the
-    // mutation lane it re-acquires. It then re-reads the tuple from the
-    // COMMITTED document rather than applying this spawn's captured one:
-    // a later commit already owns the lane when this job runs, and
-    // applying the earlier tuple would regress the newer generation's
-    // change — commit order is not spawn-completion order (Codex review).
-    let ledger_state = Arc::clone(state);
-    tokio::spawn(async move {
-        let _lane = CONFIG_MUTATION.lock().await;
-        let ledger = {
-            let guard = ledger_state.raw_config.read();
-            let raw = guard.traffic_ledger.as_ref();
-            (
-                meow_config::raw::RawTrafficLedger::enabled(raw),
-                meow_config::raw::RawTrafficLedger::options(raw),
-            )
-        };
-        let _ = tokio::task::spawn_blocking(move || {
-            meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
-        })
-        .await;
-    });
+    // — it waits on its database — so it runs on the blocking pool, but
+    // the lane must hold until the apply lands: answering first would let
+    // a 204 acknowledge a `traffic-ledger` switch the old policy has not
+    // handed off yet (Codex review). The tuple is re-read from the
+    // COMMITTED document rather than a captured candidate, and this lane
+    // still holds it — the apply matches the document just installed.
+    let ledger = {
+        let guard = state.raw_config.read();
+        let raw = guard.traffic_ledger.as_ref();
+        (
+            meow_config::raw::RawTrafficLedger::enabled(raw),
+            meow_config::raw::RawTrafficLedger::options(raw),
+        )
+    };
+    let _ = tokio::task::spawn_blocking(move || {
+        meow_common::traffic_ledger::reconfigure(ledger.0, ledger.1);
+    })
+    .await;
     PublishReceipt {
         dropped,
         tun: tun_result,
