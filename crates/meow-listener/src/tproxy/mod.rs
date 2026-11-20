@@ -897,18 +897,20 @@ async fn handle_tproxy_flow(
     ) {
         return Err("unmapped fake-ip destination".into());
     }
-    // Strict `resolve_proxy_flow` below requires the dst-IP pre-resolution
-    // contract (match_engine doc): fake-IP rescue above may have cleared
-    // `dst_ip` after recovering the hostname, and without this, IP rules
-    // never matched on the TProxy TCP path at all (issue #625 review).
-    inner.pre_resolve(&mut metadata).await;
+    // Lazy resolution, the same contract plain TCP flows get: fake-IP
+    // rescue above may have cleared `dst_ip` after recovering the
+    // hostname, and a staged conditional SUB-RULE reports its IP demand
+    // to the demand gate — the lazy path resolves then re-scans. A flow
+    // matched by a domain rule never pays the resolution (issue #974
+    // review — the eager `pre_resolve` could not answer a staged demand
+    // at all).
     let admission = inner.tcp_admission();
     let Some(ResolvedTarget {
         adapter: proxy,
         rule_name,
         rule_payload,
         route,
-    }) = inner.resolve_proxy_flow(&mut metadata).await
+    }) = inner.resolve_proxy_lazy(&mut metadata).await
     else {
         return Err("no matching rule".into());
     };
