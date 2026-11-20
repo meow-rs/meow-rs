@@ -1235,6 +1235,15 @@ impl BoundDnsServer {
         self.socket.local_addr()
     }
 
+    /// Weak handle to the UDP listen socket for teardown observation: the
+    /// serve loop is its sole strong owner, so `upgrade` failing proves
+    /// the port was released. An in-flight reply can hold an upgraded ref
+    /// briefly past the serve task's death — a same-address rebind must
+    /// wait this probe out, not just the task's join.
+    pub fn socket_weak(&self) -> Weak<UdpSocket> {
+        Arc::downgrade(&self.socket)
+    }
+
     /// Serve queries until the future is dropped.
     ///
     /// Dispatch model (issue #515): queries the resolver can fully decide
