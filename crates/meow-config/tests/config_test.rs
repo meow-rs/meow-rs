@@ -4899,6 +4899,30 @@ mod ntp_resolution {
             "ntp:\n  enable: true\n  dialer-proxy: g1\nproxy-groups:\n  - name: g1\n    type: select\n    proxies: [g2]\n  - name: g2\n    type: select\n    proxies: [DIRECT]\n"
         )
         .is_ok());
+        // But a group that only lands *late in the build's final pass*
+        // must not rescue an EARLIER group's dependency on it: the real
+        // settle never revisits, so `a` drops while `b` still lands
+        // (Codex review: the plain fixpoint revisited `a` and admitted
+        // it, letting a forced PUT commit a `dialer-proxy` the next boot
+        // fails to find). `c` is unbuildable, so `b`'s [DIRECT, c] keeps
+        // only DIRECT.
+        let e = check(
+            "ntp:\n  enable: true\n  dialer-proxy: a\nproxy-groups:\n  - name: a\n    type: select\n    proxies: [b]\n  - name: b\n    type: select\n    proxies: [DIRECT, c]\n  - name: c\n    type: not-a-group\n    proxies: [DIRECT]\n",
+        )
+        .expect_err("a depends on a group that only lands after it in the final pass");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
+        // The built map agrees: `b` lands, `a` and `c` do not.
+        let raw = meow_config::parse_raw_yaml(
+            "proxy-groups:\n  - name: a\n    type: select\n    proxies: [b]\n  - name: b\n    type: select\n    proxies: [DIRECT, c]\n  - name: c\n    type: not-a-group\n    proxies: [DIRECT]\n",
+        )
+        .unwrap();
+        let rebuilt = meow_config::rebuild_from_raw(&raw).unwrap();
+        assert!(rebuilt.proxies.contains_key("b"), "b must land");
+        assert!(!rebuilt.proxies.contains_key("a"), "a must drop");
+        assert!(!rebuilt.proxies.contains_key("c"), "c must drop");
         // A compiled-out spelling keeps an unavailable placeholder in
         // the built map, but the placeholder carries no transport — it
         // cannot serve as the NTP dialer target.

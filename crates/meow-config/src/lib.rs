@@ -5962,9 +5962,10 @@ fn declared_leaf_binding(name: &str, raw: &raw::RawConfig) -> Option<bool> {
 /// when at least one static member or provider slot resolves and its
 /// type-specific gates pass. Member names resolve against the set the
 /// build's map carries at group-parse time — the transports (built-ins),
-/// every landed leaf, and every group that already landed — computed as
-/// a fixpoint over the declared groups, since a group member that names
-/// a later group resolves once that group lands.
+/// every landed leaf, and every group that already landed — settled by
+/// the same multi-pass structure `build_config` uses, not a plain
+/// fixpoint, so a late landing does not rescue an earlier deferred
+/// dependency (Codex review).
 ///
 /// `cache_dir` must be the provider-cache directory the rebuild would
 /// use: it feeds [`declared_provider_buildable`]'s safe-path mirror, and
@@ -6010,22 +6011,56 @@ fn declared_group_lands(name: &str, raw: &raw::RawConfig, cache_dir: Option<&Pat
                 .collect()
         })
         .unwrap_or_default();
+    let declared: std::collections::HashSet<&str> =
+        groups.iter().map(|g| g.name.as_str()).collect();
     let mut landed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // Mirror the build's multi-pass settle (`build_config`'s group loop):
+    // a group whose `proxies:` member names a declared-but-unlanded group
+    // is deferred to a later pass — a member resolves only once its group
+    // landed in an earlier pass. When a pass lands nothing, the build
+    // makes one final lenient pass over what is left, in declaration
+    // order and without revisiting — so a group landing late in that
+    // pass does NOT rescue an earlier group's dependency on it. A plain
+    // fixpoint would revisit and admit it, letting a forced commit claim
+    // a `dialer-proxy` target the next boot drops (Codex review).
+    let mut remaining: Vec<&raw::RawProxyGroup> = groups.iter().collect();
     loop {
-        let before = landed.len();
-        for g in groups {
-            if landed.contains(g.name.as_str()) {
+        let mut still = Vec::new();
+        let mut progress = false;
+        for g in remaining {
+            let dep_pending = g
+                .proxies
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|m| declared.contains(m.as_str()) && !landed.contains(m.as_str()));
+            if dep_pending {
+                still.push(g);
                 continue;
             }
             if declared_group_would_land(g, &resolvable, &providers, landed_leaves, strict) {
                 landed.insert(g.name.as_str());
                 resolvable.insert(g.name.as_str());
+                progress = true;
+            } else {
+                still.push(g);
             }
         }
-        if landed.len() == before {
-            return landed.contains(name);
+        if still.is_empty() {
+            break;
         }
+        if !progress {
+            for g in &still {
+                if declared_group_would_land(g, &resolvable, &providers, landed_leaves, strict) {
+                    landed.insert(g.name.as_str());
+                    resolvable.insert(g.name.as_str());
+                }
+            }
+            break;
+        }
+        remaining = still;
     }
+    landed.contains(name)
 }
 
 /// Whether the declared `proxy-providers:` def would construct — the
