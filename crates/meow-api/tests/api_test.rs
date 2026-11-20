@@ -9892,8 +9892,8 @@ async fn patch_configs_tun_enable_without_listener_tun_fails_and_rolls_back() {
         "the live find-process-mode must be restored"
     );
     // The riding `disable-keep-alive` must not reach the socket policy
-    // either — the candidate keepalive is gated on the TUN outcome
-    // (issue #974 review).
+    // either — the keepalive resolves from `final_doc`, which is the
+    // pre-patch document on a failed TUN reconcile (issue #974 review).
     assert!(
         meow_common::outbound_tcp_keepalive().enabled,
         "a failed TUN patch must leave the socket keepalive posture alone"

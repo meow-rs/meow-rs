@@ -2292,10 +2292,10 @@ async fn apply_raw_to_tunnel(
 /// `change` is recorded in the logbook once the candidate is committed.
 /// The candidate build (`apply_raw_to_tunnel`) still runs request-side
 /// so a cancelled caller leaves zero change; everything from the swap on
-/// — the TUN transition, the synchronous publish, the keepalive
-/// re-assert — runs inside [`run_owned_mutation`], which holds the lane
-/// continuously until the whole commit has landed. The lane is returned
-/// so the caller keeps its critical section.
+/// — the TUN transition and the synchronous publish — runs inside
+/// [`run_owned_mutation`], which holds the lane continuously until the
+/// whole commit has landed. The lane is returned so the caller keeps its
+/// critical section.
 async fn commit_raw_candidate(
     state: &Arc<AppState>,
     candidate: RawConfig,
@@ -4389,9 +4389,8 @@ struct PublishReceipt {
 /// the `CONFIG_MUTATION` guard moves into the spawned task, keeps the
 /// lane continuously held for the whole operation, and comes back
 /// through the JoinHandle. Cancelling the handler future can no longer
-/// interrupt a commit halfway — once `work` starts it always lands, and
-/// the keepalive re-assert installs the final committed posture before
-/// the lane lets a sibling in (issue #974, Codex review).
+/// interrupt a commit halfway — once `work` starts it always lands
+/// before the lane lets a sibling in (issue #974, Codex review).
 async fn run_owned_mutation<T, Fut>(
     state: &Arc<AppState>,
     lane: tokio::sync::MutexGuard<'static, ()>,
@@ -4402,11 +4401,7 @@ where
     T: Send + 'static,
 {
     let state = Arc::clone(state);
-    let task = tokio::spawn(async move {
-        let out = work(Arc::clone(&state)).await;
-        install_committed_keepalive(&state);
-        (lane, out)
-    });
+    let task = tokio::spawn(async move { (lane, work(state).await) });
     task.await.expect("config commit task panicked")
 }
 
@@ -4555,8 +4550,7 @@ async fn swap_config_and_reconcile_tun(
     // the committed document lands exactly like the old in-place rollback.
     // The spawned listener's handle is only stored inside the commit
     // section (`install_tun_handle` is synchronous; `stop_tun`/`spawn`
-    // are not), and its value still decides the keepalive install and
-    // the receipt below.
+    // are not); `tun_result` picks `final_doc` and the receipt below.
     let mut tun_handle: Option<meow_tunnel::TunHandle> = None;
     // Whether the (re)spawned listener adopted the pre-installed global
     // binding — the commit section then flushes sessions opened before
@@ -4887,21 +4881,6 @@ async fn swap_config_and_reconcile_tun(
     PublishReceipt {
         dropped,
         tun: tun_result,
-    }
-}
-
-/// Install the *committed* document's `keep-alive-*` posture. Inside
-/// `swap_config_and_reconcile_tun` the same posture is installed in the
-/// commit section — ahead of the `ntp:` reconcile — only on a clean TUN
-/// outcome (issue #974 review); this re-assert runs at each lane's own
-/// commit point, POST-swap on the lanes that keep the document even when
-/// the TUN reconcile failed. Candidates were validated before commit, so
-/// a failure here means a caller skipped its gate: log loudly and keep
-/// the live posture rather than silently installing a fallback.
-fn install_committed_keepalive(state: &AppState) {
-    match meow_config::resolve_outbound_tcp_keepalive(&state.raw_config.read()) {
-        Ok(ka) => meow_common::set_outbound_tcp_keepalive(ka),
-        Err(e) => warn!("outbound keepalive resolution failed at commit: {e}"),
     }
 }
 
