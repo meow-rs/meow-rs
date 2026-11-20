@@ -1561,34 +1561,15 @@ async fn update_configs(
         let prior = state.raw_config.read().clone();
         let mut candidate = prior.clone();
         candidate.tun = Some(tun);
-        // Carry a patched routing-mark through the same commit path
-        // (`set_routing_mark` inside the swap applies it; the write below
-        // re-asserts it so a mark-only PATCH also lands).
-        if tail.routing_mark.is_some() {
-            candidate.routing_mark = tail.routing_mark;
-        }
-        // `interface-name` and `global-ua` ride the same commit
-        // (issue #974). `tcp-concurrent` does too — the swap installs it
-        // with the rest of the process-globals.
-        if tail.interface_name.is_some() {
-            candidate.interface_name = tail.interface_name.clone();
-        }
-        if tail.global_ua.is_some() {
-            candidate.global_ua = tail.global_ua.clone();
-        }
-        if tail.tcp_concurrent.is_some() {
-            candidate.tcp_concurrent = tail.tcp_concurrent;
-        }
-        if tail.find_process_mode.is_some() {
-            candidate.find_process_mode = tail.find_process_mode;
-        }
-        // The keepalive patch rides the same commit — the swap installs
-        // the merged posture with the rest of the process-globals.
-        if let Some((ref merged, _)) = tail.keepalive {
-            candidate.keep_alive_idle = merged.keep_alive_idle;
-            candidate.keep_alive_interval = merged.keep_alive_interval;
-            candidate.disable_keep_alive = merged.disable_keep_alive;
-        }
+        // The tail fields deliberately do NOT ride the candidate: the
+        // swap's commit would publish them (and the keepalive posture it
+        // resolves from `final_doc`) BEFORE `finish_patch_writes` runs
+        // the fallible log-level reload — a reloader error would answer
+        // 500 over an already-committed PATCH. With `candidate` carrying
+        // only the `tun:` change, the swap's process-global installs all
+        // re-assert the committed values (no-ops) and every tail knob
+        // still lands in `finish_patch_writes`, after every fallible
+        // step — the same ordering the non-TUN path below already uses.
         let preinstalled = preinstall_global_route_binding(
             &candidate,
             PreinstallScope::Mutation {
@@ -1601,8 +1582,9 @@ async fn update_configs(
         // No routing publish runs here, so tracked TCP predating a
         // pre-installed global-route binding is still live. The rollback
         // document is the pre-patch one: a failed spawn commits it with
-        // `tun.enable` rolled back, so the candidate's riding fields and
-        // keepalive posture never publish at all (issue #974).
+        // `tun.enable` rolled back, and the tail fields were never
+        // merged into the candidate — a rejected PATCH publishes none of
+        // them (issue #974).
         let (lane, response) = run_owned_mutation(&state, mutation, |state| async move {
             let receipt = swap_config_and_reconcile_tun(
                 &state,
@@ -1630,9 +1612,10 @@ async fn update_configs(
     finish_patch_writes(&state, tail)
 }
 
-/// The PATCH fields a candidate with a `tun:` patch rides through the
-/// swap's commit — and the plain-commit writes below — so both paths
-/// land the same set of knobs.
+/// The PATCH fields `finish_patch_writes` installs and writes into the
+/// committed document — after every fallible step (the TUN reconcile,
+/// the log-level reload), so both PATCH paths land the same set of
+/// knobs with the same failure semantics.
 struct PatchTail {
     mode: Option<TunnelMode>,
     log_level: Option<String>,
@@ -1692,18 +1675,14 @@ fn finish_patch_writes(state: &AppState, tail: PatchTail) -> Response {
     }
     if let Some(concurrent) = tail.tcp_concurrent {
         // Dial policy is a live process-global like `global-ua`: commit
-        // here after every fallible step above. A riding `tun:` patch
-        // already installed the same value through the swap's commit;
-        // re-asserting is idempotent.
+        // here after every fallible step above.
         meow_common::dial::set_tcp_concurrent(concurrent);
         info!("tcp-concurrent changed to {concurrent}");
         raw.tcp_concurrent = Some(concurrent);
     }
     if let Some(mode) = tail.find_process_mode {
         // The tunnel's live policy — the traffic ledger shares the cell,
-        // so queued app lookups recheck it too (issue #974). Same
-        // idempotent re-assertion as `tcp-concurrent` when a `tun:` patch
-        // rode the swap.
+        // so queued app lookups recheck it too (issue #974).
         state.tunnel.set_process_lookup_mode(mode);
         info!("find-process-mode changed to {mode}");
         raw.find_process_mode = Some(mode);
@@ -1711,8 +1690,7 @@ fn finish_patch_writes(state: &AppState, tail: PatchTail) -> Response {
     if let Some((merged, ka)) = tail.keepalive {
         // Commit point after every fallible step above: install the
         // merged policy and echo the merged fields into the document —
-        // an omitted key keeps its committed value. Idempotent when a
-        // `tun:` patch already installed the same posture via the swap.
+        // an omitted key keeps its committed value.
         meow_common::set_outbound_tcp_keepalive(ka);
         raw.keep_alive_idle = merged.keep_alive_idle;
         raw.keep_alive_interval = merged.keep_alive_interval;
