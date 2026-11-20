@@ -4934,6 +4934,94 @@ mod ntp_resolution {
         assert!(check("ntp:\n  enable: true\n  dialer-proxy: DIRECT\n").is_ok());
     }
 
+    /// The built-map side of the same gate: `proxies.contains_key` alone
+    /// cannot tell an `UnavailableAdapter` placeholder — bound by the
+    /// lenient build for a node it cannot construct — from a live leaf,
+    /// yet every dial on it fails (Codex review). A group naming the
+    /// placeholder beside a usable member stays valid: groups route
+    /// around dead members the same way they route around down nodes.
+    #[test]
+    fn ntp_dialer_target_rejects_placeholder_leaves_not_groups() {
+        let node = "proxies:\n  - name: front\n    type: trusttunnel\n    server: s\n    port: 1\n    username: u\n    password: p\n";
+
+        // `front` parses to a dead placeholder when trusttunnel is
+        // compiled out of this build; with the feature it is a live leaf.
+        let raw = meow_config::parse_raw_yaml(&format!(
+            "ntp:\n  enable: true\n  dialer-proxy: front\n{node}"
+        ))
+        .unwrap();
+        let result = meow_config::rebuild_from_raw(&raw);
+        if cfg!(feature = "trusttunnel") {
+            result.expect("a live leaf target must pass the gate");
+        } else {
+            let e = result.err().expect("a placeholder leaf must fail the gate");
+            assert!(
+                e.to_string().contains("no such top-level"),
+                "unexpected error: {e}"
+            );
+        }
+
+        // The same placeholder as a group MEMBER never disqualifies the
+        // group — `placeholder_names` holds leaf bindings only, and the
+        // group dials its live sibling.
+        let raw = meow_config::parse_raw_yaml(&format!(
+            "ntp:\n  enable: true\n  dialer-proxy: g\n{node}\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [DIRECT, front]\n"
+        ))
+        .unwrap();
+        meow_config::rebuild_from_raw(&raw)
+            .expect("a group with a usable member must pass the gate");
+    }
+
+    /// `use:` names are inert when `include-all`/`include-all-providers`
+    /// supplies the provider slots — the real parser never iterates them
+    /// in that posture, so an unknown name cannot fail even `strict`
+    /// (Codex review: the fallback validator rejected them). The forced
+    /// declared-side check must mirror that precedence.
+    #[test]
+    fn declared_group_use_ignored_when_include_all_supplies_slots() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let check = |yaml: &str| {
+            let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+            let ntp = meow_config::resolve_ntp(&raw).unwrap();
+            meow_config::check_ntp_dialer_target_declared(&ntp, &raw, Some(cache_dir.path()))
+        };
+        let providers = "proxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n";
+
+        for flag in ["include-all", "include-all-providers"] {
+            assert!(
+                check(&format!(
+                    "strict: true\nntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    {flag}: true\n    use: [ghost]\n{providers}"
+                ))
+                .is_ok(),
+                "{flag} must make the unknown `use:` name inert under strict"
+            );
+        }
+        // Without include-all the same unknown name still fails strict.
+        assert!(check(&format!(
+            "strict: true\nntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [ghost]\n{providers}"
+        ))
+        .is_err());
+    }
+
+    /// The forced declared-side check runs each named block's real
+    /// constructor for a verdict only — an `ss` node's external SIP003
+    /// plugin must never spawn a local subprocess for it (Codex review).
+    /// A plugin binary that does not exist makes the spawn observable:
+    /// reaching `Plugin::start` fails the parse and warn-drops the node,
+    /// where suppressing it yields the constructor's verdict modulo
+    /// process existence — the same answer `-t` gives.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn declared_dialer_target_never_spawns_external_plugins() {
+        let raw = meow_config::parse_raw_yaml(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: ss\n    server: s\n    port: 1\n    cipher: aes-128-gcm\n    password: p\n    plugin: meow-no-such-sip003-plugin\n",
+        )
+        .unwrap();
+        let ntp = meow_config::resolve_ntp(&raw).unwrap();
+        meow_config::check_ntp_dialer_target_declared(&ntp, &raw, None)
+            .expect("the verdict-only parse must not spawn the plugin binary");
+    }
+
     /// Local shape/range gates precede the first candidate network work
     /// (issue #974): `ech-opts.enable` with no `config:` and no query
     /// source is a deterministic strict defect that never dials, yet an

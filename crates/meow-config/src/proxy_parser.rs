@@ -816,8 +816,12 @@ pub fn parse_proxy_with_dialer_and_fp(
                     "ss[{name}]: external plugins are disabled by process policy"
                 ));
             }
-            // Validation constructs adapters, but must never execute a plugin.
-            let plugin = if crate::is_offline_validate() && is_external_sip003_plugin(plugin) {
+            // Validation constructs adapters, but must never execute a plugin —
+            // a dry-run mirror parse suppresses the same spawn
+            // (`plugin_spawn_suppressed`) for its verdict-only needs.
+            let plugin = if (crate::is_offline_validate() || plugin_spawn_suppressed())
+                && is_external_sip003_plugin(plugin)
+            {
                 None
             } else {
                 plugin
@@ -1056,6 +1060,40 @@ pub fn parse_proxy_with_dialer_and_fp(
         }
         _ => Err(format!("unsupported proxy type: {proxy_type}")),
     }
+}
+
+// Depth-counted suppression of the external SIP003 subprocess spawn —
+// set by a dry-run parse that needs `ShadowsocksAdapter::new`'s verdict
+// without a plugin process the candidate may never use (the NTP
+// dialer-target mirror parses every declared leaf; Codex review).
+// Thread-local because the mirror is synchronous code a `spawn_blocking`
+// owns outright; a counter, not a bool, so nested scopes compose.
+#[cfg(feature = "ss")]
+thread_local! {
+    static PLUGIN_SPAWN_DRY_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Enter a scope where the `ss` arm skips the external `Plugin::start`
+/// subprocess — every other check (the `dialer-proxy` bail, process
+/// policy, field validation, built-in plugin construction) still runs,
+/// so the parse keeps its verdict modulo the spawn itself. The returned
+/// guard resets on drop. Compiled only with `ss`: without the feature
+/// there is no spawn to suppress, and callers gate the call the same way.
+#[cfg(feature = "ss")]
+pub(crate) fn plugin_spawn_dry_run() -> impl Drop {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PLUGIN_SPAWN_DRY_RUN.with(|c| c.set(c.get() - 1));
+        }
+    }
+    PLUGIN_SPAWN_DRY_RUN.with(|c| c.set(c.get() + 1));
+    Guard
+}
+
+#[cfg(feature = "ss")]
+fn plugin_spawn_suppressed() -> bool {
+    PLUGIN_SPAWN_DRY_RUN.with(|c| c.get() > 0)
 }
 
 /// Whether `plugin` names a SIP003 plugin that runs as an external subprocess

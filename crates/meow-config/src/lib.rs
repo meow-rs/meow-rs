@@ -3003,6 +3003,15 @@ fn materialize_proxy_providers(
     Ok(out)
 }
 
+/// The registry map one `build_proxy_layer` produces plus the names it
+/// bound to unavailable placeholders — [`check_ntp_dialer_target`] needs
+/// the set: `contains_key` alone cannot tell a placeholder (every dial
+/// fails) from a live leaf.
+type BuiltProxyLayer = (
+    HashMap<SmolStr, Arc<dyn Proxy>>,
+    std::collections::HashSet<SmolStr>,
+);
+
 /// Build the complete proxy layer for one config: built-ins, `proxies:` leaf
 /// adapters, `dialer-proxy` chains, proxy groups and the auto-created GLOBAL
 /// selector, with every chain/cycle invariant validated. Shared between the
@@ -3024,7 +3033,7 @@ fn build_proxy_layer(
     selection: Option<&meow_proxy::SelectorWriter>,
     registry: &meow_proxy::dialer::ProxyRegistry,
     strict: bool,
-) -> Result<HashMap<SmolStr, Arc<dyn Proxy>>, anyhow::Error> {
+) -> Result<BuiltProxyLayer, anyhow::Error> {
     let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     let mut static_proxy_names = std::collections::HashSet::new();
@@ -3111,7 +3120,7 @@ fn build_proxy_layer(
     // not a runtime global, so a `PUT /configs` flip rebuilds cleanly.
     let global_fp =
         proxy_parser::normalize_client_fingerprint(raw.global_client_fingerprint.as_deref());
-    insert_parsed_leaves(
+    let placeholder_names = insert_parsed_leaves(
         &mut proxies,
         &mut static_proxy_names,
         raw_proxies,
@@ -3460,7 +3469,7 @@ fn build_proxy_layer(
 
     seed_chain_owners(&dialer_edges.declared, &proxies);
 
-    Ok(proxies)
+    Ok((proxies, placeholder_names))
 }
 
 /// Tell each automatic group used as a `dialer-proxy` which outbounds dial
@@ -3521,7 +3530,7 @@ fn prefetch_proxy_map(
     // cycle) hard-fails the real build with the same error; surface it
     // now instead of letting default-proxy provider/geodata fetches
     // egress direct on a config that intends chained egress.
-    let map = build_proxy_layer(
+    let (map, _) = build_proxy_layer(
         raw,
         None,
         providers,
@@ -3664,7 +3673,7 @@ fn rebuild_from_raw_impl(
         provider_dialer_registry,
         &mut dropped,
     )?;
-    let proxies = build_proxy_layer(
+    let (proxies, placeholder_names) = build_proxy_layer(
         raw,
         resolver,
         &candidate_providers,
@@ -3676,7 +3685,7 @@ fn rebuild_from_raw_impl(
     // here so every publication lane (startup, `-t`, PUT, warm republish)
     // enforces it the same way, and removing a target together with its
     // reference in one document stays legal (issue #974).
-    check_ntp_dialer_target(&ntp_resolved, &proxies)?;
+    check_ntp_dialer_target(&ntp_resolved, &proxies, &placeholder_names)?;
 
     // Publish the finished registry: the `dialer-proxy` chains bound during
     // the layer build resolve their front hop by name against it, and only
@@ -5828,14 +5837,26 @@ pub fn resolve_ntp(raw: &raw::RawConfig) -> Result<NtpConfig, anyhow::Error> {
 /// parsing still fails and a `use:`-only name never slips through.
 /// Called on every `rebuild_from_raw_impl` — startup, `-t`, PUT and the
 /// subscription/geodata republish lanes all pass through it.
+///
+/// `placeholder_names` is [`insert_parsed_leaves`]'s set: lenient builds
+/// bind a parse-failed placeholder-eligible node to an
+/// `UnavailableAdapter` that stays in the map but fails every dial — the
+/// same exclusion the declared-side fallback applies to `Some(true)`
+/// bindings (Codex review). Group names never appear in it — the
+/// duplicate-name gate keeps them disjoint — so a group whose members
+/// are unusable today still passes, matching how the target actually
+/// dials once membership changes (provider refresh, a re-pick).
 pub(crate) fn check_ntp_dialer_target(
     cfg: &NtpConfig,
     proxies: &HashMap<SmolStr, Arc<dyn meow_common::Proxy>>,
+    placeholder_names: &std::collections::HashSet<SmolStr>,
 ) -> Result<(), anyhow::Error> {
     // DIRECT/COMPATIBLE dial directly and GLOBAL is a real group — the
     // map carries all three; DIRECT is also spelled out for hand-built
     // `NtpConfig`s that skipped `resolve_ntp`'s normalization.
-    check_ntp_dialer_target_impl(cfg, |name| name == "DIRECT" || proxies.contains_key(name))
+    check_ntp_dialer_target_impl(cfg, |name| {
+        name == "DIRECT" || (proxies.contains_key(name) && !placeholder_names.contains(name))
+    })
 }
 
 /// The same `ntp.enable + dialer-proxy` gate where no built candidate
@@ -5892,6 +5913,14 @@ fn declared_leaf_binding(name: &str, raw: &raw::RawConfig) -> Option<bool> {
     if BUILTIN_ADAPTER_NAMES.contains(&name) {
         return None;
     }
+    // This mirror runs the real constructors for their verdicts only —
+    // an `ss` node's external SIP003 plugin must not spawn a local
+    // subprocess just to answer "would the name land" for a candidate
+    // that may still be rejected (Codex review). Every other check in
+    // the arm still applies, so the verdict stays the constructor's
+    // modulo the spawn itself.
+    #[cfg(feature = "ss")]
+    let _plugin_dry_run = proxy_parser::plugin_spawn_dry_run();
     let raw_proxies = raw.proxies.as_ref()?;
     let strict = raw.strict.unwrap_or(false);
     let Ok(edges) = collect_dialer_edges(raw_proxies, strict) else {
@@ -6111,6 +6140,12 @@ fn declared_group_would_land(
     }
     let is_relay = g.group_type == "relay";
     let proxy_names = g.proxies.as_deref().unwrap_or(&[]);
+    // `parse_proxy_group_inner` consults `use:` only when include-all
+    // supplies no provider slots: with `include-all`/`include-all-providers`
+    // set the slot list is every provider and `use:` is never iterated —
+    // an unknown name there cannot fail the parse even under `strict`.
+    let include_all_providers =
+        g.include_all.unwrap_or(false) || g.include_all_providers.unwrap_or(false);
     // Under `strict` an unresolved static member (or a non-relay group's
     // unknown `use:`) fails the parse — and the build it belongs to.
     if strict {
@@ -6118,6 +6153,7 @@ fn declared_group_would_land(
             return false;
         }
         if !is_relay
+            && !include_all_providers
             && g.use_providers
                 .as_deref()
                 .unwrap_or(&[])
@@ -6138,22 +6174,16 @@ fn declared_group_would_land(
     // inert (issue #533) — so they count only for the other types.
     let slots = if is_relay {
         0
+    } else if include_all_providers {
+        providers.len()
     } else {
         let mut seen = std::collections::HashSet::new();
-        let used = g
-            .use_providers
+        g.use_providers
             .as_deref()
             .unwrap_or(&[])
             .iter()
             .filter(|p| providers.contains(p.as_str()) && seen.insert(p.as_str()))
-            .count();
-        let include_all_providers =
-            g.include_all.unwrap_or(false) || g.include_all_providers.unwrap_or(false);
-        used + if include_all_providers {
-            providers.len()
-        } else {
-            0
-        }
+            .count()
     };
     if members == 0 && slots == 0 {
         return false;
