@@ -17,6 +17,7 @@ use std::sync::Arc;
 use anyhow::anyhow;
 use meow_common::Rule;
 use meow_rules::sub_rule::{SubRuleBlock, SubRuleRule};
+use meow_rules::sub_rule_cond::{parse_cond, SubRuleRef};
 use meow_rules::{ParserContext, RuleSet};
 use tracing::warn;
 
@@ -82,7 +83,9 @@ pub fn parse_sub_rules(
 }
 
 /// Build `block_name -> Vec<referenced_block_names>` from raw YAML.
-/// Validates that every `SUB-RULE,<name>` reference points at a defined block.
+/// Validates that every `SUB-RULE` reference — plain or conditional —
+/// points at a defined block. The block name is the graph edge; a
+/// fourth-field fallback target never is (issue #974).
 fn build_reference_graph(
     raw: &HashMap<String, Vec<String>>,
 ) -> Result<HashMap<String, Vec<String>>, anyhow::Error> {
@@ -90,13 +93,19 @@ fn build_reference_graph(
     for (name, lines) in raw {
         let mut refs = Vec::new();
         for line in lines {
-            if let Some(target) = parse_sub_rule_reference(line) {
-                if !raw.contains_key(&target) {
+            // A malformed reference head is a hard error here the same
+            // way the body parse below treats it — block bodies have no
+            // lenient arm (issue #974).
+            if let Some(reference) =
+                parse_sub_rule_reference(line).map_err(|e| anyhow!("sub-rule '{name}': {e}"))?
+            {
+                if !raw.contains_key(&reference.name) {
                     return Err(anyhow!(
-                        "sub-rule block '{name}' references undefined block '{target}'"
+                        "sub-rule block '{name}' references undefined block '{}'",
+                        reference.name
                     ));
                 }
-                refs.push(target);
+                refs.push(reference.name);
             }
         }
         graph.insert(name.clone(), refs);
@@ -104,33 +113,12 @@ fn build_reference_graph(
     Ok(graph)
 }
 
-/// Extract the target block name from a `SUB-RULE,NAME` line, if the line is
-/// a SUB-RULE reference. Returns `None` for any other rule type.
-///
-/// upstream: `rules/parser.go` SUB-RULE case — two-field form
-/// `SUB-RULE,<block-name>` (upstream also accepts a `(cond)` field that
-/// meow-rs does not implement). Further comma-delimited fields after the
-/// block name are *rejected* at rule-parse time (issue #625); this
-/// extractor still takes the first field so the reference-graph builder
-/// can point the error at the would-be name.
-pub(crate) fn parse_sub_rule_reference(line: &str) -> Option<String> {
-    let line = line.trim();
-    if line.is_empty() || line.starts_with('#') {
-        return None;
-    }
-    let mut it = line.splitn(2, ',');
-    let ty = it.next()?.trim();
-    if !ty.eq_ignore_ascii_case("SUB-RULE") {
-        return None;
-    }
-    let rest = it.next()?.trim();
-    if rest.is_empty() {
-        return None;
-    }
-    // Trailing comma-separated fields are rejected at rule-parse time
-    // (issue #625); for reference-graph building we only need the first
-    // field to name the would-be target in the undefined-block error.
-    Some(rest.split(',').next()?.trim().to_string())
+/// Extract the structured reference from a `SUB-RULE` line — the shared
+/// [`meow_rules::sub_rule_cond`] grammar. `Ok(None)` for any other rule
+/// type; `Err` for a malformed head; `Ok(Some)` carries the name (graph
+/// edges), the `(…)` condition text and the optional fallback.
+pub(crate) fn parse_sub_rule_reference(line: &str) -> Result<Option<SubRuleRef>, String> {
+    meow_rules::sub_rule_cond::parse_sub_rule_reference(line)
 }
 
 /// DFS-based topological sort with cycle detection.  Returns the order in
@@ -197,16 +185,37 @@ fn topo_order_with_cycle_check(
     Ok(order)
 }
 
-/// Construct a `SubRuleRule` from a resolved block reference. Used by the
-/// top-level `rules:` parser.
+/// Construct a `SubRuleRule` from a resolved block reference — plain,
+/// conditional, or conditional with the MEOW fourth-field fallback
+/// (issue #974). The condition is fully validated here: `parse_cond`'s
+/// whitelist and grammar apply identically at every level the line can
+/// appear (top-level `rules:`, block bodies, API dry-parse).
 pub fn build_sub_rule_rule(
-    block_name: &str,
+    reference: &SubRuleRef,
+    ctx: &ParserContext,
     resolved: &SubRuleBlocks,
 ) -> Result<Box<dyn Rule>, String> {
     let block = resolved
-        .get(block_name)
-        .ok_or_else(|| format!("sub-rule '{block_name}' not defined"))?;
-    Ok(Box::new(SubRuleRule::new(block_name, Arc::clone(block))))
+        .get(&reference.name)
+        .ok_or_else(|| format!("sub-rule '{}' not defined", reference.name))?;
+    match &reference.cond {
+        None => Ok(Box::new(SubRuleRule::new(
+            &reference.name,
+            Arc::clone(block),
+        ))),
+        Some(cond_text) => {
+            let expr = parse_cond(cond_text)
+                .map_err(|e| format!("SUB-RULE,{cond_text},{}: {e}", reference.name))?;
+            let cond = expr.build(ctx)?;
+            Ok(Box::new(SubRuleRule::new_conditional(
+                &reference.name,
+                Arc::clone(block),
+                cond,
+                cond_text,
+                reference.fallback.as_deref(),
+            )))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -229,26 +238,42 @@ mod tests {
 
     #[test]
     fn parses_sub_rule_reference_line() {
-        assert_eq!(
-            parse_sub_rule_reference("SUB-RULE,LOCAL"),
-            Some("LOCAL".into())
-        );
-        assert_eq!(
-            parse_sub_rule_reference("  sub-rule , FOO  "),
-            Some("FOO".into())
-        );
-        assert_eq!(parse_sub_rule_reference("DOMAIN,example.com,DIRECT"), None);
-        assert_eq!(parse_sub_rule_reference(""), None);
-        assert_eq!(parse_sub_rule_reference("# SUB-RULE,X"), None);
-        assert_eq!(parse_sub_rule_reference("SUB-RULE"), None);
-        assert_eq!(parse_sub_rule_reference("SUB-RULE,"), None);
+        let plain = parse_sub_rule_reference("SUB-RULE,LOCAL").unwrap().unwrap();
+        assert_eq!(plain.name, "LOCAL");
+        assert!(plain.cond.is_none() && plain.fallback.is_none());
+
+        let spaced = parse_sub_rule_reference("  sub-rule , FOO  ")
+            .unwrap()
+            .unwrap();
+        assert_eq!(spaced.name, "FOO");
+
+        // Conditional forms: the block name is the graph edge; the
+        // fourth field never is (issue #974).
+        let cond = parse_sub_rule_reference("SUB-RULE,(DOMAIN-SUFFIX,x),blk,T")
+            .unwrap()
+            .unwrap();
+        assert_eq!(cond.name, "blk");
+        assert_eq!(cond.cond.as_deref(), Some("(DOMAIN-SUFFIX,x)"));
+        assert_eq!(cond.fallback.as_deref(), Some("T"));
+
+        assert!(parse_sub_rule_reference("DOMAIN,example.com,DIRECT")
+            .unwrap()
+            .is_none());
+        assert!(parse_sub_rule_reference("").unwrap().is_none());
+        assert!(parse_sub_rule_reference("# SUB-RULE,X").unwrap().is_none());
+        assert!(parse_sub_rule_reference("SUB-RULE").unwrap().is_none());
+        // A malformed head is an error, not a silent non-reference.
+        assert!(parse_sub_rule_reference("SUB-RULE,").is_err());
+        assert!(parse_sub_rule_reference("SUB-RULE,name,junk").is_err());
+        assert!(parse_sub_rule_reference("SUB-RULE,(DOMAIN,x").is_err());
     }
 
     #[test]
     fn sub_rule_trailing_fields_rejected_inside_block_body() {
         // `a` is defined so the reference graph succeeds and the body
         // parse itself must surface the trailing-field error (fatal —
-        // block bodies have no lenient arm).
+        // block bodies have no lenient arm). The malformed head errors
+        // out at graph build — same hard-error outcome.
         let raw_map = raw(&[
             ("a", &["DOMAIN-SUFFIX,x.test,DIRECT"]),
             ("b", &["SUB-RULE,a,junk"]),
@@ -261,6 +286,44 @@ mod tests {
             err.to_string().contains("trailing"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Issue #974 — a conditional reference's *name* is the graph edge;
+    /// the fallback target never is, and forward references are allowed.
+    #[test]
+    fn conditional_reference_edges_and_forward_refs() {
+        let raw_map = raw(&[
+            ("b", &["SUB-RULE,(DOMAIN,x),fwd,T", "DOMAIN,y,DIRECT"]),
+            (
+                "fwd",
+                &["SUB-RULE,(DOMAIN,j),leaf,REJECT", "DOMAIN,z,DIRECT"],
+            ),
+            ("leaf", &["DOMAIN,w,DIRECT"]),
+        ]);
+        // `fwd` is referenced before its declaration — allowed. The
+        // fallback names `T`/`REJECT` are targets, not edges, so no
+        // "undefined block" error may fire on them.
+        let providers = HashMap::new();
+        let resolved = parse_sub_rules(&raw_map, &providers, &ParserContext::default(), false)
+            .expect("conditional references with fallback must resolve");
+        assert_eq!(resolved.len(), 3);
+
+        // A cond pointing at an undefined block still hard-errors.
+        let bad = raw(&[("a", &["SUB-RULE,(DOMAIN,x),missing,T"])]);
+        let err = parse_sub_rules(&bad, &providers, &ParserContext::default(), false)
+            .err()
+            .expect("conditional reference to undefined block must fail");
+        assert!(err.to_string().contains("missing"), "{err}");
+
+        // A cycle through conditional edges is still a cycle.
+        let cyc = raw(&[
+            ("a", &["SUB-RULE,(DOMAIN,x),b"]),
+            ("b", &["SUB-RULE,(DOMAIN,y),a,T"]),
+        ]);
+        let err = parse_sub_rules(&cyc, &providers, &ParserContext::default(), false)
+            .err()
+            .expect("conditional cycle must fail");
+        assert!(err.to_string().contains("cycle"), "{err}");
     }
 
     /// Dead and match-all domain payloads inside a block body are flagged

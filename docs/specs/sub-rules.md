@@ -111,10 +111,39 @@ An inner rule whose target is the literal name `PASS-RULE`, or an adapter
 upstream `matchSubRules`' `continue`. At top level a rule targeting
 `PASS-RULE` materializes the nop adapter and rejects like `REJECT`.
 
-**YAML syntax**: the implemented form is the two-field `SUB-RULE,BLOCK-NAME`.
+**YAML syntax**: the base form is the two-field `SUB-RULE,BLOCK-NAME`.
 A third field (`SUB-RULE,blk,junk`) is a parse error — it was silently dropped
-before #625, which read like a fallback target that never existed. Upstream's
-parenthesized `(cond)` gate-expression form is not implemented.
+before #625, which read like a fallback target that never existed.
+
+Issue #974 adds the conditional forms:
+
+```
+SUB-RULE,(<cond>),<name>            # upstream mihomo's conditional form
+SUB-RULE,(<cond>),<name>,<target>   # MEOW extension: exhaustion fallback
+```
+
+A false condition skips the whole block — no inner rule evaluates, and no
+inner IP/process demand is spent on the flow (condition-first staged
+evaluation; the compiled rule set gives staged slots zero static demand so a
+false condition never forces enrichment). A true condition scans the block in
+order; the first usable inner target wins. Three-field exhaustion falls
+through; four-field exhaustion yields `<target>`, which goes through the
+normal outer target checks. The fallback is an adapter name, not a block
+name — cycle detection and undefined-reference validation see only `<name>`.
+
+Condition leaves are whitelisted to `DOMAIN`, `DOMAIN-SUFFIX`,
+`DOMAIN-KEYWORD`, `GEOSITE` and `GEOIP` — anything else (including `MATCH`
+and other process/IP leaf types) is a parse error, and only `GEOIP` accepts
+trailing flags (`no-resolve`, `src` — `src` selects the source axis and
+never demands resolution; `GEOSITE` tolerates a vestigial `no-resolve` like
+the top-level parser). Leaves compose with upstream's prefix operators
+`(AND,(A),(B))`, `(OR,(A),(B))`, `(NOT,(A))` and with the infix operators
+`&`, `|` and `!` (precedence `!` > `&` > `|`, left-associative, parentheses
+override). A condition leaf that demands a resolved IP reports that demand
+per-predicate — the staged evaluation maps it to the tunnel's
+`NeedsEnrichment` path instead of the push-resolution gate the plain
+reference keeps; an unresolved-but-unavailable demand reads the predicate
+as undecided, never as false.
 
 **Divergences from upstream** (classified per
 [ADR-0002](../adr/0002-upstream-divergence-policy.md)):

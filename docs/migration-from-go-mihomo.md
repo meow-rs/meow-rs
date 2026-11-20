@@ -71,8 +71,11 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `rules:` — GEOSITE | ✓ | mrs format only — see §Rules. |
 | `rules:` — RULE-SET | ✓ | M1.D-5, mrs + yaml formats. |
 | `rules:` — PROCESS-NAME | ✓ | Platform lookup wired. `find-process-mode` selects when it runs (below). |
+| `rules:` — PROCESS-PATH | ✓ | Same lookup as PROCESS-NAME; plus a `/`-prefix directory match and `*` glob (meow-rs extensions over upstream's filename match). |
+| `rules:` — PROCESS-NAME-REGEX, PROCESS-PATH-REGEX | ✓ | Case-insensitive search semantics; comma-protected payloads like DOMAIN-REGEX. |
+| `rules:` — PROCESS-NAME-WILDCARD, PROCESS-PATH-WILDCARD | ✓ | Whole-field `*`/`?` glob (`,`-unprotected fixed fields; a fourth field is parsed as upstream params and ignored). |
 | `rules:` — IN-NAME, IN-TYPE, IN-PORT, IN-USER | ✓ | Named listeners and auth metadata are wired. |
-| `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection. |
+| `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection, including the conditional `SUB-RULE,(<cond>),<name>` form. **Extension:** a fourth field `SUB-RULE,(<cond>),<name>,<target>` applies a fallback target when the entered block exhausts (upstream has no such field); conditions additionally accept infix `&`/`|`/`!`. |
 | `rules:` — AND, OR, NOT | ✓ | Logic composition supported. |
 | `rules:` — MATCH | ✓ | Fully supported. |
 | `rule-providers:` — http | ✓ | With interval refresh (M1.D-5). |

@@ -90,7 +90,7 @@ pub use process_lookup::{
 };
 pub use protocol_clock::{protocol_now, set_protocol_offset_ns};
 pub use replay_window::ReplayWindow;
-pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};
+pub use rule::{MatchDemand, Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};
 pub use sniffer::SnifferConfig;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use socket_protect::set_listener_socket_mark;

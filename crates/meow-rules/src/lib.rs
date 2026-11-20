@@ -33,10 +33,12 @@ pub mod parser;
 pub mod port;
 pub mod process;
 pub mod process_path;
+pub mod process_pattern;
 pub mod rule_set;
 pub mod rule_set_rule;
 pub mod src_geoip;
 pub mod sub_rule;
+pub mod sub_rule_cond;
 pub mod uid;
 
 pub use domain_key::{

@@ -3812,15 +3812,19 @@ fn rebuild_from_raw_impl(
         strict,
     )?;
 
-    // Validate: any `SUB-RULE,<name>` in top-level rules must reference a
-    // defined block. `parse_rules_full` warns on unknown blocks; promote
-    // undefined-block to a hard error here (Class A per ADR-0002).
+    // Validate: any `SUB-RULE` reference in top-level rules must point at a
+    // defined block — plain, conditional or fallback form alike (issue
+    // #974). `parse_rules_full` warns on unknown blocks; promote
+    // undefined-block to a hard error here (Class A per ADR-0002). Only a
+    // well-formed reference head counts: a malformed one fails at the
+    // parse stage, so skipping it here leaves exactly one error channel.
     if let Some(raw_rules) = raw.rules.as_deref() {
         for line in raw_rules {
-            if let Some(name) = sub_rules_parser::parse_sub_rule_reference(line) {
-                if !sub_rules.contains_key(&name) {
+            if let Ok(Some(reference)) = sub_rules_parser::parse_sub_rule_reference(line) {
+                if !sub_rules.contains_key(&reference.name) {
                     return Err(anyhow::anyhow!(
-                        "rules: SUB-RULE,{name} references undefined sub-rule block"
+                        "rules: SUB-RULE,{} references undefined sub-rule block",
+                        reference.name
                     ));
                 }
             }
@@ -4745,16 +4749,71 @@ fn geoip_scan_regex() -> &'static regex::Regex {
     })
 }
 
+/// One raw rule line classified for geo discovery (issue #974): the text
+/// the plain `GEOIP,`/`GEOSITE,`/`IP-ASN,` regexes may scan, plus the
+/// parsed SUB-RULE condition tree — the only position cond leaves can
+/// legally live. `text` is `None` for process-pattern and SUB-RULE lines:
+/// their free-form pattern / name / fallback fields could spoof a
+/// `GEOIP,`/`GEOSITE,` declaration, and malformed cond text contributes
+/// nothing (the parse stage owns that error).
+struct GeoLineScan<'a> {
+    text: Option<&'a str>,
+    cond: Option<meow_rules::sub_rule_cond::CondExpr>,
+}
+
+fn geo_scan_targets(line: &str) -> GeoLineScan<'_> {
+    use meow_rules::sub_rule_cond::{parse_cond, parse_sub_rule_reference};
+    let trimmed = line.trim();
+    let none = || GeoLineScan {
+        text: None,
+        cond: None,
+    };
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return none();
+    }
+    let ty = trimmed.split(',').next().map_or("", str::trim);
+    let ty = meow_common::RuleType::from_mihomo_name(ty)
+        .map_or_else(|| ty.to_ascii_uppercase(), |t| t.as_str().to_string());
+    match ty.as_str() {
+        // The pattern field is unbounded expression text: a `GEOIP,x`
+        // inside a regex or glob is process-name text, never a geo
+        // declaration.
+        "PROCESS-NAME-REGEX"
+        | "PROCESS-PATH-REGEX"
+        | "PROCESS-NAME-WILDCARD"
+        | "PROCESS-PATH-WILDCARD" => none(),
+        "SUB-RULE" => {
+            let cond = parse_sub_rule_reference(trimmed)
+                .ok()
+                .flatten()
+                .and_then(|r| r.cond)
+                .and_then(|c| parse_cond(&c).ok());
+            GeoLineScan { text: None, cond }
+        }
+        _ => GeoLineScan {
+            text: Some(trimmed),
+            cond: None,
+        },
+    }
+}
+
 fn collect_geoip_countries(lines: &[String]) -> std::collections::HashSet<String> {
+    use meow_rules::sub_rule_cond::CondLeafKind;
     let re = geoip_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        let scan = geo_scan_targets(line);
+        if let Some(text) = scan.text {
+            for cap in re.captures_iter(text) {
+                out.insert(cap[1].to_ascii_uppercase());
+            }
         }
-        for cap in re.captures_iter(line) {
-            out.insert(cap[1].to_ascii_uppercase());
+        if let Some(cond) = &scan.cond {
+            for leaf in cond.leaves() {
+                if leaf.kind == CondLeafKind::GeoIp {
+                    out.insert(leaf.payload.to_ascii_uppercase());
+                }
+            }
         }
     }
     out
@@ -4776,15 +4835,29 @@ fn geosite_scan_regex() -> &'static regex::Regex {
 }
 
 fn collect_geosite_categories(lines: &[String]) -> std::collections::HashSet<String> {
+    use meow_rules::sub_rule_cond::CondLeafKind;
     let re = geosite_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        let scan = geo_scan_targets(line);
+        if let Some(text) = scan.text {
+            for cap in re.captures_iter(text) {
+                out.insert(cap[1].to_ascii_lowercase());
+            }
         }
-        for cap in re.captures_iter(line) {
-            out.insert(cap[1].to_ascii_lowercase());
+        if let Some(cond) = &scan.cond {
+            for leaf in cond.leaves() {
+                if leaf.kind == CondLeafKind::GeoSite {
+                    // Same `category@attr` split the GeoSite leaf build
+                    // performs — only the category keys the loader.
+                    if let Some(cat) = leaf.payload.split('@').next() {
+                        let cat = cat.trim();
+                        if !cat.is_empty() {
+                            out.insert(cat.to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
         }
     }
     out
@@ -4836,11 +4909,12 @@ fn collect_asn_numbers(lines: &[String]) -> std::collections::HashSet<u32> {
     let re = asn_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        // A cond leaf can never declare an ASN (not in the whitelist),
+        // so only the text classification matters here.
+        let Some(text) = geo_scan_targets(line).text else {
             continue;
-        }
-        for cap in re.captures_iter(line) {
+        };
+        for cap in re.captures_iter(text) {
             if let Ok(asn) = cap[1].parse::<u32>() {
                 out.insert(asn);
             }
@@ -4850,26 +4924,37 @@ fn collect_asn_numbers(lines: &[String]) -> std::collections::HashSet<u32> {
 }
 
 /// True iff `line` references the GeoIP Country database anywhere — as a
-/// top-level `GEOIP,`/`SRC-GEOIP,` rule or nested inside a logic rule
-/// (`AND`/`OR`/`NOT`). Comment lines never match. Uses the same regex as
+/// top-level `GEOIP,`/`SRC-GEOIP,` rule, nested inside a logic rule
+/// (`AND`/`OR`/`NOT`), or as a SUB-RULE condition leaf (issue #974).
+/// Comment lines never match. Uses the same classifier as
 /// [`collect_geoip_countries`] so the trigger and the allowlist agree.
 fn line_references_geoip(line: &str) -> bool {
-    let line = line.trim();
-    !line.is_empty() && !line.starts_with('#') && geoip_scan_regex().is_match(line)
+    use meow_rules::sub_rule_cond::CondLeafKind;
+    let scan = geo_scan_targets(line);
+    scan.text.is_some_and(|t| geoip_scan_regex().is_match(t))
+        || scan
+            .cond
+            .is_some_and(|c| c.leaves().iter().any(|l| l.kind == CondLeafKind::GeoIp))
 }
 
-/// True iff `line` references the geosite database anywhere (top-level or
-/// nested inside a logic rule). Comment lines never match.
+/// True iff `line` references the geosite database anywhere (top-level,
+/// nested inside a logic rule, or a SUB-RULE condition leaf). Comment
+/// lines never match.
 fn line_references_geosite(line: &str) -> bool {
-    let line = line.trim();
-    !line.is_empty() && !line.starts_with('#') && geosite_scan_regex().is_match(line)
+    use meow_rules::sub_rule_cond::CondLeafKind;
+    let scan = geo_scan_targets(line);
+    scan.text.is_some_and(|t| geosite_scan_regex().is_match(t))
+        || scan
+            .cond
+            .is_some_and(|c| c.leaves().iter().any(|l| l.kind == CondLeafKind::GeoSite))
 }
 
 /// True iff `line` references the GeoLite2-ASN database anywhere — `IP-ASN,`
 /// or `SRC-IP-ASN,`, top-level or nested. Comment lines never match.
 fn line_references_asn(line: &str) -> bool {
-    let line = line.trim();
-    !line.is_empty() && !line.starts_with('#') && asn_scan_regex().is_match(line)
+    geo_scan_targets(line)
+        .text
+        .is_some_and(|t| asn_scan_regex().is_match(t))
 }
 
 /// Gather every rule line that can reference a geo database (issue #277):
@@ -9416,6 +9501,31 @@ mod geoip_context_tests {
         assert!(collect_asn_numbers(&lines).contains(&15169));
     }
 
+    /// Issue #974 — a GEOIP key that appears only inside a condition leaf
+    /// likewise triggers the mmdb load, observed as the fail-fast error
+    /// naming the nonexistent DB path.
+    #[test]
+    fn cond_only_geoip_triggers_mmdb_load() {
+        let mut sub_rules = HashMap::new();
+        sub_rules.insert("blk".to_string(), vec!["DOMAIN,x.test,DIRECT".to_string()]);
+        let raw = raw::RawConfig {
+            rules: Some(vec!["SUB-RULE,(GEOIP,JP),blk".to_string()]),
+            sub_rules: Some(sub_rules),
+            ..Default::default()
+        };
+        let nonexistent = PathBuf::from("/nonexistent-test-path-974/Country.mmdb");
+        let err = build_parser_context_at(
+            &raw,
+            &nonexistent,
+            &nonexistent_asn(),
+            &nonexistent_geosite(),
+            None,
+            &rule_provider::PrefetchedPayloads::default(),
+        )
+        .expect_err("a cond-only GEOIP leaf must trigger the mmdb load");
+        assert!(format!("{err}").contains("/nonexistent-test-path-974/Country.mmdb"));
+    }
+
     /// Issue #277 — a GEOIP rule that appears only inside a sub-rules block
     /// must trigger the mmdb load (observable here as the fail-fast error for
     /// a missing DB, which names the triggering line).
@@ -9455,6 +9565,51 @@ mod geoip_context_tests {
             "DOMAIN,example.com,DIRECT".to_string(),
         ];
         assert!(collect_geoip_countries(&lines).is_empty());
+    }
+
+    /// Issue #974 — a GEOIP/GEOSITE key that exists only inside a
+    /// `SUB-RULE,(cond),…` predicate still triggers and bins the database
+    /// load, across every condition grammar form: prefix composites,
+    /// infix `&`/`|`/`!`, and `category@attr` payloads.
+    #[test]
+    fn cond_leaves_feed_geo_discovery() {
+        let lines = vec![
+            "SUB-RULE,(GEOIP,JP),blk".to_string(),
+            "SUB-RULE,((GEOIP,KR)|(GEOSITE,youtube@ads)),blk2,T".to_string(),
+            "SUB-RULE,(AND,((GEOSITE,cn),(GEOIP,US,src))),blk3".to_string(),
+            "SUB-RULE,(NOT,((GEOIP,TW))),blk4".to_string(),
+            // A plain reference's block name is never a geo declaration.
+            "SUB-RULE,GEOIP-fake-name".to_string(),
+        ];
+        let countries = collect_geoip_countries(&lines);
+        for code in ["JP", "KR", "US", "TW"] {
+            assert!(countries.contains(code), "missing cond country {code}");
+        }
+        assert_eq!(countries.len(), 4);
+        let categories = collect_geosite_categories(&lines);
+        // `@ads` keys the category, not the attribute — same split the
+        // leaf build performs.
+        assert!(categories.contains("youtube"));
+        assert!(categories.contains("cn"));
+        assert_eq!(categories.len(), 2);
+    }
+
+    /// A malformed condition contributes nothing — the parse stage owns
+    /// that error; discovery must not read a geo declaration out of text
+    /// it cannot validate (issue #974).
+    #[test]
+    fn malformed_cond_declares_no_geo() {
+        let lines = vec![
+            "SUB-RULE,(GEOIP,XX".to_string(),                 // unbalanced
+            "SUB-RULE,(GEOIP,YY),blk,junk,extra".to_string(), // too many fields
+            "SUB-RULE,(PROCESS-NAME,GEOIP,ZZ),blk".to_string(),
+            "PROCESS-NAME-REGEX,GEOIP,XX,DIRECT".to_string(),
+            "PROCESS-PATH-WILDCARD,GEOSITE-*-cn,DIRECT".to_string(),
+        ];
+        assert!(collect_geoip_countries(&lines).is_empty());
+        assert!(collect_geosite_categories(&lines).is_empty());
+        assert!(!lines.iter().any(|l| line_references_geoip(l)));
+        assert!(!lines.iter().any(|l| line_references_geosite(l)));
     }
 
     fn nonexistent_asn() -> PathBuf {

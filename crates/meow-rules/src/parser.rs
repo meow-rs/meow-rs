@@ -27,6 +27,7 @@ use crate::network::NetworkRule;
 use crate::port::PortRule;
 use crate::process::ProcessRule;
 use crate::process_path::ProcessPathRule;
+use crate::process_pattern::ProcessPatternRule;
 use crate::rule_set::RuleSet;
 use crate::rule_set_rule::RuleSetRule;
 use crate::src_geoip::SrcGeoIpRule;
@@ -212,6 +213,45 @@ fn parse_rule_depth(
         "DST-PORT" => PortRule::new(payload, adapter, false).map(|r| Box::new(r) as Box<dyn Rule>),
         "NETWORK" => NetworkRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
         "PROCESS-NAME" => Ok(Box::new(ProcessRule::new(payload, adapter))),
+        "PROCESS-NAME-REGEX" | "PROCESS-PATH-REGEX" => {
+            // Comma-protected like DOMAIN-REGEX (upstream parser.go treats
+            // both process regex types that way): the adapter is the last
+            // comma field, the pattern is everything between the type and
+            // it — `TYPE,pattern,DIRECT,no-resolve` therefore targets
+            // `no-resolve` over the pattern `pattern,DIRECT`, never a flag.
+            let ty = if rule_type == "PROCESS-NAME-REGEX" {
+                meow_common::RuleType::ProcessNameRegex
+            } else {
+                meow_common::RuleType::ProcessPathRegex
+            };
+            let Some((_, rest)) = line.split_once(',') else {
+                return Err(format!("rule needs at least 3 parts: {line}"));
+            };
+            let (pattern, adapter) = rest
+                .rsplit_once(',')
+                .map(|(p, a)| (p.trim(), a.trim()))
+                .ok_or_else(|| format!("rule needs at least 3 parts: {line}"))?;
+            if adapter.is_empty() {
+                return Err(format!("{rule_type}: empty adapter"));
+            }
+            ProcessPatternRule::new_regex(ty, pattern, adapter)
+                .map(|r| Box::new(r) as Box<dyn Rule>)
+        }
+        "PROCESS-NAME-WILDCARD" | "PROCESS-PATH-WILDCARD" => {
+            // Fixed slots, not comma-protected: field 2 is the glob,
+            // field 3 the target, and anything later is an upstream-style
+            // params list these rules do not consume (`no-resolve`/`src`
+            // included — they change nothing, like upstream).
+            let ty = if rule_type == "PROCESS-NAME-WILDCARD" {
+                meow_common::RuleType::ProcessNameWildcard
+            } else {
+                meow_common::RuleType::ProcessPathWildcard
+            };
+            if adapter.is_empty() {
+                return Err(format!("{rule_type}: empty adapter"));
+            }
+            ProcessPatternRule::new_glob(ty, payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>)
+        }
         "GEOIP" => {
             let index = ctx.geoip.as_ref().ok_or_else(|| {
                 "GEOIP rule requires a GeoIP database, but none is configured".to_string()
@@ -523,12 +563,16 @@ fn splice_inner_adapter(entry: &str) -> String {
     // DOMAIN-REGEX joins that class: its payload may contain commas and its
     // adapter slot is the *last* field, so the placeholder must likewise go
     // at the end (`DOMAIN-REGEX,a,b` → `DOMAIN-REGEX,a,b,<PH>` keeps `a,b`
-    // — inserting it mid-entry would splice into the expression).
+    // — inserting it mid-entry would splice into the expression). The two
+    // process regex types share that comma protection (issue #974).
     if let Some((ty, _)) = entry.split_once(',') {
         let ty = meow_common::RuleType::from_mihomo_name(ty.trim())
             .map_or(ty.trim(), |t| t.as_str())
             .to_ascii_uppercase();
-        if matches!(ty.as_str(), "AND" | "OR" | "NOT" | "DOMAIN-REGEX") {
+        if matches!(
+            ty.as_str(),
+            "AND" | "OR" | "NOT" | "DOMAIN-REGEX" | "PROCESS-NAME-REGEX" | "PROCESS-PATH-REGEX"
+        ) {
             return format!("{entry},{LOGIC_INNER_PLACEHOLDER}");
         }
     }
@@ -905,6 +949,115 @@ mod tests {
         // `domain_payload_defect` machinery owns that warning (issue
         // #869), same as `DOMAIN-KEYWORD,,X`.
         assert!(parse_rule("DOMAIN-REGEX,,DIRECT", &ctx()).is_ok());
+    }
+
+    /// Issue #974 — the process regex types are comma-protected exactly
+    /// like `DOMAIN-REGEX` (upstream treats them through the same
+    /// needTarget path): the adapter is the last comma field, the
+    /// pattern is everything between the type and it — including commas
+    /// and flag-looking text.
+    #[test]
+    fn test_parse_process_regex_comma_protected() {
+        let make_proc = |name: &str| Metadata {
+            process: name.into(),
+            ..Default::default()
+        };
+        // `no-resolve` is the *target* here, not a flag — the pattern is
+        // `pattern,DIRECT` and matches a literal comma in the name.
+        let rule = parse_rule("PROCESS-NAME-REGEX,pattern,DIRECT,no-resolve", &ctx()).unwrap();
+        assert_eq!(rule.rule_type(), RuleType::ProcessNameRegex);
+        assert_eq!(rule.adapter(), "no-resolve");
+        assert_eq!(rule.payload(), "pattern,DIRECT");
+        assert!(rule.match_metadata(&make_proc("pattern,direct"), &noop_helper()));
+        assert!(!rule.match_metadata(&make_proc("pattern"), &noop_helper()));
+
+        // Repetition bounds keep their commas.
+        let rule = parse_rule(r"PROCESS-NAME-REGEX,^fo{1,3}$,DIRECT", &ctx()).unwrap();
+        assert_eq!(rule.adapter(), "DIRECT");
+        assert!(rule.match_metadata(&make_proc("foo"), &noop_helper()));
+        assert!(!rule.match_metadata(&make_proc("foooo"), &noop_helper()));
+
+        // Path axis keeps the whole string; the mihomo API spelling
+        // (`ProcessPathRegex`) parses too.
+        let rule = parse_rule(r"ProcessPathRegex,^/usr/bin/cu[rR]l$,Proxy", &ctx()).unwrap();
+        assert_eq!(rule.rule_type(), RuleType::ProcessPathRegex);
+        let path_meta = Metadata {
+            process_path: "/usr/bin/curl".into(),
+            ..Default::default()
+        };
+        assert!(rule.match_metadata(&path_meta, &noop_helper()));
+
+        // Two-field and empty-adapter lines are errors; an empty pattern
+        // is rejected by the constructor.
+        assert!(parse_rule("PROCESS-NAME-REGEX,onlyone", &ctx()).is_err());
+        assert!(parse_rule("PROCESS-NAME-REGEX,p,", &ctx()).is_err());
+        assert!(parse_rule("PROCESS-NAME-REGEX,,T", &ctx()).is_err());
+        assert!(parse_rule("PROCESS-PATH-REGEX,[,T", &ctx()).is_err());
+    }
+
+    /// Wildcard process rules use fixed fields: field 2 is the glob,
+    /// field 3 the target, and anything later is an unused upstream
+    /// params slot (`no-resolve`/`src`/junk all ignored — issue #974).
+    #[test]
+    fn test_parse_process_wildcard_fixed_fields() {
+        let rule = parse_rule("PROCESS-NAME-WILDCARD,Cu?l*,DIRECT,no-resolve", &ctx()).unwrap();
+        assert_eq!(rule.rule_type(), RuleType::ProcessNameWildcard);
+        assert_eq!(rule.adapter(), "DIRECT");
+        assert_eq!(rule.payload(), "Cu?l*");
+        let curl = Metadata {
+            process: "CURL.EXE".into(),
+            ..Default::default()
+        };
+        assert!(rule.match_metadata(&curl, &noop_helper()));
+
+        let path = parse_rule("PROCESS-PATH-WILDCARD,/opt/*/tool,Proxy,src", &ctx()).unwrap();
+        let meta = Metadata {
+            process_path: "/opt/a/b/tool".into(),
+            ..Default::default()
+        };
+        assert!(path.match_metadata(&meta, &noop_helper()));
+
+        // Empty glob / empty adapter are rejected; a glob containing a
+        // comma is truncated to its first field exactly like every
+        // other fixed-field rule (no comma protection for wildcards).
+        assert!(parse_rule("PROCESS-NAME-WILDCARD,,T", &ctx()).is_err());
+        assert!(parse_rule("PROCESS-NAME-WILDCARD,g,", &ctx()).is_err());
+        let comma = parse_rule("PROCESS-NAME-WILDCARD,a,b,c", &ctx()).unwrap();
+        assert_eq!(comma.payload(), "a");
+        assert_eq!(comma.adapter(), "b");
+    }
+
+    /// A comma-containing process regex inside a logic group must not be
+    /// truncated by the placeholder splice — the same protection the
+    /// top-level arm gives (issue #974).
+    #[test]
+    fn test_parse_process_regex_inside_logic_group() {
+        let meta = Metadata {
+            process: "foo,direct".into(),
+            host: "a.example".into(),
+            ..Default::default()
+        };
+        // `(PROCESS-NAME-REGEX,foo,direct)` — payload `foo,direct` keeps
+        // its comma; the placeholder adapter is spliced *after* it.
+        let rule = parse_rule(
+            "AND,((PROCESS-NAME-REGEX,foo,direct),(DOMAIN,a.example)),Proxy",
+            &ctx(),
+        )
+        .unwrap();
+        assert!(rule.match_metadata(&meta, &noop_helper()));
+
+        // The wildcard types splice mid-position normally.
+        let rule = parse_rule(
+            "AND,((PROCESS-NAME-WILDCARD,foo*),(DOMAIN,a.example)),Proxy",
+            &ctx(),
+        )
+        .unwrap();
+        let meta2 = Metadata {
+            process: "foobar".into(),
+            host: "a.example".into(),
+            ..Default::default()
+        };
+        assert!(rule.match_metadata(&meta2, &noop_helper()));
     }
 
     /// `IP-CIDR6,...,src` shares the IP-CIDR arm — IPv6 source axis.
