@@ -3,8 +3,8 @@
 //! `jls_plugin`, `kcptun_plugin`, `ech_tls_tunnel`.
 
 // `MeowError`/`Result` are only needed by the helpers whose consumers sit
-// behind the per-plugin features — under an `ss`-only build (v2ray-plugin +
-// simple-obfs) nothing here returns `Result`.
+// behind the per-plugin features — under an `ss`-only build nothing here
+// returns `Result`.
 #[cfg(any(
     feature = "gost-plugin",
     feature = "shadow-tls",
@@ -12,6 +12,11 @@
     feature = "kcptun"
 ))]
 use meow_common::error::{MeowError, Result};
+#[cfg(any(
+    feature = "ss-v2ray-plugin",
+    feature = "kcptun",
+    feature = "ech-tls-tunnel"
+))]
 use tracing::warn;
 
 /// SIP003 `plugin-opts` tokenizer shared by every built-in plugin parser:
@@ -34,6 +39,11 @@ pub(crate) fn sip003_opts(s: &str) -> impl Iterator<Item = (String, String)> + '
 /// there for compatibility and use `parse_bool_strict` for knobs
 /// where a typo would silently weaken security (enabling TLS,
 /// skipping verification).
+#[cfg(any(
+    feature = "ss-v2ray-plugin",
+    feature = "kcptun",
+    feature = "ech-tls-tunnel"
+))]
 pub(crate) fn parse_bool(s: &str, plugin: &str, key: &str) -> bool {
     match s.to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => true,
@@ -241,15 +251,24 @@ mod tests {
     }
 
     #[cfg(any(
+        feature = "ss-v2ray-plugin",
+        feature = "kcptun",
+        feature = "ech-tls-tunnel"
+    ))]
+    #[test]
+    fn parse_bool_lenient_values() {
+        assert!(parse_bool("YES", "p", "k"));
+        assert!(!parse_bool("bogus", "p", "k"));
+    }
+
+    #[cfg(any(
         feature = "gost-plugin",
         feature = "shadow-tls",
         feature = "restls",
         feature = "kcptun"
     ))]
     #[test]
-    fn parse_bool_lenient_vs_strict() {
-        assert!(parse_bool("YES", "p", "k"));
-        assert!(!parse_bool("bogus", "p", "k"));
+    fn parse_bool_strict_rejects_non_bool() {
         assert!(parse_bool_strict("on", "p", "k").unwrap());
         assert!(parse_bool_strict("bogus", "p", "k").is_err());
         // Strict also rejects the lenient empty-string coercion.

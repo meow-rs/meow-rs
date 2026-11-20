@@ -75,7 +75,9 @@ public-suffix = ["meow-proxy/public-suffix"]
 kcptun = ["meow-config/kcptun", "meow-proxy/kcptun"]
 # Built-in SIP003 plugin transports on the `ss` outbound — each implies
 # `ss`; in `full`/`default`, excluded from `minimal` (ADR-0007
-# binary-size caps), where `ss` keeps only simple-obfs + v2ray-plugin.
+# binary-size caps), where `ss` carries none of them.
+ss-obfs = ["ss", "meow-config/ss-obfs", "meow-proxy/ss-obfs"]
+ss-v2ray-plugin = ["ss", "meow-config/ss-v2ray-plugin", "meow-proxy/ss-v2ray-plugin"]
 shadow-tls = ["ss", "meow-config/shadow-tls", "meow-proxy/shadow-tls"]
 restls = ["ss", "meow-config/restls", "meow-proxy/restls"]
 jls = ["ss", "meow-config/jls", "meow-proxy/jls"]
@@ -126,7 +128,7 @@ listener-wireguard = ["meow-listener/listener-wireguard", "wireguard"]
 # Convenience bundles
 minimal = ["ss", "trojan", "dns-server", "listener-mixed"]
 full = [
-    "ss", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "wireguard", "ech-tls-tunnel", "mux", "kcptun",
+    "ss", "ss-obfs", "ss-v2ray-plugin", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "wireguard", "ech-tls-tunnel", "mux", "kcptun",
     "shadow-tls", "restls", "jls", "gost-plugin",
     "dns-server", "dns-encrypted", "dns-doh-h2", "dns-quic",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",

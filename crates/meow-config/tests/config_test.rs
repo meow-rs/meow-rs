@@ -1791,6 +1791,7 @@ proxies:
     assert!(!config.proxies.contains_key("ss-plugin-str"));
 }
 
+#[cfg(feature = "ss-obfs")]
 #[tokio::test]
 async fn test_proxy_parsing_ss_with_builtin_obfs_table() {
     // Built-in simple-obfs (`plugin: obfs` / `plugin: simple-obfs`) needs no

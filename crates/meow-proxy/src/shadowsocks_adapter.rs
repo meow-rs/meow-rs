@@ -11,6 +11,7 @@ use crate::kcptun_plugin;
 use crate::restls_plugin;
 #[cfg(feature = "shadow-tls")]
 use crate::shadow_tls_plugin;
+#[cfg(feature = "ss-v2ray-plugin")]
 use crate::v2ray_plugin::{self, V2rayPluginConfig};
 use async_trait::async_trait;
 use meow_common::atomic::{checked_increment, AtomicU};
@@ -18,7 +19,13 @@ use meow_common::{
     AdapterType, MeowError, Metadata, Network, PollPacketConn, ProxyAdapter, ProxyConn,
     ProxyHealth, ProxyPacketConn, Result,
 };
+#[cfg(feature = "ss-obfs")]
 use meow_transport::simple_obfs::client::{HttpObfs, TlsObfs};
+#[cfg(any(
+    feature = "ss-v2ray-plugin",
+    feature = "shadow-tls",
+    feature = "ech-tls-tunnel"
+))]
 use meow_transport::tls::TlsLayer;
 use shadowsocks::config::{Mode, ServerAddr, ServerConfig, ServerType};
 use shadowsocks::context::{Context, SharedContext};
@@ -44,6 +51,7 @@ use tracing::debug;
 use tracing::warn;
 
 /// Built-in (native, no external process) simple-obfs configuration.
+#[cfg(feature = "ss-obfs")]
 #[derive(Debug, Clone)]
 pub enum BuiltinObfs {
     /// HTTP simple-obfs with the configured fake `Host` header.
@@ -78,7 +86,9 @@ enum PluginKind {
     /// External SIP003 plugin subprocess. The `Plugin` handle keeps the
     /// subprocess alive for the adapter's lifetime.
     External(#[allow(dead_code)] Plugin),
+    #[cfg(feature = "ss-obfs")]
     Obfs(BuiltinObfs),
+    #[cfg(feature = "ss-v2ray-plugin")]
     V2ray(V2rayPluginConfig, Option<TlsLayer>),
     /// Native gost-plugin websocket (+ optional TLS and smux) transport.
     /// `WsLayer` is built at construction so a malformed headers/path
@@ -116,6 +126,7 @@ impl PluginKind {
     /// `dial_udp` gate can't drift as variants accrete.
     fn udp_block_reason(&self) -> Option<&'static str> {
         match self {
+            #[cfg(feature = "ss-v2ray-plugin")]
             PluginKind::V2ray(..) => Some("v2ray-plugin does not support UDP relay"),
             #[cfg(feature = "gost-plugin")]
             PluginKind::Gost(..) => Some("gost-plugin does not support UDP relay"),
@@ -135,7 +146,12 @@ impl PluginKind {
 /// Dial-relevant SS state, shared (Arc) between the adapter and any mux
 /// session so the SIP003 plugin handle stays alive for both.
 struct SsCore {
+    /// Read only by the feature-gated plugin transports (obfs TLS wrap,
+    /// v2ray/gost/shadow-tls/… WS dial); `None`/`External` go through
+    /// `server_config`, so an `ss`-only build leaves both unreferenced.
+    #[allow(dead_code, reason = "read only by feature-gated plugin arms")]
     server: SmolStr,
+    #[allow(dead_code, reason = "read only by feature-gated plugin arms")]
     port: u16,
     server_config: ServerConfig,
     context: shadowsocks::context::SharedContext,
@@ -216,11 +232,13 @@ impl ShadowsocksAdapter {
         let addr_str = SmolStr::from(format!("{server}:{port}"));
 
         let plugin = match plugin_name.filter(|name| !name.is_empty()) {
+            #[cfg(feature = "ss-obfs")]
             Some(p) if is_builtin_obfs_plugin(p) => {
                 let cfg = parse_obfs_opts(plugin_opts, server)?;
                 debug!("SS '{}' using built-in simple-obfs ({:?})", name, cfg);
                 PluginKind::Obfs(cfg)
             }
+            #[cfg(feature = "ss-v2ray-plugin")]
             Some("v2ray-plugin") => {
                 let mut cfg = v2ray_plugin::parse_opts(plugin_opts.unwrap_or(""))?;
                 if cfg.host.is_empty() {
@@ -321,7 +339,7 @@ impl ShadowsocksAdapter {
             }
 
             Some(pname) => {
-                if let Some(feature) = feature_gated_plugin_feature(pname) {
+                if let Some(feature) = missing_plugin_feature(pname) {
                     return Err(MeowError::Config(format!(
                         "plugin '{pname}' is not compiled into this build; rebuild with `--features {feature}`"
                     )));
@@ -523,6 +541,7 @@ impl SsCore {
     /// user streams regardless of which dial triggered its establishment.
     async fn dial_tcp_stream(&self, addr: Address, internal: bool) -> Result<Box<dyn ProxyConn>> {
         match &self.plugin {
+            #[cfg(feature = "ss-obfs")]
             PluginKind::Obfs(obfs) => {
                 // Open a raw TCP connection to the SS server, wrap it in the
                 // simple-obfs codec, then layer the SS crypto stream on top.
@@ -556,6 +575,7 @@ impl SsCore {
                     }
                 }
             }
+            #[cfg(feature = "ss-v2ray-plugin")]
             PluginKind::V2ray(cfg, tls) => {
                 let transport = v2ray_plugin::dial(
                     cfg,
@@ -670,6 +690,7 @@ impl SsCore {
     ) -> Result<Box<dyn ProxyConn>> {
         match &self.plugin {
             PluginKind::None => Ok(self.ss_conn(stream, addr)),
+            #[cfg(feature = "ss-obfs")]
             PluginKind::Obfs(obfs) => {
                 let stream = match obfs.clone() {
                     BuiltinObfs::Http { host } => Box::new(
@@ -685,6 +706,7 @@ impl SsCore {
                 };
                 Ok(self.ss_conn(stream, addr))
             }
+            #[cfg(feature = "ss-v2ray-plugin")]
             PluginKind::V2ray(cfg, tls) => {
                 let transport = v2ray_plugin::handshake_over(
                     cfg,
@@ -835,6 +857,10 @@ pub fn is_builtin_obfs_plugin(name: &str) -> bool {
 /// remain *reserved* names that must never reach the external
 /// `Plugin::start` path — `ShadowsocksAdapter::new` reports
 /// "not compiled into this build" for them instead.
+/// `obfs-local` is deliberately *not* listed: it is the SIP003 binary
+/// name, which keeps its external-subprocess spawn wherever `ss-obfs`
+/// is compiled in and hard-errors naming the feature when it is not
+/// (see `FEATURE_GATED_PLUGINS`).
 /// Must stay in sync with the dispatch match in `ShadowsocksAdapter::new`
 /// (single source of truth for `meow-config`'s dialer-injection and
 /// external-plugin gates, which cannot see the feature-gated arms
@@ -853,13 +879,26 @@ pub fn is_builtin_sip003_plugin(name: &str) -> bool {
         )
 }
 
-/// Every reserved built-in SIP003 name whose transport sits behind an
-/// opt-in cargo feature, paired with the feature that re-enables it and a
-/// compile-time flag recording whether this build carries it.
+/// Every reserved SIP003 name whose transport sits behind an opt-in cargo
+/// feature, paired with the feature that re-enables it and a compile-time
+/// flag recording whether this build carries it.
 /// Single source for the "not compiled" fallback in `ShadowsocksAdapter::new`:
-/// a name listed here must never reach the external `Plugin::start` arm,
-/// whatever the feature set — the constructor reports its identity separately.
+/// a name listed here must never reach the external `Plugin::start` arm
+/// while its feature is compiled out — the constructor reports its identity
+/// separately. `obfs-local` is the one entry that is *not* a built-in
+/// spelling: compiled in, it keeps spawning the real SIP003 binary like
+/// any other external name; compiled out, it hard-errors alongside the
+/// built-in `obfs` spellings rather than silently running a subprocess for
+/// a transport the build deliberately dropped.
 const FEATURE_GATED_PLUGINS: &[(&str, &str, bool)] = &[
+    ("obfs", "ss-obfs", cfg!(feature = "ss-obfs")),
+    ("simple-obfs", "ss-obfs", cfg!(feature = "ss-obfs")),
+    ("obfs-local", "ss-obfs", cfg!(feature = "ss-obfs")),
+    (
+        "v2ray-plugin",
+        "ss-v2ray-plugin",
+        cfg!(feature = "ss-v2ray-plugin"),
+    ),
     ("gost-plugin", "gost-plugin", cfg!(feature = "gost-plugin")),
     ("shadow-tls", "shadow-tls", cfg!(feature = "shadow-tls")),
     ("restls", "restls", cfg!(feature = "restls")),
@@ -871,13 +910,6 @@ const FEATURE_GATED_PLUGINS: &[(&str, &str, bool)] = &[
         cfg!(feature = "ech-tls-tunnel"),
     ),
 ];
-
-fn feature_gated_plugin_feature(name: &str) -> Option<&'static str> {
-    FEATURE_GATED_PLUGINS
-        .iter()
-        .find(|(reserved, _, _)| *reserved == name)
-        .map(|(_, feature, _)| *feature)
-}
 
 /// The cargo feature a reserved built-in plugin name needs, when this build
 /// lacks it — `None` for unreserved names and for plugins that are compiled
@@ -906,6 +938,7 @@ pub fn missing_plugin_feature(name: &str) -> Option<&'static str> {
 ///
 /// Unknown keys are silently ignored to stay forward-compatible with the
 /// upstream Go reference.
+#[cfg(feature = "ss-obfs")]
 pub(crate) fn parse_obfs_opts(plugin_opts: Option<&str>, server: &str) -> Result<BuiltinObfs> {
     let opts = plugin_opts.unwrap_or("").trim();
     let mut mode: Option<String> = None;
@@ -1746,6 +1779,7 @@ impl ProxyAdapter for ShadowsocksAdapter {
 
         let internal = metadata.is_internal();
         let conn = self.core.dial_tcp_stream(addr.clone(), internal).await?;
+        #[cfg(feature = "ss-obfs")]
         if matches!(self.core.plugin, PluginKind::Obfs(BuiltinObfs::Http { .. })) {
             let core = Arc::clone(&self.core);
             // The redial fires later, from `FirstFlight`'s poll_read /
@@ -2144,7 +2178,7 @@ mod tests {
                 is_builtin_sip003_plugin(name),
                 "is_builtin_sip003_plugin must list {name}"
             );
-            let disabled = missing_plugin_feature(name).is_some();
+            let disabled_feature = missing_plugin_feature(name);
             match ShadowsocksAdapter::new(
                 "inv",
                 "127.0.0.1",
@@ -2157,13 +2191,111 @@ mod tests {
                 None,
                 std::sync::Arc::new(crate::dialer::DirectDialer),
             ) {
-                Ok(_) => assert!(!disabled, "disabled {name} unexpectedly constructed"),
-                Err(MeowError::Config(message)) if disabled => {
-                    assert_eq!(message, format!("plugin '{name}' is not compiled into this build; rebuild with `--features {name}`"));
+                Ok(_) => assert!(
+                    disabled_feature.is_none(),
+                    "disabled {name} unexpectedly constructed"
+                ),
+                Err(MeowError::Config(message)) if disabled_feature.is_some() => {
+                    // The plugin name and the feature re-enabling it differ
+                    // for the split-out pair (`obfs` → `ss-obfs`, …), so
+                    // assert on the table's verdict rather than the name.
+                    assert_eq!(
+                        message,
+                        format!("plugin '{name}' is not compiled into this build; rebuild with `--features {}`", disabled_feature.unwrap())
+                    );
                 }
                 Err(other) => panic!("{name}: unexpected error: {other}"),
             }
         }
+    }
+
+    /// `obfs-local` is the SIP003 binary name, not a built-in spelling —
+    /// with `ss-obfs` compiled out it must hard-error naming the feature
+    /// (like the built-in spellings) rather than spawn a subprocess for a
+    /// transport the build deliberately dropped; compiled in, it keeps its
+    /// external-spawn semantics and never reports the missing-feature
+    /// error.
+    #[cfg(feature = "ss-obfs")]
+    #[test]
+    fn obfs_local_keeps_external_spawn_when_obfs_compiled_in() {
+        assert_eq!(missing_plugin_feature("obfs-local"), None);
+        // `obfs-local` stays off the built-in list, so the provider gate
+        // and the dry-run spawn suppressor keep treating it as external.
+        assert!(!is_builtin_sip003_plugin("obfs-local"));
+        // Adapter construction reaches the spawn path (the binary need not
+        // exist): the error is the spawn failure, never "not compiled".
+        match ShadowsocksAdapter::new(
+            "s",
+            "127.0.0.1",
+            8388,
+            "p",
+            "aes-128-gcm",
+            false,
+            Some("obfs-local"),
+            Some("obfs=http"),
+            None,
+            std::sync::Arc::new(crate::dialer::DirectDialer),
+        ) {
+            Ok(_) => {}
+            Err(e) => {
+                assert!(
+                    !e.to_string().contains("not compiled into this build"),
+                    "compiled-in build must not report the feature error: {e}"
+                );
+            }
+        }
+    }
+
+    /// A build without `ss-obfs`/`ss-v2ray-plugin` answers every obfs
+    /// spelling — `obfs`, `simple-obfs`, and the SIP003 `obfs-local`
+    /// binary name — plus `v2ray-plugin` with the feature-named "not
+    /// compiled" Config error, never a silent plain-SS dial, an
+    /// "unknown plugin" spawn, or a dead bound node.
+    #[cfg(all(not(feature = "ss-obfs"), not(feature = "ss-v2ray-plugin")))]
+    #[test]
+    fn disabled_obfs_and_v2ray_plugin_error_naming_the_feature() {
+        for (name, feature) in [
+            ("obfs", "ss-obfs"),
+            ("simple-obfs", "ss-obfs"),
+            ("obfs-local", "ss-obfs"),
+            ("v2ray-plugin", "ss-v2ray-plugin"),
+        ] {
+            match ShadowsocksAdapter::new(
+                "s",
+                "127.0.0.1",
+                8388,
+                "p",
+                "aes-128-gcm",
+                false,
+                Some(name),
+                Some("mode=http"),
+                None,
+                std::sync::Arc::new(crate::dialer::DirectDialer),
+            ) {
+                Err(MeowError::Config(message)) => {
+                    assert_eq!(
+                        message,
+                        format!("plugin '{name}' is not compiled into this build; rebuild with `--features {feature}`")
+                    );
+                }
+                Ok(_) => panic!("{name} must not construct without {feature}"),
+                Err(other) => panic!("{name}: wrong error class: {other}"),
+            }
+        }
+        // A plugin-less node still builds normally.
+        ShadowsocksAdapter::new(
+            "s",
+            "127.0.0.1",
+            8388,
+            "p",
+            "aes-128-gcm",
+            false,
+            None,
+            None,
+            None,
+            std::sync::Arc::new(crate::dialer::DirectDialer),
+        )
+        .expect("plugin-less ss node must build under plain `ss`");
     }
 
     #[test]
@@ -2851,7 +2983,10 @@ mod tests {
     /// error there).
     #[tokio::test]
     async fn builtin_tcp_plugins_refuse_udp() {
-        for (plugin, opts, tag) in [
+        // Typed slice: every entry is feature-gated, so an `ss`-only build
+        // leaves the table empty (the loop is then a vacuous pass).
+        let cases: &[(&str, &str, &str)] = &[
+            #[cfg(feature = "ss-v2ray-plugin")]
             ("v2ray-plugin", "host=cdn.example.com", "v2ray-plugin"),
             #[cfg(feature = "gost-plugin")]
             (
@@ -2873,7 +3008,8 @@ mod tests {
             ),
             #[cfg(feature = "jls")]
             ("jls", "host=cover.example.com;username=u;password=p", "jls"),
-        ] {
+        ];
+        for (plugin, opts, tag) in cases {
             let adapter = ShadowsocksAdapter::new(
                 "ss-test",
                 "127.0.0.1",
@@ -3085,6 +3221,7 @@ mod tests {
         assert!(!is_builtin_obfs_plugin(""));
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_http_yaml_keys() {
         // YAML map form serializes to `mode=http;host=foo`.
@@ -3095,6 +3232,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_tls_yaml_keys() {
         let got = parse_obfs_opts(Some("mode=tls;host=gateway.icloud.com"), "1.2.3.4").unwrap();
@@ -3104,6 +3242,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_sip003_alias_keys() {
         // Native SIP003 keys (`obfs`/`obfs-host`).
@@ -3114,6 +3253,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_rejects_ctl_host() {
         // `host` lands verbatim in the emitted `Host:` header (http) or SNI
@@ -3136,6 +3276,7 @@ mod tests {
         assert!(parse_obfs_opts(Some(&at_limit), "1.2.3.4").is_ok());
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_mode_is_case_insensitive() {
         let http = parse_obfs_opts(Some("mode=HTTP;host=foo"), "1.2.3.4").unwrap();
@@ -3146,6 +3287,7 @@ mod tests {
         assert!(matches!(mixed, BuiltinObfs::Tls { .. }));
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_extra_whitespace() {
         // Tolerate whitespace around `;` and `=`, similar to the Go reference.
@@ -3156,6 +3298,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_unknown_keys_ignored() {
         // Forward-compat: unknown keys must be silently dropped.
@@ -3170,6 +3313,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_missing_host_falls_back_to_server() {
         let got = parse_obfs_opts(Some("mode=http"), "ss.example.org").unwrap();
@@ -3179,6 +3323,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_empty_host_falls_back_to_server() {
         let got = parse_obfs_opts(Some("mode=tls;host="), "ss.example.org").unwrap();
@@ -3188,6 +3333,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_missing_mode_errors() {
         let err = parse_obfs_opts(Some("host=bing.com"), "1.2.3.4").unwrap_err();
@@ -3200,6 +3346,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_empty_opts_errors() {
         // Empty / missing opts is also "no mode" — must error.
@@ -3208,6 +3355,7 @@ mod tests {
         assert!(parse_obfs_opts(Some("   "), "1.2.3.4").is_err());
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_invalid_mode_errors() {
         let err = parse_obfs_opts(Some("mode=quic;host=foo"), "1.2.3.4").unwrap_err();
@@ -3223,6 +3371,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "ss-obfs")]
     #[test]
     fn test_parse_obfs_opts_yaml_overrides_sip003_when_both_present() {
         // If both `mode=` and `obfs=` are passed (unusual but legal), the last
