@@ -394,6 +394,13 @@ pub struct TunListener {
     /// the named `type: tun` entry's: a named entry's `dns-hijack` admits
     /// wildcard UDP targets only, so this stays `false` on that path.
     tcp_dns_hijack: bool,
+    /// Resolver whose fake-IP geometry (gateway, routed ranges) setup
+    /// reads instead of the tunnel's live slot. A reload that changes
+    /// `dns.fake-ip-range*` builds the candidate resolver before it is
+    /// published; handing it here keeps the device's gateway/routes in
+    /// the generation being committed rather than the one being retired.
+    /// Live-traffic readers keep following the tunnel slot.
+    setup_resolver: Option<Arc<meow_dns::Resolver>>,
 }
 
 impl TunListener {
@@ -407,6 +414,7 @@ impl TunListener {
             sniffer: None,
             route_override: None,
             tcp_dns_hijack: false,
+            setup_resolver: None,
         }
     }
 
@@ -430,6 +438,14 @@ impl TunListener {
         if sniffer.is_enabled() {
             self.sniffer = Some(sniffer);
         }
+        self
+    }
+
+    /// Override the resolver setup reads for fake-IP geometry — see the
+    /// field's comment. `None` (the default) keeps reading the tunnel's
+    /// live resolver, which is also what post-setup traffic sees.
+    pub fn with_setup_resolver(mut self, resolver: Option<Arc<meow_dns::Resolver>>) -> Self {
+        self.setup_resolver = resolver;
         self
     }
 
@@ -483,6 +499,16 @@ impl TunListener {
         info!("TUN listener '{}' starting...", self.name);
 
         let cfg = &self.cfg;
+        // Fake-IP gateway/range geometry is setup-time state: a reload
+        // that changes `dns.fake-ip-range*` hands the candidate resolver
+        // in via `with_setup_resolver` so the device is built for the
+        // generation being committed. Everything that serves live flows
+        // below keeps reading `self.tunnel`'s slot.
+        let setup_resolver = self
+            .setup_resolver
+            .clone()
+            .unwrap_or_else(|| self.tunnel.resolver());
+        let setup_resolver = setup_resolver.as_ref();
 
         // Windows: sidecar wintun.dll next to the exe / in cwd, else extract
         // the official DLL embedded in this binary. Fail before the retry
@@ -506,7 +532,7 @@ impl TunListener {
         const TUN_CREATE_RETRY_DELAY: Duration = Duration::from_millis(500);
         let base_addr = cfg.inet4_address.addr();
         let prefix = cfg.inet4_address.prefix_len();
-        let fake_ip_gateway = match self.tunnel.resolver().fake_ip_v4_gateway() {
+        let fake_ip_gateway = match setup_resolver.fake_ip_v4_gateway() {
             Some(std::net::IpAddr::V4(gateway)) => Some(gateway),
             _ => None,
         };
@@ -699,8 +725,8 @@ impl TunListener {
             v6: cfg.inet6_address,
             nat: None,
         };
-        let fake_ip_nets = fake_ip_route_nets(&self.tunnel.resolver(), cfg.inet6_address.is_some());
-        if cfg.inet6_address.is_none() && self.tunnel.resolver().fake_ip_v6_net().is_some() {
+        let fake_ip_nets = fake_ip_route_nets(setup_resolver, cfg.inet6_address.is_some());
+        if cfg.inet6_address.is_none() && setup_resolver.fake_ip_v6_net().is_some() {
             warn!(
                 "tun '{}': 'dns.fake-ip-range6' is configured but the device has no \
                  'inet6-address' — fake AAAA answers have no route into '{dev_name}'. \
@@ -819,16 +845,14 @@ impl TunListener {
         // another resolver), this fails startup loudly instead of silently
         // leaving the whole machine with DNS aimed at a dead address.
         #[cfg(target_os = "windows")]
-        let local_dns_sockets = if cfg.dns_hijack
-            && cfg.auto_route
-            && self.tunnel.resolver().fake_ip_v4_gateway().is_some()
-        {
-            Some(local_dns::bind().await.map_err(|e| {
-                io::Error::other(format!("loopback DNS server startup failed: {e}"))
-            })?)
-        } else {
-            None
-        };
+        let local_dns_sockets =
+            if cfg.dns_hijack && cfg.auto_route && setup_resolver.fake_ip_v4_gateway().is_some() {
+                Some(local_dns::bind().await.map_err(|e| {
+                    io::Error::other(format!("loopback DNS server startup failed: {e}"))
+                })?)
+            } else {
+                None
+            };
 
         // When dns-hijack is on and we're in fake-IP mode, point the OS
         // resolver at the loopback DNS server.  The backup + set calls into
