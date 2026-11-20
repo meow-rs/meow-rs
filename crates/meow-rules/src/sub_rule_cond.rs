@@ -10,8 +10,10 @@
 //! ```
 //!
 //! `<cond>` is one parenthesised predicate expression whose *leaves* are
-//! targetless `(TYPE,payload[,flag…])` atoms from the whitelist
-//! `DOMAIN` / `DOMAIN-SUFFIX` / `DOMAIN-KEYWORD` / `GEOSITE` / `GEOIP`.
+//! targetless `(TYPE,payload[,flag…])` atoms. Every rule type is a legal
+//! leaf except `MATCH` and `SUB-RULE` — the same exclusion upstream's
+//! `payloadToRule` applies to logic legs (`rules/logic/logic.go`), which
+//! is where condition leaves build through (issue #974 review).
 //! Combination is either mihomo's prefix form (`(AND,((a),(b)))`,
 //! `(NOT,((a)))`) or MEOW's infix `&` `|` `!` extension (precedence
 //! `!` > `&` > `|`, left-associative, parentheses override). The head
@@ -25,14 +27,10 @@
 
 use meow_common::{Rule, RuleType};
 
-use crate::domain::DomainRule;
-use crate::domain_keyword::DomainKeywordRule;
-use crate::domain_suffix::DomainSuffixRule;
-use crate::geoip::GeoIpRule;
-use crate::geosite_rule::GeoSiteRule;
 use crate::logic::{AndRule, NotRule, OrRule};
-use crate::parser::{ParserContext, LOGIC_INNER_PLACEHOLDER};
-use crate::src_geoip::SrcGeoIpRule;
+use crate::parser::{
+    matching_paren, parse_inner_leg, ParserContext, RuleSets, LOGIC_INNER_PLACEHOLDER,
+};
 
 /// Nesting budget shared with the logic-group parser (`MAX_LOGIC_DEPTH`):
 /// every `(` group and `!` in the expression counts once.
@@ -104,6 +102,17 @@ pub fn parse_sub_rule_reference(line: &str) -> Result<Option<SubRuleRef>, String
     // and optional fallback follow after its closing paren.
     let close = matching_paren(rest)
         .ok_or_else(|| format!("SUB-RULE: unbalanced parentheses in '{line}'"))?;
+    // A single parenthesised, comma-free field is a plain block name that
+    // happens to carry parens — `SUB-RULE,(local)` — not a condition (a
+    // predicate always carries `<TYPE>,<payload>`). Anything with a tail
+    // or an inner comma stays on the conditional grammar.
+    if close == rest.len() - 1 && !rest[1..close].contains(',') {
+        return Ok(Some(SubRuleRef {
+            name: rest.to_string(),
+            cond: None,
+            fallback: None,
+        }));
+    }
     let cond_text = rest[..=close].to_string();
     let tail = rest[close + 1..].trim_start();
     let tail = tail
@@ -132,47 +141,25 @@ pub fn parse_sub_rule_reference(line: &str) -> Result<Option<SubRuleRef>, String
     }))
 }
 
-/// Byte offset of the `)` closing the `(` at `text[0]`, or `None` when
-/// unbalanced. Bytes scan — `(`/`)` are ASCII so UTF-8 is unaffected.
-fn matching_paren(text: &str) -> Option<usize> {
-    debug_assert!(text.starts_with('('));
-    let mut depth = 0i32;
-    for (i, b) in text.bytes().enumerate() {
-        match b {
-            b'(' => depth += 1,
-            b')' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// One whitelisted leaf kind inside a condition.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CondLeafKind {
-    Domain,
-    DomainSuffix,
-    DomainKeyword,
-    GeoSite,
-    GeoIp,
-}
-
 /// A leaf predicate `(TYPE,payload[,flag…])` — targetless by grammar.
+/// `ty`/`payload` are the canonical type name and first payload field
+/// (geo discovery keys on them); `entry` is the verbatim inner text fed
+/// to the shared leg grammar at [`CondExpr::build`].
 #[derive(Debug)]
 pub struct CondLeaf {
-    pub kind: CondLeafKind,
+    /// Canonical rule-type name (`GEOIP`, `DOMAIN-SUFFIX`, `IP-ASN`, …).
+    pub ty: String,
+    /// The leaf's first payload field — `GEOIP,CN` → `CN`,
+    /// `GEOSITE,cat@attr` → `cat@attr`, `IP-ASN,1234` → `1234`.
     pub payload: String,
-    pub no_resolve: bool,
-    pub is_src: bool,
+    /// The verbatim `TYPE,payload[,param…]` text inside the parens —
+    /// built through [`crate::parser::parse_inner_leg`] so flags,
+    /// comma-joins and constructors match a logic leg byte for byte.
+    entry: String,
 }
 
 /// The condition predicate tree. `And`/`Or`/`Not` mirror the logic-rule
-/// semantics; leaves are the five whitelisted types only.
+/// semantics; leaves are any rule type except `MATCH`/`SUB-RULE`.
 #[derive(Debug)]
 pub enum CondExpr {
     Leaf(CondLeaf),
@@ -201,80 +188,44 @@ impl CondExpr {
     /// Lower the predicate tree into `Rule` objects sharing the logic
     /// composites. Leaves carry `LOGIC_INNER_PLACEHOLDER` adapters —
     /// the condition only gates a block scan, so its adapters never
-    /// route, validate or account (issue #974).
-    pub fn build(&self, ctx: &ParserContext) -> Result<Box<dyn Rule>, String> {
+    /// route, validate or account (issue #974). `rule_sets` resolves
+    /// `(RULE-SET,name)` leaves against the candidate's declared
+    /// rule-providers, the same scope a logic leg sees.
+    pub fn build(
+        &self,
+        ctx: &ParserContext,
+        rule_sets: &RuleSets,
+    ) -> Result<Box<dyn Rule>, String> {
         match self {
-            CondExpr::Leaf(leaf) => leaf.build(ctx),
+            // Depth 0: the leaf is a flat `(TYPE,…)` — combinators were
+            // already lifted into `CondExpr` nodes by the parser.
+            CondExpr::Leaf(leaf) => parse_inner_leg(&leaf.entry, ctx, rule_sets, 0),
             CondExpr::And(items) => Ok(Box::new(AndRule::new(
                 items
                     .iter()
-                    .map(|item| item.build(ctx))
+                    .map(|item| item.build(ctx, rule_sets))
                     .collect::<Result<Vec<_>, _>>()?,
                 LOGIC_INNER_PLACEHOLDER,
             ))),
             CondExpr::Or(items) => Ok(Box::new(OrRule::new(
                 items
                     .iter()
-                    .map(|item| item.build(ctx))
+                    .map(|item| item.build(ctx, rule_sets))
                     .collect::<Result<Vec<_>, _>>()?,
                 LOGIC_INNER_PLACEHOLDER,
             ))),
             CondExpr::Not(inner) => Ok(Box::new(NotRule::new(
-                inner.build(ctx)?,
+                inner.build(ctx, rule_sets)?,
                 LOGIC_INNER_PLACEHOLDER,
             ))),
-        }
-    }
-}
-
-impl CondLeaf {
-    fn build(&self, ctx: &ParserContext) -> Result<Box<dyn Rule>, String> {
-        match self.kind {
-            CondLeafKind::Domain => Ok(Box::new(DomainRule::new(
-                &self.payload,
-                LOGIC_INNER_PLACEHOLDER,
-            ))),
-            CondLeafKind::DomainSuffix => Ok(Box::new(DomainSuffixRule::new(
-                &self.payload,
-                LOGIC_INNER_PLACEHOLDER,
-            ))),
-            CondLeafKind::DomainKeyword => Ok(Box::new(DomainKeywordRule::new(
-                &self.payload,
-                LOGIC_INNER_PLACEHOLDER,
-            ))),
-            CondLeafKind::GeoSite => Ok(Box::new(GeoSiteRule::new(
-                &self.payload,
-                LOGIC_INNER_PLACEHOLDER,
-                ctx.geosite.clone(),
-            ))),
-            CondLeafKind::GeoIp => {
-                let index = ctx.geoip.as_ref().ok_or_else(|| {
-                    "GEOIP rule requires a GeoIP database, but none is configured".to_string()
-                })?;
-                let ranges = index.ranges_for(&self.payload);
-                if self.is_src {
-                    Ok(Box::new(SrcGeoIpRule::new(
-                        &self.payload,
-                        LOGIC_INNER_PLACEHOLDER,
-                        ranges,
-                    )))
-                } else {
-                    Ok(Box::new(GeoIpRule::new(
-                        &self.payload,
-                        LOGIC_INNER_PLACEHOLDER,
-                        self.no_resolve,
-                        ranges,
-                    )))
-                }
-            }
         }
     }
 }
 
 /// Parse a condition region — the balanced `(…)` text from
 /// [`parse_sub_rule_reference`] — into its predicate tree. Full-input
-/// consumption, whitelist enforcement, and the shared depth budget all
-/// live here so every caller sees the same grammar.
+/// consumption, the `MATCH`/`SUB-RULE` leaf exclusion, and the shared
+/// depth budget all live here so every caller sees the same grammar.
 pub fn parse_cond(text: &str) -> Result<CondExpr, String> {
     let mut parser = CondParser { text, pos: 0 };
     let expr = parser.parse_expr(0)?;
@@ -413,9 +364,9 @@ impl CondParser<'_> {
         self.text.as_bytes().get(self.pos).copied()
     }
 
-    /// `(TYPE,…)` inside a predicate region: either a whitelisted leaf
-    /// `(LEAF,payload[,flag…])` or a prefix combinator `(AND|OR,(items))` /
-    /// `(NOT,(item))`.
+    /// `(TYPE,…)` inside a predicate region: either a leaf
+    /// `(LEAF,payload[,flag…])` — every type but `MATCH`/`SUB-RULE` — or a
+    /// prefix combinator `(AND|OR,(items))` / `(NOT,(item))`.
     fn parse_predicate(&mut self, inner: &str, depth: usize) -> Result<CondExpr, String> {
         let Some((ty, tail)) = inner.split_once(',') else {
             return Err(format!(
@@ -428,13 +379,14 @@ impl CondParser<'_> {
         );
         match ty.as_str() {
             "AND" | "OR" | "NOT" => self.parse_prefix_group(&ty, tail.trim(), depth),
-            "DOMAIN" | "DOMAIN-SUFFIX" | "DOMAIN-KEYWORD" | "GEOSITE" | "GEOIP" => {
-                parse_cond_leaf(&ty, tail)
-            }
-            _ => Err(format!(
-                "SUB-RULE condition: '{ty}' is not allowed as a condition leaf \
-                 (allowed: DOMAIN, DOMAIN-SUFFIX, DOMAIN-KEYWORD, GEOSITE, GEOIP)"
+            // Upstream `payloadToRule` excludes exactly MATCH and
+            // SUB-RULE at inner position; every other type builds through
+            // the shared leg grammar at `CondExpr::build` (an unknown
+            // type surfaces its error there).
+            "MATCH" | "SUB-RULE" => Err(format!(
+                "SUB-RULE condition: '{ty}' is not allowed as a condition leaf"
             )),
+            _ => parse_cond_leaf(&ty, tail, inner),
         }
     }
 
@@ -497,14 +449,25 @@ impl CondParser<'_> {
 
 /// Split a prefix group's inside text on commas at paren depth 0. Empty
 /// items (`(a),`, `,(a)`, `(a),,(b)`) are an error — a missing operand.
+/// `\`-escaped and `[...]`-class parens inside regex payloads never
+/// count as structural, matching [`matching_paren`].
 fn split_group_items(inner: &str) -> Result<Vec<&str>, String> {
     let mut items = Vec::new();
     let (mut depth, mut start) = (0i32, 0usize);
+    let mut in_class = false;
+    let mut escaped = false;
     for (i, b) in inner.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
         match b {
-            b'(' => depth += 1,
-            b')' => depth -= 1,
-            b',' if depth == 0 => {
+            b'\\' => escaped = true,
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => depth += 1,
+            b')' if !in_class => depth -= 1,
+            b',' if depth == 0 && !in_class => {
                 let item = inner[start..i].trim();
                 if item.is_empty() {
                     return Err(format!(
@@ -527,47 +490,34 @@ fn split_group_items(inner: &str) -> Result<Vec<&str>, String> {
     Ok(items)
 }
 
-/// One whitelisted leaf `(TYPE,payload[,flag…])` — payload non-empty and
-/// flags confined to what the leaf type actually consumes, so a typo'd
-/// trailing field can never be swallowed as a "maybe-flag" (issue #974).
-fn parse_cond_leaf(ty: &str, tail: &str) -> Result<CondExpr, String> {
-    let mut fields = tail.split(',');
-    let payload = fields.next().map_or("", str::trim);
+/// One leaf `(TYPE,payload[,flag…])` — payload non-empty. Trailing
+/// params are validated by the shared leg grammar at build: flags a
+/// leaf type does not consume are ignored there, the same way upstream
+/// ignores unknown `ParseParams` entries (issue #974 review).
+fn parse_cond_leaf(ty: &str, tail: &str, inner: &str) -> Result<CondExpr, String> {
+    // A rule-type name is `[A-Z0-9-]+` — a head field carrying a paren,
+    // operator or space was never a leaf (`| (DOMAIN,a)` splits on its
+    // own inner comma into a bogus type); reject here rather than
+    // surfacing a misleading "unknown rule type" at build.
+    if ty.is_empty()
+        || !ty
+            .bytes()
+            .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'-')
+    {
+        return Err(format!(
+            "SUB-RULE condition: expected '(TYPE,payload)', got '({inner})'"
+        ));
+    }
+    let payload = tail.split(',').next().map_or("", str::trim);
     if payload.is_empty() {
         return Err(format!(
             "SUB-RULE condition: '({ty},)' has an empty payload"
         ));
     }
-    let kind = match ty {
-        "DOMAIN" => CondLeafKind::Domain,
-        "DOMAIN-SUFFIX" => CondLeafKind::DomainSuffix,
-        "DOMAIN-KEYWORD" => CondLeafKind::DomainKeyword,
-        "GEOSITE" => CondLeafKind::GeoSite,
-        "GEOIP" => CondLeafKind::GeoIp,
-        _ => unreachable!("caller gates ty"),
-    };
-    let (mut no_resolve, mut is_src) = (false, false);
-    for flag in fields {
-        let flag = flag.trim();
-        match (kind, flag.to_ascii_lowercase().as_str()) {
-            // GEOSITE's `no-resolve` is a vestigial no-op, matching the
-            // top-level parser.
-            (CondLeafKind::GeoIp | CondLeafKind::GeoSite, "no-resolve") => no_resolve = true,
-            (CondLeafKind::GeoIp, "src") => is_src = true,
-            _ => {
-                return Err(format!(
-                    "SUB-RULE condition: '({ty},{payload},{flag})' — \
-                     '{flag}' is not a valid flag for {ty}"
-                ))
-            }
-        }
-    }
-    no_resolve |= is_src;
     Ok(CondExpr::Leaf(CondLeaf {
-        kind,
+        ty: ty.to_string(),
         payload: payload.to_string(),
-        no_resolve,
-        is_src,
+        entry: inner.to_string(),
     }))
 }
 
@@ -613,55 +563,93 @@ mod tests {
         assert!(parse_sub_rule_reference("SUB-RULE").unwrap().is_none());
     }
 
-    fn leaf_kind(e: &CondExpr) -> Option<CondLeafKind> {
+    fn leaf_ty(e: &CondExpr) -> Option<&str> {
         match e {
-            CondExpr::Leaf(l) => Some(l.kind),
+            CondExpr::Leaf(l) => Some(l.ty.as_str()),
             _ => None,
         }
     }
 
     #[test]
-    fn cond_leaf_whitelist() {
-        for (text, kind) in [
-            ("(DOMAIN,a)", CondLeafKind::Domain),
-            ("(DOMAIN-SUFFIX,a.b)", CondLeafKind::DomainSuffix),
-            ("(DOMAIN-KEYWORD,x)", CondLeafKind::DomainKeyword),
-            ("(GEOSITE,cn)", CondLeafKind::GeoSite),
-            ("(GEOIP,JP)", CondLeafKind::GeoIp),
-            ("(GEOSITE,cat@attr)", CondLeafKind::GeoSite),
-            ("(GEOIP,JP,no-resolve)", CondLeafKind::GeoIp),
-            ("(GEOIP,JP,src)", CondLeafKind::GeoIp),
-            ("(GEOSITE,cn,no-resolve)", CondLeafKind::GeoSite),
+    fn cond_leaf_types() {
+        // Every rule type except MATCH/SUB-RULE is a legal leaf — the
+        // upstream `payloadToRule` exclusion set (issue #974 review).
+        for (text, ty) in [
+            ("(DOMAIN,a)", "DOMAIN"),
+            ("(DOMAIN-SUFFIX,a.b)", "DOMAIN-SUFFIX"),
+            ("(DOMAIN-KEYWORD,x)", "DOMAIN-KEYWORD"),
+            ("(GEOSITE,cn)", "GEOSITE"),
+            ("(GEOIP,JP)", "GEOIP"),
+            ("(GEOSITE,cat@attr)", "GEOSITE"),
+            ("(GEOIP,JP,no-resolve)", "GEOIP"),
+            ("(GEOIP,JP,src)", "GEOIP"),
+            ("(GEOSITE,cn,no-resolve)", "GEOSITE"),
+            ("(RULE-SET,p)", "RULE-SET"),
+            ("(PROCESS-NAME,x)", "PROCESS-NAME"),
+            ("(NETWORK,tcp)", "NETWORK"),
+            ("(IP-CIDR,1.1.1.1/32)", "IP-CIDR"),
+            ("(DST-PORT,443)", "DST-PORT"),
+            ("(IP-ASN,13335)", "IP-ASN"),
         ] {
             let e = parse_cond(text).unwrap_or_else(|err| panic!("{text}: {err}"));
-            assert_eq!(leaf_kind(&e), Some(kind), "{text}");
+            assert_eq!(leaf_ty(&e), Some(ty), "{text}");
         }
-        let e = parse_cond("(GEOIP,JP,src,no-resolve)").unwrap();
-        let CondExpr::Leaf(l) = e else { panic!() };
-        assert!(l.is_src && l.no_resolve);
     }
 
     #[test]
     fn cond_leaf_rejections() {
         for text in [
             "(MATCH,x)",
-            "(RULE-SET,p)",
             "(SUB-RULE,a)",
-            "(PROCESS-NAME,x)",
-            "(NETWORK,tcp)",
-            "(IP-CIDR,1.1.1.1/32)",
-            "(DST-PORT,443)",
             "(DOMAIN,)",
             "(GEOSITE,)",
-            "(DOMAIN,a,no-resolve)",
-            "(DOMAIN-SUFFIX,a,src)",
-            "(GEOIP,JP,bogus)",
-            "(GEOSITE,cn,src)",
-            "(FOO,a)",
             "(AND)",
+            "(FOO)",
+            "(,a)",
         ] {
             assert!(parse_cond(text).is_err(), "{text} must fail");
         }
+    }
+
+    #[test]
+    fn cond_leaf_build_uses_shared_leg_grammar() {
+        use crate::parser::ParserContext;
+        let ctx = ParserContext::empty();
+        let empty: crate::parser::RuleSets = Default::default();
+
+        // A `(GEOIP,JP,src)` leaf becomes SrcGeoIpRule through the shared
+        // grammar — flags fold exactly like a logic leg.
+        let cond = parse_cond("(GEOIP,JP,src)").unwrap().build(&ctx, &empty);
+        // No geoip index in the empty context — the error proves the leaf
+        // reached the GEOIP arm at all.
+        assert!(cond.is_err(), "GEOIP leaf must reach the GEOIP builder");
+        let err = cond.err().unwrap();
+        assert!(err.contains("GeoIP"), "{err}");
+
+        // Unknown leaf types surface the shared parser's error at build.
+        let err = parse_cond("(FOO,a)")
+            .unwrap()
+            .build(&ctx, &empty)
+            .err()
+            .expect("unknown leaf must fail at build");
+        assert!(err.contains("unknown rule type"), "{err}");
+
+        // `(GEOSITE,@attr)` — an empty category name errors at build the
+        // same way a top-level `GEOSITE,@attr,x` line does.
+        let err = parse_cond("(GEOSITE,@attr)")
+            .unwrap()
+            .build(&ctx, &empty)
+            .err()
+            .expect("empty GEOSITE category must fail at build");
+        assert!(err.contains("category"), "{err}");
+
+        // `(RULE-SET,missing)` resolves against the supplied provider map.
+        let err = parse_cond("(RULE-SET,missing)")
+            .unwrap()
+            .build(&ctx, &empty)
+            .err()
+            .expect("unknown provider must fail at build");
+        assert!(err.contains("rule-provider"), "{err}");
     }
 
     #[test]
@@ -671,8 +659,8 @@ mod tests {
             panic!("expected And")
         };
         assert_eq!(items.len(), 2);
-        assert_eq!(leaf_kind(&items[0]), Some(CondLeafKind::Domain));
-        assert_eq!(leaf_kind(&items[1]), Some(CondLeafKind::DomainSuffix));
+        assert_eq!(leaf_ty(&items[0]), Some("DOMAIN"));
+        assert_eq!(leaf_ty(&items[1]), Some("DOMAIN-SUFFIX"));
 
         let e = parse_cond("(OR,((DOMAIN,a),(DOMAIN-KEYWORD,k)))").unwrap();
         assert!(matches!(e, CondExpr::Or(_)));
@@ -681,7 +669,7 @@ mod tests {
         let CondExpr::Not(inner) = e else {
             panic!("expected Not")
         };
-        assert_eq!(leaf_kind(&inner), Some(CondLeafKind::Domain));
+        assert_eq!(leaf_ty(&inner), Some("DOMAIN"));
 
         assert!(parse_cond("(NOT,((DOMAIN,a),(DOMAIN,b)))").is_err());
         assert!(parse_cond("(AND,())").is_err());
@@ -699,11 +687,11 @@ mod tests {
             panic!("expected Or")
         };
         assert_eq!(items.len(), 2);
-        assert_eq!(leaf_kind(&items[0]), Some(CondLeafKind::Domain));
+        assert_eq!(leaf_ty(&items[0]), Some("DOMAIN"));
         let CondExpr::And(and_items) = &items[1] else {
             panic!("expected And on the right")
         };
-        assert_eq!(leaf_kind(&and_items[0]), Some(CondLeafKind::DomainKeyword));
+        assert_eq!(leaf_ty(&and_items[0]), Some("DOMAIN-KEYWORD"));
         assert!(matches!(&and_items[1], CondExpr::Not(_)));
 
         // parens override precedence: (a | b) & c

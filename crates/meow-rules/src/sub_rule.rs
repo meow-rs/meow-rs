@@ -87,15 +87,22 @@ pub enum StagedVerdict<'a> {
 enum CondVerdict {
     True,
     False,
-    Need { ip: bool, process: bool },
+    /// An IP-demanding leaf with no `dst_ip` whose demand the gate
+    /// cannot fulfill — undecidable, never read as false: `NOT` of it
+    /// stays undecided (issue #974 spec §3.3).
+    Undecided,
+    Need {
+        ip: bool,
+        process: bool,
+    },
 }
 
 pub struct SubRuleRule {
     block_name: String,
     block: SubRuleBlock,
     /// The condition predicate tree — `None` for the plain
-    /// `SUB-RULE,<name>` reference. Built from whitelisted leaves plus
-    /// the shared logic composites; its adapters are placeholders and
+    /// `SUB-RULE,<name>` reference. Built from shared-leg-grammar leaves
+    /// plus the logic composites; its adapters are placeholders and
     /// never route, validate or account.
     cond: Option<Box<dyn Rule>>,
     /// MEOW's fourth field (issue #974): yielded when a true condition's
@@ -195,10 +202,24 @@ impl SubRuleRule {
         if let Some(cond) = &self.cond {
             match eval_cond(cond.as_ref(), metadata, helper, demand) {
                 CondVerdict::True => {}
-                CondVerdict::False => return StagedVerdict::Miss,
+                CondVerdict::False | CondVerdict::Undecided => return StagedVerdict::Miss,
                 CondVerdict::Need { ip, process } => return StagedVerdict::Need { ip, process },
             }
         }
+        // The plain reference's unresolved-IP gate, scoped to the
+        // ordinary members: while the block carries a live IP-demanding
+        // member and the flow is unresolved, the whole ordinary section
+        // waits — a leading domain member must not pre-empt an IP member
+        // that would match post-resolution (#625). Staged members carry
+        // their own demand-aware gates and evaluate on position.
+        let ordinary_needs_ip = self.block.iter().any(|member| {
+            member
+                .as_any()
+                .and_then(|any| any.downcast_ref::<SubRuleRule>())
+                .is_none_or(|sub| !sub.is_staged())
+                && !member.never_matches()
+                && member.should_resolve_ip()
+        });
         for member in self.block.iter() {
             if let Some(sub) = member
                 .as_any()
@@ -218,6 +239,20 @@ impl SubRuleRule {
                         need @ StagedVerdict::Need { .. } => return need,
                     }
                 }
+            }
+            if ordinary_needs_ip && !metadata.resolved() {
+                // Under `MatchDemand::NONE` this is exactly the plain
+                // gate's skip; under the demand gate it reports the IP
+                // the ordinary section needs — or concedes the block is
+                // unreachable when nothing can resolve it.
+                return if demand.needs_ip(metadata) {
+                    StagedVerdict::Need {
+                        ip: true,
+                        process: false,
+                    }
+                } else {
+                    StagedVerdict::Miss
+                };
             }
             // A non-staged member asks for enrichment through its own
             // aggregate demand — but only when live and reachable, so a
@@ -248,7 +283,10 @@ impl SubRuleRule {
 
 /// Demand-aware condition-tree evaluation: AND stops on false, OR on
 /// true, NOT inverts only a decided verdict — "still needs enrichment"
-/// is never read as false (issue #974 §3.3).
+/// is never read as false, and neither is "undecidable": an IP-demanding
+/// leaf whose input the flow does not carry and the gate cannot produce
+/// is [`CondVerdict::Undecided`], which a `NOT` propagates unchanged
+/// (issue #974 §3.3 — undecided, never as false).
 fn eval_cond(
     node: &dyn Rule,
     metadata: &Metadata,
@@ -257,30 +295,42 @@ fn eval_cond(
 ) -> CondVerdict {
     if let Some(any) = node.as_any() {
         if let Some(and) = any.downcast_ref::<AndRule>() {
+            let mut undecided = false;
             for leg in and.sub_rules() {
                 match eval_cond(leg.as_ref(), metadata, helper, demand) {
                     CondVerdict::False => return CondVerdict::False,
                     need @ CondVerdict::Need { .. } => return need,
+                    CondVerdict::Undecided => undecided = true,
                     CondVerdict::True => {}
                 }
             }
-            return CondVerdict::True;
+            return if undecided {
+                CondVerdict::Undecided
+            } else {
+                CondVerdict::True
+            };
         }
         if let Some(or) = any.downcast_ref::<OrRule>() {
+            let mut undecided = false;
             for leg in or.sub_rules() {
                 match eval_cond(leg.as_ref(), metadata, helper, demand) {
                     CondVerdict::True => return CondVerdict::True,
                     need @ CondVerdict::Need { .. } => return need,
+                    CondVerdict::Undecided => undecided = true,
                     CondVerdict::False => {}
                 }
             }
-            return CondVerdict::False;
+            return if undecided {
+                CondVerdict::Undecided
+            } else {
+                CondVerdict::False
+            };
         }
         if let Some(not) = any.downcast_ref::<NotRule>() {
             return match eval_cond(not.inner(), metadata, helper, demand) {
                 CondVerdict::True => CondVerdict::False,
                 CondVerdict::False => CondVerdict::True,
-                need => need,
+                other => other,
             };
         }
     }
@@ -288,10 +338,19 @@ fn eval_cond(
     // dst-GEOIP-style rule asks for an IP (a `no-resolve` or `src` leaf
     // never does). A dead leaf just evaluates — always false anyway.
     if !node.never_matches() {
-        let ip = node.should_resolve_ip() && demand.needs_ip(metadata);
+        let wants_ip = node.should_resolve_ip();
+        let ip = wants_ip && demand.needs_ip(metadata);
         let process = node.should_find_process() && demand.needs_process(metadata);
         if ip || process {
             return CondVerdict::Need { ip, process };
+        }
+        // An IP-demanding leaf whose input is absent and whose demand the
+        // gate cannot fulfill is undecidable — not false. `no-resolve` /
+        // `src` leaves never land here (`wants_ip` is false for them),
+        // and a process leaf with no process info reads its "no process"
+        // as decided, like its top-level rule does.
+        if wants_ip && !metadata.resolved() {
+            return CondVerdict::Undecided;
         }
     }
     if node.match_metadata(metadata, helper) {
@@ -922,6 +981,136 @@ mod tests {
         assert_eq!(
             outer.match_and_resolve(&m, &helper(), &|_: &str| true),
             Some("LEAF")
+        );
+    }
+
+    /// IP-rule stand-in for the staged-block gate tests.
+    struct NeedsIpRule;
+    impl Rule for NeedsIpRule {
+        fn rule_type(&self) -> RuleType {
+            RuleType::Match
+        }
+        fn match_metadata(&self, m: &Metadata, _: &RuleMatchHelper) -> bool {
+            m.resolved()
+        }
+        fn adapter(&self) -> &str {
+            "IP-TARGET"
+        }
+        fn payload(&self) -> &str {
+            "ip"
+        }
+        fn should_resolve_ip(&self) -> bool {
+            true
+        }
+    }
+
+    /// Issue #974 review — the plain reference's unresolved-IP gate
+    /// survives a staged member in the same block: while the ordinary
+    /// section carries an IP-demanding rule and the flow is unresolved,
+    /// it waits (or misses under an unactionable gate) rather than
+    /// letting a leading domain member pre-empt the IP rule.
+    #[test]
+    fn staged_block_retains_plain_ip_gate() {
+        let staged_member = cond_ref(vec![match_rule("STAGED")], true, None);
+        let block: Vec<Box<dyn Rule>> = vec![
+            match_rule("DOMAIN-TARGET"),
+            Box::new(NeedsIpRule),
+            Box::new(staged_member),
+        ];
+        let outer = SubRuleRule::new("blk", Arc::new(block));
+        assert!(outer.is_staged());
+        let unresolved = Metadata {
+            host: "x.example".into(),
+            ..Default::default()
+        };
+        // Eager path: the gate is the plain skip — the leading domain
+        // member must NOT win while the flow is unresolved.
+        assert!(
+            outer
+                .match_and_resolve(&unresolved, &helper(), &|_: &str| true)
+                .is_none(),
+            "the ordinary section must wait for resolution"
+        );
+        assert!(!outer.match_metadata(&unresolved, &helper()));
+        // Actionable gate: the section reports the IP it waits for.
+        let demand = MatchDemand {
+            ip: true,
+            process: true,
+        };
+        assert_eq!(
+            outer.match_staged(&unresolved, &helper(), &|_: &str| true, &demand),
+            StagedVerdict::Need {
+                ip: true,
+                process: false
+            }
+        );
+        // Resolved: the block evaluates in order — the domain member wins.
+        let resolved = Metadata {
+            dst_ip: Some("9.9.9.9".parse().unwrap()),
+            ..unresolved
+        };
+        assert_eq!(
+            outer.match_and_resolve(&resolved, &helper(), &|_: &str| true),
+            Some("DOMAIN-TARGET")
+        );
+    }
+
+    /// Issue #974 spec — an IP-demanding cond leaf the gate cannot
+    /// fulfill is undecided, never false: a `NOT` over it stays
+    /// undecided, so the block is not entered on an unresolvable flow.
+    #[test]
+    fn cond_undecided_ip_leaf_under_not() {
+        use crate::logic::NotRule;
+        let leaf: Box<dyn Rule> = Box::new(CondLeaf {
+            verdict: false,
+            ip: true,
+            process: false,
+            dead: false,
+        });
+        let not: Box<dyn Rule> = Box::new(NotRule::new(leaf, "PH"));
+        let sub = SubRuleRule::new_conditional(
+            "blk",
+            Arc::new(vec![match_rule("INNER")]),
+            not,
+            "(!(GEOIP,JP))",
+            None,
+        );
+        // Host empty → no name to resolve → the leaf is undecidable under
+        // either gate; `!(undecidable)` is undecidable, never true.
+        let unresolved = Metadata::default();
+        assert_eq!(
+            sub.match_staged(&unresolved, &helper(), &|_: &str| true, &MatchDemand::NONE),
+            StagedVerdict::Miss
+        );
+        let demand = MatchDemand {
+            ip: true,
+            process: true,
+        };
+        assert_eq!(
+            sub.match_staged(&unresolved, &helper(), &|_: &str| true, &demand),
+            StagedVerdict::Miss,
+            "an undecidable leaf under NOT must not enter the block"
+        );
+        // A resolvable flow still reports the demand instead.
+        let resolvable = Metadata {
+            host: "x.example".into(),
+            ..Metadata::default()
+        };
+        assert_eq!(
+            sub.match_staged(&resolvable, &helper(), &|_: &str| true, &demand),
+            StagedVerdict::Need {
+                ip: true,
+                process: false
+            }
+        );
+        // Resolved → the leaf evaluates to false → NOT true → block entered.
+        let resolved = Metadata {
+            dst_ip: Some("9.9.9.9".parse().unwrap()),
+            ..unresolved
+        };
+        assert_eq!(
+            sub.match_staged(&resolved, &helper(), &|_: &str| true, &demand),
+            StagedVerdict::Matched("INNER")
         );
     }
 }

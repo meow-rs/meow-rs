@@ -4750,67 +4750,98 @@ fn geoip_scan_regex() -> &'static regex::Regex {
 }
 
 /// One raw rule line classified for geo discovery (issue #974): the text
-/// the plain `GEOIP,`/`GEOSITE,`/`IP-ASN,` regexes may scan, plus the
-/// parsed SUB-RULE condition tree — the only position cond leaves can
-/// legally live. `text` is `None` for process-pattern and SUB-RULE lines:
-/// their free-form pattern / name / fallback fields could spoof a
-/// `GEOIP,`/`GEOSITE,` declaration, and malformed cond text contributes
-/// nothing (the parse stage owns that error).
+/// segments the plain `GEOIP,`/`GEOSITE,`/`IP-ASN,` regexes may scan,
+/// plus the parsed SUB-RULE condition trees — the only position cond
+/// leaves can legally live. Free-form pattern fields never become scan
+/// text: a `GEOIP,x` inside a regex or glob — or inside a logic-group
+/// leg of those types — is process/domain text, never a declaration.
+/// Malformed lines contribute nothing (the parse stage owns the error).
+#[derive(Default)]
 struct GeoLineScan<'a> {
-    text: Option<&'a str>,
-    cond: Option<meow_rules::sub_rule_cond::CondExpr>,
+    texts: Vec<&'a str>,
+    conds: Vec<meow_rules::sub_rule_cond::CondExpr>,
 }
 
 fn geo_scan_targets(line: &str) -> GeoLineScan<'_> {
-    use meow_rules::sub_rule_cond::{parse_cond, parse_sub_rule_reference};
+    let mut scan = GeoLineScan::default();
     let trimmed = line.trim();
-    let none = || GeoLineScan {
-        text: None,
-        cond: None,
-    };
-    if trimmed.is_empty() || trimmed.starts_with('#') {
-        return none();
+    if !trimmed.is_empty() && !trimmed.starts_with('#') {
+        collect_geo_segments(trimmed, &mut scan);
     }
-    let ty = trimmed.split(',').next().map_or("", str::trim);
+    scan
+}
+
+/// Classify one rule-position text — a top-level line or a logic leg —
+/// into scan segments, recursing through logic groups so a leg's own
+/// type governs how its text is treated (issue #974 review: a
+/// `PROCESS-*` leg's `GEOIP,x` text must not trigger a geo load).
+fn collect_geo_segments<'a>(text: &'a str, scan: &mut GeoLineScan<'a>) {
+    use meow_rules::sub_rule_cond::{parse_cond, parse_sub_rule_reference};
+    let ty = text.split(',').next().map_or("", str::trim);
     let ty = meow_common::RuleType::from_mihomo_name(ty)
         .map_or_else(|| ty.to_ascii_uppercase(), |t| t.as_str().to_string());
     match ty.as_str() {
         // The pattern field is unbounded expression text: a `GEOIP,x`
-        // inside a regex or glob is process-name text, never a geo
-        // declaration.
-        "PROCESS-NAME-REGEX"
+        // inside a regex or glob is process-name/domain text, never a
+        // geo declaration. DOMAIN-REGEX joins the class: its
+        // comma-protected payload could carry `GEOIP,x` too.
+        "PROCESS-NAME"
+        | "PROCESS-PATH"
+        | "PROCESS-NAME-REGEX"
         | "PROCESS-PATH-REGEX"
         | "PROCESS-NAME-WILDCARD"
-        | "PROCESS-PATH-WILDCARD" => none(),
+        | "PROCESS-PATH-WILDCARD"
+        | "DOMAIN-REGEX" => {}
         "SUB-RULE" => {
-            let cond = parse_sub_rule_reference(trimmed)
+            if let Some(cond) = parse_sub_rule_reference(text)
                 .ok()
                 .flatten()
                 .and_then(|r| r.cond)
-                .and_then(|c| parse_cond(&c).ok());
-            GeoLineScan { text: None, cond }
+                .and_then(|c| parse_cond(&c).ok())
+            {
+                scan.conds.push(cond);
+            }
         }
-        _ => GeoLineScan {
-            text: Some(trimmed),
-            cond: None,
-        },
+        "AND" | "OR" | "NOT" => {
+            // Decompose `(leg),(leg),<target>` and classify each leg on
+            // its own type; a malformed shape falls back to the raw
+            // text (conservative — the parse stage fails it anyway).
+            let decomposed = text
+                .split_once(',')
+                .map(|(_, rest)| rest.trim_start())
+                .filter(|rest| rest.starts_with('('))
+                .and_then(|rest| {
+                    let end = meow_rules::parser::matching_paren(rest)?;
+                    meow_rules::parser::split_logic_groups(&rest[1..end]).ok()
+                });
+            match decomposed {
+                Some(legs) => {
+                    for leg in legs {
+                        collect_geo_segments(leg.trim(), scan);
+                    }
+                }
+                None => scan.texts.push(text),
+            }
+        }
+        _ => scan.texts.push(text),
     }
 }
 
 fn collect_geoip_countries(lines: &[String]) -> std::collections::HashSet<String> {
-    use meow_rules::sub_rule_cond::CondLeafKind;
     let re = geoip_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
         let scan = geo_scan_targets(line);
-        if let Some(text) = scan.text {
+        for text in &scan.texts {
             for cap in re.captures_iter(text) {
                 out.insert(cap[1].to_ascii_uppercase());
             }
         }
-        if let Some(cond) = &scan.cond {
+        for cond in &scan.conds {
             for leaf in cond.leaves() {
-                if leaf.kind == CondLeafKind::GeoIp {
+                // `GEOIP` covers the `,src` param form; `SRC-GEOIP` is
+                // its dedicated name — both key the country index.
+                if matches!(leaf.ty.as_str(), "GEOIP" | "SRC-GEOIP") {
                     out.insert(leaf.payload.to_ascii_uppercase());
                 }
             }
@@ -4835,19 +4866,18 @@ fn geosite_scan_regex() -> &'static regex::Regex {
 }
 
 fn collect_geosite_categories(lines: &[String]) -> std::collections::HashSet<String> {
-    use meow_rules::sub_rule_cond::CondLeafKind;
     let re = geosite_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
         let scan = geo_scan_targets(line);
-        if let Some(text) = scan.text {
+        for text in &scan.texts {
             for cap in re.captures_iter(text) {
                 out.insert(cap[1].to_ascii_lowercase());
             }
         }
-        if let Some(cond) = &scan.cond {
+        for cond in &scan.conds {
             for leaf in cond.leaves() {
-                if leaf.kind == CondLeafKind::GeoSite {
+                if leaf.ty == "GEOSITE" {
                     // Same `category@attr` split the GeoSite leaf build
                     // performs — only the category keys the loader.
                     if let Some(cat) = leaf.payload.split('@').next() {
@@ -4909,14 +4939,21 @@ fn collect_asn_numbers(lines: &[String]) -> std::collections::HashSet<u32> {
     let re = asn_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
-        // A cond leaf can never declare an ASN (not in the whitelist),
-        // so only the text classification matters here.
-        let Some(text) = geo_scan_targets(line).text else {
-            continue;
-        };
-        for cap in re.captures_iter(text) {
-            if let Ok(asn) = cap[1].parse::<u32>() {
-                out.insert(asn);
+        let scan = geo_scan_targets(line);
+        for text in &scan.texts {
+            for cap in re.captures_iter(text) {
+                if let Ok(asn) = cap[1].parse::<u32>() {
+                    out.insert(asn);
+                }
+            }
+        }
+        for cond in &scan.conds {
+            for leaf in cond.leaves() {
+                if matches!(leaf.ty.as_str(), "IP-ASN" | "SRC-IP-ASN") {
+                    if let Ok(asn) = leaf.payload.trim().parse::<u32>() {
+                        out.insert(asn);
+                    }
+                }
             }
         }
     }
@@ -4929,32 +4966,38 @@ fn collect_asn_numbers(lines: &[String]) -> std::collections::HashSet<u32> {
 /// Comment lines never match. Uses the same classifier as
 /// [`collect_geoip_countries`] so the trigger and the allowlist agree.
 fn line_references_geoip(line: &str) -> bool {
-    use meow_rules::sub_rule_cond::CondLeafKind;
     let scan = geo_scan_targets(line);
-    scan.text.is_some_and(|t| geoip_scan_regex().is_match(t))
-        || scan
-            .cond
-            .is_some_and(|c| c.leaves().iter().any(|l| l.kind == CondLeafKind::GeoIp))
+    scan.texts.iter().any(|t| geoip_scan_regex().is_match(t))
+        || scan.conds.iter().any(|c| {
+            c.leaves()
+                .iter()
+                .any(|l| matches!(l.ty.as_str(), "GEOIP" | "SRC-GEOIP"))
+        })
 }
 
 /// True iff `line` references the geosite database anywhere (top-level,
 /// nested inside a logic rule, or a SUB-RULE condition leaf). Comment
 /// lines never match.
 fn line_references_geosite(line: &str) -> bool {
-    use meow_rules::sub_rule_cond::CondLeafKind;
     let scan = geo_scan_targets(line);
-    scan.text.is_some_and(|t| geosite_scan_regex().is_match(t))
+    scan.texts.iter().any(|t| geosite_scan_regex().is_match(t))
         || scan
-            .cond
-            .is_some_and(|c| c.leaves().iter().any(|l| l.kind == CondLeafKind::GeoSite))
+            .conds
+            .iter()
+            .any(|c| c.leaves().iter().any(|l| l.ty == "GEOSITE"))
 }
 
 /// True iff `line` references the GeoLite2-ASN database anywhere — `IP-ASN,`
-/// or `SRC-IP-ASN,`, top-level or nested. Comment lines never match.
+/// or `SRC-IP-ASN,`, top-level, nested in a logic rule, or a SUB-RULE
+/// condition leaf. Comment lines never match.
 fn line_references_asn(line: &str) -> bool {
-    geo_scan_targets(line)
-        .text
-        .is_some_and(|t| asn_scan_regex().is_match(t))
+    let scan = geo_scan_targets(line);
+    scan.texts.iter().any(|t| asn_scan_regex().is_match(t))
+        || scan.conds.iter().any(|c| {
+            c.leaves()
+                .iter()
+                .any(|l| matches!(l.ty.as_str(), "IP-ASN" | "SRC-IP-ASN"))
+        })
 }
 
 /// Gather every rule line that can reference a geo database (issue #277):
@@ -4984,16 +5027,25 @@ fn collect_geo_scan_lines(
     // for providers the candidate does not carry (issue #543).
     let declared = raw.rule_providers.as_ref();
     for (name, bytes) in provider_payloads.iter() {
-        if !declared.is_some_and(|m| m.contains_key(name)) || meow_rules::is_mrs_bytes(bytes) {
+        let Some(cfg) = declared.and_then(|m| m.get(name)) else {
+            continue;
+        };
+        if meow_rules::is_mrs_bytes(bytes) {
             continue;
         }
         let text = String::from_utf8_lossy(bytes);
-        lines.extend(
-            text.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(String::from),
-        );
+        // Decode per the declared `format:` so a YAML payload's entries —
+        // not its raw `- "…"` source text — feed the geo scan (issue
+        // #974 review); an undecodable payload falls back to raw lines.
+        match rule_provider::payload_entries_for_scan(cfg, &text) {
+            Some(entries) => lines.extend(entries),
+            None => lines.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(String::from),
+            ),
+        }
     }
     lines
 }

@@ -121,6 +121,42 @@ pub(crate) fn parse_sub_rule_reference(line: &str) -> Result<Option<SubRuleRef>,
     meow_rules::sub_rule_cond::parse_sub_rule_reference(line)
 }
 
+/// Structural validation for a `sub-rules:` document that must commit
+/// without a successful build — the `PUT /configs?force` verbatim
+/// fallback (issue #974 review). Runs the exact checks the rebuild
+/// performs that do not depend on environment: reference-head grammar,
+/// per-block body grammar (condition leaves included), undefined-block
+/// references inside bodies and from top-level `rules:`, and cycles.
+///
+/// Provider *availability* is environment, not shape: `providers` maps
+/// each declared name to a stand-in set so a `(RULE-SET,name)` cond leaf
+/// or a `RULE-SET` body line resolves its name without fetching. A
+/// database-dependent leaf (GEOIP/IP-ASN) likewise only needs the
+/// caller's `ctx` — the API's empty-index context keeps those leaves
+/// structural rather than re-running the geo probe.
+pub fn check_sub_rules_shape(
+    raw_rules: &[String],
+    sub_rules_map: &HashMap<String, Vec<String>>,
+    providers: &HashMap<String, Arc<dyn RuleSet>>,
+    ctx: &ParserContext,
+) -> Result<(), anyhow::Error> {
+    parse_sub_rules(sub_rules_map, providers, ctx, false)?;
+    // The top-level `rules:` → `sub-rules:` undefined-block gate the
+    // rebuild applies — a verbatim commit must not persist a reference
+    // the next boot hard-fails on.
+    for line in raw_rules {
+        if let Ok(Some(reference)) = parse_sub_rule_reference(line) {
+            if !sub_rules_map.contains_key(&reference.name) {
+                return Err(anyhow!(
+                    "rules: SUB-RULE,{} references undefined sub-rule block",
+                    reference.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// DFS-based topological sort with cycle detection.  Returns the order in
 /// which to build blocks so that when we build `A`, every block it
 /// references is already resolved.
@@ -188,10 +224,13 @@ fn topo_order_with_cycle_check(
 /// Construct a `SubRuleRule` from a resolved block reference — plain,
 /// conditional, or conditional with the MEOW fourth-field fallback
 /// (issue #974). The condition is fully validated here: `parse_cond`'s
-/// whitelist and grammar apply identically at every level the line can
-/// appear (top-level `rules:`, block bodies, API dry-parse).
+/// grammar and the shared inner-leg exclusion apply identically at every
+/// level the line can appear (top-level `rules:`, block bodies, API
+/// dry-parse). `providers` is the scope `(RULE-SET,name)` cond leaves
+/// resolve against — the same scope logic legs see.
 pub fn build_sub_rule_rule(
     reference: &SubRuleRef,
+    providers: &HashMap<String, Arc<dyn RuleSet>>,
     ctx: &ParserContext,
     resolved: &SubRuleBlocks,
 ) -> Result<Box<dyn Rule>, String> {
@@ -206,7 +245,7 @@ pub fn build_sub_rule_rule(
         Some(cond_text) => {
             let expr = parse_cond(cond_text)
                 .map_err(|e| format!("SUB-RULE,{cond_text},{}: {e}", reference.name))?;
-            let cond = expr.build(ctx)?;
+            let cond = expr.build(ctx, providers)?;
             Ok(Box::new(SubRuleRule::new_conditional(
                 &reference.name,
                 Arc::clone(block),

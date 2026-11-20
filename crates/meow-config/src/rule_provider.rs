@@ -1766,6 +1766,27 @@ fn parse_text_payload(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// Decode prefetched provider bytes into rule lines for geo discovery —
+/// the declared `format:` governs, so a YAML `payload:` list yields its
+/// entries rather than raw `- "GEOIP,CN"` source text (which the geo
+/// regexes would scan with the list-marker still attached). `None` when
+/// the declared format cannot decode — the caller falls back to scanning
+/// the raw text lines (conservative; the build stage owns the error).
+pub(crate) fn payload_entries_for_scan(cfg: &RawRuleProvider, text: &str) -> Option<Vec<String>> {
+    let format = parse_explicit_format(cfg)
+        .ok()
+        .flatten()
+        .unwrap_or(RuleSetFormat::Yaml);
+    match format {
+        RuleSetFormat::Yaml => parse_yaml_payload(text, false).ok(),
+        RuleSetFormat::Text => Some(parse_text_payload(text)),
+        // MRS bytes are skipped upstream of this call; a declared-mrs
+        // provider whose bytes are not MRS decodes as nothing the geo
+        // regexes could read anyway — let the caller scan raw text.
+        RuleSetFormat::Mrs => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Path resolution
 // ---------------------------------------------------------------------------

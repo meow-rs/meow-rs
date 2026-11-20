@@ -414,22 +414,8 @@ fn parse_logic_rule(
         ));
     }
     // Find the matching ')' for the outer group-list parenthesis.
-    let mut depth: i32 = 0;
-    let mut end: Option<usize> = None;
-    for (i, c) in rest.char_indices() {
-        match c {
-            '(' => depth += 1,
-            ')' => {
-                depth -= 1;
-                if depth == 0 {
-                    end = Some(i);
-                    break;
-                }
-            }
-            _ => {}
-        }
-    }
-    let end = end.ok_or_else(|| format!("{rule_type} rule: unbalanced parentheses"))?;
+    let end =
+        matching_paren(rest).ok_or_else(|| format!("{rule_type} rule: unbalanced parentheses"))?;
     let inner = &rest[1..end];
     let tail = rest[end + 1..].trim_start();
     // Upstream `ParseRulePayload` takes the *last* comma field as the
@@ -457,33 +443,10 @@ fn parse_logic_rule(
 
     let mut inner_rules: Vec<Box<dyn Rule>> = Vec::with_capacity(groups.len());
     for g in &groups {
-        // Upstream `payloadToRule` rejects MATCH inside logic sub-rules —
-        // it would splice into an always-true `FinalRule` leg. Nested
-        // groups recurse through here, so the check covers any depth.
-        let mut fields = g.splitn(3, ',');
-        let first = fields.next().map_or("", str::trim);
-        // The guards below compare the config grammar's names, so a mihomo
-        // API spelling must translate first, the same way `parse_rule_depth`
-        // does — otherwise `(Match,X)` parses an always-true inner leg and
-        // `(DomainRegex,a,b)` silently truncates its payload.
-        let first = meow_common::RuleType::from_mihomo_name(first).map_or(first, |t| t.as_str());
-        if first == "MATCH" {
-            return Err(format!(
-                "{rule_type} rule: MATCH is not allowed inside logic groups"
-            ));
-        }
-        // An empty or missing payload silently degrades to match-all for
-        // the substring-match types (`DOMAIN-SUFFIX,` → ends_with(""),
-        // `DOMAIN-KEYWORD,` → contains("")) — same class as MATCH.
-        // Reject loudly.
-        if fields.next().map_or("", str::trim).is_empty() {
-            return Err(format!("{rule_type} rule: '{g}' has no payload"));
-        }
-        // A comma-containing DOMAIN-REGEX payload parses through the
-        // last-field adapter split below — upstream comma-protects it
-        // the same way (inner `payloadToRule` joins all fields).
-        let patched = splice_inner_adapter(g.trim());
-        inner_rules.push(parse_rule_depth(&patched, ctx, rule_sets, logic_depth + 1)?);
+        inner_rules.push(
+            parse_inner_leg(g.trim(), ctx, rule_sets, logic_depth + 1)
+                .map_err(|e| format!("{rule_type} rule: {e}"))?,
+        );
     }
 
     match rule_type {
@@ -505,45 +468,98 @@ fn parse_logic_rule(
     }
 }
 
-/// Split the body of a logic payload — a sequence of `(...)` groups optionally
-/// separated by commas — into the string contents of each group, preserving
-/// balanced parens inside.
-fn split_logic_groups(inner: &str) -> Result<Vec<String>, String> {
-    let mut groups = Vec::new();
-    let mut chars = inner.char_indices().peekable();
-    loop {
-        while let Some(&(_, c)) = chars.peek() {
-            if c == ' ' || c == ',' {
-                chars.next();
-            } else {
-                break;
-            }
+/// Byte offset of the `)` closing the `(` at `text[0]`, or `None` when
+/// unbalanced. `\`-escaped bytes and `[...]`-class contents never count
+/// as structural parens, so a literal paren inside a regex payload —
+/// `(DOMAIN-REGEX,a\),b)` or `[(]` — stays data instead of ending the
+/// group (issue #974 review; upstream counts them all, so this is a
+/// deliberate permissiveness superset). Byte scan — the structural
+/// bytes are ASCII.
+pub fn matching_paren(text: &str) -> Option<usize> {
+    debug_assert!(text.starts_with('('));
+    let mut depth = 0i32;
+    let mut in_class = false;
+    let mut escaped = false;
+    for (i, b) in text.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
         }
-        let Some(&(_, c)) = chars.peek() else { break };
+        match b {
+            b'\\' => escaped = true,
+            b'[' if !in_class => in_class = true,
+            b']' if in_class => in_class = false,
+            b'(' if !in_class => depth += 1,
+            b')' if !in_class => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Split the body of a logic payload — a sequence of `(...)` groups
+/// separated by commas/whitespace — into each group's inner text.
+/// `(`/`)` recognition follows [`matching_paren`]: escaped and
+/// char-class parens inside regex payloads stay literal.
+pub fn split_logic_groups(inner: &str) -> Result<Vec<&str>, String> {
+    let mut groups = Vec::new();
+    let mut rest = inner;
+    loop {
+        rest = rest.trim_start_matches([' ', ',']);
+        let Some(c) = rest.chars().next() else { break };
         if c != '(' {
             return Err(format!("expected '(' starting a group, got '{c}'"));
         }
-        chars.next(); // consume '('
-        let start = chars.peek().map_or(inner.len(), |&(i, _)| i);
-        let mut depth = 1i32;
-        let mut end: Option<usize> = None;
-        for (i, c) in chars.by_ref() {
-            match c {
-                '(' => depth += 1,
-                ')' => {
-                    depth -= 1;
-                    if depth == 0 {
-                        end = Some(i);
-                        break;
-                    }
-                }
-                _ => {}
-            }
-        }
-        let end = end.ok_or_else(|| "unbalanced parentheses in logic payload".to_string())?;
-        groups.push(inner[start..end].to_string());
+        let end = matching_paren(rest)
+            .ok_or_else(|| "unbalanced parentheses in logic payload".to_string())?;
+        groups.push(&rest[1..end]);
+        rest = &rest[end + 1..];
     }
     Ok(groups)
+}
+
+/// The one leg grammar `AND`/`OR`/`NOT` groups and `SUB-RULE` conditions
+/// share — upstream's `payloadToRule` runs the same `ParseRulePayload`
+/// + `ParseRule` chain for both (rules/logic/logic.go).
+///
+/// Only `MATCH` (an always-true leg that would splice into a `FinalRule`)
+/// and `SUB-RULE` (no adapter slot to carry the block name) are excluded
+/// — every other rule type, comma-protected ones included, parses exactly
+/// as it does inside a logic group.
+pub(crate) fn parse_inner_leg(
+    entry: &str,
+    ctx: &ParserContext,
+    rule_sets: &RuleSets,
+    logic_depth: usize,
+) -> Result<Box<dyn Rule>, String> {
+    let mut fields = entry.splitn(3, ',');
+    let first = fields.next().map_or("", str::trim);
+    // The guards below compare the config grammar's names, so a mihomo
+    // API spelling must translate first, the same way `parse_rule_depth`
+    // does — otherwise `(Match,X)` parses an always-true inner leg and
+    // `(DomainRegex,a,b)` silently truncates its payload.
+    let first = meow_common::RuleType::from_mihomo_name(first).map_or(first, |t| t.as_str());
+    if matches!(first, "MATCH" | "SUB-RULE") {
+        return Err(format!("{first} is not allowed as an inner rule"));
+    }
+    // An empty or missing payload silently degrades to match-all for
+    // the substring-match types (`DOMAIN-SUFFIX,` → ends_with(""),
+    // `DOMAIN-KEYWORD,` → contains("")) — same class as MATCH.
+    // Reject loudly.
+    if fields.next().map_or("", str::trim).is_empty() {
+        return Err(format!("'{entry}' has no payload"));
+    }
+    // A comma-containing DOMAIN-REGEX / process-regex payload parses
+    // through the splice's last-field adapter split — upstream
+    // comma-protects them identically (`ParseRulePayload` joins all
+    // middle fields into the payload even at needTarget=false).
+    let patched = splice_inner_adapter(entry.trim());
+    parse_rule_depth(&patched, ctx, rule_sets, logic_depth)
 }
 
 /// Adapter slot filler spliced into logic sub-rules by

@@ -193,7 +193,7 @@ pub fn parse_one_rule_or_subrule(
     // a silent drop would route by a different block than written (#625).
     match parse_sub_rule_reference(line) {
         Err(e) => return Err(e),
-        Ok(Some(reference)) => return build_sub_rule_rule(&reference, ctx, sub_rules),
+        Ok(Some(reference)) => return build_sub_rule_rule(&reference, providers, ctx, sub_rules),
         Ok(None) => {}
     }
     // Providers reach `RULE-SET` inside AND/OR/NOT groups too (mihomo parity).
@@ -273,6 +273,11 @@ mod tests {
             "SUB-RULE,(DOMAIN,a),blk,REJECT",
             "SUB-RULE,((DOMAIN,a)&(DOMAIN-SUFFIX,b)),blk",
             "SUB-RULE,(!(DOMAIN,b)|(DOMAIN-KEYWORD,u)),blk,DIRECT",
+            // Every non-excluded type is a legal cond leaf — upstream's
+            // payloadToRule set (issue #974 review).
+            "SUB-RULE,(PROCESS-NAME,x),blk",
+            "SUB-RULE,(IP-CIDR,10.0.0.0/8),blk",
+            "SUB-RULE,(NETWORK,tcp),blk",
         ] {
             let ok =
                 parse_one_rule_or_subrule(line, &providers, &ParserContext::default(), &sub_rules);
@@ -289,10 +294,17 @@ mod tests {
             ("SUB-RULE,(DOMAIN,a,blk", "unbalanced"),
             ("SUB-RULE,DOMAIN,blk", "trailing"),
             ("SUB-RULE,(AND,(DOMAIN,a),(DOMAIN,b)),blk", "expected '('"),
-            // A non-whitelisted cond leaf is rejected even though the
-            // reference head itself is well-formed.
+            // A leaf that needs a database the context lacks surfaces
+            // the shared leg grammar's error — even though the head is
+            // well-formed.
             ("SUB-RULE,(GEOIP,CN),blk", "GeoIP database"),
-            ("SUB-RULE,(PROCESS-NAME,x),blk", "allowed"),
+            // MATCH/SUB-RULE stay excluded at leaf position — upstream's
+            // `payloadToRule` set (issue #974 review).
+            ("SUB-RULE,(MATCH,x),blk", "not allowed as a condition leaf"),
+            (
+                "SUB-RULE,(SUB-RULE,inner),blk",
+                "not allowed as a condition leaf",
+            ),
         ] {
             let err =
                 parse_one_rule_or_subrule(line, &providers, &ParserContext::default(), &sub_rules)
