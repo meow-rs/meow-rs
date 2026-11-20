@@ -2216,8 +2216,8 @@ mod tests {
     /// external-spawn semantics and never reports the missing-feature
     /// error.
     #[cfg(feature = "ss-obfs")]
-    #[test]
-    fn obfs_local_keeps_external_spawn_when_obfs_compiled_in() {
+    #[tokio::test]
+    async fn obfs_local_keeps_external_spawn_when_obfs_compiled_in() {
         assert_eq!(missing_plugin_feature("obfs-local"), None);
         // `obfs-local` stays off the built-in list, so the provider gate
         // and the dry-run spawn suppressor keep treating it as external.
