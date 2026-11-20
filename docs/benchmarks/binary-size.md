@@ -304,3 +304,35 @@ before→after package-set diff): **removed** `sysinfo v0.32.1`,
 `sysinfo v0.32.1` (now `system` component only). `Cargo.lock` is
 byte-identical — `rayon` remains locked via `criterion` (dev-dep) and
 `meow-dns`'s sysinfo dev-dep, and the lock records no target-cfg edges.
+
+## `ss-obfs`/`ss-v2ray-plugin` leave `minimal` — cap restored (2026-11-21)
+
+Measured 2026-11-21 on macOS/Apple Silicon with cargo-zigbuild + zig, the
+`--no-default-features --features minimal` aarch64-musl leg, `stat`
+bytes of the stripped binary (`lto = fat, strip = true, codegen-units = 1,
+panic = abort, opt-level = "z"`):
+
+| Build | Size | vs 8 MiB cap (8,388,608 B) |
+|-------|------|---------------------------|
+| before (`c3045b43`, `ss` still bundling both plugins) | 8,399,176 B (~8.01 MiB) | **+10,568 B over — hard gate fails** |
+| after (plugins behind `ss-obfs`/`ss-v2ray-plugin`) | 8,290,952 B (~7.91 MiB) | **−97,656 B headroom** |
+
+Delta: **−108,224 B (~−105.7 KiB)**. The two named modules contribute
+~18.7 KB of `meow_proxy` symbols (`simple_obfs` 13,356 B + `v2ray_plugin`
+5,340 B); the rest is dead-stripped machinery that only their dial paths
+instantiated — `meow_transport::simple_obfs::{client,server}` codecs, the
+`first_flight` HTTP-obfs redial shim, `plugin_util` opts helpers, and the
+WS/TLS monomorphizations LTO can now drop. `plugin:`/`plugin-opts:`
+parsing, the external SIP003 subprocess path (`PluginKind::External` +
+`"failed to start ss plugin"`), and the feature-named "not compiled into
+this build" error strings remain in the stripped binary (verified via
+`strings`). `Cargo.lock` is unchanged — `meow-transport/simple-obfs`
+stays in the graph for `snell` and `listener-shadowsocks`, which carry
+their own feature edges.
+
+Feature semantics unchanged for `default`/`full`: both features are
+re-bundled, so release binaries keep `plugin: obfs`/`simple-obfs`/
+`v2ray-plugin` working; `minimal` answers those nodes with the dead
+placeholder + feature-named dial error. `obfs-local` follows `ss-obfs`:
+compiled in it keeps spawning the SIP003 binary; compiled out it reports
+"rebuild with `--features ss-obfs`" before `Plugin::start` can run.
