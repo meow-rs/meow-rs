@@ -394,6 +394,16 @@ pub struct TunListener {
     /// the named `type: tun` entry's: a named entry's `dns-hijack` admits
     /// wildcard UDP targets only, so this stays `false` on that path.
     tcp_dns_hijack: bool,
+    /// Fake-IP geometry (gateway, routed ranges) setup reads instead of
+    /// the tunnel's live slot. A reload that changes `dns.fake-ip-range*`
+    /// builds the candidate resolver before it is published;
+    /// [`Self::with_setup_resolver`] extracts this geometry eagerly so the
+    /// device's gateway/routes come from the generation being committed —
+    /// WITHOUT retaining the resolver itself: a listener that survives a
+    /// DNS-only reload must not pin the retired resolver's caches and
+    /// flush tasks for its whole life (Codex review). Live-traffic
+    /// readers keep following the tunnel slot.
+    setup_geometry: Option<FakeIpGeometry>,
 }
 
 impl TunListener {
@@ -407,6 +417,7 @@ impl TunListener {
             sniffer: None,
             route_override: None,
             tcp_dns_hijack: false,
+            setup_geometry: None,
         }
     }
 
@@ -430,6 +441,16 @@ impl TunListener {
         if sniffer.is_enabled() {
             self.sniffer = Some(sniffer);
         }
+        self
+    }
+
+    /// Override the resolver setup reads for fake-IP geometry — see the
+    /// field's comment. The geometry is extracted NOW so the resolver
+    /// itself is never retained by the listener; `None` (the default)
+    /// keeps reading the tunnel's live resolver, which is also what
+    /// post-setup traffic sees.
+    pub fn with_setup_resolver(mut self, resolver: Option<&meow_dns::Resolver>) -> Self {
+        self.setup_geometry = resolver.map(FakeIpGeometry::extract);
         self
     }
 
@@ -483,6 +504,18 @@ impl TunListener {
         info!("TUN listener '{}' starting...", self.name);
 
         let cfg = &self.cfg;
+        // Fake-IP gateway/range geometry is setup-time state: a reload
+        // that changes `dns.fake-ip-range*` hands the candidate resolver
+        // in via `with_setup_resolver`, which extracts the geometry so
+        // the device is built for the generation being committed — and
+        // so the resolver is not retained for the listener's life (a
+        // survivor of a DNS-only reload would otherwise pin the retired
+        // resolver's caches). The fallback snapshot reads the live slot
+        // once and drops the Arc the same way. Everything that serves
+        // live flows below keeps reading `self.tunnel`'s slot.
+        let geometry = self
+            .setup_geometry
+            .unwrap_or_else(|| FakeIpGeometry::extract(self.tunnel.resolver().as_ref()));
 
         // Windows: sidecar wintun.dll next to the exe / in cwd, else extract
         // the official DLL embedded in this binary. Fail before the retry
@@ -506,7 +539,7 @@ impl TunListener {
         const TUN_CREATE_RETRY_DELAY: Duration = Duration::from_millis(500);
         let base_addr = cfg.inet4_address.addr();
         let prefix = cfg.inet4_address.prefix_len();
-        let fake_ip_gateway = match self.tunnel.resolver().fake_ip_v4_gateway() {
+        let fake_ip_gateway = match geometry.v4_gateway {
             Some(std::net::IpAddr::V4(gateway)) => Some(gateway),
             _ => None,
         };
@@ -699,8 +732,8 @@ impl TunListener {
             v6: cfg.inet6_address,
             nat: None,
         };
-        let fake_ip_nets = fake_ip_route_nets(&self.tunnel.resolver(), cfg.inet6_address.is_some());
-        if cfg.inet6_address.is_none() && self.tunnel.resolver().fake_ip_v6_net().is_some() {
+        let fake_ip_nets = fake_ip_route_nets(&geometry, cfg.inet6_address.is_some());
+        if cfg.inet6_address.is_none() && geometry.v6_net.is_some() {
             warn!(
                 "tun '{}': 'dns.fake-ip-range6' is configured but the device has no \
                  'inet6-address' — fake AAAA answers have no route into '{dev_name}'. \
@@ -819,9 +852,7 @@ impl TunListener {
         // another resolver), this fails startup loudly instead of silently
         // leaving the whole machine with DNS aimed at a dead address.
         #[cfg(target_os = "windows")]
-        let local_dns_sockets = if cfg.dns_hijack
-            && cfg.auto_route
-            && self.tunnel.resolver().fake_ip_v4_gateway().is_some()
+        let local_dns_sockets = if cfg.dns_hijack && cfg.auto_route && geometry.v4_gateway.is_some()
         {
             Some(local_dns::bind().await.map_err(|e| {
                 io::Error::other(format!("loopback DNS server startup failed: {e}"))
@@ -1406,16 +1437,33 @@ async fn flow_slot(
     Ok(Some(permit))
 }
 
+/// The fake-IP geometry a TUN setup needs, snapshotted from the resolver
+/// generation being committed — so the listener never retains the
+/// resolver itself for its whole life.
+#[derive(Debug, Clone, Copy)]
+struct FakeIpGeometry {
+    v4_gateway: Option<std::net::IpAddr>,
+    v4_net: Option<ipnet::IpNet>,
+    v6_net: Option<ipnet::IpNet>,
+}
+
+impl FakeIpGeometry {
+    fn extract(resolver: &meow_dns::Resolver) -> Self {
+        Self {
+            v4_gateway: resolver.fake_ip_v4_gateway(),
+            v4_net: resolver.fake_ip_v4_net(),
+            v6_net: resolver.fake_ip_v6_net(),
+        }
+    }
+}
+
 /// Main-table fake-IP routes also capture forwarded LAN/container traffic,
 /// which Linux's host-originated policy rules deliberately leave untouched.
-fn fake_ip_route_nets(resolver: &meow_dns::Resolver, ipv6: bool) -> Vec<ipnet::IpNet> {
-    [
-        resolver.fake_ip_v4_net(),
-        ipv6.then(|| resolver.fake_ip_v6_net()).flatten(),
-    ]
-    .into_iter()
-    .flatten()
-    .collect()
+fn fake_ip_route_nets(geometry: &FakeIpGeometry, ipv6: bool) -> Vec<ipnet::IpNet> {
+    [geometry.v4_net, ipv6.then_some(geometry.v6_net).flatten()]
+        .into_iter()
+        .flatten()
+        .collect()
 }
 
 /// The split default routes of global route scope (#375): more specific
@@ -1754,11 +1802,53 @@ mod tests {
                 resolver.set_fakeip_v4(pool);
             }
         }
-        assert_eq!(super::fake_ip_route_nets(&resolver, true), vec![v4, v6]);
+        let geometry = super::FakeIpGeometry::extract(&resolver);
+        assert_eq!(super::fake_ip_route_nets(&geometry, true), vec![v4, v6]);
         assert_eq!(
-            super::fake_ip_route_nets(&resolver, false),
+            super::fake_ip_route_nets(&geometry, false),
             vec![v4],
             "an IPv4-only device must not claim IPv6 routes"
+        );
+    }
+
+    /// `with_setup_resolver` must snapshot the geometry without keeping
+    /// the resolver: a listener that outlives a DNS-only reload would
+    /// otherwise pin the retired resolver (caches, FileStore flush tasks)
+    /// for its whole lifetime (Codex review).
+    #[test]
+    fn setup_geometry_does_not_retain_the_resolver() {
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::FakeIp,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let listener = super::TunListener::new(
+            crate::test_rule_tunnel(),
+            super::TunListenerConfig {
+                device: None,
+                mtu: 1500,
+                inet4_address: "172.19.0.1/30".parse().unwrap(),
+                inet6_address: None,
+                auto_route: true,
+                route_scope: super::TunRouteScope::Global,
+                outbound_interface: None,
+                dns_hijack: false,
+                udp_timeout: Duration::from_secs(60),
+                max_connections: 0,
+                stack: super::TunStack::Lwip,
+            },
+            "t".into(),
+        )
+        .with_setup_resolver(Some(resolver.as_ref()));
+        assert!(listener.setup_geometry.is_some());
+        drop(listener);
+        assert_eq!(
+            Arc::strong_count(&resolver),
+            1,
+            "the listener must not retain the setup resolver"
         );
     }
 

@@ -379,10 +379,16 @@ struct VlessUdpReader {
     /// Datagram payload (or the response addon bytes mid-discard).
     payload: Vec<u8>,
     payload_pos: usize,
+    /// The request's fixed destination, reported as every datagram's
+    /// source — connection-oriented UDP-over-TCP has no per-datagram
+    /// source addr, and the bound target IS the peer (`UdpTarget::
+    /// src_matches` consumers rely on it; same convention as the VMess
+    /// and mux packet conns).
+    bound: std::net::SocketAddr,
 }
 
 impl VlessUdpReader {
-    fn new(stream: tokio::io::ReadHalf<Box<dyn Stream>>) -> Self {
+    fn new(stream: tokio::io::ReadHalf<Box<dyn Stream>>, bound: std::net::SocketAddr) -> Self {
         Self {
             stream,
             hdr: [0; 2],
@@ -392,6 +398,7 @@ impl VlessUdpReader {
             len_pos: 0,
             payload: Vec::new(),
             payload_pos: 0,
+            bound,
         }
     }
 
@@ -514,10 +521,7 @@ impl VlessUdpReader {
         }
         buf[..packet_len].copy_from_slice(&self.payload);
         self.reset_datagram();
-        // Return a placeholder source address (connection-oriented
-        // UDP-over-TCP has no per-datagram source addr).
-        let placeholder: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
-        Ok((packet_len, placeholder))
+        Ok((packet_len, self.bound))
     }
 }
 
@@ -535,9 +539,25 @@ impl VlessPacketConn {
         stream.write_all(&buf).await.map_err(MeowError::Io)?;
         stream.flush().await.map_err(MeowError::Io)?;
 
+        // The wire identity reads report: the request's fixed target. A
+        // domain carries no locally-known IP — report the port on the
+        // unspecified address, the only half a name-bound demux can check
+        // (VMess does the same; issue #974).
+        let bound = match addr {
+            VlessAddr::Ipv4(octets) => {
+                std::net::SocketAddr::new(std::net::Ipv4Addr::from(*octets).into(), dst_port)
+            }
+            VlessAddr::Ipv6(octets) => {
+                std::net::SocketAddr::new(std::net::Ipv6Addr::from(*octets).into(), dst_port)
+            }
+            VlessAddr::Domain(_) => std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                dst_port,
+            ),
+        };
         let (reader, writer) = tokio::io::split(stream);
         Ok(Self {
-            reader: tokio::sync::Mutex::new(VlessUdpReader::new(reader)),
+            reader: tokio::sync::Mutex::new(VlessUdpReader::new(reader, bound)),
             writer: tokio::sync::Mutex::new(writer),
             poisoned: std::sync::atomic::AtomicBool::new(false),
         })
@@ -1093,6 +1113,49 @@ mod tests {
         let hdr = rx.await.expect("header");
         // cmd byte at offset 18 (version=1 + uuid=16 + addon_length=1)
         assert_eq!(hdr[18], 0x02, "UDP cmd must be 0x02, not 0x01");
+    }
+
+    // ─── bound-source reporting (issue #974) ──────────────────────────────
+
+    /// A bound UDP-over-TCP conn reports every datagram as coming from the
+    /// request's fixed target: literal destinations report their real
+    /// `ip:port`, domain destinations the port on the unspecified address
+    /// — the wire identity `UdpTarget::src_matches` consumers (the NTP
+    /// exchange among them) check.
+    #[tokio::test]
+    async fn vless_packet_conn_reports_bound_destination_as_source() {
+        use tokio::io::AsyncWriteExt;
+
+        for (addr, expected) in [
+            (
+                VlessAddr::Ipv4([8, 8, 8, 8]),
+                "8.8.8.8:123".parse::<std::net::SocketAddr>().unwrap(),
+            ),
+            (
+                VlessAddr::domain("ntp.test").unwrap(),
+                "0.0.0.0:123".parse::<std::net::SocketAddr>().unwrap(),
+            ),
+        ] {
+            let (client, server) = duplex(1024);
+            tokio::spawn(async move {
+                let mut s = server;
+                // Request header, then answer one datagram: response
+                // header + [len][payload].
+                let hdr_len = 26;
+                let mut hdr = vec![0u8; hdr_len];
+                tokio::io::AsyncReadExt::read_exact(&mut s, &mut hdr)
+                    .await
+                    .unwrap();
+                s.write_all(&[0x00, 0x00, 0x00, 0x01, b'x']).await.unwrap();
+            });
+            let conn = VlessPacketConn::new(Box::new(client), &TEST_UUID, 123, &addr)
+                .await
+                .expect("VlessPacketConn::new");
+            let mut buf = [0u8; 16];
+            let (n, src) = conn.read_packet(&mut buf).await.unwrap();
+            assert_eq!(&buf[..n], b"x");
+            assert_eq!(src, expected);
+        }
     }
 
     // ─── F8: Mux request (CommandMux=0x03) omits port/address ─────────────────

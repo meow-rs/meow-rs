@@ -75,6 +75,37 @@ ipv6: false
 # relays started after the commit (in-flight relays keep their bound).
 # tcp-idle-timeout: 600             # seconds; 0 = disabled (default: disabled)
 
+# Outbound TCP keepalive — applied once to every physical upstream socket
+# (all dial paths). Detects silently-dead remote ends; `0`/absent timings
+# resolve to 15 s, bounds are 0-32767 s, `disable-keep-alive: true`
+# turns the whole policy off. PUT /configs applies at commit; PATCH
+# merges the supplied fields.
+# keep-alive-idle: 15
+# keep-alive-interval: 15
+# disable-keep-alive: false
+
+# Selection / fake-IP persistence across restarts.
+# store-selected (default: true) remembers `select`-group choices in a
+# file next to the config; `false` stops restoring AND writing (the
+# existing cache file is kept, just not opened). store-fake-ip falls
+# back to `dns.store-fake-ip` then `false` when omitted.
+# profile:
+#   store-selected: true
+#   store-fake-ip: false
+
+# Periodic SNTP sync feeding only VMess auth-ID and REALITY timestamp
+# protocol fields — the OS clock is never written (write-to-system is
+# parsed for compatibility, warn-ignored even under root). TLS
+# certificate checks keep using wall time. `dialer-proxy` routes the
+# poll through a named proxy/group or DIRECT (default: direct).
+# ntp:
+#   enable: false
+#   server: time.apple.com          # host or IP literal; brackets ok
+#   port: 123                       # 1-65535
+#   interval: 30                    # minutes, 1-525600
+#   dialer-proxy: "PROXY"           # optional; must exist when enabled
+#   write-to-system: false          # parsed, always ignored
+
 # REST API
 external-controller: 127.0.0.1:9090
 # Use a strong secret for remote access, DNS hostnames other than localhost,

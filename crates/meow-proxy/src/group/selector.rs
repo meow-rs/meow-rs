@@ -1,4 +1,4 @@
-use super::selector_store::SelectorStore;
+use super::selector_store::SelectorWriter;
 use async_trait::async_trait;
 use meow_common::{
     AdapterType, DelayHistory, GroupDisplay, MeowError, Metadata, ProviderSlot, Proxy,
@@ -18,7 +18,7 @@ pub struct SelectorGroup {
     /// DIRECT either way, so the divergence is cosmetic.)
     selected: RwLock<Option<SmolStr>>,
     /// Optional write-through persistence; primed at construction.
-    store: Option<Arc<SelectorStore>>,
+    store: Option<SelectorWriter>,
     health: ProxyHealth,
     display: GroupDisplay,
 }
@@ -52,14 +52,15 @@ impl SelectorGroup {
         }
     }
 
-    /// Attach a persistent store. The previously-saved choice (if any) is
-    /// loaded into `selected` immediately so the group dials it on first use.
-    /// Subsequent successful `select()` calls flush back through the store.
+    /// Attach the epoch-fenced persistence writer. The saved choice is
+    /// not copied out here: `selected_proxy` asks the store lazily, so
+    /// the group serves the exact map the backing's `commit` adopts —
+    /// adoption re-reads the file, and a build-time snapshot could name
+    /// whatever it read before the file changed (issue #974 review).
+    /// `select()` writes still flush through while the writer's
+    /// generation owns the persistence epoch.
     #[must_use]
-    pub fn with_store(mut self, store: Arc<SelectorStore>) -> Self {
-        if let Some(prev) = store.get(&self.name) {
-            *self.selected.write() = Some(SmolStr::from(prev));
-        }
+    pub fn with_store(mut self, store: SelectorWriter) -> Self {
         self.store = Some(store);
         self
     }
@@ -99,11 +100,23 @@ impl SelectorGroup {
         }
     }
 
+    /// The name this group would dial: a `select()`/`force_set` pick in
+    /// the lock first, else the store's saved choice — read lazily so it
+    /// always reflects the map the persistence backing serves.
+    fn effective_selection(&self) -> Option<SmolStr> {
+        self.selected.read().clone().or_else(|| {
+            self.store
+                .as_ref()
+                .and_then(|store| store.get(&self.name))
+                .map(SmolStr::from)
+        })
+    }
+
     /// Resolve `selected` to an `Arc<dyn Proxy>` without allocating a unified
     /// `Vec`. Walks `static_proxies` then provider slots; falls back to the
     /// first proxy if `selected` is unset or names something no longer present.
     pub fn selected_proxy(&self) -> Option<Arc<dyn Proxy>> {
-        let sel: Option<SmolStr> = self.selected.read().clone();
+        let sel: Option<SmolStr> = self.effective_selection();
         let mut first_any: Option<Arc<dyn Proxy>> = None;
         if let Some(name) = sel {
             for p in &self.static_proxies {
@@ -389,7 +402,9 @@ mod tests {
 
         let a = MockProxy::new("a");
         let b = MockProxy::new("b");
-        let g = SelectorGroup::new("sel", vec![a, b]).with_store(Arc::clone(&store));
+        let g = SelectorGroup::new("sel", vec![a, b]).with_store(
+            crate::group::selector_store::SelectorWriter::standalone(Arc::clone(&store)),
+        );
         assert_eq!(
             g.selected_proxy().unwrap().name(),
             "b",

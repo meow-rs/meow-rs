@@ -227,6 +227,12 @@ pub struct TunnelInner {
     /// socket-table scan in [`Self::flow_process`]. `None` in production.
     #[cfg(test)]
     process_lookup_hook: Mutex<Option<ProcessLookupHook>>,
+    /// The config's `profile.store-selected` persistence owner — set once
+    /// at startup from `Config::selection`; every rebuild lane reads it so
+    /// groups share one store and one enable epoch (issue #974). Empty
+    /// OnceLock → `SelectionBacking::unpersisted()` semantics via the
+    /// getter's fallback (tests/embedders never install one).
+    selection_backing: std::sync::OnceLock<Arc<meow_proxy::SelectionBacking>>,
     /// Handle to the running TUN listener (if any). Abort + await it to
     /// stop TUN. Stored so `put_configs` can start/stop TUN at runtime.
     pub tun_handle: RwLock<Option<TunHandle>>,
@@ -1574,6 +1580,7 @@ impl Tunnel {
                 process_lookup_hook: Mutex::new(None),
                 tun_handle: RwLock::new(None),
                 dialer_registry: std::sync::OnceLock::new(),
+                selection_backing: std::sync::OnceLock::new(),
                 udp_flush: tokio::sync::watch::Sender::new(0),
                 connection_notes: AtomicBool::new(false),
                 tcp_idle_timeout: AtomicU64::new(0),
@@ -1664,6 +1671,28 @@ impl Tunnel {
                  it will fail every dial"
             );
         }
+    }
+
+    /// Install the config's selection-persistence owner (issue #974) —
+    /// called once at startup with `Config::selection`; every rebuild
+    /// lane then reads it via [`Self::selection_backing`] so rebuilt
+    /// groups share the startup store and the commit lane's epoch bumps.
+    pub fn set_selection_backing(&self, backing: Arc<meow_proxy::SelectionBacking>) {
+        if self.inner.selection_backing.set(backing).is_err() {
+            warn!("selection backing already installed; ignoring re-install");
+        }
+    }
+
+    /// The selection-persistence owner rebuild lanes attach writers to.
+    /// Before the startup install (tests, embedders that never set one)
+    /// this pins an unpersisted backing — attach yields no writer, so
+    /// selections simply stay in-memory like a disabled profile.
+    pub fn selection_backing(&self) -> Arc<meow_proxy::SelectionBacking> {
+        Arc::clone(
+            self.inner
+                .selection_backing
+                .get_or_init(|| Arc::new(meow_proxy::SelectionBacking::unpersisted())),
+        )
     }
 
     /// Republish the live proxies map into the provider-node dialer
@@ -2108,6 +2137,14 @@ impl Tunnel {
             udp::DEFAULT_UDP_IDLE,
             udp::DEFAULT_SWEEP_INTERVAL,
         );
+    }
+
+    /// The commit-section half of [`Self::set_tun_handle`]: store the
+    /// handle synchronously and return any replaced one, whose teardown
+    /// the caller detaches — a config mutation's publish section holds
+    /// the document write guard and may not await (issue #974 review).
+    pub fn install_tun_handle(&self, handle: TunHandle) -> Option<TunHandle> {
+        self.inner.tun_handle.write().replace(handle)
     }
 
     /// Store a running TUN listener handle. If a previous TUN listener was

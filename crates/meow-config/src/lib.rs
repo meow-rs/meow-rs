@@ -118,6 +118,15 @@ pub struct Config {
     /// Hand it to `Tunnel::update_routing` so the route table retains it —
     /// chained adapters resolve through it weakly (issue #533).
     pub dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    /// The config-scoped `profile.store-selected` persistence owner —
+    /// install it on the `Tunnel` (`set_selection_backing`) so every
+    /// runtime rebuild lane shares this build's store and epoch
+    /// (issue #974).
+    pub selection: std::sync::Arc<meow_proxy::SelectionBacking>,
+    /// The resolved `ntp:` service configuration — the supervisor
+    /// reconciles workers against it; `PUT` diffs a new resolution on
+    /// this (issue #974).
+    pub ntp: NtpConfig,
     pub listeners: ListenerConfig,
     pub tun: TunConfig,
     pub api: ApiConfig,
@@ -1462,12 +1471,19 @@ pub fn parse_raw_yaml(content: &str) -> Result<raw::RawConfig, anyhow::Error> {
     // below the 32-level budget (migration review F1). The join is a
     // synchronous block on paths that already parsed inline — startup and
     // reload — so nothing downstream changes. See `meow_common::yaml`.
-    meow_common::yaml::run_on_parse_stack(content, |doc| {
-        let root: yaml_tree::SpannedNode =
-            serde_saphyr::from_str_with_options(doc, yaml_options())?;
-        yaml_tree::deserialize_config(&root, doc).map_err(Into::into)
-    })
-    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))?
+    let raw = meow_common::yaml::run_on_parse_stack(
+        content,
+        |doc| -> Result<raw::RawConfig, anyhow::Error> {
+            let root: yaml_tree::SpannedNode =
+                serde_saphyr::from_str_with_options(doc, yaml_options())?;
+            yaml_tree::deserialize_config(&root, doc).map_err(Into::into)
+        },
+    )
+    .map_err(|e| anyhow::anyhow!("cannot spawn YAML parse thread: {e}"))??;
+    // Alias-conflict warnings are scoped to the document admission — this
+    // parse — not to the rebuild passes it later fans out to (issue #974).
+    validation::warn_store_fake_ip_alias(&raw);
+    Ok(raw)
 }
 
 /// Unique-per-call scratch sibling for atomic write-then-rename saves —
@@ -1851,13 +1867,21 @@ pub fn rebuild_from_raw_with_resolver(
     cache_dir: Option<&Path>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     shared_rule_providers: Option<HashMap<String, Arc<rule_provider::RuleProvider>>>,
+    // The running config's selection-persistence owner — pass
+    // `Tunnel::selection_backing()` for committed-state republishes so
+    // rebuilt groups keep the user's persisted pick (issue #974);
+    // SelectionBacking::unpersisted() otherwise.
+    selection: &meow_proxy::SelectionBacking,
 ) -> Result<RebuildResult, anyhow::Error> {
+    let store_selected = resolve_profile(raw).store_selected;
+    selection.prepare_sync(store_selected);
+    let writer = selection.attach(store_selected);
     rebuild_from_raw_impl(
         raw,
         cache_dir,
         resolver,
         providers,
-        None,
+        writer.as_ref(),
         None,
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
@@ -1887,22 +1911,24 @@ pub fn rebuild_from_raw_runtime(
     // or their `dialer-proxy` chains never resolve (issue #489). Pass
     // `Config::provider_dialer_registry`.
     provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    // The running config's selection-persistence owner — the same
+    // SelectionBacking startup built, so a rebuilt group keeps the user's
+    // persisted pick and the PUT commit's epoch bump fences these groups'
+    // writers correctly (issue #974). Pass
+    // SelectionBacking::unpersisted() for embedders without a backing file.
+    selection: &meow_proxy::SelectionBacking,
 ) -> Result<RebuildResult, anyhow::Error> {
-    let store = meow_proxy::SelectorStore::global();
-    if store.is_none() {
-        // First-`open`-wins binds the global at startup; embedders that
-        // never call `SelectorStore::open` (e.g. `load_config_from_str`)
-        // get the unpersisted behavior — selections reset on rebuild.
-        debug!(
-            "rebuild_from_raw_runtime: no global SelectorStore; group selections will not persist"
-        );
-    }
+    // This lane always runs on a blocking thread (spawn_blocking in the
+    // API/subscription callers), so the lazy store open is safe inline.
+    let store_selected = resolve_profile(raw).store_selected;
+    selection.prepare_sync(store_selected);
+    let writer = selection.attach(store_selected);
     rebuild_from_raw_impl(
         raw,
         cache_dir,
         resolver,
         providers,
-        store.as_ref(),
+        writer.as_ref(),
         None,
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
@@ -2977,6 +3003,15 @@ fn materialize_proxy_providers(
     Ok(out)
 }
 
+/// The registry map one `build_proxy_layer` produces plus the names it
+/// bound to unavailable placeholders — [`check_ntp_dialer_target`] needs
+/// the set: `contains_key` alone cannot tell a placeholder (every dial
+/// fails) from a live leaf.
+type BuiltProxyLayer = (
+    HashMap<SmolStr, Arc<dyn Proxy>>,
+    std::collections::HashSet<SmolStr>,
+);
+
 /// Build the complete proxy layer for one config: built-ins, `proxies:` leaf
 /// adapters, `dialer-proxy` chains, proxy groups and the auto-created GLOBAL
 /// selector, with every chain/cycle invariant validated. Shared between the
@@ -2995,10 +3030,10 @@ fn build_proxy_layer(
     raw: &raw::RawConfig,
     resolver: Option<&meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
     registry: &meow_proxy::dialer::ProxyRegistry,
     strict: bool,
-) -> Result<HashMap<SmolStr, Arc<dyn Proxy>>, anyhow::Error> {
+) -> Result<BuiltProxyLayer, anyhow::Error> {
     let ipv6 = effective_ipv6(raw.ipv6);
     let mut proxies: HashMap<SmolStr, Arc<dyn Proxy>> = HashMap::new();
     let mut static_proxy_names = std::collections::HashSet::new();
@@ -3085,7 +3120,7 @@ fn build_proxy_layer(
     // not a runtime global, so a `PUT /configs` flip rebuilds cleanly.
     let global_fp =
         proxy_parser::normalize_client_fingerprint(raw.global_client_fingerprint.as_deref());
-    insert_parsed_leaves(
+    let placeholder_names = insert_parsed_leaves(
         &mut proxies,
         &mut static_proxy_names,
         raw_proxies,
@@ -3216,7 +3251,7 @@ fn build_proxy_layer(
                 &proxies,
                 &include_all_proxies,
                 providers,
-                selector_store,
+                selection,
             ) {
                 Ok(group) => {
                     let name = SmolStr::from(group.name());
@@ -3258,7 +3293,7 @@ fn build_proxy_layer(
                     &proxies,
                     &include_all_proxies,
                     providers,
-                    selector_store,
+                    selection,
                 ) {
                     details.push(format!("'{}': {e}", raw_group.name));
                 }
@@ -3289,7 +3324,7 @@ fn build_proxy_layer(
                 &proxies,
                 &include_all_proxies,
                 providers,
-                selector_store,
+                selection,
             ) {
                 Ok(group) => {
                     let name = SmolStr::from(group.name());
@@ -3315,7 +3350,7 @@ fn build_proxy_layer(
                     &proxies,
                     &include_all_proxies,
                     providers,
-                    selector_store,
+                    selection,
                 ) {
                     Ok(group) => {
                         let name = SmolStr::from(group.name());
@@ -3390,7 +3425,7 @@ fn build_proxy_layer(
             &proxies,
             &[],
             providers,
-            selector_store,
+            selection,
         ) {
             Ok(group) => {
                 proxies.insert(SmolStr::new_static("GLOBAL"), group);
@@ -3434,7 +3469,7 @@ fn build_proxy_layer(
 
     seed_chain_owners(&dialer_edges.declared, &proxies);
 
-    Ok(proxies)
+    Ok((proxies, placeholder_names))
 }
 
 /// Tell each automatic group used as a `dialer-proxy` which outbounds dial
@@ -3481,7 +3516,7 @@ struct PrefetchProxies {
 fn prefetch_proxy_map(
     raw: &raw::RawConfig,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
 ) -> Result<Option<PrefetchProxies>, anyhow::Error> {
     // No `proxies:` entries means nothing to tunnel through — named `proxy:`
     // lookups and the default proxy all come back empty either way. Such a
@@ -3495,11 +3530,11 @@ fn prefetch_proxy_map(
     // cycle) hard-fails the real build with the same error; surface it
     // now instead of letting default-proxy provider/geodata fetches
     // egress direct on a config that intends chained egress.
-    let map = build_proxy_layer(
+    let (map, _) = build_proxy_layer(
         raw,
         None,
         providers,
-        selector_store,
+        selection,
         &registry,
         raw.strict.unwrap_or(false),
     )?;
@@ -3512,20 +3547,20 @@ fn prefetch_proxy_map(
 
 /// Build the prefetch proxy layer on a blocking thread — adapter and group
 /// construction can spawn plugin subprocesses and read TLS material, so it
-/// must not run inline on the async executor. `selector_store` is threaded
+/// must not run inline on the async executor. `selection` is threaded
 /// in so a `select` group's persisted choice resolves to the same member
 /// the runtime build would pick. A rejected layer or a failed build task
 /// surfaces as `Err` — the same failure pass 1 of the real build reports.
 async fn prefetch_proxy_layer_async(
     raw: &raw::RawConfig,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
 ) -> Result<Option<Arc<PrefetchProxies>>, anyhow::Error> {
     let raw = raw.clone();
     let providers = providers.clone();
-    let selector_store = selector_store.cloned();
+    let selection = selection.cloned();
     spawn_blocking_with_current_dispatcher(move || {
-        prefetch_proxy_map(&raw, &providers, selector_store.as_ref())
+        prefetch_proxy_map(&raw, &providers, selection.as_ref())
     })
     .await
     .map_err(|e| anyhow::anyhow!("prefetch proxy-layer build task failed: {e}"))?
@@ -3542,7 +3577,7 @@ fn rebuild_from_raw_impl(
     cache_dir: Option<&Path>,
     resolver: Option<&meow_dns::ResolverSlot>,
     providers: &HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selection: Option<&meow_proxy::SelectorWriter>,
     shared_ctx: Option<&meow_rules::ParserContext>,
     prefetched_payloads: Option<Arc<rule_provider::PrefetchedPayloads>>,
     // `dialer-proxy` front hops are resolved by name against this registry on
@@ -3578,6 +3613,11 @@ fn rebuild_from_raw_impl(
     // default UA, the same effective value the static would give.
     let candidate_ua =
         validate_global_ua(raw.global_ua.as_deref())?.unwrap_or(meow_common::DEFAULT_USER_AGENT);
+    // `ntp:` shape/ranges resolve before any candidate network work —
+    // disabled included: `-t` and PUT reject an out-of-range endpoint
+    // regardless of `enable` (issue #974). The named-target reference is
+    // checked against the built map below.
+    let ntp_resolved = resolve_ntp(raw)?;
     dns_parser::validate_node_policy_sources(raw)?;
     // Warn-only unknown-key reporting (issue #974): classify-and-warn every
     // key the typed schema dropped. Runs on every rebuild pass — startup's
@@ -3633,14 +3673,19 @@ fn rebuild_from_raw_impl(
         provider_dialer_registry,
         &mut dropped,
     )?;
-    let proxies = build_proxy_layer(
+    let (proxies, placeholder_names) = build_proxy_layer(
         raw,
         resolver,
         &candidate_providers,
-        selector_store,
+        selection,
         registry,
         strict,
     )?;
+    // An enabled `ntp.dialer-proxy` must name a BUILT target — checked
+    // here so every publication lane (startup, `-t`, PUT, warm republish)
+    // enforces it the same way, and removing a target together with its
+    // reference in one document stays legal (issue #974).
+    check_ntp_dialer_target(&ntp_resolved, &proxies, &placeholder_names)?;
 
     // Publish the finished registry: the `dialer-proxy` chains bound during
     // the layer build resolve their front hop by name against it, and only
@@ -3803,14 +3848,6 @@ fn rebuild_from_raw_impl(
     })
 }
 
-async fn open_selector_store_async(
-    path: PathBuf,
-) -> Result<Arc<meow_proxy::SelectorStore>, anyhow::Error> {
-    spawn_blocking_with_current_dispatcher(move || meow_proxy::SelectorStore::open(path))
-        .await
-        .map_err(|e| anyhow::anyhow!("selector store open task failed: {e}"))
-}
-
 async fn build_parser_context_with_geo_async(
     raw: raw::RawConfig,
     geo: GeoDataConfig,
@@ -3880,7 +3917,7 @@ async fn rebuild_from_raw_impl_async(
     cache_dir: Option<PathBuf>,
     resolver: Option<meow_dns::ResolverSlot>,
     providers: HashMap<String, Arc<ProxyProvider>>,
-    selector_store: Option<Arc<meow_proxy::SelectorStore>>,
+    selection: Option<meow_proxy::SelectorWriter>,
     ctx: meow_rules::ParserContext,
     provider_payloads: Arc<rule_provider::PrefetchedPayloads>,
     // Caller's registry cell — shared across a multi-pass build so pass-1
@@ -3901,7 +3938,7 @@ async fn rebuild_from_raw_impl_async(
             cache_dir.as_deref(),
             resolver.as_ref(),
             &providers,
-            selector_store.as_ref(),
+            selection.as_ref(),
             Some(&ctx),
             Some(provider_payloads),
             &registry,
@@ -5683,39 +5720,560 @@ pub fn resolve_tcp_keepalive(
             }
         }
     }
-    // Upstream mihomo applies `keep-alive-*` to BOTH inbound listeners
-    // (`net.ListenConfig.KeepAliveConfig` on accepted sockets) and
-    // outbound dials; `tcp-keepalive*` here covers the inbound side only
-    // — outbound dials carry no configurable keepalive (the residual
-    // gap). Captured only to warn on the plausible migration mistake —
-    // without this the keys are silently ignored by serde.
-    for (key, present, inbound_equivalent) in [
-        (
-            "keep-alive-idle",
-            raw.keep_alive_idle.is_some(),
-            "`tcp-keepalive-idle`",
-        ),
-        (
-            "keep-alive-interval",
-            raw.keep_alive_interval.is_some(),
-            "`tcp-keepalive-interval`",
-        ),
-        (
-            "disable-keep-alive",
-            raw.disable_keep_alive.is_some(),
-            "`tcp-keepalive: false`",
-        ),
-    ] {
-        if present {
-            warn!(
-                "{key}: tunes inbound AND outbound sockets upstream and is \
-                 ignored; the inbound-socket equivalent here is \
-                 {inbound_equivalent} (outbound dials keep no keepalive \
-                 tuning)"
+    Ok(config)
+}
+
+/// The effective `profile:` flags — what the running config and
+/// `GET /configs` report (issue #974).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedProfile {
+    /// `profile.store-selected` — selection persistence for `select`
+    /// groups and url-test/fallback `fix` pins. Upstream default `true`.
+    pub store_selected: bool,
+    /// `profile.store-fake-ip` resolved over `dns.store-fake-ip` —
+    /// explicit `profile` wins over explicit `dns`, which wins over the
+    /// `false` default (`false` is still an explicit value; `null`
+    /// falls through, matching upstream's absent-handling).
+    pub store_fake_ip: bool,
+}
+
+/// Resolve `profile:` — `store-selected` defaults to upstream's `true`;
+/// `store-fake-ip` follows `profile` > `dns` > `false`. When both
+/// explicit spellings disagree, `profile` wins and the caller warns once
+/// per admission (`validation::validate_and_warn`).
+pub fn resolve_profile(raw: &raw::RawConfig) -> ResolvedProfile {
+    let profile = raw.profile.as_ref();
+    ResolvedProfile {
+        store_selected: profile.and_then(|p| p.store_selected).unwrap_or(true),
+        store_fake_ip: profile
+            .and_then(|p| p.store_fake_ip)
+            .or_else(|| raw.dns.as_ref().and_then(|d| d.store_fake_ip))
+            .unwrap_or(false),
+    }
+}
+
+/// The resolved `ntp:` service configuration (issue #974) — what
+/// `Config` carries, `GET /configs` reports, and the supervisor
+/// reconciles against. `write-to-system` never appears here: it is
+/// warn-and-ignore at admission, not a runtime knob.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtpConfig {
+    pub enable: bool,
+    /// Host or IP literal (bracketed IPv6 unwrapped) — `time.apple.com`
+    /// by upstream default.
+    pub server: String,
+    pub port: u16,
+    /// Poll period — `interval` minutes, `1..=525600`, default 30.
+    pub interval_minutes: u32,
+    /// The named `dialer-proxy` target, `None` = direct dial. Admission
+    /// pins it to a built top-level proxy/group name or `DIRECT` when
+    /// enabled — see the check in `rebuild_from_raw_impl`.
+    pub dialer_proxy: Option<String>,
+}
+
+/// Resolve `ntp:` — ranges are checked even when disabled (`-t`
+/// rejects an out-of-range endpoint the same way a running load does).
+/// `server` must be a bare host or IP literal: bracketed IPv6 unwraps,
+/// a `host:port`/`scheme://` spelling fails; `port` and `interval`
+/// hold upstream-compatible bounds.
+pub fn resolve_ntp(raw: &raw::RawConfig) -> Result<NtpConfig, anyhow::Error> {
+    let ntp = raw.ntp.as_ref();
+    let server_raw = ntp
+        .and_then(|n| n.server.as_deref())
+        .unwrap_or("time.apple.com");
+    let server = {
+        let s = server_raw.trim();
+        anyhow::ensure!(!s.is_empty(), "ntp.server must not be empty");
+        // Bracketed IPv6 (`[::1]`) unwraps to the literal; anything else
+        // must be a hostname — `is_valid_host` is the same byte contract
+        // ingress applies, so whitespace, control bytes and every
+        // authority-shaped spelling (`host:port`, `scheme://`, `a@b`,
+        // `x/y`) fail here.
+        let inner = s
+            .strip_prefix('[')
+            .and_then(|r| r.strip_suffix(']'))
+            .unwrap_or(s);
+        if inner.parse::<std::net::IpAddr>().is_err() {
+            anyhow::ensure!(
+                meow_common::is_valid_host(inner),
+                "ntp.server '{server_raw}': expected a host or IP literal, not a host:port or URI"
             );
         }
+        inner.to_string()
+    };
+    let port = ntp.and_then(|n| n.port).unwrap_or(123);
+    anyhow::ensure!(port >= 1, "ntp.port {port}: expected 1..=65535");
+    let interval = ntp.and_then(|n| n.interval).unwrap_or(30);
+    anyhow::ensure!(
+        (1..=525_600).contains(&interval),
+        "ntp.interval {interval}: expected 1..=525600 minutes"
+    );
+    let interval_minutes = u32::try_from(interval)
+        .map_err(|_| anyhow::anyhow!("ntp.interval {interval} is out of range"))?;
+    // `dialer-proxy` matches names verbatim — no trimming: `' DIRECT '`
+    // is not the DIRECT built-in (issue #974). Empty means direct like
+    // an absent key, and `DIRECT` normalizes to the same direct path so
+    // the two spellings compare equal at reconcile and never restart an
+    // unchanged worker.
+    let dialer_proxy = ntp
+        .and_then(|n| n.dialer_proxy.as_deref())
+        .filter(|s| !s.is_empty())
+        .filter(|s| *s != "DIRECT")
+        .map(str::to_string);
+    Ok(NtpConfig {
+        enable: ntp.and_then(|n| n.enable).unwrap_or(false),
+        server,
+        port,
+        interval_minutes,
+        dialer_proxy,
+    })
+}
+
+/// The `ntp.enable + dialer-proxy` reference gate every prospective
+/// routing publication runs (issue #974): an enabled named target must
+/// resolve to a built top-level proxy/group or `DIRECT` — provider-only
+/// names and non-transport built-ins are not valid dialers. Runs against
+/// the BUILT map, not the raw names, so a group dropped by lenient
+/// parsing still fails and a `use:`-only name never slips through.
+/// Called on every `rebuild_from_raw_impl` — startup, `-t`, PUT and the
+/// subscription/geodata republish lanes all pass through it.
+///
+/// `placeholder_names` is [`insert_parsed_leaves`]'s set: lenient builds
+/// bind a parse-failed placeholder-eligible node to an
+/// `UnavailableAdapter` that stays in the map but fails every dial — the
+/// same exclusion the declared-side fallback applies to `Some(true)`
+/// bindings (Codex review). Group names never appear in it — the
+/// duplicate-name gate keeps them disjoint — so a group whose members
+/// are unusable today still passes, matching how the target actually
+/// dials once membership changes (provider refresh, a re-pick).
+pub(crate) fn check_ntp_dialer_target(
+    cfg: &NtpConfig,
+    proxies: &HashMap<SmolStr, Arc<dyn meow_common::Proxy>>,
+    placeholder_names: &std::collections::HashSet<SmolStr>,
+) -> Result<(), anyhow::Error> {
+    // DIRECT/COMPATIBLE dial directly and GLOBAL is a real group — the
+    // map carries all three; DIRECT is also spelled out for hand-built
+    // `NtpConfig`s that skipped `resolve_ntp`'s normalization.
+    check_ntp_dialer_target_impl(cfg, |name| {
+        name == "DIRECT" || (proxies.contains_key(name) && !placeholder_names.contains(name))
+    })
+}
+
+/// The same `ntp.enable + dialer-proxy` gate where no built candidate
+/// exists — the forced verbatim-commit fallback (issue #974 review). The
+/// name must be one the candidate's own `proxies:`/`proxy-groups:`
+/// declare with a `type:` this build's dispatch can construct, or a
+/// transport built-in: only those can possibly enter its built map, so
+/// anything else would commit a document the next startup's built-map
+/// check hard-fails — including a same-name node whose unknown `type:`
+/// the lenient build drops. `use:`-only provider names fail here the
+/// same way they fail there — and only a *buildable* provider counts as
+/// supplying members, since `materialize_proxy_providers` warn-drops a
+/// def it cannot construct.
+///
+/// `cache_dir` is the provider-cache directory the rebuild would use —
+/// safe-path containment inside it is part of buildability. The check
+/// runs the real provider constructor, which canonicalizes paths on
+/// disk: callers must not hold the raw write guard and should dispatch
+/// it off the async lane.
+pub fn check_ntp_dialer_target_declared(
+    cfg: &NtpConfig,
+    raw: &raw::RawConfig,
+    cache_dir: Option<&Path>,
+) -> Result<(), anyhow::Error> {
+    check_ntp_dialer_target_impl(cfg, |name| {
+        // The transports the built map always carries are spelled out —
+        // there is no map to consult here.
+        matches!(name, "DIRECT" | "COMPATIBLE" | "GLOBAL")
+            || declared_leaf_binding(name, raw) == Some(false)
+            || declared_group_lands(name, raw, cache_dir)
+    })
+}
+
+/// Whether a `proxies:` declaration named `name` would land in the
+/// lenient build's map — the same parse the build runs, restricted to
+/// the name's own blocks (local and synchronous; a parse never dials —
+/// issue #974 review). Mirrors [`insert_parsed_leaves`]: later same-name
+/// blocks win a live binding; a block on a `dialer-proxy` edge goes
+/// through [`parse_dialered_leaf`] against the earlier same-name
+/// binding; an unparseable block fills the slot with an unavailable
+/// placeholder only while nothing live is bound and its `type:` is
+/// placeholder-eligible — so a `{type: socks5}` without `server` drops
+/// out, while a compiled-out `trusttunnel` still binds a placeholder.
+/// The placeholder counts for *group membership* (a group listing it
+/// still lands) but not as the dialer target itself: it carries no
+/// transport, so an NTP dialer named on it would fail every dial.
+/// A build-fatal error (self-edge, a `strict` parse failure, a
+/// malformed-edges bail) can never land the name.
+/// Returns `Some(false)` for a live binding, `Some(true)` when only an
+/// unavailable placeholder holds the slot, `None` when nothing lands.
+fn declared_leaf_binding(name: &str, raw: &raw::RawConfig) -> Option<bool> {
+    // A block shadowing a built-in is dropped before it binds — the
+    // built-in itself was already answered by the caller's arms.
+    if BUILTIN_ADAPTER_NAMES.contains(&name) {
+        return None;
     }
-    Ok(config)
+    // This mirror runs the real constructors for their verdicts only —
+    // an `ss` node's external SIP003 plugin must not spawn a local
+    // subprocess just to answer "would the name land" for a candidate
+    // that may still be rejected (Codex review). Every other check in
+    // the arm still applies, so the verdict stays the constructor's
+    // modulo the spawn itself.
+    #[cfg(feature = "ss")]
+    let _plugin_dry_run = proxy_parser::plugin_spawn_dry_run();
+    let raw_proxies = raw.proxies.as_ref()?;
+    let strict = raw.strict.unwrap_or(false);
+    let Ok(edges) = collect_dialer_edges(raw_proxies, strict) else {
+        // The whole build bails on the declared edges — no map exists
+        // for the name to land in.
+        return None;
+    };
+    let ipv6 = effective_ipv6(raw.ipv6);
+    let fp = raw.global_client_fingerprint.as_deref();
+    let registry = meow_proxy::dialer::ProxyRegistry::default();
+    let key = SmolStr::from(name);
+    // (binding, is_placeholder) — `parse_dialered_leaf` consults both.
+    let mut bound: Option<(Arc<dyn Proxy>, bool)> = None;
+    for (index, block) in raw_proxies.iter().enumerate() {
+        if block.get("name").and_then(|v| v.as_str()) != Some(name) {
+            continue;
+        }
+        if let Some(dialer) = edges.by_index.get(&index) {
+            let mut prior = HashMap::new();
+            let mut placeholder_names = std::collections::HashSet::new();
+            if let Some((proxy, placeholder)) = &bound {
+                prior.insert(key.clone(), Arc::clone(proxy));
+                if *placeholder {
+                    placeholder_names.insert(key.clone());
+                }
+            }
+            match parse_dialered_leaf(
+                block,
+                dialer,
+                &prior,
+                &placeholder_names,
+                None,
+                ipv6,
+                strict,
+                &registry,
+                fp,
+            ) {
+                Ok(Some(b)) => bound = Some(b),
+                // Skipped — the earlier same-name binding stands.
+                Ok(None) => {}
+                Err(_) => return None,
+            }
+            continue;
+        }
+        match proxy_parser::parse_static_proxy(block, ipv6, None, fp) {
+            Ok(proxy) => bound = Some((proxy, false)),
+            Err(e) => {
+                if strict {
+                    return None;
+                }
+                if bound.is_none() {
+                    if let Some(declared) = proxy_parser::placeholder_adapter_type(block) {
+                        bound = Some((
+                            unavailable_placeholder(name, &e.to_string(), declared),
+                            true,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    bound.map(|(_, placeholder)| placeholder)
+}
+
+/// Whether a `proxy-groups:` declaration named `name` lands in the
+/// lenient build — mirroring [`proxy_parser::parse_proxy_group_inner`]'s
+/// kept-verdict without fabricating provider objects: the group survives
+/// when at least one static member or provider slot resolves and its
+/// type-specific gates pass. Member names resolve against the set the
+/// build's map carries at group-parse time — the transports (built-ins),
+/// every landed leaf, and every group that already landed — settled by
+/// the same multi-pass structure `build_config` uses, not a plain
+/// fixpoint, so a late landing does not rescue an earlier deferred
+/// dependency (Codex review).
+///
+/// `cache_dir` must be the provider-cache directory the rebuild would
+/// use: it feeds [`declared_provider_buildable`]'s safe-path mirror, and
+/// that constructor's canonicalize touches the filesystem — keep this
+/// off the raw write guard and off the async lane.
+fn declared_group_lands(name: &str, raw: &raw::RawConfig, cache_dir: Option<&Path>) -> bool {
+    let Some(groups) = raw.proxy_groups.as_ref() else {
+        return false;
+    };
+    let strict = raw.strict.unwrap_or(false);
+    let mut resolvable: std::collections::HashSet<&str> =
+        BUILTIN_ADAPTER_NAMES.iter().copied().collect();
+    let mut landed_leaves = 0usize;
+    let mut seen = std::collections::HashSet::new();
+    for block in raw.proxies.as_deref().unwrap_or(&[]) {
+        let Some(n) = block.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !seen.insert(n) {
+            continue;
+        }
+        // Placeholder-bound names resolve as members too — they occupy
+        // the built map's slot exactly like a live adapter.
+        if declared_leaf_binding(n, raw).is_some() {
+            resolvable.insert(n);
+            landed_leaves += 1;
+        }
+    }
+    // Only a provider that would construct supplies member slots —
+    // `materialize_proxy_providers` warn-drops a def that fails
+    // `ProxyProvider::new_with_client_fingerprint` (an `http` provider
+    // without `url`, a `file` one without `path` or whose `path` escapes
+    // the cache dir, an unknown `type`), and the real build wires slots
+    // from its materialized map, not the declared one (Codex review:
+    // declared membership counted slots the construction drops).
+    let providers: std::collections::HashSet<&str> = raw
+        .proxy_providers
+        .as_ref()
+        .map(|defs| {
+            defs.iter()
+                .filter(|(name, def)| declared_provider_buildable(name, def, raw, cache_dir))
+                .map(|(name, _)| name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let declared: std::collections::HashSet<&str> =
+        groups.iter().map(|g| g.name.as_str()).collect();
+    let mut landed: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    // Mirror the build's multi-pass settle (`build_config`'s group loop):
+    // a group whose `proxies:` member names a declared-but-unlanded group
+    // is deferred to a later pass — a member resolves only once its group
+    // landed in an earlier pass. When a pass lands nothing, the build
+    // makes one final lenient pass over what is left, in declaration
+    // order and without revisiting — so a group landing late in that
+    // pass does NOT rescue an earlier group's dependency on it. A plain
+    // fixpoint would revisit and admit it, letting a forced commit claim
+    // a `dialer-proxy` target the next boot drops (Codex review).
+    let mut remaining: Vec<&raw::RawProxyGroup> = groups.iter().collect();
+    loop {
+        let mut still = Vec::new();
+        let mut progress = false;
+        for g in remaining {
+            let dep_pending = g
+                .proxies
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|m| declared.contains(m.as_str()) && !landed.contains(m.as_str()));
+            if dep_pending {
+                still.push(g);
+                continue;
+            }
+            if declared_group_would_land(g, &resolvable, &providers, landed_leaves, strict) {
+                landed.insert(g.name.as_str());
+                resolvable.insert(g.name.as_str());
+                progress = true;
+            } else {
+                still.push(g);
+            }
+        }
+        if still.is_empty() {
+            break;
+        }
+        if !progress {
+            for g in &still {
+                if declared_group_would_land(g, &resolvable, &providers, landed_leaves, strict) {
+                    landed.insert(g.name.as_str());
+                    resolvable.insert(g.name.as_str());
+                }
+            }
+            break;
+        }
+        remaining = still;
+    }
+    landed.contains(name)
+}
+
+/// Whether the declared `proxy-providers:` def would construct — the
+/// exact gate `materialize_proxy_providers` applies when it decides
+/// whether a name enters the built map (`use:`/`include-all` wire slots
+/// against that map). Runs the real constructor with a throwaway dialer
+/// registry and the same `ipv6`/`strict`/fingerprint resolution the
+/// rebuild applies — including safe-path containment, which reads the
+/// filesystem, so callers must stay off the write guard and dispatch to
+/// the blocking pool.
+fn declared_provider_buildable(
+    name: &str,
+    def: &raw::RawProxyProvider,
+    raw: &raw::RawConfig,
+    cache_dir: Option<&Path>,
+) -> bool {
+    proxy_provider::ProxyProvider::new_with_client_fingerprint(
+        name,
+        def,
+        cache_dir,
+        effective_ipv6(raw.ipv6),
+        raw.strict.unwrap_or(false),
+        meow_proxy::dialer::ProxyRegistry::default(),
+        raw.global_client_fingerprint.as_deref(),
+    )
+    .is_ok()
+}
+
+/// The kept-verdict of one group parse — see [`declared_group_lands`].
+/// `resolvable` is the member-name set the built map would hold at this
+/// point (transports + landed leaves + landed groups); `providers` the
+/// declared `proxy-providers:` names — a slot wires for every declared
+/// name `use:` references and for `include-all*` only while providers
+/// exist, matching the map lookups in `parse_proxy_group_inner`.
+fn declared_group_would_land(
+    g: &raw::RawProxyGroup,
+    resolvable: &std::collections::HashSet<&str>,
+    providers: &std::collections::HashSet<&str>,
+    landed_leaves: usize,
+    strict: bool,
+) -> bool {
+    if !declared_group_type_buildable(&g.group_type) {
+        return false;
+    }
+    // A bad group filter rejects the parse outright.
+    if crate::proxy_provider::GroupFilter::from_raw_group(g).is_err() {
+        return false;
+    }
+    let is_relay = g.group_type == "relay";
+    let proxy_names = g.proxies.as_deref().unwrap_or(&[]);
+    // `parse_proxy_group_inner` consults `use:` only when include-all
+    // supplies no provider slots: with `include-all`/`include-all-providers`
+    // set the slot list is every provider and `use:` is never iterated —
+    // an unknown name there cannot fail the parse even under `strict`.
+    let include_all_providers =
+        g.include_all.unwrap_or(false) || g.include_all_providers.unwrap_or(false);
+    // Under `strict` an unresolved static member (or a non-relay group's
+    // unknown `use:`) fails the parse — and the build it belongs to.
+    if strict {
+        if proxy_names.iter().any(|n| !resolvable.contains(n.as_str())) {
+            return false;
+        }
+        if !is_relay
+            && !include_all_providers
+            && g.use_providers
+                .as_deref()
+                .unwrap_or(&[])
+                .iter()
+                .any(|p| !providers.contains(p.as_str()))
+        {
+            return false;
+        }
+    }
+    let mut members = proxy_names
+        .iter()
+        .filter(|n| resolvable.contains(n.as_str()))
+        .count();
+    if g.include_all_proxies.unwrap_or(false) {
+        members += landed_leaves;
+    }
+    // Provider slots never supply relay members — a `use:` there is
+    // inert (issue #533) — so they count only for the other types.
+    let slots = if is_relay {
+        0
+    } else if include_all_providers {
+        providers.len()
+    } else {
+        let mut seen = std::collections::HashSet::new();
+        g.use_providers
+            .as_deref()
+            .unwrap_or(&[])
+            .iter()
+            .filter(|p| providers.contains(p.as_str()) && seen.insert(p.as_str()))
+            .count()
+    };
+    if members == 0 && slots == 0 {
+        return false;
+    }
+    match g.group_type.as_str() {
+        "load-balance" => proxy_parser::parse_lb_strategy(g.strategy.as_deref()).is_ok(),
+        // `proxies` is the only member source a relay parses — it
+        // hard-errors below 2 members.
+        "relay" => members >= 2,
+        _ => true,
+    }
+}
+
+/// The `proxy-groups:` `type:` spellings the group builder dispatches
+/// on — anything else fails the parse before membership is read.
+fn declared_group_type_buildable(group_type: &str) -> bool {
+    matches!(
+        group_type,
+        "select" | "url-test" | "fallback" | "load-balance" | "relay"
+    )
+}
+
+fn check_ntp_dialer_target_impl(
+    cfg: &NtpConfig,
+    target_exists: impl Fn(&str) -> bool,
+) -> Result<(), anyhow::Error> {
+    if !cfg.enable {
+        return Ok(());
+    }
+    if let Some(name) = &cfg.dialer_proxy {
+        // REJECT/REJECT-DROP/PASS/PASS-RULE sit in the built map but are
+        // match-engine signals, not transports — they can never carry the
+        // exchange on either lane.
+        anyhow::ensure!(
+            !matches!(
+                name.as_str(),
+                "REJECT" | "REJECT-DROP" | "PASS" | "PASS-RULE"
+            ),
+            "ntp.dialer-proxy '{name}': non-transport built-ins cannot carry \
+             the exchange — name a built proxy/group, DIRECT, COMPATIBLE, \
+             or GLOBAL"
+        );
+        anyhow::ensure!(
+            target_exists(name.as_str()),
+            "ntp.dialer-proxy '{name}': no such top-level proxy or group — \
+             name a built proxy/group or DIRECT (provider-member and \
+             built-in non-dialer names are not valid targets)"
+        );
+    }
+    Ok(())
+}
+
+/// Resolve `keep-alive-idle`/`keep-alive-interval`/`disable-keep-alive`
+/// — mihomo's keepalive knobs, scoped here to *outbound* dials (the
+/// inbound side stays with `tcp-keepalive*` / [`resolve_tcp_keepalive`],
+/// an independence upstream's shared keys did not have) — into the
+/// [`meow_common::OutboundTcpKeepalive`] `connect_tcp` snapshots once per
+/// dial. Omitted or `0` timings resolve to the 15 s upstream default;
+/// `disable-keep-alive` defaults to `false`. Timing bounds hold at
+/// 0–32767 s even when disabled, like `tcp-keepalive*` — Linux EINVALs
+/// `TCP_KEEPIDLE`/`TCP_KEEPINTVL` above it. Negative values never reach
+/// here: the `u64` raw fields already failed serde.
+///
+/// `PUT`/`PATCH /configs` gate persistence on this resolver so a
+/// committed document cannot fail the next boot's `build_config`; the
+/// install itself happens at the caller's commit point, not here.
+pub fn resolve_outbound_tcp_keepalive(
+    raw: &raw::RawConfig,
+) -> Result<meow_common::OutboundTcpKeepalive, anyhow::Error> {
+    let bound = |key: &str, value: Option<u64>| -> Result<u64, anyhow::Error> {
+        match value {
+            None | Some(0) => Ok(meow_common::tcp_opts::DEFAULT_OUTBOUND_KEEPALIVE_SECS),
+            Some(secs) if secs > meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS => {
+                anyhow::bail!(
+                    "{key}: {secs}s exceeds the {}s ceiling",
+                    meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS
+                )
+            }
+            Some(secs) => Ok(secs),
+        }
+    };
+    Ok(meow_common::OutboundTcpKeepalive {
+        enabled: !raw.disable_keep_alive.unwrap_or(false),
+        idle: std::time::Duration::from_secs(bound("keep-alive-idle", raw.keep_alive_idle)?),
+        interval: std::time::Duration::from_secs(bound(
+            "keep-alive-interval",
+            raw.keep_alive_interval,
+        )?),
+        probes: meow_common::tcp_opts::OUTBOUND_KEEPALIVE_PROBES,
+    })
 }
 
 /// `lan-allowed-ips`/`lan-disallowed-ips` nested under a `listeners:`
@@ -6368,22 +6926,50 @@ async fn build_config_inner(
     mut raw: raw::RawConfig,
     cache_dir: Option<&Path>,
 ) -> Result<Config, anyhow::Error> {
-    // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
-    // sync `parse_proxy` path that follows can stay sync. Failures warn
-    // and leave the map unchanged — except the `enable: true` with no
-    // query-source defect, which `strict` promotes to an error.
-    if let Some(ps) = raw.proxies.as_mut() {
-        ech_dns::preresolve_ech(ps, raw.strict.unwrap_or(false))
-            .await
-            .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
-    }
-
-    // Geodata config — parse and validate early so path errors surface before
-    // anything tries to load the DBs. `geox-url` is the mihomo top-level
-    // alias, merged per-key under the explicit `geodata.url.*` values.
+    // Local shape/range gates BEFORE any candidate network work (issue
+    // #974): a defect in `ntp:`/`keep-alive-*`/`tcp-*`/`listeners:`/`tun:`
+    // must reject the document without the ECH pre-resolution or provider
+    // fetches below ever opening a socket. The resolvers are pure over
+    // `raw` — nothing they read is mutated by the passes that follow.
+    let ntp_resolved_for_config = resolve_ntp(&raw)?;
+    // `tcp-idle-timeout` — resolution and validation live in
+    // [`resolve_tcp_idle_timeout`], which `PUT /configs` also gates
+    // persistence and hot-apply on so a committed document cannot fail
+    // this boot path.
+    let tcp_idle_timeout = resolve_tcp_idle_timeout(&raw)?;
+    // `tcp-keepalive*` — the keepalive posture every inbound listener
+    // applies to accepted sockets. Resolution and validation live in
+    // [`resolve_tcp_keepalive`], which `PUT /configs` also gates
+    // persistence on so a committed document cannot fail this boot path.
+    let tcp_keepalive = resolve_tcp_keepalive(&raw)?;
+    // `keep-alive-*` — the keepalive posture `connect_tcp` applies to
+    // outbound dials. Validated here (and on `-t`) so a bad value fails
+    // admission; the process-global install belongs to the launcher's
+    // commit point — a candidate build must never mutate live policy.
+    let _ = resolve_outbound_tcp_keepalive(&raw)?;
+    // `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound TCP ACL.
+    // Startup-only like `listeners:` (upstream live-patches the prefix
+    // lists; meow deliberately matches its listener-auth lifecycle).
+    let lan_acl = Arc::new(resolve_lan_acl(&raw)?);
+    // The `listeners:` shape: duplicate names/ports, `rule:`/`proxy:`
+    // declaration checks, the one-TUN gates — all document-local.
+    let (bind_addr, global_tproxy_sni) = listener_bind_inputs(&raw);
+    let named_listeners = build_named_listeners(&raw, &bind_addr, global_tproxy_sni)?;
+    // TUN inbound (issue #326) — parses `tun:`/`sniffer:` off raw only.
+    let tun = parse_tun_config(raw.tun.as_ref(), raw.max_connections, raw.fake_ip_range())?;
+    let sniffer = parse_sniffer_config(&raw, raw.strict.unwrap_or(false))?;
+    let auth = Arc::new(
+        auth::parse_auth_config(
+            raw.authentication.as_deref(),
+            raw.skip_auth_prefixes.as_deref(),
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?,
+    );
+    // Geodata config — `geox-url` is the mihomo top-level alias, merged
+    // per-key under the explicit `geodata.url.*` values.
     let geodata = geodata::parse_geodata(&raw)?;
-
-    // General config
+    // `mode` is a shape check too — under `strict` an unknown value
+    // hard-fails.
     let mode = match raw.mode.as_deref().unwrap_or("rule").parse::<TunnelMode>() {
         Ok(m) => m,
         Err(e) if raw.strict.unwrap_or(false) => {
@@ -6394,6 +6980,26 @@ async fn build_config_inner(
             TunnelMode::Rule
         }
     };
+
+    // `smux:`/`mux:` blocks on the static leaves are the last local
+    // shape check: a malformed one must reject here, before the ECH
+    // pre-resolution below opens sockets (issue #974 review). The gate
+    // mirrors the parse's strictness — the rejection it orders ahead of
+    // the socket work is the strict one; lenient mode warn-drops the
+    // node in the real parse below instead.
+    proxy_parser::check_mux_shape(&raw, raw.strict.unwrap_or(false))
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Pre-resolve any DNS-sourced ECH configs into inline base64 so the
+    // sync `parse_proxy` path that follows can stay sync. Failures warn
+    // and leave the map unchanged — except the `enable: true` with no
+    // query-source defect, which `strict` promotes to an error.
+    if let Some(ps) = raw.proxies.as_mut() {
+        ech_dns::preresolve_ech(ps, raw.strict.unwrap_or(false))
+            .await
+            .map_err(|e| anyhow::anyhow!("{e} (strict mode)"))?;
+    }
+
+    // General config
     let log_level = raw.log_level.clone().unwrap_or_else(|| "info".to_string());
     // mihomo (and Clash Verge output) use `bind-address: '*'` as the
     // all-interfaces wildcard; normalize it here so listeners never see the
@@ -6404,12 +7010,6 @@ async fn build_config_inner(
         Some("*" | "") => "0.0.0.0".to_string(),
         Some(addr) => addr.to_string(),
     };
-
-    // `tcp-idle-timeout` — resolution and validation live in
-    // [`resolve_tcp_idle_timeout`], which `PUT /configs` also gates
-    // persistence and hot-apply on so a committed document cannot fail
-    // this boot path.
-    let tcp_idle_timeout = resolve_tcp_idle_timeout(&raw)?;
 
     let general = GeneralConfig {
         mode,
@@ -6475,17 +7075,29 @@ async fn build_config_inner(
     // Open the persistent selector store (one JSON file in cache_dir).
     // Missing/unreadable files yield an empty store — no fatal errors.
     let cache_dir_buf = cache_dir.map(Path::to_path_buf);
-    let selector_store = match cache_dir_buf.as_ref() {
-        Some(d) => Some(open_selector_store_async(d.join("selector-cache.json")).await?),
-        None => None,
-    };
+    // The config-scoped selection-persistence owner: the file-backed
+    // store opens lazily for an enabled `profile.store-selected` only —
+    // a disabled profile never touches disk, and `-t` validation never
+    // reaches this point's fs work at all (issue #974).
+    let selection_backing = std::sync::Arc::new(meow_proxy::SelectionBacking::new(
+        cache_dir_buf
+            .as_ref()
+            .map(|d| d.join("selector-cache.json")),
+    ));
+    let resolved_profile = resolve_profile(&raw);
+    if !is_offline_validate() {
+        selection_backing
+            .prepare(resolved_profile.store_selected)
+            .await;
+    }
+    let selector_writer = selection_backing.attach(resolved_profile.store_selected);
 
     // One shared pre-registry proxy layer for the two startup fetches that
     // can ride a proxy (rule-provider prefetch + geodata download). Built
     // only when at least one of them could need it — a full layer costs an
     // adapter construction per `proxies:` entry (issue #533).
     let prefetch_proxies = if prefetch_proxy_layer_needed(&raw, &geodata) {
-        prefetch_proxy_layer_async(&raw, &proxy_providers, selector_store.as_ref()).await?
+        prefetch_proxy_layer_async(&raw, &proxy_providers, selector_writer.as_ref()).await?
     } else {
         None
     };
@@ -6536,7 +7148,7 @@ async fn build_config_inner(
             cache_dir_buf.clone(),
             None,
             proxy_providers.clone(),
-            selector_store.clone(),
+            selector_writer.clone(),
             ctx.clone(),
             Arc::clone(&provider_payloads),
             dialer_registry.clone(),
@@ -6594,7 +7206,7 @@ async fn build_config_inner(
             cache_dir_buf.clone(),
             Some(Arc::clone(&dns_config.resolver_slot)),
             proxy_providers.clone(),
-            selector_store.clone(),
+            selector_writer.clone(),
             ctx.clone(),
             Arc::clone(&provider_payloads),
             dialer_registry.clone(),
@@ -6608,23 +7220,9 @@ async fn build_config_inner(
         (res.proxies, res.rules, res.sub_rules, res.dialer_registry)
     };
 
-    // Listener config
-    let (bind_addr, global_tproxy_sni) = listener_bind_inputs(&raw);
-
-    // Build the named-listener list, checking for duplicate ports/names.
-    let named_listeners = build_named_listeners(&raw, &bind_addr, global_tproxy_sni)?;
-
-    // `tcp-keepalive*` — the keepalive posture every inbound listener
-    // applies to accepted sockets. Resolution and validation live in
-    // [`resolve_tcp_keepalive`], which `PUT /configs` also gates
-    // persistence on so a committed document cannot fail this boot path.
-    let tcp_keepalive = resolve_tcp_keepalive(&raw)?;
-
-    // `lan-allowed-ips`/`lan-disallowed-ips` — the shared inbound TCP ACL.
-    // Startup-only like `listeners:` (upstream live-patches the prefix
-    // lists; meow deliberately matches its listener-auth lifecycle).
-    let lan_acl = Arc::new(resolve_lan_acl(&raw)?);
-
+    // Listener config — `named_listeners`, `tcp_keepalive` and `lan_acl`
+    // resolved in the local-gates block above, before the ECH/provider
+    // network passes (issue #974).
     let listeners = ListenerConfig {
         mixed_port: raw.mixed_port,
         socks_port: raw.socks_port,
@@ -6641,9 +7239,6 @@ async fn build_config_inner(
         lan_acl,
         named: named_listeners,
     };
-
-    // TUN inbound (issue #326).
-    let tun = parse_tun_config(raw.tun.as_ref(), raw.max_connections, raw.fake_ip_range())?;
 
     // API config
     let external_ui = raw
@@ -6672,23 +7267,18 @@ async fn build_config_inner(
             .map(String::from),
     };
 
-    // Sniffer config — also handles deprecated `tproxy_sni` alias.
-    let sniffer = parse_sniffer_config(&raw, raw.strict.unwrap_or(false))?;
-
-    // Auth config.
-    let auth = auth::parse_auth_config(
-        raw.authentication.as_deref(),
-        raw.skip_auth_prefixes.as_deref(),
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let auth = Arc::new(auth);
-
     info!(
         "Config loaded: mode={}, proxies={}, rules={}",
         mode,
         proxies.len(),
         rules.len()
     );
+
+    // Startup's route commit for the selection epoch: writers this build
+    // attached priced the pending enable transition, so publishing the
+    // resolved flag here is what un-fences them. A `-t` validation runs
+    // the same no-op on a throwaway backing — memory only, no fs.
+    selection_backing.commit(resolved_profile.store_selected);
 
     Ok(Config {
         general,
@@ -6701,6 +7291,8 @@ async fn build_config_inner(
         rule_providers,
         dropped_providers,
         dialer_registry,
+        selection: selection_backing,
+        ntp: ntp_resolved_for_config,
         listeners,
         tun,
         api,
@@ -7314,7 +7906,8 @@ mod dialer_proxy_tests {
         let dir = tempfile::tempdir().unwrap();
         let store = meow_proxy::SelectorStore::open(dir.path().join("sel.json"));
         store.set("G", "B2");
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&store))
+        let writer = meow_proxy::SelectorWriter::standalone(store);
+        let layer = prefetch_proxy_map(&raw, &providers, Some(&writer))
             .expect("layer builds")
             .expect("proxies configured");
         let geo = geodata::parse_geodata(&raw).unwrap();
@@ -7340,7 +7933,8 @@ mod dialer_proxy_tests {
         // A fresh store → the group falls back to its first member.
         let empty_dir = tempfile::tempdir().unwrap();
         let empty_store = meow_proxy::SelectorStore::open(empty_dir.path().join("sel.json"));
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_store))
+        let empty_writer = meow_proxy::SelectorWriter::standalone(empty_store);
+        let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_writer))
             .expect("layer builds")
             .expect("proxies configured");
         let geo = geodata::parse_geodata(&raw).unwrap();
@@ -8522,8 +9116,15 @@ rules:
              \x20 - name: front\n    type: direct\n",
         )
         .unwrap();
-        let result = rebuild_from_raw_with_resolver(&raw, Some(&slot), None, &HashMap::new(), None)
-            .expect("direct chain builds");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            Some(&slot),
+            None,
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("direct chain builds");
 
         let metadata = meow_common::Metadata {
             network: meow_common::Network::Tcp,
@@ -9175,6 +9776,7 @@ mod geoip_context_tests {
                 &HashMap::new(),
                 None,
                 &meow_proxy::dialer::ProxyRegistry::default(),
+                &meow_proxy::SelectionBacking::unpersisted(),
             )
         })
         .await
@@ -9918,11 +10520,15 @@ rules:
 
         // `rebuild_from_raw_with_resolver` — used by geodata_fetch's
         // rules-only rebuilds.
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect(
-                    "trusted rebuild with the real cache dir must not hard-fail on a file provider",
-                );
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("trusted rebuild with the real cache dir must not hard-fail on a file provider");
         assert_eq!(result.rules.len(), 2);
 
         // `rebuild_from_raw_runtime` — used by meow-api's `PUT /configs`
@@ -9933,6 +10539,7 @@ rules:
             &HashMap::new(),
             Some(dir.path()),
             &Default::default(),
+            &meow_proxy::SelectionBacking::unpersisted(),
         )
         .expect(
             "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
@@ -9973,9 +10580,15 @@ rules:
             parking_lot::RwLock::new(HashMap::new());
 
         // Commit path: swap the returned set in after validation succeeds.
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("rebuild ok");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("rebuild ok");
         *live.write() = result.rule_providers;
         assert!(live.read().contains_key("ads"));
 
@@ -9988,6 +10601,7 @@ rules:
             Some(dir.path()),
             &HashMap::new(),
             None,
+            &meow_proxy::SelectionBacking::unpersisted(),
         )
         .expect("rebuild ok");
         *live.write() = result.rule_providers;
@@ -9999,9 +10613,15 @@ rules:
             "rule-providers:\n  ads:\n    type: file\n    behavior: domain\n    format: yaml\n    path: ads.yaml\nrules:\n  - RULE-SET,ads,REJECT\n  - \"MATCH,DIRECT\"\n",
         )
         .unwrap();
-        let result =
-            rebuild_from_raw_with_resolver(&raw_ok, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("rebuild ok");
+        let result = rebuild_from_raw_with_resolver(
+            &raw_ok,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("rebuild ok");
         *live.write() = result.rule_providers;
         let raw_bad: raw::RawConfig =
             serde_saphyr::from_str("rules:\n  - SUB-RULE,(MATCH,DIRECT),missing\n").unwrap();
@@ -10010,7 +10630,8 @@ rules:
             None,
             Some(dir.path()),
             &HashMap::new(),
-            None
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
         )
         .is_err());
         assert!(
@@ -10632,9 +11253,15 @@ rules:
 "#;
         let raw = raw_config(yaml);
         // Empty live map — the declaration itself must authorize `use:`.
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("strict must accept use: of a candidate-declared provider");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("strict must accept use: of a candidate-declared provider");
         assert!(result.proxies.contains_key("g"));
         assert!(result.proxy_providers.contains_key("airport"));
     }
@@ -10662,15 +11289,29 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let Err(err) = rebuild_from_raw_with_resolver(&raw, None, None, &live, None) else {
+        let Err(err) = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            None,
+            &live,
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        ) else {
             panic!("use: of a removed provider must fail strict");
         };
         assert!(err.to_string().contains("airport"), "unexpected: {err}");
 
         // Lenient keeps the group — the zombie Arc is not consulted.
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
-        let result = rebuild_from_raw_with_resolver(&raw, None, None, &live, None)
-            .expect("lenient mode must tolerate the removal");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            None,
+            &live,
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("lenient mode must tolerate the removal");
         assert!(result.proxies.contains_key("g"));
         assert!(
             result.proxy_providers.is_empty(),
@@ -10720,8 +11361,15 @@ rules:
 "#
             );
             let raw = raw_config(&yaml);
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .unwrap_or_else(|e| panic!("strict must ignore inert use: under {flag}: {e}"));
+            rebuild_from_raw_with_resolver(
+                &raw,
+                None,
+                Some(dir.path()),
+                &HashMap::new(),
+                None,
+                &meow_proxy::SelectionBacking::unpersisted(),
+            )
+            .unwrap_or_else(|e| panic!("strict must ignore inert use: under {flag}: {e}"));
         }
     }
 
@@ -10763,9 +11411,15 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("strict must keep an unreadable provider as a known-empty set");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("strict must keep an unreadable provider as a known-empty set");
         assert!(result.rule_providers.contains_key("remote"));
         assert_eq!(
             result.rules.len(),
@@ -10794,9 +11448,14 @@ rule-providers:
     url: 'not a url'
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let Err(err) =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-        else {
+        let Err(err) = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        ) else {
             panic!("strict must reject an unparseable provider url");
         };
         assert!(err.to_string().contains("url"), "unexpected: {err}");
@@ -10804,8 +11463,15 @@ rule-providers:
         // Lenient keeps the acquisition-failure contract: the bad URL is a
         // fetch-time error → empty registered provider.
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
-        rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-            .expect("lenient registers an empty provider on bad url");
+        rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("lenient registers an empty provider on bad url");
     }
 
     /// A bad `format:` is a DEFECT in the definition, not an acquisition
@@ -10826,9 +11492,14 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        let Err(err) =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-        else {
+        let Err(err) = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        ) else {
             panic!("a bogus format: is a defect — strict must reject");
         };
         assert!(err.to_string().contains("bad"), "unexpected: {err}");
@@ -10859,16 +11530,29 @@ rules:
   - "MATCH,DIRECT"
 "#;
         let raw = raw_config(&yaml.replace("{STRICT}", "true"));
-        if rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-            .is_ok()
+        if rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .is_ok()
         {
             panic!("strict must reject a non-string payload item");
         }
 
         let raw = raw_config(&yaml.replace("{STRICT}", "false"));
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, Some(dir.path()), &HashMap::new(), None)
-                .expect("lenient drops the non-string item and keeps the provider");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("lenient drops the non-string item and keeps the provider");
         assert!(result.rule_providers.contains_key("mixed"));
     }
 
@@ -11576,9 +12260,15 @@ mod dns_provider_sharing_tests {
             rule_provider::test_provider("p", rule_provider::ProviderType::Http, 0),
         );
 
-        let result =
-            rebuild_from_raw_with_resolver(&raw, None, None, &HashMap::new(), Some(shared))
-                .expect("a shared rebuild must not need the network");
+        let result = rebuild_from_raw_with_resolver(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            Some(shared),
+            &meow_proxy::SelectionBacking::unpersisted(),
+        )
+        .expect("a shared rebuild must not need the network");
         // Any would-be fetch attempt gets a beat to reach the listener.
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         assert_eq!(

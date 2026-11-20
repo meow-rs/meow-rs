@@ -1450,6 +1450,45 @@ proxies:
     assert!(!config.proxies.contains_key("trojan-scalar-mux"));
 }
 
+/// `strict: true` promotes the bad-`smux:` node defect to a document
+/// error — `check_mux_shape` gates it before the ECH pre-resolution
+/// opens sockets, so the load fails on the shape check itself.
+#[tokio::test]
+async fn test_proxy_parsing_strict_rejects_bad_mux_block() {
+    for yaml in [
+        r#"
+strict: true
+proxies:
+  - name: "trojan-bad-mux"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    smux:
+      enabled: "true"
+"#,
+        r#"
+strict: true
+proxies:
+  - name: "trojan-scalar-mux"
+    type: trojan
+    server: "example.com"
+    port: 443
+    password: "password123"
+    smux: true
+"#,
+    ] {
+        let err = load_config_from_str(yaml)
+            .await
+            .err()
+            .expect("strict mode must reject a malformed smux block");
+        assert!(
+            err.to_string().contains("mux"),
+            "the error must name the mux defect, got: {err}"
+        );
+    }
+}
+
 #[cfg(feature = "mux")]
 #[tokio::test]
 async fn test_proxy_parsing_trojan_mux_h2mux_accepted() {
@@ -3608,33 +3647,79 @@ async fn test_tcp_keepalive_disabled_still_rejects_invalid() {
     }
 }
 
-/// Upstream mihomo's `keep-alive-*` keys (which tune inbound listeners
-/// AND outbound dials there) are captured and warned (never honored),
-/// not silently dropped: they must land in the `RawConfig` capture
-/// fields AND not fail the load.
+/// Upstream mihomo's `keep-alive-*` keys tune the OUTBOUND side here
+/// (`tcp-keepalive*` keeps the inbound side) — typed fields resolving
+/// into the `OutboundTcpKeepalive` snapshot, never silently dropped.
 #[tokio::test]
-async fn test_upstream_keepalive_keys_warn_but_parse() {
+async fn test_upstream_keepalive_keys_resolve_outbound() {
     let yaml = r#"
 keep-alive-idle: 15
 keep-alive-interval: 30
 disable-keep-alive: false
 mixed-port: 7890
 "#;
-    // The keys must be captured, not dropped as unknown fields — a
-    // misnamed serde field would leave `keep-alive-idle` silently
-    // ignored while this test's load assertions still pass.
+    // The keys must be captured as typed fields — a misnamed serde field
+    // would leave `keep-alive-idle` silently ignored while the load
+    // assertions below still pass.
     let raw = meow_config::parse_raw_yaml(yaml).unwrap();
-    assert!(raw.keep_alive_idle.is_some());
-    assert!(raw.keep_alive_interval.is_some());
-    assert!(raw.disable_keep_alive.is_some());
+    assert_eq!(raw.keep_alive_idle, Some(15));
+    assert_eq!(raw.keep_alive_interval, Some(30));
+    assert_eq!(raw.disable_keep_alive, Some(false));
+
+    let outbound = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert!(outbound.enabled);
+    assert_eq!(outbound.idle, std::time::Duration::from_secs(15));
+    assert_eq!(outbound.interval, std::time::Duration::from_secs(30));
+    assert_eq!(outbound.probes, 9);
 
     let config = load_config_from_str(yaml).await.unwrap();
-    // Ignored upstream keys never reach the resolved inbound posture.
+    // The independent inbound posture is untouched by outbound knobs.
     let ka = config.listeners.tcp_keepalive;
     assert!(ka.enabled);
     assert_eq!(ka.idle, std::time::Duration::from_secs(300));
     assert_eq!(ka.interval, std::time::Duration::from_secs(30));
     assert_eq!(ka.probes, 5);
+}
+
+/// Omitted and explicit-0 keepalive timings resolve to the 15 s upstream
+/// default; `disable-keep-alive` defaults to enabled policy.
+#[test]
+fn test_outbound_keepalive_defaults() {
+    let raw = meow_config::parse_raw_yaml("mixed-port: 7890\n").unwrap();
+    let ka = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert_eq!(ka, meow_common::OutboundTcpKeepalive::default());
+
+    let raw = meow_config::parse_raw_yaml("keep-alive-idle: 0\nkeep-alive-interval: 0\n").unwrap();
+    let ka = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert_eq!(ka, meow_common::OutboundTcpKeepalive::default());
+}
+
+/// Timing bounds hold at 0–32767 s even while disabled; a negative value
+/// fails the typed field's serde before resolution.
+#[test]
+fn test_outbound_keepalive_bounds() {
+    let err = meow_config::parse_raw_yaml("keep-alive-idle: 32768\n")
+        .ok()
+        .and_then(|raw| meow_config::resolve_outbound_tcp_keepalive(&raw).err())
+        .expect("32768 must fail the 32767 s ceiling");
+    assert!(err.to_string().contains("keep-alive-idle"), "{err}");
+
+    assert!(
+        meow_config::parse_raw_yaml("keep-alive-interval: -5\n").is_err(),
+        "a negative interval must fail the typed field's serde"
+    );
+
+    // Disabled keeps the timing bounds — a disabled-but-invalid knob is
+    // still rejected rather than committed.
+    let err = meow_config::parse_raw_yaml("disable-keep-alive: true\nkeep-alive-idle: 40000\n")
+        .ok()
+        .and_then(|raw| meow_config::resolve_outbound_tcp_keepalive(&raw).err())
+        .expect("an out-of-range idle must fail even when disabled");
+    assert!(err.to_string().contains("keep-alive-idle"), "{err}");
+
+    let raw = meow_config::parse_raw_yaml("disable-keep-alive: true\n").unwrap();
+    let ka = meow_config::resolve_outbound_tcp_keepalive(&raw).unwrap();
+    assert!(!ka.enabled);
 }
 
 /// `redir-port` is mihomo's REDIRECT inbound — meow's tproxy
@@ -3784,17 +3869,11 @@ mod unknown_key_warns {
         let (_config, logs) = load_and_capture_warns(
             r#"
 brutal-delay: 1
-ntp:
-  enable: true
 tcp-idl-timeout: 5
 "#,
         );
         assert!(
             logs.contains("unsupported key in top-level config: brutal-delay"),
-            "got: {logs}"
-        );
-        assert!(
-            logs.contains("unsupported key in top-level config: ntp (issue #974)"),
             "got: {logs}"
         );
         assert!(
@@ -4391,7 +4470,10 @@ strict-bogus-key: 1
             "max-connections",
             "mixed-port",
             "mode",
+            // Typed `ntp:`/`profile:` sections (issue #974) — deliberate.
+            "ntp",
             "port",
+            "profile",
             "proxies",
             "proxy-groups",
             "proxy-providers",
@@ -4488,5 +4570,476 @@ proxies:
         let err = meow_config::parse_raw_yaml("x-tpl: {~: v}\n")
             .expect_err("a null mapping key must still fail");
         assert!(err.to_string().contains("null"), "got: {err}");
+    }
+}
+
+/// `resolve_profile` — `profile.store-fake-ip` outranks
+/// `dns.store-fake-ip`, which outranks the `false` default; plus
+/// upstream's `store-selected: true` default and the typed-shape
+/// contract (`profile:` must be a mapping, flags booleans when
+/// non-null) — issue #974.
+#[test]
+fn test_resolve_profile_matrix() {
+    // Omitted everything → upstream defaults.
+    let raw = meow_config::parse_raw_yaml("mode: rule\n").unwrap();
+    let p = meow_config::resolve_profile(&raw);
+    assert!(p.store_selected);
+    assert!(!p.store_fake_ip);
+
+    // Explicit profile values win over dns and defaults.
+    let raw = meow_config::parse_raw_yaml(
+        "profile:\n  store-selected: false\n  store-fake-ip: true\ndns:\n  store-fake-ip: false\n",
+    )
+    .unwrap();
+    let p = meow_config::resolve_profile(&raw);
+    assert!(!p.store_selected);
+    assert!(p.store_fake_ip, "profile.store-fake-ip outranks dns'");
+
+    // The alias carries over when profile omits the key — including an
+    // explicit `store-fake-ip: false` in dns (false is a value, not a
+    // fallthrough).
+    let raw = meow_config::parse_raw_yaml(
+        "profile:\n  store-selected: true\ndns:\n  store-fake-ip: true\n",
+    )
+    .unwrap();
+    assert!(meow_config::resolve_profile(&raw).store_fake_ip);
+    let raw = meow_config::parse_raw_yaml("dns:\n  store-fake-ip: false\n").unwrap();
+    assert!(!meow_config::resolve_profile(&raw).store_fake_ip);
+
+    // `null` falls through to the next source; a `null` profile section
+    // resolves like an absent one.
+    let raw =
+        meow_config::parse_raw_yaml("profile:\n  store-fake-ip: ~\ndns:\n  store-fake-ip: true\n")
+            .unwrap();
+    assert!(
+        meow_config::resolve_profile(&raw).store_fake_ip,
+        "null falls through to the dns spelling"
+    );
+    let raw = meow_config::parse_raw_yaml("profile: ~\n").unwrap();
+    let p = meow_config::resolve_profile(&raw);
+    assert!(p.store_selected && !p.store_fake_ip);
+
+    // Typed shape: non-bool flags and a non-mapping section are hard
+    // failures, not warn-and-ignore.
+    for doc in [
+        "profile: {store-selected: 5}\n",
+        "profile: {store-fake-ip: yes-but-no}\n",
+        "profile: 3\n",
+    ] {
+        assert!(
+            meow_config::parse_raw_yaml(doc).is_err(),
+            "must fail raw parse: {doc:?}"
+        );
+    }
+
+    // Unmodeled children survive into `extra` for the scoped warning —
+    // `selected`/`tracing` must NOT be silently accepted as config.
+    let raw = meow_config::parse_raw_yaml(
+        "profile:\n  store-selected: false\n  selected: {G: X}\n  tracing: true\n",
+    )
+    .unwrap();
+    let profile = raw.profile.as_ref().unwrap();
+    assert!(profile.extra.contains_key("selected"));
+    assert!(profile.extra.contains_key("tracing"));
+}
+
+/// `resolve_ntp` — upstream defaults, the disabled-section range
+/// checks, server-shape rules, and `write-to-system` compatibility
+/// (issue #974).
+mod ntp_resolution {
+
+    fn resolve(yaml: &str) -> Result<meow_config::NtpConfig, anyhow::Error> {
+        let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+        meow_config::resolve_ntp(&raw)
+    }
+
+    #[test]
+    fn defaults_apply_when_absent_or_partial() {
+        let c = resolve("{}").unwrap();
+        assert!(!c.enable);
+        assert_eq!(c.server, "time.apple.com");
+        assert_eq!(c.port, 123);
+        assert_eq!(c.interval_minutes, 30);
+        assert_eq!(c.dialer_proxy, None);
+
+        let c = resolve("ntp:\n  enable: true\n").unwrap();
+        assert!(c.enable);
+        assert_eq!(c.server, "time.apple.com");
+        assert_eq!(c.port, 123);
+        assert_eq!(c.interval_minutes, 30);
+    }
+
+    #[test]
+    fn explicit_values_and_direct_spelling() {
+        let c = resolve(
+            "ntp:\n  enable: true\n  server: pool.ntp.org\n  port: 1123\n  interval: 60\n  dialer-proxy: DIRECT\n",
+        )
+        .unwrap();
+        assert_eq!(c.server, "pool.ntp.org");
+        assert_eq!(c.port, 1123);
+        assert_eq!(c.interval_minutes, 60);
+        // `dialer-proxy: DIRECT` normalizes to the absent spelling — both
+        // resolve to the direct dial path, so the two spellings must
+        // compare equal or reconcile would restart an unchanged worker.
+        assert_eq!(c.dialer_proxy, None);
+        assert_eq!(
+            c,
+            resolve("ntp:\n  enable: true\n  server: pool.ntp.org\n  port: 1123\n  interval: 60\n")
+                .unwrap()
+        );
+    }
+
+    #[test]
+    fn dialer_proxy_matches_names_verbatim() {
+        // No trimming: `' DIRECT '` is not the DIRECT built-in — enabled,
+        // it must fail the named-target gate like any undeclared name.
+        let raw = meow_config::parse_raw_yaml("ntp:\n  enable: true\n  dialer-proxy: ' DIRECT '\n")
+            .unwrap();
+        let c = meow_config::resolve_ntp(&raw).unwrap();
+        assert_eq!(c.dialer_proxy.as_deref(), Some(" DIRECT "));
+        let e = meow_config::rebuild_from_raw(&raw)
+            .err()
+            .expect("a whitespace-padded name must not resolve to DIRECT");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
+    }
+
+    #[test]
+    fn server_shape_accepts_hosts_and_literals_rejects_compound() {
+        for good in ["1.2.3.4", "time.apple.com", "[2001:db8::1]", "2001:db8::1"] {
+            let y = format!("ntp:\n  server: '{good}'\n");
+            let c = resolve(&y).unwrap_or_else(|e| panic!("{good}: {e}"));
+            assert_eq!(c.server, good.trim_matches(|x| x == '[' || x == ']'));
+        }
+        for bad in [
+            "",
+            "bad host",
+            "host:123",
+            "udp://host",
+            "host/path",
+            "user@host",
+            "ntp://pool.ntp.org:123",
+            "ho\tst",
+        ] {
+            let y = format!("ntp:\n  server: '{bad}'\n");
+            assert!(resolve(&y).is_err(), "{bad} must fail");
+        }
+    }
+
+    #[test]
+    fn ranges_checked_even_when_disabled() {
+        assert!(resolve("ntp:\n  enable: false\n  port: 0\n").is_err());
+        assert!(resolve("ntp:\n  enable: false\n  interval: 0\n").is_err());
+        assert!(resolve("ntp:\n  enable: false\n  interval: 525601\n").is_err());
+        assert!(resolve("ntp:\n  enable: false\n  interval: 525600\n").is_ok());
+        assert!(resolve("ntp:\n  interval: 1\n").is_ok());
+    }
+
+    #[test]
+    fn write_to_system_resolves_but_stays_out_of_the_config() {
+        // The raw field parses; the resolved config has no such knob.
+        let c = resolve("ntp:\n  enable: true\n  write-to-system: true\n").unwrap();
+        assert!(c.enable);
+    }
+
+    /// An enabled `dialer-proxy` must name a transport: the
+    /// REJECT/REJECT-DROP/PASS/PASS-RULE built-ins sit in the proxy map
+    /// but are match-engine signals, so admission denies them by name.
+    /// DIRECT/COMPATIBLE dial direct and GLOBAL is a group — all valid.
+    #[test]
+    fn dialer_proxy_rejects_non_transport_builtins() {
+        for name in ["REJECT", "REJECT-DROP", "PASS", "PASS-RULE"] {
+            let raw = meow_config::parse_raw_yaml(&format!(
+                "ntp:\n  enable: true\n  dialer-proxy: {name}\n"
+            ))
+            .unwrap();
+            let e = meow_config::rebuild_from_raw(&raw)
+                .err()
+                .unwrap_or_else(|| panic!("{name} must fail admission"));
+            assert!(
+                e.to_string().contains("non-transport built-in"),
+                "{name}: unexpected error: {e}"
+            );
+        }
+        for name in ["DIRECT", "COMPATIBLE", "GLOBAL"] {
+            let raw = meow_config::parse_raw_yaml(&format!(
+                "ntp:\n  enable: true\n  dialer-proxy: {name}\n"
+            ))
+            .unwrap();
+            meow_config::rebuild_from_raw(&raw)
+                .unwrap_or_else(|e| panic!("{name} must pass admission: {e}"));
+        }
+        // A disabled section's dialer-proxy never reaches the gate.
+        let raw =
+            meow_config::parse_raw_yaml("ntp:\n  enable: false\n  dialer-proxy: REJECT\n").unwrap();
+        meow_config::rebuild_from_raw(&raw)
+            .expect("a disabled ntp section must not gate its dialer name");
+        // An undeclared name still fails the map check.
+        let raw =
+            meow_config::parse_raw_yaml("ntp:\n  enable: true\n  dialer-proxy: ghost\n").unwrap();
+        let e = meow_config::rebuild_from_raw(&raw)
+            .err()
+            .expect("ghost must fail");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
+    }
+
+    /// `check_ntp_dialer_target_declared` — the forced verbatim-commit
+    /// fallback must prove the name can enter the built map: a declared
+    /// node/group whose `type:` the build dispatch cannot construct is
+    /// dropped by the lenient build, so name-only presence is not enough
+    /// (Codex review: same-name unbuildable node bypass).
+    #[test]
+    fn declared_dialer_target_requires_a_buildable_type() {
+        let check = |yaml: &str| {
+            let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+            let ntp = meow_config::resolve_ntp(&raw).unwrap();
+            meow_config::check_ntp_dialer_target_declared(&ntp, &raw, None)
+        };
+        // A declared node with a known `type:` passes.
+        assert!(
+            check("ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: socks5\n    server: s\n    port: 1\n").is_ok()
+        );
+        // A declared group with a known `type:` passes.
+        assert!(
+            check("ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [DIRECT]\n").is_ok()
+        );
+        // A same-name node with an unknown `type:` would be dropped by
+        // the lenient build — the raw declaration must not count.
+        let e = check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: not-a-protocol\n    server: s\n    port: 1\n",
+        )
+        .expect_err("an unbuildable same-name node must fail");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
+        // A node with no `type:` at all is dropped for the same reason.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    server: s\n    port: 1\n"
+        )
+        .is_err());
+        // A known `type:` with missing required fields fails the real
+        // parse the check runs — the lenient build drops the node
+        // (socks5 is not placeholder-eligible), so the name never lands.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: socks5\n"
+        )
+        .is_err());
+        // Same hole on the group lane: an unknown group `type:` fails.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: not-a-group\n    proxies: [DIRECT]\n"
+        )
+        .is_err());
+        // A group whose only member is undeliverable drops too.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [ghost]\n"
+        )
+        .is_err());
+        // A relay below its two-member floor drops.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: relay\n    proxies: [DIRECT]\n"
+        )
+        .is_err());
+        // A group whose only member source is an UNBUILDABLE provider
+        // drops too — `materialize_proxy_providers` warn-drops a def the
+        // constructor refuses, so declared `use:` membership cannot count
+        // it (Codex review: provider-only target floor).
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: http\n"
+        )
+        .is_err());
+        // Same for a `file` provider when no cache dir exists to contain
+        // its path — the constructor refuses it in that posture.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n"
+        )
+        .is_err());
+        // And for an unknown provider `type:`.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: carrier-pigeon\n"
+        )
+        .is_err());
+
+        // A buildable provider DOES land its `use:` slot — the same gate
+        // the build applies, run against a real cache dir.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let check_dir = |yaml: &str| {
+            let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+            let ntp = meow_config::resolve_ntp(&raw).unwrap();
+            meow_config::check_ntp_dialer_target_declared(&ntp, &raw, Some(cache_dir.path()))
+        };
+        assert!(
+            check_dir(
+                "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n"
+            )
+            .is_ok(),
+            "a contained file provider must satisfy the provider-only target"
+        );
+        // The same def with an escaping path is dropped by containment —
+        // the group no longer lands even though `use:` still names it.
+        assert!(check_dir(
+            "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [p]\nproxy-providers:\n  p:\n    type: file\n    path: ../outside.yaml\n"
+        )
+        .is_err());
+        // `include-all-providers` wires the same buildable set.
+        assert!(
+            check_dir(
+                "ntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    include-all-providers: true\nproxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n"
+            )
+            .is_ok()
+        );
+        // A member that names a later group resolves once that group
+        // lands — the fixpoint mirrors the build's multi-pass settle.
+        assert!(check(
+            "ntp:\n  enable: true\n  dialer-proxy: g1\nproxy-groups:\n  - name: g1\n    type: select\n    proxies: [g2]\n  - name: g2\n    type: select\n    proxies: [DIRECT]\n"
+        )
+        .is_ok());
+        // But a group that only lands *late in the build's final pass*
+        // must not rescue an EARLIER group's dependency on it: the real
+        // settle never revisits, so `a` drops while `b` still lands
+        // (Codex review: the plain fixpoint revisited `a` and admitted
+        // it, letting a forced PUT commit a `dialer-proxy` the next boot
+        // fails to find). `c` is unbuildable, so `b`'s [DIRECT, c] keeps
+        // only DIRECT.
+        let e = check(
+            "ntp:\n  enable: true\n  dialer-proxy: a\nproxy-groups:\n  - name: a\n    type: select\n    proxies: [b]\n  - name: b\n    type: select\n    proxies: [DIRECT, c]\n  - name: c\n    type: not-a-group\n    proxies: [DIRECT]\n",
+        )
+        .expect_err("a depends on a group that only lands after it in the final pass");
+        assert!(
+            e.to_string().contains("no such top-level proxy or group"),
+            "unexpected error: {e}"
+        );
+        // The built map agrees: `b` lands, `a` and `c` do not.
+        let raw = meow_config::parse_raw_yaml(
+            "proxy-groups:\n  - name: a\n    type: select\n    proxies: [b]\n  - name: b\n    type: select\n    proxies: [DIRECT, c]\n  - name: c\n    type: not-a-group\n    proxies: [DIRECT]\n",
+        )
+        .unwrap();
+        let rebuilt = meow_config::rebuild_from_raw(&raw).unwrap();
+        assert!(rebuilt.proxies.contains_key("b"), "b must land");
+        assert!(!rebuilt.proxies.contains_key("a"), "a must drop");
+        assert!(!rebuilt.proxies.contains_key("c"), "c must drop");
+        // A compiled-out spelling keeps an unavailable placeholder in
+        // the built map, but the placeholder carries no transport — it
+        // cannot serve as the NTP dialer target.
+        let tt = check(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: trusttunnel\n    server: s\n    port: 1\n    username: u\n    password: p\n",
+        );
+        assert_eq!(tt.is_ok(), cfg!(feature = "trusttunnel"));
+        // DIRECT remains the always-valid spelling.
+        assert!(check("ntp:\n  enable: true\n  dialer-proxy: DIRECT\n").is_ok());
+    }
+
+    /// The built-map side of the same gate: `proxies.contains_key` alone
+    /// cannot tell an `UnavailableAdapter` placeholder — bound by the
+    /// lenient build for a node it cannot construct — from a live leaf,
+    /// yet every dial on it fails (Codex review). A group naming the
+    /// placeholder beside a usable member stays valid: groups route
+    /// around dead members the same way they route around down nodes.
+    #[test]
+    fn ntp_dialer_target_rejects_placeholder_leaves_not_groups() {
+        let node = "proxies:\n  - name: front\n    type: trusttunnel\n    server: s\n    port: 1\n    username: u\n    password: p\n";
+
+        // `front` parses to a dead placeholder when trusttunnel is
+        // compiled out of this build; with the feature it is a live leaf.
+        let raw = meow_config::parse_raw_yaml(&format!(
+            "ntp:\n  enable: true\n  dialer-proxy: front\n{node}"
+        ))
+        .unwrap();
+        let result = meow_config::rebuild_from_raw(&raw);
+        if cfg!(feature = "trusttunnel") {
+            result.expect("a live leaf target must pass the gate");
+        } else {
+            let e = result.err().expect("a placeholder leaf must fail the gate");
+            assert!(
+                e.to_string().contains("no such top-level"),
+                "unexpected error: {e}"
+            );
+        }
+
+        // The same placeholder as a group MEMBER never disqualifies the
+        // group — `placeholder_names` holds leaf bindings only, and the
+        // group dials its live sibling.
+        let raw = meow_config::parse_raw_yaml(&format!(
+            "ntp:\n  enable: true\n  dialer-proxy: g\n{node}\nproxy-groups:\n  - name: g\n    type: select\n    proxies: [DIRECT, front]\n"
+        ))
+        .unwrap();
+        meow_config::rebuild_from_raw(&raw)
+            .expect("a group with a usable member must pass the gate");
+    }
+
+    /// `use:` names are inert when `include-all`/`include-all-providers`
+    /// supplies the provider slots — the real parser never iterates them
+    /// in that posture, so an unknown name cannot fail even `strict`
+    /// (Codex review: the fallback validator rejected them). The forced
+    /// declared-side check must mirror that precedence.
+    #[test]
+    fn declared_group_use_ignored_when_include_all_supplies_slots() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let check = |yaml: &str| {
+            let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+            let ntp = meow_config::resolve_ntp(&raw).unwrap();
+            meow_config::check_ntp_dialer_target_declared(&ntp, &raw, Some(cache_dir.path()))
+        };
+        let providers = "proxy-providers:\n  p:\n    type: file\n    path: subs.yaml\n";
+
+        for flag in ["include-all", "include-all-providers"] {
+            assert!(
+                check(&format!(
+                    "strict: true\nntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    {flag}: true\n    use: [ghost]\n{providers}"
+                ))
+                .is_ok(),
+                "{flag} must make the unknown `use:` name inert under strict"
+            );
+        }
+        // Without include-all the same unknown name still fails strict.
+        assert!(check(&format!(
+            "strict: true\nntp:\n  enable: true\n  dialer-proxy: g\nproxy-groups:\n  - name: g\n    type: select\n    use: [ghost]\n{providers}"
+        ))
+        .is_err());
+    }
+
+    /// The forced declared-side check runs each named block's real
+    /// constructor for a verdict only — an `ss` node's external SIP003
+    /// plugin must never spawn a local subprocess for it (Codex review).
+    /// A plugin binary that does not exist makes the spawn observable:
+    /// reaching `Plugin::start` fails the parse and warn-drops the node,
+    /// where suppressing it yields the constructor's verdict modulo
+    /// process existence — the same answer `-t` gives.
+    #[cfg(feature = "ss")]
+    #[test]
+    fn declared_dialer_target_never_spawns_external_plugins() {
+        let raw = meow_config::parse_raw_yaml(
+            "ntp:\n  enable: true\n  dialer-proxy: front\nproxies:\n  - name: front\n    type: ss\n    server: s\n    port: 1\n    cipher: aes-128-gcm\n    password: p\n    plugin: meow-no-such-sip003-plugin\n",
+        )
+        .unwrap();
+        let ntp = meow_config::resolve_ntp(&raw).unwrap();
+        meow_config::check_ntp_dialer_target_declared(&ntp, &raw, None)
+            .expect("the verdict-only parse must not spawn the plugin binary");
+    }
+
+    /// Local shape/range gates precede the first candidate network work
+    /// (issue #974): `ech-opts.enable` with no `config:` and no query
+    /// source is a deterministic strict defect that never dials, yet an
+    /// out-of-range `ntp.interval` must still be the reported failure —
+    /// ECH pre-resolution may not open a socket before it.
+    #[tokio::test]
+    async fn build_config_local_gates_precede_ech_preresolve() {
+        let raw = meow_config::parse_raw_yaml(
+            "strict: true\nntp:\n  interval: 0\nproxies:\n  - name: p\n    type: direct\n    ech-opts:\n      enable: true\n",
+        )
+        .unwrap();
+        let e = meow_config::build_config(raw, None)
+            .await
+            .err()
+            .expect("interval 0 must fail");
+        assert!(
+            e.to_string().contains("ntp.interval"),
+            "the ntp range defect must surface before the strict ECH defect: {e}"
+        );
     }
 }

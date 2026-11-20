@@ -369,7 +369,11 @@ pub async fn parse_dns(
     // silently fall back to the upstream resolver, which is a user-surprising
     // privacy regression.
     if mode == DnsMode::FakeIp {
-        install_fakeip(&mut resolver, dns, cache_dir, prior, strict).await?;
+        // `profile.store-fake-ip` > `dns.store-fake-ip` > false — resolved
+        // once for both family pools so a spelling flip can't leave v4/v6
+        // disagreeing about persistence (issue #974).
+        let persist = crate::resolve_profile(raw).store_fake_ip;
+        install_fakeip(&mut resolver, dns, cache_dir, prior, strict, persist).await?;
         if let Some(range) = &dns.fake_ip_range6 {
             let prefix: ipnet::Ipv6Net = range.parse().map_err(|e| {
                 anyhow::anyhow!("dns.fake-ip-range6 '{range}' is not a valid IPv6 CIDR: {e}")
@@ -382,7 +386,7 @@ pub async fn parse_dns(
             }
             let mut v6 = dns.clone();
             v6.fake_ip_range = Some(prefix.to_string());
-            install_fakeip(&mut resolver, &v6, cache_dir, prior, strict).await?;
+            install_fakeip(&mut resolver, &v6, cache_dir, prior, strict, persist).await?;
         }
     } else {
         // Dead-key observability for the fake-IP ranges: a user who pairs
@@ -425,6 +429,9 @@ async fn install_fakeip(
     cache_dir: Option<&std::path::Path>,
     prior: Option<&Resolver>,
     strict: bool,
+    // The profile-resolved persistence flag — `profile.store-fake-ip`
+    // already folded over `dns.store-fake-ip` by the caller (issue #974).
+    persist: bool,
 ) -> Result<(), anyhow::Error> {
     let range_str = dns
         .fake_ip_range
@@ -434,12 +441,13 @@ async fn install_fakeip(
         .parse()
         .map_err(|e| anyhow::anyhow!("dns.fake-ip-range '{range_str}' is not a valid CIDR: {e}"))?;
 
-    let persist = dns.store_fake_ip.unwrap_or(false);
-
     // The file this generation would bind to, when persisting. Computed
     // before the reuse check so the check can compare store identity, not
-    // just store kind.
-    let wanted_store_path = persist.then(|| {
+    // just store kind. A `-t` validation run takes the memory path like
+    // `persist: false` — `FileStore::open_async` would both touch the
+    // cache dir and spawn a debounce flush task, two side effects an
+    // offline candidate must not run (issue #974).
+    let wanted_store_path = (persist && !crate::is_offline_validate()).then(|| {
         // `cache_dir` is `None` for a `--config-string` run — the launch
         // CWD is not the daemon's to write into, so persist under the
         // resolved home (same base geodata defaults use) instead of
@@ -2252,6 +2260,62 @@ mod tests {
             .fakeip_pool_over("198.19.0.1/16".parse().unwrap())
             .unwrap();
         assert!(new_pool.look_back(ip).is_none());
+    }
+
+    /// `profile.store-fake-ip: true` under `-t` must not open the
+    /// `FileStore` — its `open_async` touches the cache dir and spawns a
+    /// debounce flush task, both forbidden on a validation run
+    /// (issue #974). The flag is a one-way process-global, so the
+    /// assertion runs in a child process (same pattern as
+    /// `MEOW_OFFLINE_VALIDATE_CHILD`).
+    #[test]
+    fn offline_validate_store_fake_ip_stays_memory() {
+        const CHILD: &str = "MEOW_OFFLINE_FAKEIP_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            crate::set_offline_validate(true);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async {
+                let dir = tempfile::tempdir().unwrap();
+                let raw: RawConfig = serde_saphyr::from_str(
+                    "profile:\n  store-fake-ip: true\ndns:\n  enable: true\n  \
+                     enhanced-mode: fake-ip\n  nameserver:\n    - 1.1.1.1\n",
+                )
+                .unwrap();
+                let cfg = parse_dns(
+                    &raw,
+                    None,
+                    Some(dir.path()),
+                    &HashMap::new(),
+                    None,
+                    &HashMap::new(),
+                    None,
+                )
+                .await
+                .unwrap();
+                let pool = cfg
+                    .resolver
+                    .fakeip_pool_over("198.18.0.0/16".parse().unwrap())
+                    .expect("fake-ip mode installs the v4 pool");
+                assert!(
+                    !pool.is_persistent(),
+                    "an offline validate must not bind a FileStore"
+                );
+                assert!(
+                    !dir.path().join("fakeip-v4.json").exists(),
+                    "no store file may be created under -t"
+                );
+            });
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "dns_parser::tests::offline_validate_store_fake_ip_stays_memory",
+                "--exact",
+            ])
+            .env(CHILD, "1")
+            .status()
+            .expect("spawn the -t arm child");
+        assert!(status.success(), "child offline arm failed: {status:?}");
     }
 
     /// `store-fake-ip: true` across a reload: the persistent pool is

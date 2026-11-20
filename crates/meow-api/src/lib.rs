@@ -323,6 +323,9 @@ pub struct ApiServer {
     /// Provider-dialer cell `PUT /configs` rebuilds hand to newly declared
     /// providers (issue #489).
     provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    /// The NTP supervisor's reconcile handle, forwarded into `AppState`
+    /// (issue #974).
+    ntp_reconcile: Option<routes::NtpReconcile>,
 }
 
 impl ApiServer {
@@ -349,6 +352,7 @@ impl ApiServer {
         external_ui: Option<PathBuf>,
         dns_server: Arc<RwLock<Option<routes::DnsServerHandle>>>,
         provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
+        ntp_reconcile: Option<routes::NtpReconcile>,
     ) -> Self {
         Self {
             tunnel,
@@ -365,6 +369,7 @@ impl ApiServer {
             external_ui,
             dns_server,
             provider_dialer_registry,
+            ntp_reconcile,
         }
     }
 
@@ -399,6 +404,7 @@ impl ApiServer {
             dns_server: Arc::clone(&self.dns_server),
             ui_storage: Default::default(),
             provider_dialer_registry: self.provider_dialer_registry.clone(),
+            ntp_reconcile: self.ntp_reconcile.clone(),
         });
 
         let app = routes::create_router(state);

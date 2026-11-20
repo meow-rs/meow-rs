@@ -4,14 +4,24 @@ use std::time::Duration;
 use tokio::net::TcpStream;
 use tracing::debug;
 
-/// Enable low-latency options on a TCP stream (best-effort).
-pub fn configure_tcp_stream(stream: &TcpStream, context: &str) {
+/// Enable `TCP_NODELAY` on a TCP stream (best-effort).
+pub fn set_nodelay(stream: &TcpStream, context: &str) {
     if let Err(err) = stream.set_nodelay(true) {
         debug!(
             "[Net] Failed to enable TCP_NODELAY for {}: {}",
             context, err
         );
     }
+}
+
+/// Enable low-latency options on a TCP stream (best-effort).
+///
+/// Only for streams this crate dialed itself: a host-installed
+/// `TcpDialer` already applied the host app's outbound keepalive policy,
+/// and overwriting it here would silently fight that posture — callers
+/// use [`set_nodelay`] alone on bridge-owned streams.
+pub fn configure_tcp_stream(stream: &TcpStream, context: &str) {
+    set_nodelay(stream, context);
 
     #[cfg(any(unix, windows))]
     {

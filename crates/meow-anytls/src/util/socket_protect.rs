@@ -270,11 +270,21 @@ pub(crate) fn split_host_port(addr: &str) -> Option<(&str, u16)> {
 /// Dial a `host:port` address string, preferring the installed [`TcpDialer`]
 /// and falling back to [`connect_tcp`] (system resolver + optional
 /// protector) when none is installed or the address doesn't split.
+///
+/// Socket tuning is applied here at the dispatch: a host-installed dialer
+/// already applied the host app's outbound keepalive policy inside its own
+/// connect path (meow-common's `connect_tcp`), so bridge-owned streams get
+/// only `TCP_NODELAY` — the standalone fallback keeps this crate's default
+/// keepalive posture.
 pub async fn connect_tcp_addr(addr: &str) -> io::Result<TcpStream> {
     if let (Some(dialer), Some((host, port))) = (tcp_dialer(), split_host_port(addr)) {
-        return dialer.dial(host, port).await;
+        let stream = dialer.dial(host, port).await?;
+        crate::util::set_nodelay(&stream, addr);
+        return Ok(stream);
     }
-    connect_tcp(addr).await
+    let stream = connect_tcp(addr).await?;
+    crate::util::configure_tcp_stream(&stream, addr);
+    Ok(stream)
 }
 
 #[cfg(test)]

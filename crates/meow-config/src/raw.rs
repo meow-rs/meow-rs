@@ -649,17 +649,78 @@ pub struct RawConfig {
     /// tproxy entry; `udp-timeout` on `listeners:`/`tun:`, issue #564).
     pub udp: Option<serde_json::Value>,
     pub udp_timeout: Option<serde_json::Value>,
-    /// Upstream mihomo's `keep-alive-*` keys tune BOTH inbound listeners
-    /// and outbound dials — captured only to warn on the plausible
-    /// migration mistake (`tcp-keepalive*` above covers the inbound
-    /// side; the outbound-dialer tuning is not honored).
-    pub keep_alive_idle: Option<serde_json::Value>,
-    pub keep_alive_interval: Option<serde_json::Value>,
-    pub disable_keep_alive: Option<serde_json::Value>,
+    /// `keep-alive-idle` — seconds of outbound-socket silence before the
+    /// first keepalive probe (`TCP_KEEPIDLE` / `TCP_KEEPALIVE` /
+    /// `SIO_KEEPALIVE_VALS.keepalivetime`). Upstream mihomo applies the
+    /// `keep-alive-*` keys to BOTH inbound listeners and outbound dials;
+    /// here they cover the outbound side only (`tcp-keepalive*` above
+    /// covers inbound). Omitted or `0` resolves to
+    /// [`meow_common::tcp_opts::DEFAULT_OUTBOUND_KEEPALIVE_SECS`]; max
+    /// [`meow_common::tcp_opts::MAX_TCP_KEEPALIVE_SECS`] (Linux's
+    /// `TCP_KEEPIDLE` ceiling — larger would EINVAL at setsockopt).
+    pub keep_alive_idle: Option<u64>,
+    /// `keep-alive-interval` — seconds between outbound keepalive probes
+    /// (`TCP_KEEPINTVL`); same 0→default resolution and 32767 ceiling as
+    /// `keep-alive-idle`.
+    pub keep_alive_interval: Option<u64>,
+    /// `disable-keep-alive` — `true` clears `SO_KEEPALIVE` on outbound
+    /// dials instead of applying the timing knobs above.
+    pub disable_keep_alive: Option<bool>,
+    /// `profile:` — mihomo's selection/fake-IP persistence switches
+    /// ([`RawProfile`]).
+    pub profile: Option<RawProfile>,
+    /// `ntp:` — mihomo's protocol-clock sync service ([`RawNtp`]).
+    pub ntp: Option<RawNtp>,
     /// Keys no field above models land here — `validation::validate_and_warn`
     /// warns on them by name (forward-compat, ADR-0002) instead of serde
     /// dropping them silently (issue #974). `BTreeMap` so the save path
     /// writes them back in sorted order.
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
+/// The `profile:` section — mihomo's two persistence switches (issue
+/// #974). Both are optional so an explicit value always wins over the
+/// fallback chain [`crate::resolve_profile`] applies; unmodeled children
+/// (`selected`, `tracing`, …) land in `extra` and get a scoped
+/// warn-and-ignore like every other section.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct RawProfile {
+    /// `store-selected` — persist `select`/url-test/fallback pins to the
+    /// config's selector cache and restore them into newly built groups.
+    /// Absent resolves `true` (upstream's default); `false` builds groups
+    /// with no persistence handle at all — in-memory selection still
+    /// works, nothing reads or writes the file.
+    pub store_selected: Option<bool>,
+    /// `store-fake-ip` — persist fake-IP forward/reverse mappings to a
+    /// JSON file. Resolution is `profile` > `dns.store-fake-ip` > `false`.
+    pub store_fake_ip: Option<bool>,
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
+/// The `ntp:` section — mihomo's SNTP clock-sync service (issue #974).
+/// Ranges are validated at [`crate::resolve_ntp`] even when `enable` is
+/// false; unmodeled children land in `extra` for the scoped warning.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct RawNtp {
+    /// `enable` — run the supervisor. Absent resolves `false`.
+    pub enable: Option<bool>,
+    /// `server` — host or IP literal (bracketed IPv6 accepted) to poll;
+    /// absent resolves `time.apple.com` like upstream.
+    pub server: Option<String>,
+    /// `port` — `1..=65535`, default `123`.
+    pub port: Option<u16>,
+    /// `interval` — poll period in minutes, `1..=525600`, default `30`.
+    pub interval: Option<u64>,
+    /// `dialer-proxy` — a top-level proxy/group name to carry the poll;
+    /// absent or empty dials direct.
+    pub dialer_proxy: Option<String>,
+    /// `write-to-system` — parsed for compatibility and always ignored
+    /// (with a warning when true): meow never invokes a clock syscall.
+    pub write_to_system: Option<bool>,
     #[serde(flatten)]
     pub extra: BTreeMap<String, UnknownYamlValue>,
 }

@@ -16,8 +16,6 @@ use tracing::warn;
 const UNSUPPORTED_KEYS: &[(&str, Option<u32>, &str)] = &[
     ("brutal-delay", None, "experimental, no spec"),
     ("brutal-opts", None, "experimental, no spec"),
-    ("ntp", Some(974), "NTP time sync not implemented"),
-    ("profile", None, "not a routing concern"),
     (
         "geox-update-interval",
         None,
@@ -86,6 +84,36 @@ const MISPLACED_KEYS: &[(&str, &str)] = &[
         "the top-level config (use 'client-fingerprint' on a proxies: entry)",
     ),
     ("global-ua", "the top-level config"),
+    (
+        "keep-alive-idle",
+        "the top-level config (outbound-dial keepalive)",
+    ),
+    (
+        "keep-alive-interval",
+        "the top-level config (outbound-dial keepalive)",
+    ),
+    (
+        "disable-keep-alive",
+        "the top-level config (outbound-dial keepalive)",
+    ),
+    (
+        "statistic",
+        "a proxies: entry's smux: block (and is ignored there: \
+         carrier-level traffic accounting is not modeled)",
+    ),
+    (
+        "max-connections",
+        "the top-level config or a trusttunnel: node (a smux: block \
+         accepts it on trojan/vless/ss/vmess nodes)",
+    ),
+    (
+        "min-streams",
+        "a trusttunnel: node or a proxies: entry's smux: block",
+    ),
+    (
+        "max-streams",
+        "a trusttunnel: node or a proxies: entry's smux: block",
+    ),
 ];
 
 /// Frequent misspellings of a real mihomo key — the hint renders inline
@@ -460,6 +488,26 @@ pub(crate) fn warn_extra<T>(context: &str, extra: &BTreeMap<String, T>) {
     emit_unknown_keys_warn(context, &extra.keys().cloned().collect::<Vec<_>>());
 }
 
+/// The `store-fake-ip` spelling conflict — `profile` wins when the two
+/// disagree. Emitted at the document-parse boundary (`parse_raw_yaml`)
+/// rather than inside [`validate_and_warn`], because the admission it is
+/// scoped to is the document itself: a startup runs two rebuild passes
+/// and a `PUT` up to two more over the same raw, and per-pass emission
+/// double-warned the operator (issue #974).
+pub(crate) fn warn_store_fake_ip_alias(raw: &crate::raw::RawConfig) {
+    if let (Some(pv), Some(dv)) = (
+        raw.profile.as_ref().and_then(|p| p.store_fake_ip),
+        raw.dns.as_ref().and_then(|d| d.store_fake_ip),
+    ) {
+        if pv != dv {
+            warn!(
+                "profile.store-fake-ip ({pv}) and dns.store-fake-ip ({dv}) disagree — \
+                 the profile value wins"
+            );
+        }
+    }
+}
+
 /// Warn on every key the typed schema dropped silently, across all
 /// surfaces [`crate::raw::RawConfig`] models — called once per rebuild
 /// pass so `-t` validation, startup, and `PUT`/`PATCH /configs` reloads
@@ -495,6 +543,19 @@ pub(crate) fn validate_and_warn(raw: &crate::raw::RawConfig) {
         }
     }
 
+    if let Some(ntp) = &raw.ntp {
+        warn_extra("ntp", &ntp.extra);
+        // Always warn-and-ignore, even when disabled: the knob reads like
+        // it writes the OS clock and meow never invokes one (issue #974).
+        if ntp.write_to_system == Some(true) {
+            warn!(
+                "ntp.write-to-system: ignored — meow never writes the system clock;                  the offset adjusts VMess/REALITY protocol timestamps only"
+            );
+        }
+    }
+    if let Some(profile) = &raw.profile {
+        warn_extra("profile", &profile.extra);
+    }
     if let Some(dns) = &raw.dns {
         warn_extra("dns", &dns.extra);
         if let Some(ff) = &dns.fallback_filter {

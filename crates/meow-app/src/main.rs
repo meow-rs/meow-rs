@@ -47,6 +47,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 
+mod ntp;
 #[cfg(target_os = "windows")]
 mod windows_service;
 
@@ -653,6 +654,12 @@ fn run_application_inner(
         meow_common::dial::set_tcp_concurrent(meow_config::effective_tcp_concurrent(
             raw.tcp_concurrent,
         ));
+        // `keep-alive-*` — the outbound-dial keepalive policy, same
+        // lane and same ordering rationale: `connect_tcp` snapshots it
+        // per dial, so it must be installed before the build's first
+        // provider/geodata fetch opens a socket. `-t` never reaches here;
+        // PUT/PATCH re-assert at their commit points.
+        meow_common::set_outbound_tcp_keepalive(meow_config::resolve_outbound_tcp_keepalive(&raw)?);
 
         let mut config = if args.config_string.is_some() {
             early_binding = preinstall_global_route_binding(&raw);
@@ -1518,6 +1525,15 @@ async fn run(
     // Share the DNS config's resolver slot so runtime `set_resolver` swaps
     // reach the map's DIRECT adapters built from this slot (issue #514).
     let tunnel = Tunnel::new_with_slot(Arc::clone(&config.dns.resolver_slot));
+    // The config-scoped `profile.store-selected` persistence owner — every
+    // rebuild lane (API PUT, subscription/geodata republish) attaches
+    // through it so groups share the startup store and enable epoch.
+    tunnel.set_selection_backing(Arc::clone(&config.selection));
+    // The `ntp:` supervisor holds only a Weak at the tunnel so shutdown's
+    // drop order can't strand it; the worker starts after TUN binding
+    // settles below, and PUT reconciles it through the API lane
+    // (issue #974).
+    let ntp_supervisor = Arc::new(ntp::NtpSupervisor::new(&tunnel));
     meow_tunnel::nftset::install(
         &tunnel,
         config
@@ -1573,6 +1589,7 @@ async fn run(
             .bind()
             .await
             .map_err(|e| anyhow::anyhow!("dns.listen {listen_addr}: {e}"))?;
+        let socket = bound.socket_weak();
         let task = tokio::spawn(async move {
             if let Err(e) = bound.run().await {
                 error!("DNS server error: {}", e);
@@ -1582,6 +1599,7 @@ async fn run(
             listen: listen_addr,
             task,
             resolver_slot: slot,
+            socket: Some(socket),
         });
     }
 
@@ -2070,6 +2088,10 @@ async fn run(
             config.api.external_ui.clone(),
             Arc::clone(&dns_server_handle),
             config.provider_dialer_registry.clone(),
+            Some({
+                let supervisor = Arc::clone(&ntp_supervisor);
+                Arc::new(move |cfg| supervisor.reconcile(cfg)) as meow_api::routes::NtpReconcile
+            }),
         );
         // Bind eagerly like the DNS listener and the `listeners:` entries:
         // an `external-controller` failure is a hard startup error, not a
@@ -2182,6 +2204,33 @@ async fn run(
         }
     }
 
+    // Start the NTP worker now that routing, the resolver hook, and any
+    // TUN binding are settled — its own dial may ride the tunnel.
+    // Reconcile from the COMMITTED document rather than the boot
+    // `config.ntp` snapshot: the API lane has been serving since before
+    // the TUN wait, and a PUT committed in that window already swapped
+    // `raw_config` and fired its own reconcile — firing the stale boot
+    // target now would resurrect a worker the operator just disabled
+    // (issue #974 review). The resolve+reconcile pair runs inside the
+    // `CONFIG_MUTATION` lane so it cannot split a PUT's commit (publish
+    // seen, its reconcile still pending) — either this fires before the
+    // PUT's own reconcile or it already sees the fully committed
+    // document. A committed document always resolves (PUT admission
+    // gates `resolve_ntp`); on a defect leave the worker stopped and
+    // say so.
+    {
+        let _mutation = meow_api::routes::CONFIG_MUTATION.lock().await;
+        // Arm the supervisor only now that readiness settled: a PUT
+        // committed while the TUN wait was open already fired its own
+        // reconcile — stored, never spawned — and its stored config
+        // starts below (issue #974 review).
+        ntp_supervisor.settle();
+        match meow_config::resolve_ntp(&raw_config.read()) {
+            Ok(ntp) => ntp_supervisor.reconcile(ntp),
+            Err(e) => warn!("startup ntp resolution failed; worker left stopped: {e}"),
+        }
+    }
+
     // Only now: a signal before `shutdown.wait()` installs its handler
     // kills the process, which must not read as an unclean exit.
     meow_common::logbook::engine_started(config_path.as_deref().unwrap_or("--config-string"));
@@ -2193,6 +2242,7 @@ async fn run(
     // Wait for shutdown signal
     let by = shutdown.wait().await?;
     info!("Shutting down ({by})...");
+    ntp_supervisor.shutdown().await;
     meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Requested(by));
     meow_common::traffic_ledger::uninstall();
     drop(controller_file);

@@ -101,7 +101,7 @@ pub use group::fallback::FallbackGroup;
 pub use group::load_balance::{LbStrategy, LoadBalanceGroup};
 pub use group::relay::RelayGroup;
 pub use group::selector::SelectorGroup;
-pub use group::selector_store::SelectorStore;
+pub use group::selector_store::{SelectionBacking, SelectorStore, SelectorWriter};
 pub use group::urltest::UrlTestGroup;
 pub use http_adapter::HttpAdapter;
 pub use reject::RejectAdapter;

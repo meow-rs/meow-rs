@@ -41,6 +41,7 @@ pub mod network;
 pub mod nftset;
 pub mod outbound_iface;
 pub mod process_lookup;
+pub mod protocol_clock;
 pub mod replay_window;
 pub mod rule;
 pub mod sniffer;
@@ -87,6 +88,7 @@ pub use process_lookup::{
     disable_socket_table_cache, find_process, find_process_async, FlowLookup, ProcessInfo,
     ProcessLookupMode, ProcessLookupPolicy,
 };
+pub use protocol_clock::{protocol_now, set_protocol_offset_ns};
 pub use replay_window::ReplayWindow;
 pub use rule::{Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe};
 pub use sniffer::SnifferConfig;
@@ -101,7 +103,9 @@ pub use socket_protect::{
     set_global_ua, set_routing_mark, DialerOpts, GlobalDialerOpts, IpVersion, RoutingMarkPin,
     DEFAULT_USER_AGENT,
 };
-pub use tcp_opts::TcpKeepaliveConfig;
+pub use tcp_opts::{
+    outbound_tcp_keepalive, set_outbound_tcp_keepalive, OutboundTcpKeepalive, TcpKeepaliveConfig,
+};
 // Host-resolver hook is cross-platform (iOS installs it without a protector).
 pub use socket_protect::{clear_host_resolver, host_resolver, set_host_resolver, HostResolver};
 // Socket protector is Android / OpenHarmony only (raw-fd `protect(fd)`).

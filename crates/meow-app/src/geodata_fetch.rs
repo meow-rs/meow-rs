@@ -398,6 +398,7 @@ async fn auto_update_tick(
         let raw = raw.clone();
         let rule_providers = Arc::clone(&rule_providers);
         let provider_map = provider_map.clone();
+        let selection = tunnel.selection_backing();
         move || {
             meow_config::rebuild_from_raw_with_resolver(
                 &raw,
@@ -408,6 +409,7 @@ async fn auto_update_tick(
                 // to the LIVE provider set so API/provider refreshes
                 // keep reaching them (issue #533 review).
                 Some(rule_providers.read().clone()),
+                &selection,
             )
         }
     })
@@ -528,6 +530,7 @@ mod tests {
             Some(dir.path()),
             &HashMap::new(),
             None,
+            &tunnel.selection_backing(),
         )
         .unwrap();
         let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
@@ -586,6 +589,7 @@ mod tests {
             Some(dir.path()),
             &HashMap::new(),
             None,
+            &tunnel.selection_backing(),
         )
         .unwrap();
 
@@ -605,6 +609,7 @@ mod tests {
                 listen: "127.0.0.1:0".parse().unwrap(),
                 task: tokio::spawn(std::future::pending::<()>()),
                 resolver_slot: Arc::clone(&slot),
+                socket: None,
             })));
 
         // Production callers hold the lane; the debug_assert in
@@ -706,6 +711,7 @@ mod tests {
             Some(dir.path()),
             &HashMap::new(),
             None,
+            &tunnel.selection_backing(),
         )
         .unwrap();
         let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
@@ -767,6 +773,7 @@ mod tests {
             Some(dir.path()),
             &HashMap::new(),
             None,
+            &tunnel.selection_backing(),
         )
         .unwrap();
         let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
@@ -833,6 +840,7 @@ mod tests {
             Some(dir.path()),
             &HashMap::new(),
             None,
+            &tunnel.selection_backing(),
         )
         .unwrap();
         let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =
@@ -893,6 +901,7 @@ mod tests {
             Some(dir.path()),
             &HashMap::new(),
             None,
+            &tunnel.selection_backing(),
         )
         .unwrap();
         assert!(!rebuild.sub_rules.contains_key("blk"));
@@ -959,6 +968,7 @@ mod tests {
             Some(dir.path()),
             &HashMap::new(),
             None,
+            &meow_proxy::SelectionBacking::unpersisted(),
         )
         .unwrap();
         let before_dns = meow_config::parse_dns_from_raw(
@@ -988,6 +998,7 @@ mod tests {
             Some(dir.path()),
             &HashMap::new(),
             None,
+            &tunnel.selection_backing(),
         )
         .unwrap();
         let dns_server: Arc<RwLock<Option<meow_api::routes::DnsServerHandle>>> =

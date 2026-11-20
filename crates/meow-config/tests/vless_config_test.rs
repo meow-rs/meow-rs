@@ -1405,6 +1405,30 @@ proxies:
     );
 }
 
+/// D16g companion: the canonical `smux:` spelling warns the same way —
+/// `mux_config_block` routes both keys through one warn path.
+#[cfg(feature = "mux")]
+#[tokio::test]
+async fn parse_vless_smux_statistic_warns_and_ignores() {
+    let yaml = r#"
+proxies:
+  - name: v
+    type: vless
+    server: example.com
+    port: 443
+    uuid: b831381d-6324-4d53-ad4f-8cda48b30811
+    smux:
+      enabled: true
+      statistic: true
+"#;
+    let (result, lines) = with_warn_capture_async(load_config_from_str(yaml)).await;
+    result.expect("`statistic` must warn, not error");
+    assert!(
+        lines.iter().any(|l| l.contains("mux option 'statistic'")),
+        "expected the statistic warn under the canonical `smux:` key; {lines:?}"
+    );
+}
+
 /// D16c: explicit `protocol: yamux` → accepted without warn.
 #[cfg(feature = "mux")]
 #[tokio::test]

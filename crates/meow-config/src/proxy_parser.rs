@@ -816,8 +816,12 @@ pub fn parse_proxy_with_dialer_and_fp(
                     "ss[{name}]: external plugins are disabled by process policy"
                 ));
             }
-            // Validation constructs adapters, but must never execute a plugin.
-            let plugin = if crate::is_offline_validate() && is_external_sip003_plugin(plugin) {
+            // Validation constructs adapters, but must never execute a plugin —
+            // a dry-run mirror parse suppresses the same spawn
+            // (`plugin_spawn_suppressed`) for its verdict-only needs.
+            let plugin = if (crate::is_offline_validate() || plugin_spawn_suppressed())
+                && is_external_sip003_plugin(plugin)
+            {
                 None
             } else {
                 plugin
@@ -1056,6 +1060,40 @@ pub fn parse_proxy_with_dialer_and_fp(
         }
         _ => Err(format!("unsupported proxy type: {proxy_type}")),
     }
+}
+
+// Depth-counted suppression of the external SIP003 subprocess spawn —
+// set by a dry-run parse that needs `ShadowsocksAdapter::new`'s verdict
+// without a plugin process the candidate may never use (the NTP
+// dialer-target mirror parses every declared leaf; Codex review).
+// Thread-local because the mirror is synchronous code a `spawn_blocking`
+// owns outright; a counter, not a bool, so nested scopes compose.
+#[cfg(feature = "ss")]
+thread_local! {
+    static PLUGIN_SPAWN_DRY_RUN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Enter a scope where the `ss` arm skips the external `Plugin::start`
+/// subprocess — every other check (the `dialer-proxy` bail, process
+/// policy, field validation, built-in plugin construction) still runs,
+/// so the parse keeps its verdict modulo the spawn itself. The returned
+/// guard resets on drop. Compiled only with `ss`: without the feature
+/// there is no spawn to suppress, and callers gate the call the same way.
+#[cfg(feature = "ss")]
+pub(crate) fn plugin_spawn_dry_run() -> impl Drop {
+    struct Guard;
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            PLUGIN_SPAWN_DRY_RUN.with(|c| c.set(c.get() - 1));
+        }
+    }
+    PLUGIN_SPAWN_DRY_RUN.with(|c| c.set(c.get() + 1));
+    Guard
+}
+
+#[cfg(feature = "ss")]
+fn plugin_spawn_suppressed() -> bool {
+    PLUGIN_SPAWN_DRY_RUN.with(|c| c.get() > 0)
 }
 
 /// Whether `plugin` names a SIP003 plugin that runs as an external subprocess
@@ -2789,7 +2827,7 @@ fn parse_wg_reserved(
 /// Hard error on unknown values (Class A per ADR-0002): unknown strategy means
 /// the user may get different distribution behaviour than intended.
 /// Upstream also rejects (`errStrategy` in adapter/outboundgroup/loadbalance.go).
-fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, String> {
+pub(crate) fn parse_lb_strategy(strategy: Option<&str>) -> std::result::Result<LbStrategy, String> {
     match strategy.unwrap_or("round-robin") {
         "round-robin" => Ok(LbStrategy::RoundRobin),
         // Upstream maps "" to consistent-hashing (`case "",
@@ -3327,7 +3365,27 @@ fn parse_mux_options(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<Option<meow_proxy::mux::MuxOptions>, String> {
-    let Some(mux_cfg) = mux_config_block(name, config)? else {
+    parse_mux_options_impl(name, config, false)
+}
+
+/// [`parse_mux_options`] with the advisory warnings silenced — used by
+/// the early shape gate (`check_mux_shape`) so they only emit once, from
+/// the real parse below.
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn parse_mux_options_impl(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+    quiet: bool,
+) -> std::result::Result<Option<meow_proxy::mux::MuxOptions>, String> {
+    let Some(mux_cfg) = mux_config_block(name, config, quiet)? else {
         return Ok(None);
     };
     let enabled = mux_bool_field(name, mux_cfg, "enabled", false)?;
@@ -3351,29 +3409,45 @@ fn parse_mux_options(
             "{name}: unknown mux protocol '{protocol_str}'; valid values: smux, yamux, h2mux, muxcool"
         ));
     };
-    // max-connections=0 AND max-streams=0 means one physical connection
-    // per stream (mirrors mihomo/sing-mux exactly) — almost never what an
-    // operator wants, so say so.
-    let max_connections = mux_usize_field(name, mux_cfg, "max-connections", 4)?;
-    let max_streams = mux_usize_field(name, mux_cfg, "max-streams", 4)?;
-    if max_connections == 0 && max_streams == 0 {
+    // The shipped 4/4/4 defaults live on `MuxOptions::default` — the parse
+    // fallbacks read it so the two sources can never drift apart.
+    let defaults = meow_proxy::mux::MuxOptions::default();
+    let max_connections =
+        mux_usize_field(name, mux_cfg, "max-connections", defaults.max_connections)?;
+    let min_streams = mux_usize_field(name, mux_cfg, "min-streams", defaults.min_streams)?;
+    let max_streams = mux_usize_field(name, mux_cfg, "max-streams", defaults.max_streams)?;
+    // All three at 0 turns off pooling across busy carriers: an idle
+    // session is still reused, but one already carrying a stream is never
+    // shared, so every *concurrent* stream dials its own carrier — almost
+    // never what an operator wants, so say so.
+    if !quiet && max_connections == 0 && min_streams == 0 && max_streams == 0 {
         tracing::warn!(
             proxy = %name,
-            "mux: max-connections and max-streams are both 0 — every stream dials its own \
-             physical connection (mirrors mihomo); consider the 4/4/4 defaults"
+            "mux: max-connections, min-streams and max-streams are all 0 — a carrier that \
+             already holds a stream is never shared, so concurrent streams each dial their \
+             own connection; consider the 4/4/4 defaults"
         );
     }
-    // Parsed but unsupported upstream fields: `statistic` (per-connection
-    // traffic attribution in mihomo's dialer) and `brutal-opts` (TCP Brutal,
-    // Linux-only upstream).  Warn once so operators know the divergence.
-    for unsupported in ["statistic", "brutal-opts"] {
-        if mux_cfg.get(unsupported).is_some() {
-            tracing::warn!(
-                proxy = %name,
-                "mux option '{}' is not supported in meow-rs and will be ignored",
-                unsupported
-            );
-        }
+    // `statistic` opts into mihomo's per-carrier traffic attribution, which
+    // meow does not model — the logical-flow APIs (`GET /connections`,
+    // `GET /traffic`, `GET /statistics`) already report the same totals.
+    // Validate the flag so a malformed value is a node defect like every
+    // other mux bool, but warn rather than fail when set: the node still
+    // works, just without carrier-level accounting.
+    if mux_bool_field(name, mux_cfg, "statistic", false)? && !quiet {
+        tracing::warn!(
+            proxy = %name,
+            "mux option 'statistic' is not supported in meow-rs (carrier-level traffic \
+             accounting is not modeled); use GET /connections or GET /statistics for \
+             per-flow counters"
+        );
+    }
+    // `brutal-opts` (TCP Brutal, Linux-only upstream) stays warn-ignore.
+    if !quiet && mux_cfg.get("brutal-opts").is_some() {
+        tracing::warn!(
+            proxy = %name,
+            "mux option 'brutal-opts' is not supported in meow-rs and will be ignored"
+        );
     }
     // Padding is a sing-mux session layer; Mux.Cool has none, so honouring
     // the flag is impossible and ignoring it would send the unpadded traffic
@@ -3390,7 +3464,7 @@ fn parse_mux_options(
         protocol,
         padding,
         max_connections,
-        min_streams: mux_usize_field(name, mux_cfg, "min-streams", 4)?,
+        min_streams,
         max_streams,
         only_tcp: mux_bool_field(name, mux_cfg, "only-tcp", false)?,
     }))
@@ -3413,12 +3487,31 @@ fn parse_mux_options(
     name: &str,
     config: &HashMap<String, serde_json::Value>,
 ) -> std::result::Result<(), String> {
-    if let Some(mux_cfg) = mux_config_block(name, config)? {
+    parse_mux_options_impl(name, config, false)
+}
+
+/// [`parse_mux_options`] with the not-compiled warning silenced for the
+/// early shape gate (`check_mux_shape`).
+#[cfg(all(
+    not(feature = "mux"),
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn parse_mux_options_impl(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+    quiet: bool,
+) -> std::result::Result<(), String> {
+    if let Some(mux_cfg) = mux_config_block(name, config, quiet)? {
         let enabled = mux_cfg
             .get("enabled")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        if enabled {
+        if enabled && !quiet {
             tracing::warn!(
                 proxy = %name,
                 "mux is enabled in config but this build was compiled without the `mux` feature; the option is ignored"
@@ -3437,15 +3530,18 @@ fn parse_mux_options(
 fn mux_config_block<'a>(
     name: &str,
     config: &'a HashMap<String, serde_json::Value>,
+    quiet: bool,
 ) -> std::result::Result<Option<&'a serde_json::Value>, String> {
     let block = match (config.get("smux"), config.get("mux")) {
         (Some(_), Some(_)) => {
             // Migration-friendly: prefer the canonical key and say so,
             // instead of rejecting the node for a likely leftover.
-            tracing::warn!(
-                proxy = %name,
-                "both `smux` and legacy alias `mux` are configured; using the canonical `smux` key"
-            );
+            if !quiet {
+                tracing::warn!(
+                    proxy = %name,
+                    "both `smux` and legacy alias `mux` are configured; using the canonical `smux` key"
+                );
+            }
             config.get("smux")
         }
         (Some(config), None) | (None, Some(config)) => Some(config),
@@ -3512,6 +3608,74 @@ fn mux_usize_field(
         )),
     }
 }
+
+/// Cheap `smux:`/`mux:` shape gate over the static `proxies:` list, run
+/// before ECH pre-resolution so a malformed block rejects the document
+/// without the network fetches ever opening a socket (issue #974
+/// review — local shape/range checks precede candidate network work).
+/// Only the mux-capable leaf types are checked — the same arms that
+/// parse the block at build time. The gate runs quiet: advisory
+/// warnings belong to the real parse below, which re-runs the same
+/// validation.
+///
+/// `strict` mirrors the real parse's strictness: a malformed block is a
+/// *node-level* defect, which only `strict` promotes to a document
+/// error — the rejection this gate exists to order before ECH I/O.
+/// Lenient mode warn-drops the node in the real parse and the document
+/// succeeds, so the gate skips the scan entirely.
+#[cfg(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "ss",
+    feature = "vmess"
+))]
+pub fn check_mux_shape(
+    raw: &crate::raw::RawConfig,
+    strict: bool,
+) -> std::result::Result<(), String> {
+    if !strict {
+        return Ok(());
+    }
+    let Some(proxies) = raw.proxies.as_deref() else {
+        return Ok(());
+    };
+    for node in proxies {
+        let Some(kind) = node.get("type").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        // Exactly the types whose parse arms consume the block — other
+        // protocols never reach it, so their `smux:` key is not ours to
+        // reject here.
+        let capable = (kind == "ss" && cfg!(feature = "ss"))
+            || (kind == "trojan" && cfg!(feature = "trojan"))
+            || (kind == "vless" && cfg!(feature = "vless"))
+            || (kind == "vmess" && cfg!(feature = "vmess"));
+        if !capable {
+            continue;
+        }
+        let name = node
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("?");
+        parse_mux_options_impl(name, node, true)?;
+    }
+    Ok(())
+}
+
+/// [`check_mux_shape`] when no mux-capable protocol is compiled in.
+#[cfg(not(any(
+    feature = "trojan",
+    feature = "vless",
+    feature = "ss",
+    feature = "vmess"
+)))]
+pub fn check_mux_shape(
+    _raw: &crate::raw::RawConfig,
+    _strict: bool,
+) -> std::result::Result<(), String> {
+    Ok(())
+}
+
 #[cfg(feature = "vless")]
 fn parse_vless_xhttp_config(
     config: &HashMap<String, serde_json::Value>,
@@ -3880,6 +4044,9 @@ fn parse_vless_reality_opts(
         public_key,
         short_id,
         support_x25519_mlkem768,
+        // The REALITY timestamp is a protocol field; ride the shared
+        // protocol clock so `ntp:` offsets apply (issue #974).
+        protocol_clock: Some(meow_common::protocol_now),
     }))
 }
 
@@ -4225,7 +4392,7 @@ pub fn parse_proxy_group_with_store(
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
     include_all_proxies: &[Arc<dyn Proxy>],
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
-    store: Option<&Arc<meow_proxy::SelectorStore>>,
+    store: Option<&meow_proxy::SelectorWriter>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     parse_proxy_group_inner(
         config,
@@ -4267,7 +4434,7 @@ pub fn parse_proxy_group_lenient_with_store(
     existing_proxies: &HashMap<SmolStr, Arc<dyn Proxy>>,
     include_all_proxies: &[Arc<dyn Proxy>],
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
-    store: Option<&Arc<meow_proxy::SelectorStore>>,
+    store: Option<&meow_proxy::SelectorWriter>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     parse_proxy_group_inner(
         config,
@@ -4285,7 +4452,7 @@ fn parse_proxy_group_inner(
     include_all_proxies: &[Arc<dyn Proxy>],
     strict: bool,
     providers: &HashMap<String, Arc<crate::proxy_provider::ProxyProvider>>,
-    selector_store: Option<&Arc<meow_proxy::SelectorStore>>,
+    selector_store: Option<&meow_proxy::SelectorWriter>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let mut proxies: Vec<Arc<dyn Proxy>> = Vec::new();
 
@@ -4387,7 +4554,7 @@ fn parse_proxy_group_inner(
             let mut group = SelectorGroup::new_with_providers(&config.name, proxies, slots)
                 .with_display(group_display(config));
             if let Some(store) = selector_store {
-                group = group.with_store(Arc::clone(store));
+                group = group.with_store(store.clone());
             }
             Ok(Arc::new(group))
         }
@@ -4611,6 +4778,73 @@ mod tests {
 
     fn proxy_config(yaml: &str) -> HashMap<String, serde_json::Value> {
         serde_saphyr::from_str(yaml).unwrap()
+    }
+
+    /// Omitted `smux:` pool fields resolve to `MuxOptions::default` — the
+    /// parser must not carry a second copy of the 4/4/4 constants that can
+    /// drift from the runtime source of truth.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_omitted_pool_fields_use_muxoptions_default() {
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n",
+        );
+        let opts = parse_mux_options("n", &node).unwrap().unwrap();
+        assert_eq!(opts, meow_proxy::mux::MuxOptions::default());
+    }
+
+    /// A single explicit field overrides only that field; the rest still
+    /// come from `MuxOptions::default`.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_partial_override_keeps_other_defaults() {
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n  max-streams: 2\n",
+        );
+        let opts = parse_mux_options("n", &node).unwrap().unwrap();
+        let expected = meow_proxy::mux::MuxOptions {
+            max_streams: 2,
+            ..Default::default()
+        };
+        assert_eq!(opts, expected);
+    }
+
+    /// The legacy `mux:` alias feeds the same parse; `smux:` wins when both
+    /// are present.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_key_takes_precedence_over_mux_alias() {
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\n\
+             smux:\n  enabled: true\n  max-streams: 2\n\
+             mux:\n  enabled: true\n  max-streams: 9\n",
+        );
+        let opts = parse_mux_options("n", &node).unwrap().unwrap();
+        assert_eq!(opts.max_streams, 2);
     }
 
     #[cfg(feature = "vless")]
