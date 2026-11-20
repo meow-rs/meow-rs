@@ -897,18 +897,20 @@ async fn handle_tproxy_flow(
     ) {
         return Err("unmapped fake-ip destination".into());
     }
-    // Strict `resolve_proxy_flow` below requires the dst-IP pre-resolution
-    // contract (match_engine doc): fake-IP rescue above may have cleared
-    // `dst_ip` after recovering the hostname, and without this, IP rules
-    // never matched on the TProxy TCP path at all (issue #625 review).
-    inner.pre_resolve(&mut metadata).await;
+    // Lazy resolution, the same contract plain TCP flows get: fake-IP
+    // rescue above may have cleared `dst_ip` after recovering the
+    // hostname, and a staged conditional SUB-RULE reports its IP demand
+    // to the demand gate — the lazy path resolves then re-scans. A flow
+    // matched by a domain rule never pays the resolution (issue #974
+    // review — the eager `pre_resolve` could not answer a staged demand
+    // at all).
     let admission = inner.tcp_admission();
     let Some(ResolvedTarget {
         adapter: proxy,
         rule_name,
         rule_payload,
         route,
-    }) = inner.resolve_proxy_flow(&mut metadata).await
+    }) = inner.resolve_proxy_lazy(&mut metadata).await
     else {
         return Err("no matching rule".into());
     };
@@ -1374,11 +1376,11 @@ mod tests {
         );
     }
 
-    /// Issue #625 review: the strict `resolve_proxy_flow` match requires
-    /// the pre-resolve contract — a fake-IP-rescued flow arrives with
-    /// `dst_ip=None` and a recovered host, so `pre_resolve` must run or the
-    /// IP-CIDR slot can never match and the flow silently falls through to
-    /// `MATCH`. Without the call, this test would observe `MATCH/DIRECT`.
+    /// Issue #625 review: `resolve_proxy_lazy` must satisfy a fake-IP-rescued
+    /// flow's IP demand — it arrives with `dst_ip=None` and a recovered host,
+    /// so the lazy resolver must resolve it or the IP-CIDR slot can never
+    /// match and the flow silently falls through to `MATCH`. Without it this
+    /// test would observe `MATCH/DIRECT`.
     #[tokio::test]
     async fn tcp_flow_pre_resolves_dst_ip_for_ip_rules() {
         use meow_dns::fakeip::{MemoryStore, Pool};

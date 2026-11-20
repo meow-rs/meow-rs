@@ -559,8 +559,13 @@ impl<'a> ClassicalRuleSetBuilder<'a> {
             ));
         }
         // Classical rules have no target column. Every byte after the first
-        // comma belongs to the regex, including repetition bounds and commas.
-        if first_field == "DOMAIN-REGEX" {
+        // comma belongs to the regex, including repetition bounds and
+        // commas — same for the two process regex types (issue #974), all
+        // built through the shared matcher constructors.
+        if matches!(
+            first_field,
+            "DOMAIN-REGEX" | "PROCESS-NAME-REGEX" | "PROCESS-PATH-REGEX"
+        ) {
             // This path bypasses parse_rule, but must retain its input bound
             // before allocating or compiling an untrusted provider expression.
             let max_len = crate::parser::MAX_RULE_LINE_LEN;
@@ -571,12 +576,31 @@ impl<'a> ClassicalRuleSetBuilder<'a> {
             if pattern.is_empty() {
                 return Err(format!("'{entry}': missing payload"));
             }
-            let rule = crate::domain_regex::DomainRegexRule::new(
-                pattern,
-                crate::parser::LOGIC_INNER_PLACEHOLDER,
-            )
-            .map_err(|error| format!("'{entry}': invalid regex: {error}"))?;
-            self.rules.push(Box::new(rule));
+            const PH: &str = crate::parser::LOGIC_INNER_PLACEHOLDER;
+            let rule: Box<dyn Rule> = match first_field {
+                "DOMAIN-REGEX" => Box::new(
+                    crate::domain_regex::DomainRegexRule::new(pattern, PH)
+                        .map_err(|error| format!("'{entry}': invalid regex: {error}"))?,
+                ),
+                "PROCESS-NAME-REGEX" => Box::new(
+                    crate::process_pattern::ProcessPatternRule::new_regex(
+                        meow_common::RuleType::ProcessNameRegex,
+                        pattern,
+                        PH,
+                    )
+                    .map_err(|error| format!("'{entry}': {error}"))?,
+                ),
+                "PROCESS-PATH-REGEX" => Box::new(
+                    crate::process_pattern::ProcessPatternRule::new_regex(
+                        meow_common::RuleType::ProcessPathRegex,
+                        pattern,
+                        PH,
+                    )
+                    .map_err(|error| format!("'{entry}': {error}"))?,
+                ),
+                _ => unreachable!("first_field was matched above"),
+            };
+            self.rules.push(rule);
             return Ok(());
         }
         // An empty or missing payload silently degrades to match-all for
@@ -795,6 +819,57 @@ mod tests {
         let set = builder.build();
         assert!(set.matches(&meta_host("a,b"), &helper()));
         assert!(!set.matches(&meta_host("a"), &helper()));
+    }
+
+    /// The process regex types are comma-protected in classical payloads
+    /// too (issue #974): every byte after the first comma is the pattern —
+    /// a classical entry carries no target column.
+    #[test]
+    fn classical_process_regex_preserves_commas() {
+        let meta_proc = |name: &str| Metadata {
+            process: name.into(),
+            ..Default::default()
+        };
+        let ctx = ParserContext::empty();
+        let mut builder = ClassicalRuleSetBuilder::new(&ctx);
+        builder
+            .push_checked("PROCESS-NAME-REGEX,^fo{1,3}$")
+            .unwrap();
+        builder.push_checked("PROCESS-NAME-REGEX,a,b").unwrap();
+        builder
+            .push_checked("ProcessPathRegex,^/opt/x,y/bin$")
+            .unwrap();
+        let set = builder.build();
+        assert_eq!(set.len(), 3);
+        assert!(set.matches(&meta_proc("foo"), &helper()));
+        assert!(!set.matches(&meta_proc("foooo"), &helper()));
+        assert!(set.matches(&meta_proc("a,b"), &helper()));
+        assert!(!set.matches(&meta_proc("a"), &helper()));
+        let meta_path = |p: &str| Metadata {
+            process_path: p.into(),
+            ..Default::default()
+        };
+        assert!(set.matches(&meta_path("/opt/x,y/bin"), &helper()));
+
+        // Wildcard types take the ordinary splice path — `?`/`*` keep
+        // working with the placeholder target.
+        let mut builder = ClassicalRuleSetBuilder::new(&ctx);
+        builder.push_checked("PROCESS-NAME-WILDCARD,Cu?l*").unwrap();
+        let set = builder.build();
+        assert!(set.matches(&meta_proc("CURL.EXE"), &helper()));
+        assert!(!set.matches(&meta_proc("mycurl"), &helper()));
+
+        // An invalid process regex surfaces the same error class as
+        // DOMAIN-REGEX.
+        let mut builder = ClassicalRuleSetBuilder::new(&ctx);
+        for entry in [
+            "PROCESS-NAME-REGEX",
+            "PROCESS-NAME-REGEX,",
+            "PROCESS-NAME-REGEX,[",
+            "PROCESS-PATH-REGEX,a{3,2}",
+        ] {
+            assert!(builder.push_checked(entry).is_err(), "{entry}");
+        }
     }
 
     #[test]

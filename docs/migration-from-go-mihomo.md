@@ -71,8 +71,11 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `rules:` — GEOSITE | ✓ | mrs format only — see §Rules. |
 | `rules:` — RULE-SET | ✓ | M1.D-5, mrs + yaml formats. |
 | `rules:` — PROCESS-NAME | ✓ | Platform lookup wired. `find-process-mode` selects when it runs (below). |
+| `rules:` — PROCESS-PATH | ✓ | Same lookup as PROCESS-NAME; plus a `/`-prefix directory match and `*` glob (meow-rs extensions over upstream's filename match). |
+| `rules:` — PROCESS-NAME-REGEX, PROCESS-PATH-REGEX | ✓ | Case-insensitive search semantics; comma-protected payloads like DOMAIN-REGEX. |
+| `rules:` — PROCESS-NAME-WILDCARD, PROCESS-PATH-WILDCARD | ✓ | Whole-field `*`/`?` glob (`,`-unprotected fixed fields; a fourth field is parsed as upstream params and ignored). |
 | `rules:` — IN-NAME, IN-TYPE, IN-PORT, IN-USER | ✓ | Named listeners and auth metadata are wired. |
-| `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection. |
+| `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection, including the conditional `SUB-RULE,(<cond>),<name>` form. Condition leaves accept every rule type except `MATCH`/`SUB-RULE` — upstream's logic-leg exclusion set. **Extensions:** a fourth field `SUB-RULE,(<cond>),<name>,<target>` applies a fallback target when the entered block exhausts (upstream has no such field); conditions additionally accept infix `&`/`|`/`!` (upstream parses only the prefix `AND`/`OR`/`NOT` forms). |
 | `rules:` — AND, OR, NOT | ✓ | Logic composition supported. |
 | `rules:` — MATCH | ✓ | Fully supported. |
 | `rule-providers:` — http | ✓ | With interval refresh (M1.D-5). |
@@ -215,15 +218,18 @@ UDP relay via UDP-over-TCP). External SIP003 plugin binaries are
 supported via `plugin:` on `ss` nodes and `allow-external-plugin` on
 providers.
 
-Feature prerequisites: `obfs`/`simple-obfs` and `v2ray-plugin` are
-bundled with `ss` itself (so they are in `minimal`); `gost-plugin`,
-`shadow-tls`, `restls` and `jls` each sit behind a same-named Cargo
-feature, all re-bundled into `default`/`full` but absent from `minimal`
-— a `plugin:` line naming a compiled-out built-in keeps the node bound
-as an unavailable placeholder whose dials fail with a "not compiled
-into this build" error (it is never handed to the external-plugin spawn
-path). `kcptun` and `ech-tls-tunnel` were already separate features and
-behave the same way.
+Feature prerequisites: plain `ss` carries no built-in plugin transport —
+`obfs`/`simple-obfs` sit behind `ss-obfs` and `v2ray-plugin` behind
+`ss-v2ray-plugin`, while `gost-plugin`, `shadow-tls`, `restls` and `jls`
+each sit behind a same-named Cargo feature. All are re-bundled into
+`default`/`full` but absent from `minimal` — a `plugin:` line naming a
+compiled-out built-in keeps the node bound as an unavailable placeholder
+whose dials fail with a "not compiled into this build" error (it is never
+handed to the external-plugin spawn path). `kcptun` and `ech-tls-tunnel`
+were already separate features and behave the same way. The SIP003 binary
+name `obfs-local` follows `ss-obfs` too: with the feature on it keeps its
+external-subprocess semantics; without it the node fails naming
+`ss-obfs` rather than spawning a pruned binary.
 
 ### Trojan
 
@@ -502,7 +508,8 @@ used at dial time. This matches upstream.
 TLS/WS/obfs stack to its own server, then the protocol handshake — over the
 preceding hop's stream (mihomo `DialContextWithDialer` semantics).
 `direct`, `reject`, `http`, `socks5`, `snell`, `vless`, `vmess`, `trojan`,
-`anytls`, and `ss` (built-in obfs/v2ray-plugin/ech-tls-tunnel included) all
+`anytls`, and `ss` (built-in obfs/v2ray-plugin/ech-tls-tunnel included —
+`ss-obfs`, `ss-v2ray-plugin`, `ech-tls-tunnel` features respectively) all
 terminate a relay chain. Two carve-outs fail loudly instead of silently
 misbehaving: `hysteria2` (QUIC/UDP cannot ride a TCP stream — first-hop
 only) and `ss` with `gost-plugin`/`shadow-tls`/`restls`/`jls` (when those

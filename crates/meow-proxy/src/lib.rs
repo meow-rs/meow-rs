@@ -16,7 +16,7 @@ mod aead;
 mod certificate_pin;
 pub mod dialer;
 pub mod direct;
-#[cfg(feature = "ss")]
+#[cfg(feature = "ss-obfs")]
 mod first_flight;
 pub mod group;
 pub mod health;
@@ -41,7 +41,17 @@ pub mod gost_plugin;
 pub mod jls_plugin;
 #[cfg(feature = "kcptun")]
 pub mod kcptun_plugin;
-#[cfg(feature = "ss")]
+// The shared SIP003 opts helpers are consumed only by the built-in plugin
+// transports — each an opt-in feature on top of `ss`.
+#[cfg(any(
+    feature = "ss-v2ray-plugin",
+    feature = "gost-plugin",
+    feature = "shadow-tls",
+    feature = "restls",
+    feature = "jls",
+    feature = "kcptun",
+    feature = "ech-tls-tunnel"
+))]
 mod plugin_util;
 #[cfg(feature = "restls")]
 pub mod restls_plugin;
@@ -49,7 +59,7 @@ pub mod restls_plugin;
 pub mod shadow_tls_plugin;
 #[cfg(feature = "ss")]
 pub mod shadowsocks_adapter;
-#[cfg(feature = "ss")]
+#[cfg(feature = "ss-v2ray-plugin")]
 pub mod v2ray_plugin;
 
 /// `uot.AddrParser` per-packet address headers — shared by the anytls and

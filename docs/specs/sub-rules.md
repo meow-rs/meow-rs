@@ -111,10 +111,50 @@ An inner rule whose target is the literal name `PASS-RULE`, or an adapter
 upstream `matchSubRules`' `continue`. At top level a rule targeting
 `PASS-RULE` materializes the nop adapter and rejects like `REJECT`.
 
-**YAML syntax**: the implemented form is the two-field `SUB-RULE,BLOCK-NAME`.
+**YAML syntax**: the base form is the two-field `SUB-RULE,BLOCK-NAME`.
 A third field (`SUB-RULE,blk,junk`) is a parse error — it was silently dropped
-before #625, which read like a fallback target that never existed. Upstream's
-parenthesized `(cond)` gate-expression form is not implemented.
+before #625, which read like a fallback target that never existed.
+
+Issue #974 adds the conditional forms:
+
+```
+SUB-RULE,(<cond>),<name>            # upstream mihomo's conditional form
+SUB-RULE,(<cond>),<name>,<target>   # MEOW extension: exhaustion fallback
+```
+
+A false condition skips the whole block — no inner rule evaluates, and no
+inner IP/process demand is spent on the flow (condition-first staged
+evaluation; the compiled rule set gives staged slots zero static demand so a
+false condition never forces enrichment). A true condition scans the block in
+order; the first usable inner target wins. Three-field exhaustion falls
+through; four-field exhaustion yields `<target>`, which goes through the
+normal outer target checks. The fallback is an adapter name, not a block
+name — cycle detection and undefined-reference validation see only `<name>`.
+
+A condition leaf is every rule type except `MATCH` and `SUB-RULE` — the
+same exclusion upstream's `payloadToRule` applies to logic legs
+(`rules/logic/logic.go`), and leaves build through the same inner-leg
+grammar so flags, comma-joins and constructors match a logic leg byte for
+byte: `(GEOIP,JP,src)`, `(IP-CIDR,10.0.0.0/8)`, `(DST-PORT,443)`,
+`(PROCESS-NAME,curl)` and `(RULE-SET,my-provider)` are all legal
+predicates. `GEOIP`'s `src` flag selects the source axis and never
+demands resolution. Leaves compose with upstream's prefix operators
+`(AND,((A),(B)))`, `(OR,((A),(B)))`, `(NOT,((A)))` and with MEOW's infix `&`,
+`|` and `!` extension (precedence `!` > `&` > `|`, left-associative,
+parentheses override — upstream parses only the prefix forms). A
+condition leaf that demands a resolved IP reports that demand
+per-predicate — the staged evaluation maps it to the tunnel's
+`NeedsEnrichment` path instead of the push-resolution gate the plain
+reference keeps; an unresolved-but-unavailable demand reads the predicate
+as undecided, never as false — `NOT` over an undecidable leaf stays
+undecided rather than flipping to true.
+
+A single comma-free parenthesised field is a block *name*, not a
+condition — `SUB-RULE,(local)` references a block literally named
+`(local)`. Upstream errors on that line either way (its payload wrapper
+would parse `local` as a rule type), so no upstream-compatible config
+changes meaning; the head still cannot carry a fallback
+(`SUB-RULE,(local),x` parses `local` as a condition type and fails).
 
 **Divergences from upstream** (classified per
 [ADR-0002](../adr/0002-upstream-divergence-policy.md)):

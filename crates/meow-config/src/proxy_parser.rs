@@ -1101,11 +1101,17 @@ fn plugin_spawn_suppressed() -> bool {
 ///
 /// Mirrors the dispatch in `ShadowsocksAdapter::new`: anything not recognised
 /// as built-in is handed to `Plugin::start`, which spawns a child process.
+/// A name that is feature-reserved but compiled out (`obfs-local` under an
+/// `ss`-only build, see `FEATURE_GATED_PLUGINS`) is *not* external here: it
+/// can never reach `Plugin::start` — the adapter's "not compiled" Config
+/// error fires first — so the spawn-suppression, process-policy and
+/// provider gates must not mask that verdict.
 #[cfg(feature = "ss")]
 fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
-    plugin
-        .filter(|p| !p.is_empty())
-        .is_some_and(|p| !meow_proxy::shadowsocks_adapter::is_builtin_sip003_plugin(p))
+    plugin.filter(|p| !p.is_empty()).is_some_and(|p| {
+        !meow_proxy::shadowsocks_adapter::is_builtin_sip003_plugin(p)
+            && meow_proxy::shadowsocks_adapter::missing_plugin_feature(p).is_none()
+    })
 }
 
 /// Reject a `ProxyDialer` for adapter types that do not thread it through.
@@ -7649,11 +7655,16 @@ tls: true
     #[cfg(all(feature = "ss", feature = "trojan"))]
     #[test]
     fn provider_node_allows_builtin_plugins_and_other_types() {
-        let cfg = proxy_config(
-            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
-             plugin: obfs\nplugin-opts:\n  mode: http\n",
-        );
-        assert!(super::parse_proxy_provider_node(&cfg, true, false, &direct_dialer()).is_ok());
+        // The `obfs` leg needs the transport compiled in — under an
+        // `ss`-only build `plugin: obfs` errors naming `ss-obfs` instead.
+        #[cfg(feature = "ss-obfs")]
+        {
+            let cfg = proxy_config(
+                "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+                 plugin: obfs\nplugin-opts:\n  mode: http\n",
+            );
+            assert!(super::parse_proxy_provider_node(&cfg, true, false, &direct_dialer()).is_ok());
+        }
 
         // A stray `plugin:` on a trojan node is ignored by its parser —
         // the gate must not reject it either.
@@ -7665,7 +7676,7 @@ tls: true
 
     /// v2ray-plugin is a built-in in-process plugin — the gate must let it
     /// through on provider nodes too.
-    #[cfg(feature = "ss")]
+    #[cfg(feature = "ss-v2ray-plugin")]
     #[test]
     fn provider_node_allows_v2ray_plugin() {
         let cfg = proxy_config(
@@ -7762,6 +7773,9 @@ tls: true
     #[test]
     fn disabled_builtin_plugins_error_cleanly_and_stay_reserved() {
         for name in [
+            "obfs",
+            "simple-obfs",
+            "v2ray-plugin",
             "gost-plugin",
             "shadow-tls",
             "restls",
@@ -7812,6 +7826,48 @@ tls: true
                 }
             }
         }
+    }
+
+    /// `obfs-local` is the SIP003 *binary* name, not a built-in spelling —
+    /// but without `ss-obfs` it joins the reserved names all the same: the
+    /// adapter errors naming the feature, the spawn gates no longer
+    /// classify it as external, and the node binds an ss placeholder.
+    #[cfg(all(feature = "ss", not(feature = "ss-obfs")))]
+    #[test]
+    fn obfs_local_without_ss_obfs_errors_like_a_reserved_name() {
+        assert!(!is_external_sip003_plugin(Some("obfs-local")));
+        assert_eq!(
+            meow_proxy::shadowsocks_adapter::missing_plugin_feature("obfs-local"),
+            Some("ss-obfs")
+        );
+        let cfg = proxy_config(
+            "name: s\ntype: ss\nserver: 1.2.3.4\nport: 8388\npassword: p\ncipher: aes-128-gcm\n\
+             plugin: obfs-local\n",
+        );
+        let Err(err) = parse_proxy(&cfg) else {
+            panic!("compiled-out obfs-local must not parse")
+        };
+        assert!(err.contains("not compiled into this build"), "{err}");
+        assert!(err.contains("obfs-local"), "{err}");
+        assert!(err.contains("ss-obfs"), "{err}");
+        assert_eq!(
+            placeholder_adapter_type(&cfg),
+            Some(meow_common::AdapterType::Shadowsocks),
+            "a compiled-out obfs-local node binds an ss placeholder"
+        );
+    }
+
+    /// The flip side: with `ss-obfs` compiled in `obfs-local` reverts to a
+    /// plain external name — the provider/dry-run spawn gates see it and
+    /// `missing_plugin_feature` never claims it.
+    #[cfg(feature = "ss-obfs")]
+    #[test]
+    fn obfs_local_with_ss_obfs_is_external_again() {
+        assert!(is_external_sip003_plugin(Some("obfs-local")));
+        assert_eq!(
+            meow_proxy::shadowsocks_adapter::missing_plugin_feature("obfs-local"),
+            None
+        );
     }
 
     /// A `plugin:` value that is not a string is a malformed node — never

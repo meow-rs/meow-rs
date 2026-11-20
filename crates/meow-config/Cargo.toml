@@ -9,10 +9,14 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = ["ss", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "shadow-tls", "restls", "jls", "gost-plugin"]
+default = ["ss", "ss-obfs", "ss-v2ray-plugin", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "shadow-tls", "restls", "jls", "gost-plugin"]
 ss = ["meow-proxy/ss"]
 # Built-in SIP003 plugin transports on the `ss` outbound — opt-in, each
-# implies `ss`; `ss` alone keeps only simple-obfs + v2ray-plugin.
+# implies `ss`; plain `ss` now carries none of them (ADR-0007: `minimal`
+# dropped even simple-obfs + v2ray-plugin after their symbols tipped the
+# 8 MiB aarch64-musl hard budget).
+ss-obfs = ["ss", "meow-proxy/ss-obfs"]
+ss-v2ray-plugin = ["ss", "meow-proxy/ss-v2ray-plugin"]
 shadow-tls = ["ss", "meow-proxy/shadow-tls"]
 restls = ["ss", "meow-proxy/restls"]
 jls = ["ss", "meow-proxy/jls"]

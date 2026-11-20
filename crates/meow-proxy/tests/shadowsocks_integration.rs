@@ -28,6 +28,7 @@ fn ssserver_available() -> bool {
         .is_ok()
 }
 
+#[cfg(feature = "ss-obfs")]
 fn obfs_available() -> bool {
     std::process::Command::new("obfs-local")
         .stdout(Stdio::null())
@@ -41,6 +42,7 @@ fn obfs_available() -> bool {
             .is_ok()
 }
 
+#[cfg(feature = "ss-obfs")]
 fn obfs_server_available() -> bool {
     std::process::Command::new("obfs-server")
         .stdout(Stdio::null())
@@ -121,6 +123,7 @@ async fn start_ssserver_with_cipher(ss_port: u16, cipher: &str, key: &str) -> Ch
 }
 
 /// Start ssserver with an optional SIP003 plugin.
+#[cfg(feature = "ss-obfs")]
 async fn start_ssserver_with_plugin(ss_port: u16, plugin: &str, plugin_opts: &str) -> Child {
     start_ssserver_inner(
         ss_port,
@@ -421,6 +424,7 @@ async fn test_ss_udp_relay_2022() {
     }
 }
 
+#[cfg(feature = "ss-obfs")]
 #[tokio::test]
 async fn test_ss_tcp_relay_with_obfs_plugin() {
     if !ssserver_available() {
@@ -514,6 +518,7 @@ async fn test_ss_tcp_relay_with_obfs_plugin() {
 /// `obfs-server` on the server side (still external, since simple-obfs has no
 /// server-side native impl) and the in-process `HttpObfs` wrapper on the
 /// client side. Verifies wire compatibility with the reference Go protocol.
+#[cfg(feature = "ss-obfs")]
 #[tokio::test]
 async fn test_ss_tcp_relay_with_builtin_obfs_http() {
     if !ssserver_available() {
@@ -587,6 +592,7 @@ async fn test_ss_tcp_relay_with_builtin_obfs_http() {
 /// request and relay the banner back. (`obfs-server` coalesces its
 /// response headers with the first banner bytes; the header-only response
 /// case is covered by the `HttpObfs` unit tests.)
+#[cfg(feature = "ss-obfs")]
 #[tokio::test]
 async fn test_ss_builtin_obfs_http_server_first_banner() {
     if !ssserver_available() {
@@ -649,6 +655,7 @@ async fn test_ss_builtin_obfs_http_server_first_banner() {
 }
 
 /// Same as above, but for `mode=tls` simple-obfs.
+#[cfg(feature = "ss-obfs")]
 #[tokio::test]
 async fn test_ss_tcp_relay_with_builtin_obfs_tls() {
     if !ssserver_available() {
@@ -772,6 +779,7 @@ async fn test_ss_connect_over_runs_ss_handshake() {
 /// An external SIP003 plugin owns its own outbound connection — it cannot
 /// consume a relay-supplied stream. `connect_over` must fail loudly with
 /// `NotSupported` instead of silently dialing direct.
+#[cfg(feature = "ss-obfs")]
 #[tokio::test]
 async fn test_ss_connect_over_external_plugin_not_supported() {
     if !obfs_available() {
@@ -819,6 +827,7 @@ async fn test_ss_connect_over_external_plugin_not_supported() {
 /// supplied stream in HTTP obfs before SS crypto — the server-side
 /// `obfs-server` unwraps it. Same wire path as the external plugin, but the
 /// stream ownership stays in-process so connect_over works.
+#[cfg(feature = "ss-obfs")]
 #[tokio::test]
 async fn test_ss_connect_over_builtin_obfs_http() {
     if !ssserver_available() {
@@ -875,6 +884,7 @@ async fn test_ss_connect_over_builtin_obfs_http() {
 /// Same as above, but for `mode=tls` simple-obfs: the supplied stream must
 /// be wrapped in the fake-TLS record layer before SS crypto — `obfs-server`
 /// (server side, `obfs=tls`) unwraps it.
+#[cfg(feature = "ss-obfs")]
 #[tokio::test]
 async fn test_ss_connect_over_builtin_obfs_tls() {
     if !ssserver_available() {

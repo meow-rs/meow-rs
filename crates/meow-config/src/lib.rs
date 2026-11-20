@@ -3812,15 +3812,19 @@ fn rebuild_from_raw_impl(
         strict,
     )?;
 
-    // Validate: any `SUB-RULE,<name>` in top-level rules must reference a
-    // defined block. `parse_rules_full` warns on unknown blocks; promote
-    // undefined-block to a hard error here (Class A per ADR-0002).
+    // Validate: any `SUB-RULE` reference in top-level rules must point at a
+    // defined block — plain, conditional or fallback form alike (issue
+    // #974). `parse_rules_full` warns on unknown blocks; promote
+    // undefined-block to a hard error here (Class A per ADR-0002). Only a
+    // well-formed reference head counts: a malformed one fails at the
+    // parse stage, so skipping it here leaves exactly one error channel.
     if let Some(raw_rules) = raw.rules.as_deref() {
         for line in raw_rules {
-            if let Some(name) = sub_rules_parser::parse_sub_rule_reference(line) {
-                if !sub_rules.contains_key(&name) {
+            if let Ok(Some(reference)) = sub_rules_parser::parse_sub_rule_reference(line) {
+                if !sub_rules.contains_key(&reference.name) {
                     return Err(anyhow::anyhow!(
-                        "rules: SUB-RULE,{name} references undefined sub-rule block"
+                        "rules: SUB-RULE,{} references undefined sub-rule block",
+                        reference.name
                     ));
                 }
             }
@@ -4745,16 +4749,117 @@ fn geoip_scan_regex() -> &'static regex::Regex {
     })
 }
 
+/// One raw rule line classified for geo discovery (issue #974): the text
+/// segments the plain `GEOIP,`/`GEOSITE,`/`IP-ASN,` regexes may scan,
+/// plus the parsed SUB-RULE condition trees — the only position cond
+/// leaves can legally live. Free-form pattern fields never become scan
+/// text: a `GEOIP,x` inside a regex or glob — or inside a logic-group
+/// leg of those types — is process/domain text, never a declaration.
+/// Malformed lines contribute nothing (the parse stage owns the error).
+#[derive(Default)]
+struct GeoLineScan<'a> {
+    texts: Vec<&'a str>,
+    conds: Vec<meow_rules::sub_rule_cond::CondExpr>,
+}
+
+fn geo_scan_targets(line: &str) -> GeoLineScan<'_> {
+    let mut scan = GeoLineScan::default();
+    let trimmed = line.trim();
+    // The same input bound the rule parser enforces — a line it would
+    // reject contributes nothing, and the bound keeps the classifier's
+    // per-level work honest before the parse stage owns the error.
+    if !trimmed.is_empty()
+        && !trimmed.starts_with('#')
+        && trimmed.len() <= meow_rules::parser::MAX_RULE_LINE_LEN
+    {
+        collect_geo_segments(trimmed, &mut scan, 0);
+    }
+    scan
+}
+
+/// Classify one rule-position text — a top-level line or a logic leg —
+/// into scan segments, recursing through logic groups so a leg's own
+/// type governs how its text is treated (issue #974 review: a
+/// `PROCESS-*` leg's `GEOIP,x` text must not trigger a geo load).
+/// `depth` mirrors the parser's `MAX_LOGIC_DEPTH` budget — this scan
+/// runs *before* the parse stage, so an over-deep line must stop the
+/// descent here rather than overflow the stack first.
+fn collect_geo_segments<'a>(text: &'a str, scan: &mut GeoLineScan<'a>, depth: usize) {
+    use meow_rules::sub_rule_cond::{parse_cond, parse_sub_rule_reference};
+    let ty = text.split(',').next().map_or("", str::trim);
+    let ty = meow_common::RuleType::from_mihomo_name(ty)
+        .map_or_else(|| ty.to_ascii_uppercase(), |t| t.as_str().to_string());
+    match ty.as_str() {
+        // The pattern field is unbounded expression text: a `GEOIP,x`
+        // inside a regex or glob is process-name/domain text, never a
+        // geo declaration. DOMAIN-REGEX joins the class: its
+        // comma-protected payload could carry `GEOIP,x` too.
+        "PROCESS-NAME"
+        | "PROCESS-PATH"
+        | "PROCESS-NAME-REGEX"
+        | "PROCESS-PATH-REGEX"
+        | "PROCESS-NAME-WILDCARD"
+        | "PROCESS-PATH-WILDCARD"
+        | "DOMAIN-REGEX" => {}
+        "SUB-RULE" => {
+            if let Some(cond) = parse_sub_rule_reference(text)
+                .ok()
+                .flatten()
+                .and_then(|r| r.cond)
+                .and_then(|c| parse_cond(&c).ok())
+            {
+                scan.conds.push(cond);
+            }
+        }
+        "AND" | "OR" | "NOT" => {
+            // A group the parser would reject for depth can never exist
+            // as a rule — stop scanning this branch rather than recursing
+            // one stack frame per level (the parse stage owns the error).
+            if depth >= meow_rules::parser::MAX_LOGIC_DEPTH {
+                return;
+            }
+            // Decompose `(leg),(leg),<target>` and classify each leg on
+            // its own type; a malformed shape falls back to the raw
+            // text (conservative — the parse stage fails it anyway).
+            let decomposed = text
+                .split_once(',')
+                .map(|(_, rest)| rest.trim_start())
+                .filter(|rest| rest.starts_with('('))
+                .and_then(|rest| {
+                    let end = meow_rules::parser::matching_paren(rest)?;
+                    meow_rules::parser::split_logic_groups(&rest[1..end]).ok()
+                });
+            match decomposed {
+                Some(legs) => {
+                    for leg in legs {
+                        collect_geo_segments(leg.trim(), scan, depth + 1);
+                    }
+                }
+                None => scan.texts.push(text),
+            }
+        }
+        _ => scan.texts.push(text),
+    }
+}
+
 fn collect_geoip_countries(lines: &[String]) -> std::collections::HashSet<String> {
     let re = geoip_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        let scan = geo_scan_targets(line);
+        for text in &scan.texts {
+            for cap in re.captures_iter(text) {
+                out.insert(cap[1].to_ascii_uppercase());
+            }
         }
-        for cap in re.captures_iter(line) {
-            out.insert(cap[1].to_ascii_uppercase());
+        for cond in &scan.conds {
+            for leaf in cond.leaves() {
+                // `GEOIP` covers the `,src` param form; `SRC-GEOIP` is
+                // its dedicated name — both key the country index.
+                if matches!(leaf.ty.as_str(), "GEOIP" | "SRC-GEOIP") {
+                    out.insert(leaf.payload.to_ascii_uppercase());
+                }
+            }
         }
     }
     out
@@ -4779,12 +4884,25 @@ fn collect_geosite_categories(lines: &[String]) -> std::collections::HashSet<Str
     let re = geosite_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        let scan = geo_scan_targets(line);
+        for text in &scan.texts {
+            for cap in re.captures_iter(text) {
+                out.insert(cap[1].to_ascii_lowercase());
+            }
         }
-        for cap in re.captures_iter(line) {
-            out.insert(cap[1].to_ascii_lowercase());
+        for cond in &scan.conds {
+            for leaf in cond.leaves() {
+                if leaf.ty == "GEOSITE" {
+                    // Same `category@attr` split the GeoSite leaf build
+                    // performs — only the category keys the loader.
+                    if let Some(cat) = leaf.payload.split('@').next() {
+                        let cat = cat.trim();
+                        if !cat.is_empty() {
+                            out.insert(cat.to_ascii_lowercase());
+                        }
+                    }
+                }
+            }
         }
     }
     out
@@ -4836,13 +4954,21 @@ fn collect_asn_numbers(lines: &[String]) -> std::collections::HashSet<u32> {
     let re = asn_scan_regex();
     let mut out = std::collections::HashSet::new();
     for line in lines {
-        let trimmed = line.trim();
-        if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
+        let scan = geo_scan_targets(line);
+        for text in &scan.texts {
+            for cap in re.captures_iter(text) {
+                if let Ok(asn) = cap[1].parse::<u32>() {
+                    out.insert(asn);
+                }
+            }
         }
-        for cap in re.captures_iter(line) {
-            if let Ok(asn) = cap[1].parse::<u32>() {
-                out.insert(asn);
+        for cond in &scan.conds {
+            for leaf in cond.leaves() {
+                if matches!(leaf.ty.as_str(), "IP-ASN" | "SRC-IP-ASN") {
+                    if let Ok(asn) = leaf.payload.trim().parse::<u32>() {
+                        out.insert(asn);
+                    }
+                }
             }
         }
     }
@@ -4850,26 +4976,43 @@ fn collect_asn_numbers(lines: &[String]) -> std::collections::HashSet<u32> {
 }
 
 /// True iff `line` references the GeoIP Country database anywhere — as a
-/// top-level `GEOIP,`/`SRC-GEOIP,` rule or nested inside a logic rule
-/// (`AND`/`OR`/`NOT`). Comment lines never match. Uses the same regex as
+/// top-level `GEOIP,`/`SRC-GEOIP,` rule, nested inside a logic rule
+/// (`AND`/`OR`/`NOT`), or as a SUB-RULE condition leaf (issue #974).
+/// Comment lines never match. Uses the same classifier as
 /// [`collect_geoip_countries`] so the trigger and the allowlist agree.
 fn line_references_geoip(line: &str) -> bool {
-    let line = line.trim();
-    !line.is_empty() && !line.starts_with('#') && geoip_scan_regex().is_match(line)
+    let scan = geo_scan_targets(line);
+    scan.texts.iter().any(|t| geoip_scan_regex().is_match(t))
+        || scan.conds.iter().any(|c| {
+            c.leaves()
+                .iter()
+                .any(|l| matches!(l.ty.as_str(), "GEOIP" | "SRC-GEOIP"))
+        })
 }
 
-/// True iff `line` references the geosite database anywhere (top-level or
-/// nested inside a logic rule). Comment lines never match.
+/// True iff `line` references the geosite database anywhere (top-level,
+/// nested inside a logic rule, or a SUB-RULE condition leaf). Comment
+/// lines never match.
 fn line_references_geosite(line: &str) -> bool {
-    let line = line.trim();
-    !line.is_empty() && !line.starts_with('#') && geosite_scan_regex().is_match(line)
+    let scan = geo_scan_targets(line);
+    scan.texts.iter().any(|t| geosite_scan_regex().is_match(t))
+        || scan
+            .conds
+            .iter()
+            .any(|c| c.leaves().iter().any(|l| l.ty == "GEOSITE"))
 }
 
 /// True iff `line` references the GeoLite2-ASN database anywhere — `IP-ASN,`
-/// or `SRC-IP-ASN,`, top-level or nested. Comment lines never match.
+/// or `SRC-IP-ASN,`, top-level, nested in a logic rule, or a SUB-RULE
+/// condition leaf. Comment lines never match.
 fn line_references_asn(line: &str) -> bool {
-    let line = line.trim();
-    !line.is_empty() && !line.starts_with('#') && asn_scan_regex().is_match(line)
+    let scan = geo_scan_targets(line);
+    scan.texts.iter().any(|t| asn_scan_regex().is_match(t))
+        || scan.conds.iter().any(|c| {
+            c.leaves()
+                .iter()
+                .any(|l| matches!(l.ty.as_str(), "IP-ASN" | "SRC-IP-ASN"))
+        })
 }
 
 /// Gather every rule line that can reference a geo database (issue #277):
@@ -4899,16 +5042,25 @@ fn collect_geo_scan_lines(
     // for providers the candidate does not carry (issue #543).
     let declared = raw.rule_providers.as_ref();
     for (name, bytes) in provider_payloads.iter() {
-        if !declared.is_some_and(|m| m.contains_key(name)) || meow_rules::is_mrs_bytes(bytes) {
+        let Some(cfg) = declared.and_then(|m| m.get(name)) else {
+            continue;
+        };
+        if meow_rules::is_mrs_bytes(bytes) {
             continue;
         }
         let text = String::from_utf8_lossy(bytes);
-        lines.extend(
-            text.lines()
-                .map(str::trim)
-                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                .map(String::from),
-        );
+        // Decode per the declared `format:` so a YAML payload's entries —
+        // not its raw `- "…"` source text — feed the geo scan (issue
+        // #974 review); an undecodable payload falls back to raw lines.
+        match rule_provider::payload_entries_for_scan(cfg, &text) {
+            Some(entries) => lines.extend(entries),
+            None => lines.extend(
+                text.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                    .map(String::from),
+            ),
+        }
     }
     lines
 }
@@ -9302,6 +9454,78 @@ mod geoip_context_tests {
         );
     }
 
+    /// Issue #974 review — the scan descends logic nesting *before* the
+    /// rule parser sees the line, so it must apply the parser's own
+    /// bounds: a line over `MAX_RULE_LINE_LEN` contributes nothing, and
+    /// a nesting past `MAX_LOGIC_DEPTH` stops the descent. Without them
+    /// `AND,((`×N — eight bytes per level — overflows the stack here
+    /// long before the parse stage reports its "nesting exceeds" error.
+    #[test]
+    fn geo_scan_bounds_logic_nesting_and_line_length() {
+        // 8000 levels stay inside the length cap — only the depth bound
+        // stops the descent. The innermost GEOIP leg sits below the cap,
+        // so nothing is classified.
+        let mut deep = String::new();
+        for _ in 0..8000 {
+            deep.push_str("AND,((");
+        }
+        deep.push_str("GEOIP,CN");
+        for _ in 0..8000 {
+            deep.push_str("))");
+        }
+        deep.push_str(",DIRECT");
+        assert!(deep.len() <= meow_rules::parser::MAX_RULE_LINE_LEN);
+        let countries = collect_geoip_countries(std::slice::from_ref(&deep));
+        assert!(
+            countries.is_empty(),
+            "a branch the parser rejects for depth must not be scanned: {countries:?}"
+        );
+        // The parse stage then owns the failure — the same line errors
+        // on the depth cap instead of overflowing either stack.
+        let Err(err) =
+            meow_rules::parser::parse_rule(&deep, &meow_rules::parser::ParserContext::empty())
+        else {
+            panic!("the parser must reject the over-deep line");
+        };
+        assert!(err.contains("nesting"), "{err}");
+
+        // One byte past the length cap and the line contributes nothing —
+        // the parser rejects it for length, so its geo keys never exist.
+        let mut overlong = deep.clone();
+        overlong.push_str(&"x".repeat(meow_rules::parser::MAX_RULE_LINE_LEN));
+        let countries = collect_geoip_countries(&[overlong]);
+        assert!(
+            countries.is_empty(),
+            "an over-cap line must not be scanned at all: {countries:?}"
+        );
+
+        // The bound mirrors the parser exactly: 64 nested groups is the
+        // most a legal line carries — the GEOIP leaf inside still scans;
+        // one level more and the whole line (and its leaves) is dead.
+        let nested = |levels: usize| {
+            let mut line = String::new();
+            for _ in 0..levels {
+                line.push_str("AND,((");
+            }
+            line.push_str("GEOIP,CN");
+            for _ in 0..levels {
+                line.push_str("))");
+            }
+            line.push_str(",DIRECT");
+            line
+        };
+        let countries = collect_geoip_countries(&[nested(64)]);
+        assert!(
+            countries.contains("CN"),
+            "a GEOIP leaf at the legal boundary must still be found: {countries:?}"
+        );
+        let countries = collect_geoip_countries(&[nested(65)]);
+        assert!(
+            countries.is_empty(),
+            "a GEOIP leaf under an over-deep group must not be found: {countries:?}"
+        );
+    }
+
     /// Issue #277 — geo keys referenced only inside `sub-rules:` blocks must
     /// be seen by the scan (both for the DB-load trigger and the allowlist).
     #[test]
@@ -9416,6 +9640,31 @@ mod geoip_context_tests {
         assert!(collect_asn_numbers(&lines).contains(&15169));
     }
 
+    /// Issue #974 — a GEOIP key that appears only inside a condition leaf
+    /// likewise triggers the mmdb load, observed as the fail-fast error
+    /// naming the nonexistent DB path.
+    #[test]
+    fn cond_only_geoip_triggers_mmdb_load() {
+        let mut sub_rules = HashMap::new();
+        sub_rules.insert("blk".to_string(), vec!["DOMAIN,x.test,DIRECT".to_string()]);
+        let raw = raw::RawConfig {
+            rules: Some(vec!["SUB-RULE,(GEOIP,JP),blk".to_string()]),
+            sub_rules: Some(sub_rules),
+            ..Default::default()
+        };
+        let nonexistent = PathBuf::from("/nonexistent-test-path-974/Country.mmdb");
+        let err = build_parser_context_at(
+            &raw,
+            &nonexistent,
+            &nonexistent_asn(),
+            &nonexistent_geosite(),
+            None,
+            &rule_provider::PrefetchedPayloads::default(),
+        )
+        .expect_err("a cond-only GEOIP leaf must trigger the mmdb load");
+        assert!(format!("{err}").contains("/nonexistent-test-path-974/Country.mmdb"));
+    }
+
     /// Issue #277 — a GEOIP rule that appears only inside a sub-rules block
     /// must trigger the mmdb load (observable here as the fail-fast error for
     /// a missing DB, which names the triggering line).
@@ -9455,6 +9704,51 @@ mod geoip_context_tests {
             "DOMAIN,example.com,DIRECT".to_string(),
         ];
         assert!(collect_geoip_countries(&lines).is_empty());
+    }
+
+    /// Issue #974 — a GEOIP/GEOSITE key that exists only inside a
+    /// `SUB-RULE,(cond),…` predicate still triggers and bins the database
+    /// load, across every condition grammar form: prefix composites,
+    /// infix `&`/`|`/`!`, and `category@attr` payloads.
+    #[test]
+    fn cond_leaves_feed_geo_discovery() {
+        let lines = vec![
+            "SUB-RULE,(GEOIP,JP),blk".to_string(),
+            "SUB-RULE,((GEOIP,KR)|(GEOSITE,youtube@ads)),blk2,T".to_string(),
+            "SUB-RULE,(AND,((GEOSITE,cn),(GEOIP,US,src))),blk3".to_string(),
+            "SUB-RULE,(NOT,((GEOIP,TW))),blk4".to_string(),
+            // A plain reference's block name is never a geo declaration.
+            "SUB-RULE,GEOIP-fake-name".to_string(),
+        ];
+        let countries = collect_geoip_countries(&lines);
+        for code in ["JP", "KR", "US", "TW"] {
+            assert!(countries.contains(code), "missing cond country {code}");
+        }
+        assert_eq!(countries.len(), 4);
+        let categories = collect_geosite_categories(&lines);
+        // `@ads` keys the category, not the attribute — same split the
+        // leaf build performs.
+        assert!(categories.contains("youtube"));
+        assert!(categories.contains("cn"));
+        assert_eq!(categories.len(), 2);
+    }
+
+    /// A malformed condition contributes nothing — the parse stage owns
+    /// that error; discovery must not read a geo declaration out of text
+    /// it cannot validate (issue #974).
+    #[test]
+    fn malformed_cond_declares_no_geo() {
+        let lines = vec![
+            "SUB-RULE,(GEOIP,XX".to_string(),                 // unbalanced
+            "SUB-RULE,(GEOIP,YY),blk,junk,extra".to_string(), // too many fields
+            "SUB-RULE,(PROCESS-NAME,GEOIP,ZZ),blk".to_string(),
+            "PROCESS-NAME-REGEX,GEOIP,XX,DIRECT".to_string(),
+            "PROCESS-PATH-WILDCARD,GEOSITE-*-cn,DIRECT".to_string(),
+        ];
+        assert!(collect_geoip_countries(&lines).is_empty());
+        assert!(collect_geosite_categories(&lines).is_empty());
+        assert!(!lines.iter().any(|l| line_references_geoip(l)));
+        assert!(!lines.iter().any(|l| line_references_geosite(l)));
     }
 
     fn nonexistent_asn() -> PathBuf {

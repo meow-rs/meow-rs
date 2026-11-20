@@ -3797,11 +3797,12 @@ fn dry_parse_rule_line(state: &AppState, raw: &RawConfig, line: &str) -> Result<
         geosite: None,
     };
     let sub_rules = match raw.sub_rules.as_ref() {
-        // A committed `sub-rules:` section always parses — on defect the
-        // rebuild errors louder than this check, so an empty map stands in.
+        // A committed `sub-rules:` section always parses — but when it
+        // does not, the parse error is the real defect the caller needs,
+        // not a phantom "block not defined" under an empty map.
         Some(map) if !map.is_empty() => {
             meow_config::sub_rules_parser::parse_sub_rules(map, &providers, &ctx, false)
-                .unwrap_or_default()
+                .map_err(|e| format!("sub-rules: {e}"))?
         }
         _ => Default::default(),
     };
@@ -5388,17 +5389,66 @@ async fn put_configs(
             // + `resolve_named_listeners`); the live-state half cannot be
             // proven without a built candidate, so refuse it (issue #974).
             let tun_changed = tun_transition_pending(&committed, &raw_config);
-            if profile_changed || keepalive_changed || ntp_changed || tun_changed {
+            // `find-process-mode` is the same class: the commit installs
+            // the candidate's mode on the tunnel's live policy (issue
+            // #974 review).
+            let fpm_changed = committed.find_process_mode.unwrap_or_default()
+                != raw_config.find_process_mode.unwrap_or_default();
+            if profile_changed || keepalive_changed || ntp_changed || tun_changed || fpm_changed {
                 return reload_rejected(
                     StatusCode::BAD_REQUEST,
                     "config validation failed under force, and the candidate \
-                     changes an effective profile/ntp/outbound-keepalive/tun \
-                     policy — the fallback would claim a switch it cannot \
-                     apply; fix the defect and retry",
+                     changes an effective profile/ntp/outbound-keepalive/tun/\
+                     find-process-mode policy — the fallback would claim a \
+                     switch it cannot apply; fix the defect and retry",
                 );
             }
             meow_config::resolve_ntp(&raw_config).ok()
         };
+        // `sub-rules:` has no lenient arm — every block parse is strict,
+        // so a structurally broken section committed verbatim would fail
+        // the next boot and every warm mutation until then. Gate it like
+        // the other document checks; declared rule-provider names stand
+        // in for sets the failed builds could not produce (their
+        // availability is environment, not shape) — issue #974 review.
+        if let Some(sub_map) = raw_config.sub_rules.as_ref().filter(|m| !m.is_empty()) {
+            let stand_ins: std::collections::HashMap<_, _> = raw_config
+                .rule_providers
+                .as_ref()
+                .map(|providers| {
+                    providers
+                        .keys()
+                        .map(|name| {
+                            let set: Arc<dyn meow_rules::RuleSet> =
+                                Arc::from(meow_rules::build_rule_set(
+                                    meow_rules::RuleSetBehavior::Classical,
+                                    &[],
+                                    &meow_rules::ParserContext::empty(),
+                                ));
+                            (name.clone(), set)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let Err(e) = meow_config::sub_rules_parser::check_sub_rules_shape(
+                raw_config.rules.as_deref().unwrap_or(&[]),
+                sub_map,
+                &stand_ins,
+                &meow_rules::ParserContext {
+                    geoip: Some(Arc::new(meow_rules::country_index::CountryIndex::default())),
+                    asn: Some(Arc::new(meow_rules::asn_index::AsnIndex::default())),
+                    geosite: None,
+                },
+            ) {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "config validation failed under force, and the candidate's \
+                              sub-rules are structurally unsafe to commit verbatim: {e}"
+                    ),
+                );
+            }
+        }
         // An unchanged `ntp:` block escapes the diff gate even when
         // the candidate deleted the dialer target itself — committing
         // it verbatim would persist a reference the next startup's
@@ -7511,10 +7561,14 @@ mod global_route_binding_tests {
             true,
         ));
         let tunnel = Tunnel::new(resolver);
-        let meow_config::RebuildResult { proxies, rules, .. } =
-            meow_config::rebuild_from_raw(&raw).unwrap();
+        let meow_config::RebuildResult {
+            proxies,
+            rules,
+            sub_rules,
+            ..
+        } = meow_config::rebuild_from_raw(&raw).unwrap();
         tunnel.update_proxies(proxies, Default::default());
-        tunnel.update_rules(rules);
+        tunnel.update_rules_with_sub_rules(rules, sub_rules);
         let dir = std::env::temp_dir().join(format!("meow-api-695-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         Arc::new(AppState {

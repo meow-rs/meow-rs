@@ -1,4 +1,4 @@
-#![cfg(feature = "ss")]
+#![cfg(feature = "ss-v2ray-plugin")]
 //! Real-peer interop for the built-in `v2ray-plugin` transport:
 //!
 //!   meow-rs ShadowsocksAdapter  --ws-->  v2ray-plugin server  -->  ssserver  -->  TCP echo

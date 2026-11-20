@@ -126,6 +126,14 @@ pub(crate) fn domain_payload_defect(rule: &dyn Rule) -> Option<&'static str> {
         if let Some(not) = any.downcast_ref::<NotRule>() {
             return domain_payload_defect(not.inner());
         }
+        if let Some(sub) = any.downcast_ref::<meow_rules::sub_rule::SubRuleRule>() {
+            // A conditional SUB-RULE's predicate tree is built from real
+            // rules — walk it so a dead `(DOMAIN,a..b)` leaf is flagged
+            // on the reference line just like a logic-group leg
+            // (issue #974). The block's members were checked when the
+            // block itself was parsed.
+            return sub.cond().and_then(domain_payload_defect);
+        }
     }
     let rule_type = rule.rule_type();
     if rule.payload().is_empty() {
@@ -177,23 +185,16 @@ pub fn parse_one_rule_or_subrule(
     if let Some(result) = try_parse_rule_set(line, providers) {
         return result;
     }
-    if let Some(block_name) = parse_sub_rule_reference(line) {
-        // `SUB-RULE,<name>` takes exactly one field. A further comma field
-        // — upstream's unsupported `SUB-RULE,(cond),name` conditional form,
-        // or a typo'd `SUB-RULE,name,junk` — used to be silently dropped,
-        // which routes by a different block than the author wrote (#625).
-        let rest = line
-            .split_once(',')
-            .map(|(_, r)| r)
-            .unwrap_or_default()
-            .trim();
-        if rest.contains(',') {
-            return Err(format!(
-                "SUB-RULE takes exactly <block-name> — trailing fields are \
-                 not supported: '{line}'"
-            ));
-        }
-        return build_sub_rule_rule(&block_name, sub_rules);
+    // `SUB-RULE` references take the shared structured grammar: the
+    // plain `,<name>` form, mihomo's `,(cond),<name>` conditional, and
+    // MEOW's `,(cond),<name>,<target>` fallback (issue #974). Malformed
+    // heads — trailing junk fields, unbalanced cond parens, a cond that
+    // is not a parenthesized predicate — are errors, not silent drops:
+    // a silent drop would route by a different block than written (#625).
+    match parse_sub_rule_reference(line) {
+        Err(e) => return Err(e),
+        Ok(Some(reference)) => return build_sub_rule_rule(&reference, providers, ctx, sub_rules),
+        Ok(None) => {}
     }
     // Providers reach `RULE-SET` inside AND/OR/NOT groups too (mihomo parity).
     meow_rules::parse_rule_with_rule_sets(line, ctx, providers)
@@ -255,37 +256,80 @@ mod tests {
     }
 
     /// Issue #625 — `SUB-RULE,<name>` takes exactly one field: a third
-    /// comma field (a typo, or upstream's unsupported `(cond)` conditional
-    /// form) must be rejected, not silently dropped onto the first field.
-    /// A silent drop would route by a different block than written.
+    /// comma field (a typo) must be rejected, not silently dropped onto
+    /// the first field. A silent drop would route by a different block
+    /// than written. Issue #974 adds the two conditional shapes —
+    /// mihomo's `,(cond),<name>` and MEOW's `,(cond),<name>,<target>` —
+    /// which must parse cleanly while `,name,junk` keeps failing.
     #[test]
     fn sub_rule_rejects_trailing_fields() {
         use crate::sub_rules_parser::SubRuleBlocks;
         let providers = providers();
         let sub_rules: SubRuleBlocks = HashMap::from([("blk".to_string(), Arc::new(Vec::new()))]);
 
-        let ok = parse_one_rule_or_subrule(
-            "SUB-RULE,blk",
-            &providers,
-            &ParserContext::default(),
-            &sub_rules,
-        );
-        assert!(ok.is_ok(), "plain SUB-RULE,blk must parse");
-
         for line in [
-            "SUB-RULE,blk,junk",
+            "SUB-RULE,blk",
             "SUB-RULE,(DOMAIN,a),blk",
-            "SUB-RULE,blk,",
+            "SUB-RULE,(DOMAIN,a),blk,REJECT",
+            "SUB-RULE,((DOMAIN,a)&(DOMAIN-SUFFIX,b)),blk",
+            "SUB-RULE,(!(DOMAIN,b)|(DOMAIN-KEYWORD,u)),blk,DIRECT",
+            // Every non-excluded type is a legal cond leaf — upstream's
+            // payloadToRule set (issue #974 review).
+            "SUB-RULE,(PROCESS-NAME,x),blk",
+            "SUB-RULE,(IP-CIDR,10.0.0.0/8),blk",
+            "SUB-RULE,(NETWORK,tcp),blk",
+        ] {
+            let ok =
+                parse_one_rule_or_subrule(line, &providers, &ParserContext::default(), &sub_rules);
+            let rule = ok.unwrap_or_else(|e| panic!("{line}: must parse, got {e}"));
+            assert_eq!(rule.payload(), &line[9..], "{line}: /rules payload");
+        }
+
+        for (line, needle) in [
+            ("SUB-RULE,blk,junk", "trailing"),
+            ("SUB-RULE,blk,", "trailing"),
+            ("SUB-RULE,(DOMAIN,a),blk,junk,extra", "too many fields"),
+            // Unbalanced or unparenthesized conds are malformed heads,
+            // not plain references.
+            ("SUB-RULE,(DOMAIN,a,blk", "unbalanced"),
+            ("SUB-RULE,DOMAIN,blk", "trailing"),
+            ("SUB-RULE,(AND,(DOMAIN,a),(DOMAIN,b)),blk", "expected '('"),
+            // A leaf that needs a database the context lacks surfaces
+            // the shared leg grammar's error — even though the head is
+            // well-formed.
+            ("SUB-RULE,(GEOIP,CN),blk", "GeoIP database"),
+            // MATCH/SUB-RULE stay excluded at leaf position — upstream's
+            // `payloadToRule` set (issue #974 review).
+            ("SUB-RULE,(MATCH,x),blk", "not allowed as a condition leaf"),
+            (
+                "SUB-RULE,(SUB-RULE,inner),blk",
+                "not allowed as a condition leaf",
+            ),
         ] {
             let err =
                 parse_one_rule_or_subrule(line, &providers, &ParserContext::default(), &sub_rules)
                     .err()
-                    .expect("trailing comma fields must be rejected");
-            assert!(
-                err.contains("trailing fields"),
-                "{line}: unexpected error {err}"
-            );
+                    .expect("malformed reference must be rejected");
+            assert!(err.contains(needle), "{line}: unexpected error {err}");
         }
+    }
+
+    /// A dead domain payload inside a conditional predicate draws the
+    /// same defect verdict as a logic-group leg (issue #974).
+    #[test]
+    fn dead_domain_payload_inside_cond_warns() {
+        use crate::sub_rules_parser::SubRuleBlocks;
+        let providers = providers();
+        let sub_rules: SubRuleBlocks = HashMap::from([("blk".to_string(), Arc::new(Vec::new()))]);
+        let rule = parse_one_rule_or_subrule(
+            "SUB-RULE,(DOMAIN,a..b),blk",
+            &providers,
+            &ParserContext::default(),
+            &sub_rules,
+        )
+        .expect("conditional reference must parse");
+        let defect = domain_payload_defect(rule.as_ref());
+        assert!(defect.is_some(), "the dead cond leaf must be flagged");
     }
 
     /// Dead domain payloads can never equal/match the normalized

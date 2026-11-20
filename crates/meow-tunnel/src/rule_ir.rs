@@ -1,7 +1,8 @@
 use crate::match_engine::DomainIndex;
 use ipnet::IpNet;
 use meow_common::{
-    ConnType, Metadata, Network, Rule, RuleMatchHelper, RuleType, TargetCheck, TargetProbe,
+    ConnType, MatchDemand, Metadata, Network, Rule, RuleMatchHelper, RuleType, TargetCheck,
+    TargetProbe,
 };
 use meow_rules::{
     geoip::GeoIpRule,
@@ -14,6 +15,7 @@ use meow_rules::{
     rule_set::RuleSet,
     rule_set_rule::RuleSetRule,
     src_geoip::SrcGeoIpRule,
+    sub_rule::{StagedVerdict, SubRuleRule},
 };
 use regex::Regex;
 use smallvec::SmallVec;
@@ -103,6 +105,11 @@ enum TargetPlan {
     StaticAdapter,
     /// The target adapter can be returned by nested rule evaluation.
     DynamicAdapter,
+    /// A `SUB-RULE` whose evaluation is staged (issue #974): its own
+    /// condition, or a member's, is demand-aware, so the slot self-reports
+    /// per-predicate needs through `match_staged` instead of the slot's
+    /// static demand flags blocking the scan early.
+    StagedSubRule,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -250,9 +257,13 @@ struct MatchInput<'a> {
 enum ScanOutcome<'a> {
     Matched(CompiledMatchResult<'a>),
     /// Slot at `pos` demands metadata the input does not carry yet
-    /// (demand-stop scans only).
+    /// (demand-stop scans only). The flags are the slot's actual,
+    /// already-gated needs — a staged sub-rule reports them from inside
+    /// its evaluation rather than from static slot demands.
     Blocked {
         pos: usize,
+        needs_ip: bool,
+        needs_process: bool,
     },
     Exhausted,
 }
@@ -304,11 +315,14 @@ impl DemandGate {
 /// The scan cannot evaluate this slot yet: its predicate demands a field
 /// that is missing from the metadata, still materializable, and enabled
 /// by `gate` (`off` never stops on a process demand; the eager dispatch
-/// never stops on an IP one).
-fn slot_blocked(slot: &CompiledRuleSlot, input: &MatchInput<'_>) -> bool {
+/// never stops on an IP one). Returns the gated flags so the caller can
+/// report them verbatim — staged sub-rule slots carry zero static
+/// demands and self-report through their evaluation instead.
+fn slot_blocked(slot: &CompiledRuleSlot, input: &MatchInput<'_>) -> Option<(bool, bool)> {
     let gate = input.gate;
-    (gate.ip && slot.demands_ip && ip_missing(input))
-        || (gate.process && slot.demands_process && process_missing(input.metadata))
+    let needs_ip = gate.ip && slot.demands_ip && ip_missing(input);
+    let needs_process = gate.process && slot.demands_process && process_missing(input.metadata);
+    (needs_ip || needs_process).then_some((needs_ip, needs_process))
 }
 
 /// `dst_ip` is absent but resolvable: there is a hostname the enricher can
@@ -454,6 +468,7 @@ impl CompiledRuleSet {
             let payload = rule.payload();
             let mut demands_ip = rule.should_resolve_ip();
             let mut demands_process = rule.should_find_process();
+            let target_plan = target_plan(rule.as_ref());
 
             if disabled(rule_index) {
                 continue;
@@ -473,6 +488,16 @@ impl CompiledRuleSet {
                 );
                 pruned_never_match += 1;
                 continue;
+            }
+
+            // A staged sub-rule self-reports per-predicate demands from
+            // inside its evaluation (issue #974 §3.3): the aggregate must
+            // neither block the slot early nor pin the set-level
+            // enrichment flags — a false condition means the block's DNS
+            // / process demand never fires.
+            if target_plan == TargetPlan::StagedSubRule {
+                demands_ip = false;
+                demands_process = false;
             }
 
             // Payload-pure lowering first; then state-carrying native
@@ -585,7 +610,7 @@ impl CompiledRuleSet {
                 rule_index: u32::try_from(rule_index).expect("rule index exceeds u32"),
                 rule_type,
                 adapter_index: u32::try_from(adapter_index).expect("adapter index exceeds u32"),
-                target_plan: target_plan(rule_type),
+                target_plan,
                 demands_ip,
                 demands_process,
                 op,
@@ -806,7 +831,11 @@ impl CompiledRuleSet {
                         &mut on_missing,
                     ) {
                         ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
-                        ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
+                        ScanOutcome::Blocked {
+                            pos,
+                            needs_ip,
+                            needs_process,
+                        } => self.enrichment_needs(pos, needs_ip, needs_process),
                         ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
                     };
                 }
@@ -842,8 +871,12 @@ impl CompiledRuleSet {
                     // A blocked slot before the trie hit may match and beat
                     // it, so enrichment is needed even though a domain rule
                     // stands ready.
-                    ScanOutcome::Blocked { pos } => {
-                        break 'scan self.enrichment_needs(pos, &input);
+                    ScanOutcome::Blocked {
+                        pos,
+                        needs_ip,
+                        needs_process,
+                    } => {
+                        break 'scan self.enrichment_needs(pos, needs_ip, needs_process);
                     }
                     ScanOutcome::Exhausted => {}
                 }
@@ -874,7 +907,11 @@ impl CompiledRuleSet {
                     &mut on_missing,
                 ) {
                     ScanOutcome::Matched(matched) => LazyMatchOutcome::Matched(matched),
-                    ScanOutcome::Blocked { pos } => self.enrichment_needs(pos, &input),
+                    ScanOutcome::Blocked {
+                        pos,
+                        needs_ip,
+                        needs_process,
+                    } => self.enrichment_needs(pos, needs_ip, needs_process),
                     ScanOutcome::Exhausted => LazyMatchOutcome::NoMatch,
                 }
             }
@@ -889,17 +926,19 @@ impl CompiledRuleSet {
     }
 
     /// The demand report of the slot the scan stopped at — that slot's
-    /// own missing-and-gated fields only. A *later* slot's demand is
+    /// own missing-and-gated fields only (reported by `slot_blocked`, or
+    /// by a staged sub-rule's own evaluation). A *later* slot's demand is
     /// deliberately not pulled forward: an IP-only block must not spend a
     /// process scan on a rule the scan never reached, and the next pass
     /// decides the demand from the slot it reaches then (upstream's
     /// `strict` invokes the lookup callback from the reached predicate
     /// itself — issue #974 `find-process-mode`).
-    fn enrichment_needs(&self, from_pos: usize, input: &MatchInput<'_>) -> LazyMatchOutcome<'_> {
-        let slot = &self.slots[from_pos];
-        let gate = input.gate;
-        let needs_ip = gate.ip && slot.demands_ip && ip_missing(input);
-        let needs_process = gate.process && slot.demands_process && process_missing(input.metadata);
+    fn enrichment_needs(
+        &self,
+        pos: usize,
+        needs_ip: bool,
+        needs_process: bool,
+    ) -> LazyMatchOutcome<'_> {
         debug_assert!(
             needs_ip || needs_process,
             "scan blocked without an actionable demand",
@@ -907,7 +946,7 @@ impl CompiledRuleSet {
         LazyMatchOutcome::NeedsEnrichment {
             needs_ip,
             needs_process,
-            blocked_rule: slot.rule_index as usize,
+            blocked_rule: self.slots[pos].rule_index as usize,
         }
     }
 
@@ -991,10 +1030,14 @@ impl CompiledRuleSet {
     ) -> ScanOutcome<'a> {
         let start = range.start;
         for (offset, slot) in self.slots[range].iter().enumerate() {
-            if STOP_ON_DEMAND && slot_blocked(slot, input) {
-                return ScanOutcome::Blocked {
-                    pos: start + offset,
-                };
+            if STOP_ON_DEMAND {
+                if let Some((needs_ip, needs_process)) = slot_blocked(slot, input) {
+                    return ScanOutcome::Blocked {
+                        pos: start + offset,
+                        needs_ip,
+                        needs_process,
+                    };
+                }
             }
             let matched = match &slot.op {
                 // Owned by the domain index. Prefix scans skip it — the
@@ -1027,6 +1070,66 @@ impl CompiledRuleSet {
                                 let adapter_index = self.adapter_lookup.get(adapter_name).copied();
                                 self.make_match(slot, rules, adapter_name, adapter_index)
                             }),
+                        // A staged SUB-RULE (issue #974): condition-first
+                        // evaluation where only *reached* predicates may
+                        // report a metadata demand — under STOP_ON_DEMAND
+                        // the report maps to the slot's own Blocked, under
+                        // the strict scans the gate is empty and every
+                        // unreachable demand simply reads false.
+                        TargetPlan::StagedSubRule => {
+                            match rule
+                                .as_any()
+                                .and_then(|any| any.downcast_ref::<SubRuleRule>())
+                            {
+                                Some(sub) => {
+                                    let demand = if STOP_ON_DEMAND {
+                                        MatchDemand {
+                                            ip: input.gate.ip,
+                                            process: input.gate.process,
+                                        }
+                                    } else {
+                                        MatchDemand::NONE
+                                    };
+                                    match sub.match_staged(input.metadata, helper, probe, &demand) {
+                                        StagedVerdict::Matched(adapter_name) => {
+                                            let adapter_index =
+                                                self.adapter_lookup.get(adapter_name).copied();
+                                            Some(self.make_match(
+                                                slot,
+                                                rules,
+                                                adapter_name,
+                                                adapter_index,
+                                            ))
+                                        }
+                                        StagedVerdict::Miss => None,
+                                        StagedVerdict::Need {
+                                            ip: needs_ip,
+                                            process: needs_process,
+                                        } => {
+                                            if STOP_ON_DEMAND {
+                                                return ScanOutcome::Blocked {
+                                                    pos: start + offset,
+                                                    needs_ip,
+                                                    needs_process,
+                                                };
+                                            }
+                                            // Under the empty gate a Need
+                                            // can never arise.
+                                            None
+                                        }
+                                    }
+                                }
+                                // `target_plan` took the same downcast; an
+                                // unreachable fallback keeps the scan sound.
+                                None => rule.match_and_resolve(input.metadata, helper, probe).map(
+                                    |adapter_name| {
+                                        let adapter_index =
+                                            self.adapter_lookup.get(adapter_name).copied();
+                                        self.make_match(slot, rules, adapter_name, adapter_index)
+                                    },
+                                ),
+                            }
+                        }
                     }
                 }
                 op => matches_op(op, input, helper).then(|| self.static_match(slot, rules)),
@@ -1115,7 +1218,10 @@ impl CompiledRuleSlot {
     }
 
     pub fn has_dynamic_adapter(&self) -> bool {
-        self.target_plan == TargetPlan::DynamicAdapter
+        matches!(
+            self.target_plan,
+            TargetPlan::DynamicAdapter | TargetPlan::StagedSubRule
+        )
     }
 
     pub fn is_lowered(&self) -> bool {
@@ -1143,11 +1249,23 @@ fn intern_adapter(
     index
 }
 
-fn target_plan(rule_type: RuleType) -> TargetPlan {
-    match rule_type {
+fn target_plan(rule: &dyn Rule) -> TargetPlan {
+    match rule.rule_type() {
         // SUB-RULE returns the matched inner rule's adapter, not the outer
-        // rule's adapter/block name.
-        RuleType::SubRule => TargetPlan::DynamicAdapter,
+        // rule's adapter/block name. A staged reference (its own condition
+        // or a nested one, issue #974) additionally self-reports its
+        // per-predicate metadata demands during evaluation.
+        RuleType::SubRule => {
+            if rule
+                .as_any()
+                .and_then(|any| any.downcast_ref::<SubRuleRule>())
+                .is_some_and(SubRuleRule::is_staged)
+            {
+                TargetPlan::StagedSubRule
+            } else {
+                TargetPlan::DynamicAdapter
+            }
+        }
         _ => TargetPlan::StaticAdapter,
     }
 }
@@ -1576,6 +1694,13 @@ fn compile_op(rule_type: RuleType, payload: &str) -> Option<RuleOp> {
         | RuleType::SrcIpSuffix
         | RuleType::IpAsn
         | RuleType::SrcIpAsn
+        // The process-pattern batch (issue #974) evaluates through
+        // `match_metadata`: their compiled matchers live inside the rule
+        // object, so the fallback path costs one virtual call only.
+        | RuleType::ProcessNameRegex
+        | RuleType::ProcessPathRegex
+        | RuleType::ProcessNameWildcard
+        | RuleType::ProcessPathWildcard
         | RuleType::SubRule => None,
     }
 }
@@ -3366,6 +3491,290 @@ mod tests {
                 assert!(!needs_process);
             }
             _ => panic!("scan must stop at the IP-CIDR slot"),
+        }
+    }
+
+    // ── Issue #974: staged (conditional) SUB-RULE slots ──────────────
+
+    /// Build a staged `SUB-RULE`: `cond` is the predicate tree (any rule
+    /// — the parser's leaf whitelist is a config concern, not the IR's),
+    /// `members` the block, `fallback` the optional fourth field.
+    fn staged_sub_rule(
+        cond: Box<dyn Rule>,
+        members: Vec<Box<dyn Rule>>,
+        fallback: Option<&str>,
+    ) -> SubRuleRule {
+        SubRuleRule::new_conditional(
+            "blk",
+            Arc::new(members),
+            cond,
+            "(DOMAIN,cond.example)",
+            fallback,
+        )
+    }
+
+    /// A staged slot contributes zero static demands: the whole set's
+    /// aggregate flags stay clear even though the cond tree and the
+    /// block carry both kinds — a false condition means none of them
+    /// can fire, so the engine must never pre-resolve every flow for it
+    /// (issue #974 §3.3).
+    #[test]
+    fn staged_sub_rule_pins_no_static_demands() {
+        use meow_rules::process::ProcessRule;
+
+        let sub = staged_sub_rule(
+            Box::new(IpCidrRule::new("203.0.113.0/24", "unused", false, false).unwrap()),
+            vec![Box::new(ProcessRule::new("curl", "InnerProxy"))],
+            Some("FallbackProxy"),
+        );
+        assert!(sub.should_resolve_ip() && sub.should_find_process());
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+        assert_eq!(set.slots().len(), 2);
+        assert!(!set.needs_ip_resolution());
+        assert!(!set.needs_process_lookup());
+    }
+
+    /// A false condition skips the block *and its demands* — the lazy
+    /// scan must not stop for metadata the unreachable members would
+    /// want, and must not spend a lookup.
+    #[test]
+    fn staged_sub_rule_false_cond_never_demands() {
+        use meow_rules::process::ProcessRule;
+
+        let sub = staged_sub_rule(
+            // Host does not match → false.
+            Box::new(DomainRule::new("cond.example", "unused")),
+            vec![
+                // Both members would demand enrichment if reached.
+                Box::new(IpCidrRule::new("203.0.113.0/24", "IpProxy", false, false).unwrap()),
+                Box::new(ProcessRule::new("curl", "ProcProxy")),
+            ],
+            Some("FallbackProxy"),
+        );
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+        let meta = Metadata {
+            host: "other.example".into(),
+            src_ip: Some("10.0.0.1".parse::<IpAddr>().unwrap()),
+            src_port: 1234,
+            ..Default::default()
+        };
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
+            LazyMatchOutcome::Matched(m) => {
+                assert_eq!(m.adapter_name, "DIRECT");
+                assert_eq!(m.rule_type, RuleType::Match);
+            }
+            _ => panic!("false cond must fall through, not demand enrichment"),
+        }
+    }
+
+    /// A true condition enters the block in order; a reached member's
+    /// process demand stops the lazy scan exactly like a top-level
+    /// process rule's would — and resolves the same way afterwards.
+    #[test]
+    fn staged_sub_rule_lazy_reports_member_process_demand() {
+        use meow_rules::process::ProcessRule;
+
+        let sub = staged_sub_rule(
+            Box::new(DomainRule::new("cond.example", "unused")),
+            vec![Box::new(ProcessRule::new("curl", "ProcProxy"))],
+            None,
+        );
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+
+        let meta = Metadata {
+            host: "cond.example".into(),
+            src_ip: Some("10.0.0.1".parse::<IpAddr>().unwrap()),
+            src_port: 1234,
+            ..Default::default()
+        };
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
+            LazyMatchOutcome::NeedsEnrichment {
+                needs_ip,
+                needs_process,
+                ..
+            } => {
+                assert!(!needs_ip);
+                assert!(needs_process);
+            }
+            _ => panic!("reached process member must demand the lookup"),
+        }
+
+        // The strict scan (empty gate) reads the missing field as a miss
+        // and falls through — same as upstream's "not resolved → skip".
+        let result = set
+            .match_rules(&meta, &rules, &|_: &str| true)
+            .expect("FINAL still matches");
+        assert_eq!(result.adapter_name, "DIRECT");
+
+        // After enrichment the inner rule matches and resolves its own
+        // target dynamically.
+        let mut enriched = meta.clone();
+        enriched.process = "curl".into();
+        let result = set
+            .match_rules(&enriched, &rules, &|_: &str| true)
+            .expect("inner process rule must match");
+        assert_eq!(result.adapter_name, "ProcProxy");
+        assert_eq!(result.rule_type, RuleType::SubRule);
+    }
+
+    /// A reached *condition* leaf's IP demand stops the scan before the
+    /// block is even looked at — resolution then decides the predicate.
+    #[test]
+    fn staged_sub_rule_lazy_reports_cond_ip_demand() {
+        // IpCidr as the cond stands in for a dst-GEOIP leaf: the IR only
+        // sees `should_resolve_ip`, the whitelist lives in the parser.
+        let sub = staged_sub_rule(
+            Box::new(IpCidrRule::new("203.0.113.0/24", "unused", false, false).unwrap()),
+            vec![Box::new(FinalRule::new("InnerProxy"))],
+            None,
+        );
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+
+        let meta = Metadata {
+            host: "resolve.example".into(),
+            ..Default::default()
+        };
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
+            LazyMatchOutcome::NeedsEnrichment {
+                needs_ip,
+                needs_process,
+                ..
+            } => {
+                assert!(needs_ip);
+                assert!(!needs_process);
+            }
+            _ => panic!("reached cond leaf must demand resolution"),
+        }
+
+        // In-range → cond true → inner hit; out-of-range → cond false →
+        // the block is never entered and the fallback cannot fire either.
+        for (ip, expected) in [("203.0.113.7", "InnerProxy"), ("198.51.100.9", "DIRECT")] {
+            let mut resolved = meta.clone();
+            resolved.dst_ip = Some(ip.parse::<IpAddr>().unwrap());
+            let result = set
+                .match_rules(&resolved, &rules, &|_: &str| true)
+                .expect("must match");
+            assert_eq!(result.adapter_name, expected, "ip={ip}");
+        }
+    }
+
+    /// The four-field fallback resolves as a dynamic adapter — never
+    /// interned at build, only produced by evaluation.
+    #[test]
+    fn staged_sub_rule_fallback_is_a_dynamic_target() {
+        let sub = staged_sub_rule(
+            Box::new(DomainRule::new("cond.example", "unused")),
+            vec![], // empty block → exhausted on a true condition
+            Some("FallbackProxy"),
+        );
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+
+        let meta = Metadata {
+            host: "cond.example".into(),
+            ..Default::default()
+        };
+        let result = set
+            .match_rules(&meta, &rules, &|_: &str| true)
+            .expect("fallback must resolve");
+        assert_eq!(result.adapter_name, "FallbackProxy");
+        assert_eq!(result.adapter_index, None);
+        assert_eq!(result.rule_type, RuleType::SubRule);
+        assert_eq!(
+            result.rule_payload,
+            "(DOMAIN,cond.example),blk,FallbackProxy"
+        );
+    }
+
+    /// A false condition must *not* yield the fallback — the fourth
+    /// field only fires when the block was actually entered and
+    /// exhausted (issue #974 four-field semantics).
+    #[test]
+    fn staged_sub_rule_false_cond_skips_fallback() {
+        let sub = staged_sub_rule(
+            Box::new(DomainRule::new("cond.example", "unused")),
+            vec![],
+            Some("FallbackProxy"),
+        );
+        let rules: Vec<Box<dyn Rule>> = vec![Box::new(sub), Box::new(FinalRule::new("DIRECT"))];
+        let set = CompiledRuleSet::build(&rules);
+        let meta = Metadata {
+            host: "nope.example".into(),
+            ..Default::default()
+        };
+        let result = set
+            .match_rules(&meta, &rules, &|_: &str| true)
+            .expect("FINAL must match");
+        assert_eq!(result.adapter_name, "DIRECT");
+    }
+
+    /// The new process pattern types are ordinary demand-pinning slots:
+    /// they aggregate `needs_process_lookup` like any process rule and
+    /// match once the field is materialized (issue #974).
+    #[test]
+    fn process_pattern_rules_demand_process_and_match() {
+        use meow_rules::process_pattern::ProcessPatternRule;
+
+        let rules: Vec<Box<dyn Rule>> = vec![
+            Box::new(
+                ProcessPatternRule::new_regex(
+                    RuleType::ProcessNameRegex,
+                    r"^svchost\.exe$",
+                    "RegexProxy",
+                )
+                .unwrap(),
+            ),
+            Box::new(
+                ProcessPatternRule::new_glob(
+                    RuleType::ProcessPathWildcard,
+                    r"C:\Tools\*\bin\*.exe",
+                    "GlobProxy",
+                )
+                .unwrap(),
+            ),
+            Box::new(FinalRule::new("DIRECT")),
+        ];
+        let set = CompiledRuleSet::build(&rules);
+        assert!(set.needs_process_lookup());
+        assert!(!set.needs_ip_resolution());
+
+        for (name, path, expected) in [
+            ("SVCHOST.EXE", r"C:\other.exe", "RegexProxy"), // case-insensitive
+            ("x", r"c:\tools\abc\bin\t.exe", "GlobProxy"),  // glob folds case
+            ("x", r"C:\Tools\abc\t.exe", "DIRECT"),         // missing literal `\bin\`
+        ] {
+            let meta = Metadata {
+                process: name.into(),
+                process_path: path.into(),
+                ..Default::default()
+            };
+            let result = set
+                .match_rules(&meta, &rules, &|_: &str| true)
+                .expect("must match");
+            assert_eq!(result.adapter_name, expected, "name={name} path={path}");
+        }
+
+        // Missing process info blocks the lazy scan at the first
+        // process-demanding slot.
+        let meta = Metadata {
+            src_ip: Some("10.0.0.1".parse::<IpAddr>().unwrap()),
+            src_port: 1234,
+            ..Default::default()
+        };
+        match set.match_rules_lazy(&meta, &rules, &|_: &str| true, DemandGate::ALL) {
+            LazyMatchOutcome::NeedsEnrichment {
+                needs_ip,
+                needs_process,
+                ..
+            } => {
+                assert!(!needs_ip);
+                assert!(needs_process);
+            }
+            _ => panic!("process-demanding slot must stop the lazy scan"),
         }
     }
 

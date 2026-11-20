@@ -71,10 +71,14 @@ fn test_state_with_backing(raw: RawConfig, config_path: Option<String>) -> Arc<A
     let tunnel = Tunnel::new(resolver);
 
     // Build proxies/rules from raw and apply
-    let meow_config::RebuildResult { proxies, rules, .. } =
-        meow_config::rebuild_from_raw(&raw).unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
-    tunnel.update_rules(rules);
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
 
     Arc::new(AppState {
         tunnel,
@@ -152,10 +156,14 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
     ));
     let tunnel = Tunnel::new(resolver);
     let raw = test_raw_config();
-    let meow_config::RebuildResult { proxies, rules, .. } =
-        meow_config::rebuild_from_raw(&raw).unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
-    tunnel.update_rules(rules);
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
 
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
@@ -304,10 +312,14 @@ async fn external_ui_serves_static_directory() {
     ));
     let tunnel = Tunnel::new(resolver);
     let raw = test_raw_config();
-    let meow_config::RebuildResult { proxies, rules, .. } =
-        meow_config::rebuild_from_raw(&raw).unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
-    tunnel.update_rules(rules);
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
     let state = Arc::new(AppState {
         tunnel,
         secret: None,
@@ -1913,12 +1925,15 @@ async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
     // Each effective-knob diff rejects before the fallback commits. The
     // `tun:` enable flip is the same refusal: the verbatim commit keeps
     // the previous routing and resolver, so a transition it cannot back
-    // with a built candidate must not fire (issue #974).
+    // with a built candidate must not fire (issue #974). Effective
+    // `find-process-mode` is the same live tunnel policy — a diff the
+    // fallback cannot rebuild is refused, an equal value is not.
     for (label, knob) in [
         ("profile", "profile:\n  store-selected: false\n"),
         ("ntp", "ntp:\n  enable: true\n  server: ntp.test\n"),
         ("keepalive", "keep-alive-idle: 60\n"),
         ("tun", "tun:\n  enable: true\n"),
+        ("find-process-mode", "find-process-mode: always\n"),
     ] {
         let before = seen.lock().unwrap().len();
         let resp = put(
@@ -1943,7 +1958,8 @@ async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
                 raw.ntp.is_none()
                     && raw.profile.is_none()
                     && raw.keep_alive_idle.is_none()
-                    && raw.tun.is_none(),
+                    && raw.tun.is_none()
+                    && raw.find_process_mode.is_none(),
                 "{label}: a rejected PUT must not touch the committed document"
             );
         }
@@ -2085,6 +2101,169 @@ async fn put_configs_force_fallback_rejects_dangling_ntp_target() {
         StatusCode::NO_CONTENT,
         "a declared target keeps the verbatim commit"
     );
+}
+
+/// Issue #974 review: the forced verbatim-commit fallback must not commit
+/// a `sub-rules:` section that fails its structural checks — the section
+/// has no lenient arm, so a defect committed verbatim would hard-fail the
+/// next boot and every warm mutation until then. Declared rule-provider
+/// names stand in as empty sets (availability is environment, not shape);
+/// a well-formed section still commits as written.
+#[tokio::test]
+async fn put_configs_force_fallback_gates_sub_rules_shape() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    let state = test_state(test_raw_config());
+    let put = |document: &str| {
+        let app = create_router(Arc::clone(&state));
+        let payload = base64::engine::general_purpose::STANDARD.encode(document);
+        async move {
+            app.oneshot(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/configs?force=true")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "payload": payload }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // Duplicate group names fail strict AND lenient — the verbatim
+    // fallback is the only path the candidates below can reach.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+
+    // A malformed condition inside a block body is shape — the verbatim
+    // commit must refuse it, and the committed document must not move.
+    let resp = put(&format!(
+        "mode: rule\n{UNBUILDABLE}\
+         sub-rules:\n  blk:\n    - SUB-RULE,(MATCH,x),inner\n  inner:\n    - DOMAIN,x.test,DIRECT\n\
+         rules:\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        state.raw_config.read().sub_rules.is_none(),
+        "the rejected document must not replace the committed one"
+    );
+
+    // A top-level `rules:` reference to an undefined block hits the same
+    // gate — both builds already fail on it, and the fallback must too.
+    let resp = put(&format!(
+        "mode: rule\n{UNBUILDABLE}\
+         sub-rules:\n  blk:\n    - DOMAIN,x.test,DIRECT\n\
+         rules:\n  - SUB-RULE,ghost\n"
+    ))
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Structurally sound `sub-rules:` — a conditional reference carrying
+    // the MEOW fourth-field fallback included — still commits verbatim.
+    let resp = put(&format!(
+        "mode: rule\n{UNBUILDABLE}\
+         sub-rules:\n  blk:\n    - DOMAIN,x.test,DIRECT\n\
+         rules:\n  - SUB-RULE,(DOMAIN,x.test),blk,DIRECT\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert!(state
+        .raw_config
+        .read()
+        .sub_rules
+        .as_ref()
+        .is_some_and(|m| m.contains_key("blk")));
+}
+
+/// Issue #974: `/rules/append` dry-parses a candidate line against the
+/// committed `sub-rules:` — conditional references (any leaf type but
+/// MATCH/SUB-RULE), the MEOW four-field fallback, and plain names all
+/// resolve; a broken `sub-rules:` section reports its own error rather
+/// than a phantom undefined block.
+#[tokio::test]
+async fn append_sub_rule_lines_dry_parse() {
+    // Every accepted append commits a raw candidate, and the commit
+    // re-asserts the process-wide knobs — the lane keeps a sibling
+    // config test's commit-and-assert window intact.
+    let _globals_lane = process_globals_lane().await;
+    let mut raw = test_raw_config();
+    raw.sub_rules = Some(std::collections::HashMap::from([(
+        "blk".to_string(),
+        vec!["DOMAIN,inside.test,DIRECT".to_string()],
+    )]));
+    raw.rules = Some(vec!["SUB-RULE,blk".into(), "MATCH,DIRECT".into()]);
+    let state = test_state(raw);
+    let post = |rule: &'static str| {
+        let app = create_router(Arc::clone(&state));
+        async move {
+            app.oneshot(
+                Request::post("/rules/append")
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(
+                        serde_json::json!({ "rule": rule }).to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+        }
+    };
+    // Plain, conditional, and four-field references resolve against `blk`;
+    // a cond leaf is any rule type except MATCH/SUB-RULE — the widened
+    // upstream exclusion set (issue #974 review).
+    for rule in [
+        "SUB-RULE,(DOMAIN,ok.test),blk",
+        "SUB-RULE,(DOMAIN,ok.test),blk,DIRECT",
+        "SUB-RULE,((PROCESS-NAME,curl)&(DST-PORT,443)),blk",
+    ] {
+        assert_eq!(post(rule).await.status(), StatusCode::NO_CONTENT, "{rule}");
+    }
+    // The committed list carries the appended references; `/rules`
+    // reports them in mihomo spelling with the cond text as payload.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::get("/rules")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    let rules = json["rules"].as_array().unwrap();
+    for payload in ["blk", "(DOMAIN,ok.test),blk", "(DOMAIN,ok.test),blk,DIRECT"] {
+        assert!(
+            rules
+                .iter()
+                .any(|r| r["type"] == "SubRules" && r["payload"] == payload),
+            "a SubRules entry with payload {payload} must be reported"
+        );
+    }
+
+    // MATCH/SUB-RULE leaves stay excluded, an undefined block name and a
+    // malformed head fail — each with its own parse error.
+    for rule in [
+        "SUB-RULE,(MATCH,x),blk",
+        "SUB-RULE,(SUB-RULE,blk),blk",
+        "SUB-RULE,ghost",
+        "SUB-RULE,(DOMAIN,x",
+    ] {
+        assert_eq!(post(rule).await.status(), StatusCode::BAD_REQUEST, "{rule}");
+    }
+    // The rejections left nothing behind: the rule count is unchanged.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::get("/rules")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let json = body_json(resp).await;
+    assert_eq!(json["rules"].as_array().unwrap().len(), 5);
 }
 
 /// Issue #974: the local shape/range gates precede the first candidate
@@ -6326,10 +6505,14 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
     let tunnel = Tunnel::new(resolver);
     let mut raw = test_raw_config();
     raw.dns = Some(serde_saphyr::from_str("enable: true").unwrap());
-    let meow_config::RebuildResult { proxies, rules, .. } =
-        meow_config::rebuild_from_raw(&raw).unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
-    tunnel.update_rules(rules);
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
 
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
@@ -6492,10 +6675,14 @@ async fn get_dns_query_txt_relays_upstream_sections_and_flags() {
     let tunnel = Tunnel::new(resolver);
     let mut raw = test_raw_config();
     raw.dns = Some(serde_saphyr::from_str("enable: true").unwrap());
-    let meow_config::RebuildResult { proxies, rules, .. } =
-        meow_config::rebuild_from_raw(&raw).unwrap();
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).unwrap();
     tunnel.update_proxies(proxies, Default::default());
-    tunnel.update_rules(rules);
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
     let dir = tempfile::tempdir().unwrap();
     let config_path = dir.path().join("config.yaml").to_str().unwrap().to_string();
     std::mem::forget(dir);
@@ -7056,10 +7243,14 @@ async fn cold_reload_rejects_tcp_setup_waiting_for_dns() {
             false,
             false,
         )));
-        let meow_config::RebuildResult { proxies, rules, .. } =
-            meow_config::rebuild_from_raw(&raw).unwrap();
+        let meow_config::RebuildResult {
+            proxies,
+            rules,
+            sub_rules,
+            ..
+        } = meow_config::rebuild_from_raw(&raw).unwrap();
         tunnel.update_proxies(proxies, Default::default());
-        tunnel.update_rules(rules);
+        tunnel.update_rules_with_sub_rules(rules, sub_rules);
         Arc::get_mut(&mut state).unwrap().tunnel = tunnel;
 
         let origin = TcpListener::bind("127.0.0.1:0").await.unwrap();

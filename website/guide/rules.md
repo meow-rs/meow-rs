@@ -112,10 +112,23 @@ Payloads accept a single port (`443`), a range (`8000-9000`), or a list
 | --- | --- | --- |
 | `PROCESS-NAME` | `PROCESS-NAME,curl,DIRECT` | Initiating process executable name |
 | `PROCESS-PATH` | `PROCESS-PATH,/usr/bin/node,Proxy` | Process path — exact, `/prefix` match, or `*` glob |
+| `PROCESS-NAME-REGEX` | `PROCESS-NAME-REGEX,^svchost,DIRECT` | Process name matched by regex (search semantics) |
+| `PROCESS-PATH-REGEX` | `PROCESS-PATH-REGEX,/usr/bin/\w+,Proxy` | Full process path matched by regex |
+| `PROCESS-NAME-WILDCARD` | `PROCESS-NAME-WILDCARD,Cu?l*,DIRECT` | Process name matched by `*`/`?` glob |
+| `PROCESS-PATH-WILDCARD` | `PROCESS-PATH-WILDCARD,/opt/*/tool,Proxy` | Full process path matched by `*`/`?` glob |
 | `UID` | `UID,1000,Proxy` | Unix user ID (Linux only; never matches elsewhere) |
 
 `PROCESS-PATH` extends upstream: a leading `/` (or `\`) does a directory-prefix match, `*`
 does a glob, otherwise it falls back to a filename match.
+
+The `-REGEX` types compile case-insensitively by default (an inline `(?-i)` re-enables
+case-sensitivity) and match unanchored — `curl` matches `mycurl`; write `^…$` to pin.
+They are comma-protected like `DOMAIN-REGEX`: everything between the type and the
+last comma field is the pattern, so quantifiers like `{1,3}` and literal commas are
+safe. The `-WILDCARD` types match the whole field against a glob where only `*` and
+`?` are metacharacters (`?` consumes exactly one byte); separators, brackets and
+backslashes stay literal. A flow with no process identity never matches any of the
+process rules — not even `*` or `^$`.
 
 ## Inbound & network rules
 
@@ -150,9 +163,38 @@ rules:
   - MATCH,DIRECT
 ```
 
-`SUB-RULE` takes exactly one field — the block name. A trailing field
-(`SUB-RULE,my-block,Proxy`) is rejected: it was silently ignored before,
+A plain `SUB-RULE` reference takes exactly one field — the block name. A trailing
+field (`SUB-RULE,my-block,Proxy`) is rejected: it was silently ignored before,
 which read like a fallback target that never existed.
+
+The **conditional form** inserts a predicate in balanced parentheses before the
+block name (mihomo's form), plus a MEOW-only optional fourth field:
+
+```yaml
+rules:
+  # Mihomo form — enter my-block only when the condition holds:
+  - SUB-RULE,(GEOIP,CN),my-block
+  # MEOW extension — if the condition held but no inner rule matched,
+  # route to Fallback instead of falling through:
+  - SUB-RULE,(GEOIP,CN),my-block,Fallback
+```
+
+When the condition is false the block is skipped entirely — none of its rules
+evaluate, and the scan moves to the next top-level rule. When it is true the
+block evaluates in order; exhaustion falls through for the three-field form or
+yields the fourth-field fallback. The fallback goes through normal target
+checks — it is not a block name and does not participate in cycle detection.
+
+A condition leaf is any rule type except `MATCH` and `SUB-RULE` — the same
+exclusion mihomo applies inside logic rules — so `(IP-CIDR,10.0.0.0/8)`,
+`(DST-PORT,443)`, `(PROCESS-NAME,curl)` or `(RULE-SET,my-provider)` are all
+legal predicates. Flag fields keep their usual meaning (`GEOIP` takes
+`no-resolve`/`src`, a process leaf's glob/regex payload matches like the
+top-level rule of the same name). Leaves compose with mihomo's prefix
+operators — `(AND,((A),(B)))`, `(OR,((A),(B)))`, `(NOT,((A)))` — or with MEOW's
+infix `&`, `|` and `!` extension (`!` binds tightest, `&` before `|`,
+parentheses override; upstream parses only the prefix forms), e.g.
+`SUB-RULE,((DOMAIN-SUFFIX,example.com)|!(GEOIP,CN)),my-block`.
 
 ## Logic rules
 

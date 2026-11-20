@@ -490,6 +490,47 @@ a note that the cap reflects WireGuard's smoltcp stack.
 **Minimal posture**: The `minimal` build must remain below its cap. Verified by
 the CI step "minimal build size check" gating on the unchanged minimal cap.
 
+## Addendum (2026-11-21): `simple-obfs`/`obfs` + `v2ray-plugin` leave `minimal` — `ss` carries no plugins
+
+The 2026-10-29 addendum kept `simple-obfs`/`obfs` and `v2ray-plugin` inside
+plain `ss`, on the §1 rationale that SS + v2ray-plugin + TLS + ws is the
+dominant router deployment. Incremental growth on this branch then tipped
+the aarch64-musl `minimal` binary 10.6 KB over the 8 MiB hard cap
+(8,399,176 B vs 8,388,608 B measured on the reference host), and the two
+plugin surfaces contribute ~18.7 KB of symbols (`simple_obfs` 13.4 KB +
+`v2ray_plugin` 5.3 KB). Pruning them restores the budget; per §6 the cap
+itself is not amended — the bundle contract is what changed.
+
+`ss` now carries *no* built-in plugin transport. Two opt-in features
+restore them — `ss-obfs` (implies `ss` + `meow-transport/simple-obfs`) and
+`ss-v2ray-plugin` (implies `ss`) — symmetric across `meow-proxy`,
+`meow-config` and `meow-app`, and re-bundled into `default`/`full`, so
+release binaries are unchanged. A `plugin: obfs`/`simple-obfs`/
+`v2ray-plugin` node under a build without the feature binds the same dead
+placeholder the 2026-10-29 mechanism provides, with the dial reason naming
+`ss-obfs`/`ss-v2ray-plugin`.
+
+One name is special-cased: `obfs-local` is the SIP003 *binary* spelling,
+not a built-in, so it stays off `is_builtin_sip003_plugin`. With `ss-obfs`
+compiled in it keeps its external-subprocess semantics (spawn suppressed
+under `-t`, still gated by provider `allow-external-plugin`); compiled out
+it joins `FEATURE_GATED_PLUGINS` — the adapter reports the missing
+`ss-obfs` feature before `Plugin::start`, and the dry-run/policy/provider
+classification stops treating the name as spawnable. An `ss`-only build
+therefore cannot be tricked into spawning an obfs binary the operator
+deliberately pruned.
+
+Consequences:
+
+- `minimal` (`ss` + `trojan` + `dns-server` + `listener-mixed`) drops
+  ~19 KB back under the 8 MiB cap; `full`/`default` keep both plugins.
+- Generic `plugin:`/`plugin-opts:` parsing and SIP003 opts serialization
+  stay unconditional — that plumbing is shared by every plugin, built-in
+  or external.
+- `snell` and `listener-shadowsocks` keep their own
+  `meow-transport/simple-obfs` activation — their obfs is a server/snell
+  concern, not the SS plugin surface this prunes.
+
 ## References
 
 - `docs/roadmap.md` §M2 items 3 + 5 — pinned by this ADR.
