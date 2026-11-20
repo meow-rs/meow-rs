@@ -343,6 +343,15 @@ fn eval_cond(
             };
         }
     }
+    // A deterministic hit settles the leaf before any demand is spent:
+    // what the flow already proves — a domain entry inside a mixed
+    // classical provider, an exact host — stays true however the missing
+    // metadata would resolve, so it must not wait on (or be dropped to)
+    // an IP member that merely *could* match post-resolution (issue #974
+    // review). A miss falls through to the demand gates.
+    if node.match_metadata(metadata, helper) {
+        return CondVerdict::True;
+    }
     // Leaf: only a live, reached leaf may report a demand — and only a
     // dst-GEOIP-style rule asks for an IP (a `no-resolve` or `src` leaf
     // never does). A dead leaf just evaluates — always false anyway.
@@ -362,11 +371,7 @@ fn eval_cond(
             return CondVerdict::Undecided;
         }
     }
-    if node.match_metadata(metadata, helper) {
-        CondVerdict::True
-    } else {
-        CondVerdict::False
-    }
+    CondVerdict::False
 }
 
 impl Rule for SubRuleRule {
@@ -1174,6 +1179,75 @@ mod tests {
         assert_eq!(
             ip_first.match_staged(&unresolved, &helper(), &|_: &str| true, &MatchDemand::NONE),
             StagedVerdict::Matched("LATE")
+        );
+    }
+
+    /// Issue #974 review — a `(RULE-SET,name)` cond leaf over a mixed
+    /// classical provider: the provider's domain entries match a
+    /// hostname deterministically, so the leaf must read True rather
+    /// than Need/Undecided on an unresolved flow — the aggregate
+    /// `should_resolve_ip` must not shadow the deterministic hit.
+    #[test]
+    fn cond_ruleset_leaf_deterministic_hit_beats_ip_demand() {
+        use crate::parser::RuleSets;
+        let set = crate::rule_set::build_rule_set(
+            crate::rule_set::RuleSetBehavior::Classical,
+            &[
+                "DOMAIN,hit.example".to_string(),
+                "IP-CIDR,10.0.0.0/8".to_string(),
+            ],
+            &crate::parser::ParserContext::empty(),
+        );
+        let mut rule_sets: RuleSets = RuleSets::new();
+        rule_sets.insert("mixed".to_string(), std::sync::Arc::from(set));
+        let expr = crate::sub_rule_cond::parse_cond("(RULE-SET,mixed)").unwrap();
+        let cond = expr
+            .build(&crate::parser::ParserContext::empty(), &rule_sets)
+            .unwrap();
+        let sub = SubRuleRule::new_conditional(
+            "blk",
+            Arc::new(vec![match_rule("INNER")]),
+            cond,
+            "(RULE-SET,mixed)",
+            None,
+        );
+        let unresolved = Metadata {
+            host: "hit.example".into(),
+            ..Default::default()
+        };
+        // NONE: the domain entry's hit must stand — before the fix the
+        // aggregate IP demand turned the leaf Undecided and the block
+        // never ran.
+        assert_eq!(
+            sub.match_staged(&unresolved, &helper(), &|_: &str| true, &MatchDemand::NONE),
+            StagedVerdict::Matched("INNER")
+        );
+        // An actionable gate must not spend DNS on a decided leaf either.
+        let demand = MatchDemand {
+            ip: true,
+            process: true,
+        };
+        assert_eq!(
+            sub.match_staged(&unresolved, &helper(), &|_: &str| true, &demand),
+            StagedVerdict::Matched("INNER")
+        );
+
+        // A hostname the domain entries do not cover is still
+        // undecidable — the IP member may match post-resolution.
+        let other = Metadata {
+            host: "other.example".into(),
+            ..Default::default()
+        };
+        assert_eq!(
+            sub.match_staged(&other, &helper(), &|_: &str| true, &MatchDemand::NONE),
+            StagedVerdict::Miss
+        );
+        assert_eq!(
+            sub.match_staged(&other, &helper(), &|_: &str| true, &demand),
+            StagedVerdict::Need {
+                ip: true,
+                process: false
+            }
         );
     }
 }
