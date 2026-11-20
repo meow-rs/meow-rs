@@ -4192,7 +4192,7 @@ async fn spawn_tun_from_raw(
     tunnel: &Tunnel,
     raw: &RawConfig,
     binding: Option<OutboundBinding>,
-    setup_resolver: Arc<meow_dns::Resolver>,
+    setup_resolver: &meow_dns::Resolver,
 ) -> Result<Option<meow_tunnel::TunHandle>, String> {
     let tun_cfg = match meow_config::parse_tun_config(
         raw.tun.as_ref(),
@@ -4290,7 +4290,7 @@ async fn spawn_tun_from_raw(
     _tunnel: &Tunnel,
     raw: &RawConfig,
     _binding: Option<OutboundBinding>,
-    _setup_resolver: Arc<meow_dns::Resolver>,
+    _setup_resolver: &meow_dns::Resolver,
 ) -> Result<Option<meow_tunnel::TunHandle>, String> {
     if raw.tun.as_ref().is_some_and(|t| t.enable) {
         // Err (not Ok(None)) so the off→on reconcile path rolls
@@ -4588,13 +4588,8 @@ async fn swap_config_and_reconcile_tun(
             state.tunnel.stop_tun().await;
             let binding = preinstalled.take_binding();
             let adopted = binding.is_some();
-            match spawn_tun_from_raw(
-                &state.tunnel,
-                &candidate,
-                binding,
-                Arc::clone(&setup_resolver),
-            )
-            .await
+            match spawn_tun_from_raw(&state.tunnel, &candidate, binding, setup_resolver.as_ref())
+                .await
             {
                 Ok(Some(handle)) => {
                     tun_handle = Some(handle);
@@ -4637,13 +4632,7 @@ async fn swap_config_and_reconcile_tun(
         state.tunnel.stop_tun().await;
         let binding = preinstalled.take_binding();
         let adopted = binding.is_some();
-        match spawn_tun_from_raw(
-            &state.tunnel,
-            &candidate,
-            binding,
-            Arc::clone(&setup_resolver),
-        )
-        .await
+        match spawn_tun_from_raw(&state.tunnel, &candidate, binding, setup_resolver.as_ref()).await
         {
             Ok(Some(handle)) => {
                 tun_handle = Some(handle);
