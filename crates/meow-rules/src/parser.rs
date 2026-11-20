@@ -81,9 +81,12 @@ impl ParserContext {
 /// surfaces (subscriptions, rule-provider payloads): a line like
 /// `AND,((AND,((…` recurses one stack frame per nesting level and copies
 /// the inner text per level, so an unbounded line overflows the stack and
-/// amplifies transient allocation (issue #533 review).
-const MAX_LOGIC_DEPTH: usize = 64;
-pub(crate) const MAX_RULE_LINE_LEN: usize = 64 * 1024;
+/// amplifies transient allocation (issue #533 review). `pub` so the config
+/// loader's geo-discovery scan — which walks the same logic nesting before
+/// the parser sees the line — can apply the identical bounds instead of
+/// overflowing first (issue #974 review).
+pub const MAX_LOGIC_DEPTH: usize = 64;
+pub const MAX_RULE_LINE_LEN: usize = 64 * 1024;
 
 /// Named rule-providers a `RULE-SET,<name>` sub-rule can reference.
 pub type RuleSets = HashMap<String, Arc<dyn RuleSet>>;

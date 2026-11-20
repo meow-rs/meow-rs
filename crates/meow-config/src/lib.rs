@@ -4765,8 +4765,14 @@ struct GeoLineScan<'a> {
 fn geo_scan_targets(line: &str) -> GeoLineScan<'_> {
     let mut scan = GeoLineScan::default();
     let trimmed = line.trim();
-    if !trimmed.is_empty() && !trimmed.starts_with('#') {
-        collect_geo_segments(trimmed, &mut scan);
+    // The same input bound the rule parser enforces — a line it would
+    // reject contributes nothing, and the bound keeps the classifier's
+    // per-level work honest before the parse stage owns the error.
+    if !trimmed.is_empty()
+        && !trimmed.starts_with('#')
+        && trimmed.len() <= meow_rules::parser::MAX_RULE_LINE_LEN
+    {
+        collect_geo_segments(trimmed, &mut scan, 0);
     }
     scan
 }
@@ -4775,7 +4781,10 @@ fn geo_scan_targets(line: &str) -> GeoLineScan<'_> {
 /// into scan segments, recursing through logic groups so a leg's own
 /// type governs how its text is treated (issue #974 review: a
 /// `PROCESS-*` leg's `GEOIP,x` text must not trigger a geo load).
-fn collect_geo_segments<'a>(text: &'a str, scan: &mut GeoLineScan<'a>) {
+/// `depth` mirrors the parser's `MAX_LOGIC_DEPTH` budget — this scan
+/// runs *before* the parse stage, so an over-deep line must stop the
+/// descent here rather than overflow the stack first.
+fn collect_geo_segments<'a>(text: &'a str, scan: &mut GeoLineScan<'a>, depth: usize) {
     use meow_rules::sub_rule_cond::{parse_cond, parse_sub_rule_reference};
     let ty = text.split(',').next().map_or("", str::trim);
     let ty = meow_common::RuleType::from_mihomo_name(ty)
@@ -4803,6 +4812,12 @@ fn collect_geo_segments<'a>(text: &'a str, scan: &mut GeoLineScan<'a>) {
             }
         }
         "AND" | "OR" | "NOT" => {
+            // A group the parser would reject for depth can never exist
+            // as a rule — stop scanning this branch rather than recursing
+            // one stack frame per level (the parse stage owns the error).
+            if depth >= meow_rules::parser::MAX_LOGIC_DEPTH {
+                return;
+            }
             // Decompose `(leg),(leg),<target>` and classify each leg on
             // its own type; a malformed shape falls back to the raw
             // text (conservative — the parse stage fails it anyway).
@@ -4817,7 +4832,7 @@ fn collect_geo_segments<'a>(text: &'a str, scan: &mut GeoLineScan<'a>) {
             match decomposed {
                 Some(legs) => {
                     for leg in legs {
-                        collect_geo_segments(leg.trim(), scan);
+                        collect_geo_segments(leg.trim(), scan, depth + 1);
                     }
                 }
                 None => scan.texts.push(text),
@@ -9436,6 +9451,78 @@ mod geoip_context_tests {
         assert_eq!(
             got, want,
             "duplicate country rules must collapse to one entry per code"
+        );
+    }
+
+    /// Issue #974 review — the scan descends logic nesting *before* the
+    /// rule parser sees the line, so it must apply the parser's own
+    /// bounds: a line over `MAX_RULE_LINE_LEN` contributes nothing, and
+    /// a nesting past `MAX_LOGIC_DEPTH` stops the descent. Without them
+    /// `AND,((`×N — eight bytes per level — overflows the stack here
+    /// long before the parse stage reports its "nesting exceeds" error.
+    #[test]
+    fn geo_scan_bounds_logic_nesting_and_line_length() {
+        // 8000 levels stay inside the length cap — only the depth bound
+        // stops the descent. The innermost GEOIP leg sits below the cap,
+        // so nothing is classified.
+        let mut deep = String::new();
+        for _ in 0..8000 {
+            deep.push_str("AND,((");
+        }
+        deep.push_str("GEOIP,CN");
+        for _ in 0..8000 {
+            deep.push_str("))");
+        }
+        deep.push_str(",DIRECT");
+        assert!(deep.len() <= meow_rules::parser::MAX_RULE_LINE_LEN);
+        let countries = collect_geoip_countries(std::slice::from_ref(&deep));
+        assert!(
+            countries.is_empty(),
+            "a branch the parser rejects for depth must not be scanned: {countries:?}"
+        );
+        // The parse stage then owns the failure — the same line errors
+        // on the depth cap instead of overflowing either stack.
+        let Err(err) =
+            meow_rules::parser::parse_rule(&deep, &meow_rules::parser::ParserContext::empty())
+        else {
+            panic!("the parser must reject the over-deep line");
+        };
+        assert!(err.contains("nesting"), "{err}");
+
+        // One byte past the length cap and the line contributes nothing —
+        // the parser rejects it for length, so its geo keys never exist.
+        let mut overlong = deep.clone();
+        overlong.push_str(&"x".repeat(meow_rules::parser::MAX_RULE_LINE_LEN));
+        let countries = collect_geoip_countries(&[overlong]);
+        assert!(
+            countries.is_empty(),
+            "an over-cap line must not be scanned at all: {countries:?}"
+        );
+
+        // The bound mirrors the parser exactly: 64 nested groups is the
+        // most a legal line carries — the GEOIP leaf inside still scans;
+        // one level more and the whole line (and its leaves) is dead.
+        let nested = |levels: usize| {
+            let mut line = String::new();
+            for _ in 0..levels {
+                line.push_str("AND,((");
+            }
+            line.push_str("GEOIP,CN");
+            for _ in 0..levels {
+                line.push_str("))");
+            }
+            line.push_str(",DIRECT");
+            line
+        };
+        let countries = collect_geoip_countries(&[nested(64)]);
+        assert!(
+            countries.contains("CN"),
+            "a GEOIP leaf at the legal boundary must still be found: {countries:?}"
+        );
+        let countries = collect_geoip_countries(&[nested(65)]);
+        assert!(
+            countries.is_empty(),
+            "a GEOIP leaf under an over-deep group must not be found: {countries:?}"
         );
     }
 
