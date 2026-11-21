@@ -12356,6 +12356,23 @@ async fn put_configs_force_gates_malformed_rematch() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+    // The reverse edge fails the same gate: a transport node chaining
+    // through a rematch leaf is the build's hard `dialer-proxy` error —
+    // a rematch cannot carry a transport hop (issue #974).
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: front, type: rematch, target-rematch-name: x}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: front}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
     // A malformed REMATCH-NAME predicate (empty alternative) — no
     // `sub-rules:` section needed for the gate to see it.
     let resp = put_configs_payload(

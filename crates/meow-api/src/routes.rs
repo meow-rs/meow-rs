@@ -5465,6 +5465,7 @@ async fn put_configs(
         // the build's block-aware parser, so a `(cond)` inside
         // `SUB-RULE` and the legs inside logic groups get the same
         // verdict as the build did (issue #974).
+        let mut rematch_names = std::collections::HashSet::new();
         for node in raw_config.proxies.as_deref().unwrap_or(&[]) {
             if node.get("type").and_then(|v| v.as_str()) == Some("rematch") {
                 if let Err(e) = meow_config::proxy_parser::check_rematch_node(node) {
@@ -5476,6 +5477,31 @@ async fn put_configs(
                         ),
                     );
                 }
+                if let Some(name) = node.get("name").and_then(|v| v.as_str()) {
+                    rematch_names.insert(name.to_string());
+                }
+            }
+        }
+        // The reverse edge is the same hard defect the build's
+        // `apply_dialer_proxies_validate` reports: a `dialer-proxy`
+        // naming a statically known rematch leaf can never carry the
+        // hop — a rematch re-enters routing, it does not dial. A
+        // group-named front keeps its dial-time verdict, as in the
+        // build (issue #974).
+        for node in raw_config.proxies.as_deref().unwrap_or(&[]) {
+            let Some(dialer) = node.get("dialer-proxy").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if rematch_names.contains(dialer.trim()) {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "config validation failed under force, and the candidate's \
+                         dialer-proxy edges are structurally unsafe to commit verbatim: \
+                         dialer-proxy '{}' is a rematch control outbound",
+                        dialer.trim(),
+                    ),
+                );
             }
         }
         for line in raw_config.rules.as_deref().unwrap_or(&[]) {
