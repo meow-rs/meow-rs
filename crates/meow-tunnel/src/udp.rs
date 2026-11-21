@@ -349,7 +349,10 @@ pub async fn handle_udp(
     // Rule-demand gating is only an optimization. UDP still requires a real
     // address for its NAT key and outbound packet API, including after a
     // fake-IP was rewritten back to a hostname under domain-only rules.
-    tunnel.resolve_udp_dst(&mut metadata).await;
+    // When the direct-nameserver probe ran it already produced the flow's
+    // committed decision — use it verbatim; re-scanning after its dst_ip
+    // fill could match a slot the probe legitimately skipped (issue #974).
+    let probed = tunnel.resolve_udp_dst(&mut metadata).await;
 
     // Build destination SocketAddr for the NAT key.
     // pre_resolve() populates dst_ip for any hostname; if it is still None
@@ -375,12 +378,16 @@ pub async fn handle_udp(
     // (issue #533 review). The mutable flow entry point shares this
     // metadata's lookup memo with the `resolve_udp_dst` probe above —
     // one socket-table scan per flow at most (issue #974).
+    let resolved = match probed {
+        Some(target) => Some(target),
+        None => tunnel.resolve_proxy_flow(&mut metadata).await,
+    };
     let Some(ResolvedTarget {
         adapter: proxy,
         rule_name,
         rule_payload,
         route: _route,
-    }) = tunnel.resolve_proxy_flow(&mut metadata).await
+    }) = resolved
     else {
         warn!("no matching rule for UDP {}", metadata.remote_address());
         return;

@@ -637,13 +637,15 @@ impl TunnelInner {
     /// `ListenPacketContext` resolves via `DirectHostResolver`), so a
     /// main-side failure must not drop it. Other routes never reach the
     /// direct resolver, which keeps proxied names off that upstream.
-    /// Returns the pinned route-table generation when the probe ran: the
-    /// caller's committed resolve must reuse it via
-    /// [`Self::resolve_proxy_flow_on`] — a reload landing between the two
-    /// must not split the "ends DIRECT" verdict from the route the flow
-    /// actually commits to (issue #974). `None` means no probe ran, so a
-    /// live-generation resolve carries no split window.
-    pub async fn resolve_udp_dst(&self, metadata: &mut Metadata) -> Option<Arc<RouteTable>> {
+    /// Returns `Some` carrying the probe's *committed decision* when one
+    /// ran: the caller MUST use it as the flow's route rather than
+    /// re-resolve. Pinning only the generation would still split — the
+    /// direct-nameserver fill lands `dst_ip` after the scan, so a commit
+    /// re-scan can match a slot the probe legitimately skipped
+    /// (`IP-CIDR,…,no-resolve` front rules), and live mode/process-policy
+    /// reads and group selections can diverge again (issue #974 review).
+    /// `None` means no probe ran; a live resolve carries no split window.
+    pub async fn resolve_udp_dst(&self, metadata: &mut Metadata) -> Option<ResolvedTarget> {
         if metadata.dst_ip.is_some() || metadata.host.is_empty() {
             return None;
         }
@@ -653,32 +655,38 @@ impl TunnelInner {
             return None;
         }
         let direct = resolver.direct_resolver().map(Arc::clone)?;
-        // Probe only — "does this route end DIRECT?" — so it must not
-        // record the hit `resolve_proxy` counts: every UDP caller resolves
-        // for real right after (a double hit per flow), and a packet this
-        // probe leaves undialling would still have tallied (issue #882
-        // review). The probe runs on a clone: its rematch transitions
-        // stamp `rematch_name`, which only the kept resolution may write.
-        // The shared `flow_lookup` memo still carries across.
+        // The probe scans on a metadata clone so its rematch transition
+        // writes stay visible for adoption below, while `dst_ip` and the
+        // shared `flow_lookup` memo carry through either way. Hit
+        // bookkeeping is deferred into `hits` and tallied here exactly
+        // once — the probe IS the flow's resolve, so its outcome is
+        // counted but never doubled by a second scan (issue #882/#974).
         let route = self.route();
         let mut probe_metadata = metadata.clone();
-        let Some(target) = self
-            .resolve_proxy_inner_on(&route, &mut probe_metadata, false)
-            .await
-        else {
-            return Some(route);
-        };
-        if !routes_direct(target.adapter.as_ref(), &probe_metadata) {
-            return Some(route);
+        let mut hits = DecisionHits::default();
+        let target = self
+            .resolve_proxy_inner_on(&route, &mut probe_metadata, false, Some(&mut hits))
+            .await?;
+        if routes_direct(target.adapter.as_ref(), &probe_metadata) {
+            metadata.dst_ip = direct.resolve_ip_real(&metadata.host).await;
+            if let Some(ip) = metadata.dst_ip {
+                debug!(
+                    "resolve_udp_dst: {} -> {} via direct-nameserver",
+                    metadata.host, ip
+                );
+            }
         }
-        metadata.dst_ip = direct.resolve_ip_real(&metadata.host).await;
-        if let Some(ip) = metadata.dst_ip {
-            debug!(
-                "resolve_udp_dst: {} -> {} via direct-nameserver",
-                metadata.host, ip
-            );
-        }
-        Some(route)
+        // Adopt the probe's marker state — a transition's
+        // `target-rematch-name` is part of the committed decision — and
+        // charge the deferred bookkeeping.
+        metadata.set_rematch_name(probe_metadata.rematch_name());
+        hits.record(&route, &self.stats);
+        // The probe skipped the pre-dispatch lookup (`record_hit = false`
+        // in `resolve_proxy_inner_on`); the kept decision still owes
+        // `always` mode its one scan, memo-shared like any flow's.
+        self.maybe_lookup_flow_process(metadata, self.process_policy.get())
+            .await;
+        Some(target)
     }
 
     /// Resolve which proxy to use for the given metadata.
@@ -717,18 +725,6 @@ impl TunnelInner {
         self.resolve_proxy_inner(metadata, true).await
     }
 
-    /// [`Self::resolve_proxy_flow`] resolved against a caller-pinned route
-    /// generation — pair it with the snapshot [`Self::resolve_udp_dst`]
-    /// returns so the probe and the committed decision cannot split
-    /// across a reload (issue #974).
-    pub async fn resolve_proxy_flow_on(
-        &self,
-        route: &Arc<RouteTable>,
-        metadata: &mut Metadata,
-    ) -> Option<ResolvedTarget> {
-        self.resolve_proxy_inner_on(route, metadata, true).await
-    }
-
     /// [`Self::resolve_proxy_flow`] with the hit bookkeeping optional:
     /// `record_hit = false` for the `resolve_udp_dst` "does this route end
     /// DIRECT" probe, whose caller resolves for real right after — counting
@@ -749,6 +745,7 @@ impl TunnelInner {
         route: &Arc<RouteTable>,
         metadata: &Metadata,
         record_hit: bool,
+        hits: &mut DecisionHits,
     ) -> ResolvedTarget {
         let name = metadata.special_proxy();
         // Built-ins resolve through the map like any other name: the
@@ -776,8 +773,9 @@ impl TunnelInner {
                 (Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>, "REJECT")
             }
         };
+        hits.outcome = Some(("ListenerProxy", action));
         if record_hit {
-            self.stats.rule_match.increment("ListenerProxy", action);
+            hits.record(route, &self.stats);
         }
         ResolvedTarget {
             adapter,
@@ -796,11 +794,13 @@ impl TunnelInner {
         route: &Arc<RouteTable>,
         metadata: &Metadata,
         record_hit: bool,
+        hits: &mut DecisionHits,
     ) -> ResolvedTarget {
         let name = metadata.special_rules();
         warn!("listener sub-rules block '{name}' is not in the route table; rejecting flow");
+        hits.outcome = Some(("ListenerProxy", "REJECT"));
         if record_hit {
-            self.stats.rule_match.increment("ListenerProxy", "REJECT");
+            hits.record(route, &self.stats);
         }
         ResolvedTarget {
             adapter: Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>,
@@ -850,20 +850,25 @@ impl TunnelInner {
         record_hit: bool,
     ) -> Option<ResolvedTarget> {
         let route = self.route();
-        self.resolve_proxy_inner_on(&route, metadata, record_hit)
+        self.resolve_proxy_inner_on(&route, metadata, record_hit, None)
             .await
     }
 
     /// [`Self::resolve_proxy_inner`] against a caller-pinned route
-    /// generation — `resolve_udp_dst`'s probe and the flow's committed
-    /// resolve share one snapshot so a mid-window reload cannot split the
-    /// direct-nameserver verdict from the routing decision (issue #974).
+    /// generation — `resolve_udp_dst`'s probe runs on one snapshot so a
+    /// mid-window reload cannot split its decision. `deferred` receives
+    /// the hit bookkeeping a `record_hit = false` scan leaves uncounted;
+    /// callers that keep the decision tally it exactly once
+    /// (`resolve_udp_dst`), callers that discard it pass `None`.
     async fn resolve_proxy_inner_on(
         &self,
         route: &Arc<RouteTable>,
         metadata: &mut Metadata,
         record_hit: bool,
+        deferred: Option<&mut DecisionHits>,
     ) -> Option<ResolvedTarget> {
+        let mut scratch = DecisionHits::default();
+        let hits = deferred.unwrap_or(&mut scratch);
         // Sample the live `find-process-mode` once for the whole
         // resolution — a PATCH lands on the next flow, not mid-scan
         // (issue #974).
@@ -880,7 +885,7 @@ impl TunnelInner {
             if process_mode == ProcessLookupMode::Always {
                 metadata.flow_lookup.record_process(None);
             }
-            return Some(self.resolve_listener_proxy(route, metadata, record_hit));
+            return Some(self.resolve_listener_proxy(route, metadata, record_hit, hits));
         }
         if record_hit {
             self.maybe_lookup_flow_process(metadata, process_mode).await;
@@ -923,7 +928,7 @@ impl TunnelInner {
                 // is built from `resolve_udp_dst` output), so IP demand may
                 // not stop the scan — only process demand may.
                 Some(
-                    self.rule_route(route, metadata, false, process_mode, record_hit)
+                    self.rule_route(route, metadata, false, process_mode, record_hit, hits)
                         .await,
                 )
             }
@@ -951,8 +956,9 @@ impl TunnelInner {
         let process_mode = self.process_policy.get();
         self.maybe_lookup_flow_process(metadata, process_mode).await;
         let route = self.route();
+        let mut hits = DecisionHits::default();
         Some(
-            self.rule_route(&route, metadata, true, process_mode, true)
+            self.rule_route(&route, metadata, true, process_mode, true, &mut hits)
                 .await,
         )
     }
@@ -981,6 +987,7 @@ impl TunnelInner {
         allow_ip: bool,
         process_mode: ProcessLookupMode,
         record_hit: bool,
+        hits: &mut DecisionHits,
     ) -> ResolvedTarget {
         const MAX_REMATCH_TRANSITIONS: usize = 32;
         let mut active = SmolStr::from(metadata.special_rules());
@@ -991,7 +998,7 @@ impl TunnelInner {
             let scan = match Self::rule_scan(route, &active, listener_seeded) {
                 Ok(scan) => scan,
                 Err(()) if listener_seeded => {
-                    return self.missing_block_reject(route, metadata, record_hit);
+                    return self.missing_block_reject(route, metadata, record_hit, hits);
                 }
                 Err(()) => {
                     // The build warned once already; a rematch-selected
@@ -1014,16 +1021,14 @@ impl TunnelInner {
                 .await;
             let Some(candidate) = candidate else {
                 return self
-                    .materialize_rule_match(route, result, record_hit, scan.stats, metadata);
+                    .materialize_rule_match(route, result, record_hit, scan.stats, metadata, hits);
             };
             let m = result.expect("a rematch verdict only rides a terminal match");
             // The chosen slot commits this pass — count it exactly like a
             // terminal match on this vector. A block-local index never
             // reaches the top-level counters.
-            if record_hit {
-                if let Some(stats) = scan.stats {
-                    stats.record_hit(m.rule_index);
-                }
+            if scan.stats.is_some() {
+                hits.slots.push(m.rule_index);
             }
             conn_note!(
                 Rule,
@@ -1038,10 +1043,9 @@ impl TunnelInner {
                     "rematch transition loop or depth limit at '{}'; rejecting flow",
                     candidate.name
                 );
+                hits.outcome = Some((m.rule_type.as_str(), "REJECT"));
                 if record_hit {
-                    self.stats
-                        .rule_match
-                        .increment(m.rule_type.as_str(), "REJECT");
+                    hits.record(route, &self.stats);
                 }
                 return ResolvedTarget {
                     adapter: Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>,
@@ -1299,6 +1303,7 @@ impl TunnelInner {
         record_hit: bool,
         hit_stats: Option<&crate::rule_stats::RuleStats>,
         metadata: &Metadata,
+        hits: &mut DecisionHits,
     ) -> ResolvedTarget {
         match result {
             Some(m) => {
@@ -1356,17 +1361,16 @@ impl TunnelInner {
                         Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>
                     }
                 };
+                // A `sub-rules` block match carries no stats — never
+                // stamp a block-local index onto the top-level /rules
+                // counters or switches (the spec's "no fictitious rule
+                // hit"). The aggregate metric still counts it.
+                if hit_stats.is_some() {
+                    hits.slots.push(m.rule_index);
+                }
+                hits.outcome = Some((m.rule_type.as_str(), action));
                 if record_hit {
-                    // A `sub-rules` block match carries no stats — never
-                    // stamp a block-local index onto the top-level /rules
-                    // counters or switches (the spec's "no fictitious rule
-                    // hit"). The aggregate metric still counts it.
-                    if let Some(stats) = hit_stats {
-                        stats.record_hit(m.rule_index);
-                    }
-                    self.stats
-                        .rule_match
-                        .increment(m.rule_type.as_str(), action);
+                    hits.record(route, &self.stats);
                 }
                 conn_note!(
                     Rule,
@@ -1386,13 +1390,14 @@ impl TunnelInner {
             None => {
                 // No rule matched, use DIRECT
                 conn_note!(Rule, "No rule matched → DIRECT");
+                // The implicit terminal is still the committed
+                // routing outcome — a rematch-selected block that
+                // exhausts ends here too — so the aggregate counts it
+                // under the tail's "Final" name. There is no rule
+                // slot to charge: no `record_hit` index applies.
+                hits.outcome = Some(("Final", "DIRECT"));
                 if record_hit {
-                    // The implicit terminal is still the committed
-                    // routing outcome — a rematch-selected block that
-                    // exhausts ends here too — so the aggregate counts it
-                    // under the tail's "Final" name. There is no rule
-                    // slot to charge: no `record_hit` index applies.
-                    self.stats.rule_match.increment("Final", "DIRECT");
+                    hits.record(route, &self.stats);
                 }
                 ResolvedTarget {
                     adapter: Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
@@ -1570,6 +1575,35 @@ pub enum PreHandleVerdict {
     /// (issue #618); mihomo drops the same class in `preHandleMetadata`.
     /// Also returned when the flow's name is not a hostname (issue #734).
     Drop,
+}
+
+/// The `record_hit` bookkeeping a resolution accumulated, tallied once by
+/// whoever keeps the decision. `record_hit = true` paths drain it inline
+/// at the terminal; `resolve_udp_dst`'s probe leaves it populated for its
+/// caller-side commit to charge — never doubled by a second scan.
+#[derive(Default)]
+struct DecisionHits {
+    /// Top-level rule slots each committed pass chose — transition picks
+    /// included. `sub-rules` block matches add nothing: a block-local
+    /// index must not alias the top-level /rules counters.
+    slots: Vec<usize>,
+    /// The terminal outcome's `rule_match` bucket — absent on the
+    /// mode-dispatch early outs, which tally nothing.
+    outcome: Option<(&'static str, &'static str)>,
+}
+
+impl DecisionHits {
+    /// Tally the deferred bookkeeping: slots to the pinned generation's
+    /// /rules counters, the outcome to the aggregate. Draining makes a
+    /// second call a no-op, so the inline and deferred sites share it.
+    fn record(&mut self, route: &RouteTable, stats: &Statistics) {
+        for index in self.slots.drain(..) {
+            route.rule_stats.record_hit(index);
+        }
+        if let Some((rule_type, action)) = self.outcome.take() {
+            stats.rule_match.increment(rule_type, action);
+        }
+    }
 }
 
 /// The `(rules, compiled, stats)` a rule-mode scan runs over for `metadata`
@@ -3387,11 +3421,12 @@ mod tests {
         );
     }
 
-    /// `resolve_udp_dst`'s route probe is bookkeeping-free: the flow's
-    /// real `resolve_proxy` right after is what counts the hit — the pair
-    /// must tally one, not two (issue #882 review).
+    /// `resolve_udp_dst`'s route probe IS the flow's committed decision:
+    /// it tallies the hit exactly once — the caller uses the returned
+    /// target verbatim instead of a second resolve that would double it
+    /// (issues #882, #974 reviews).
     #[tokio::test]
-    async fn resolve_udp_dst_probe_records_no_hit() {
+    async fn resolve_udp_dst_commits_probe_bookkeeping() {
         use meow_dns::HostEntry;
         use meow_rules::domain_suffix::DomainSuffixRule;
         use meow_rules::final_rule::FinalRule;
@@ -3433,28 +3468,99 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        tunnel.inner().resolve_udp_dst(&mut meta).await;
+        let target = tunnel
+            .inner()
+            .resolve_udp_dst(&mut meta)
+            .await
+            .expect("a probe that ran returns the committed decision");
         assert_eq!(meta.dst_ip, Some(direct_ip));
+        assert_eq!(target.adapter.adapter_type(), AdapterType::Direct);
         let route = tunnel.route_snapshot();
         assert_eq!(
             route.rule_stats.view(0).hits,
-            0,
-            "the probe must not record a hit"
-        );
-        tunnel.inner().resolve_proxy(&meta).await.unwrap();
-        assert_eq!(
-            route.rule_stats.view(0).hits,
             1,
-            "the real resolution counts once"
+            "the probe's kept decision tallies its slot exactly once"
         );
     }
 
-    /// The probe's route generation is pinned for the commit: a reload
-    /// between `resolve_udp_dst` and `resolve_proxy_flow_on` must not
-    /// split the direct-nameserver verdict from the route the flow
-    /// actually takes (issue #974).
+    /// The probe's decision stays the committed route even when the
+    /// direct-nameserver fill it performs would change a later scan: an
+    /// `IP-CIDR,…,no-resolve` front slot sees no `dst_ip` at probe time,
+    /// so the flow falls to `MATCH,DIRECT` — the fill must not make a
+    /// commit re-scan land the flow on REJECT (issue #974 review).
     #[tokio::test]
-    async fn resolve_udp_dst_pins_the_probe_generation() {
+    async fn resolve_udp_dst_decision_survives_its_own_ip_fill() {
+        use meow_dns::HostEntry;
+        use meow_rules::final_rule::FinalRule;
+        use meow_rules::ipcidr::IpCidrRule;
+        use std::net::IpAddr;
+
+        let direct_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7));
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+        hosts.insert("split.test", vec![direct_ip].into());
+        let direct = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+        let mut main = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+        );
+        main.set_direct_resolver(Arc::new(direct));
+        let tunnel = Tunnel::new(Arc::new(main));
+
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(IpCidrRule::new("192.0.2.0/24", "REJECT", false, true).unwrap()),
+                Box::new(FinalRule::new("DIRECT")),
+            ],
+            Default::default(),
+            Default::default(),
+        );
+
+        let mut meta = Metadata {
+            network: Network::Udp,
+            host: "split.test".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let target = tunnel
+            .inner()
+            .resolve_udp_dst(&mut meta)
+            .await
+            .expect("a probe that ran returns the committed decision");
+        assert_eq!(meta.dst_ip, Some(direct_ip));
+        assert_eq!(
+            target.adapter.adapter_type(),
+            AdapterType::Direct,
+            "the commit keeps the probe's DIRECT verdict — the filled dst_ip \
+             must not feed a re-scan that matches the front slot"
+        );
+        assert_eq!(
+            target.rule_name.as_str(),
+            "Match",
+            "the flow commits the tail the probe reached, not rule #1"
+        );
+        let route = tunnel.route_snapshot();
+        assert_eq!(route.rule_stats.view(0).hits, 0);
+        assert_eq!(
+            route.rule_stats.view(1).hits,
+            1,
+            "the MATCH slot the probe committed tallies once"
+        );
+    }
+
+    /// The probe's whole decision — not only its route generation — is
+    /// what the caller commits: a reload landing after `resolve_udp_dst`
+    /// cannot re-decide the flow, and the returned target still pins the
+    /// table the probe consulted for its dialer registry (issue #974).
+    #[tokio::test]
+    async fn resolve_udp_dst_pins_the_probe_decision() {
         use meow_dns::HostEntry;
         use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
         use std::net::IpAddr;
@@ -3499,10 +3605,10 @@ mod tests {
             .inner()
             .resolve_udp_dst(&mut meta)
             .await
-            .expect("a direct-route probe returns its pinned generation");
+            .expect("a direct-route probe returns its committed decision");
         assert!(
-            Arc::ptr_eq(&pin, &probed),
-            "the pin is the generation the probe consulted"
+            Arc::ptr_eq(&pin.route, &probed),
+            "the target pins the generation the probe consulted"
         );
         assert_eq!(meta.dst_ip, Some(direct_ip));
 
@@ -3516,21 +3622,17 @@ mod tests {
             Default::default(),
             Default::default(),
         );
-        assert!(!Arc::ptr_eq(&pin, &tunnel.route_snapshot()));
-
-        let committed = tunnel
-            .inner()
-            .resolve_proxy_flow_on(&pin, &mut meta)
-            .await
-            .expect("a rule-mode flow resolves");
+        assert!(!Arc::ptr_eq(&pin.route, &tunnel.route_snapshot()));
         assert_eq!(
-            committed.adapter.adapter_type(),
+            pin.adapter.adapter_type(),
             AdapterType::Direct,
-            "the commit follows the generation that answered 'ends DIRECT'"
+            "the committed decision is the one the probe reached — the \
+             reload cannot re-decide this flow"
         );
 
-        // The live generation — what an unpinned commit would see —
-        // disagrees, proving the pin is what kept the verdict coherent.
+        // The live generation — what an unpinned re-decision would see —
+        // disagrees, proving the pinned decision is what kept the
+        // direct-nameserver verdict coherent.
         let mut live = meta.clone();
         let unpinned = tunnel
             .inner()
@@ -5194,14 +5296,14 @@ sub-rules:
         }
 
         /// The `resolve_udp_dst` probe resolves the route including
-        /// rematch transitions — on a throwaway metadata clone, so the
-        /// flow's real marker stays unset for the kept resolution — and
-        /// counts nothing: only the committed resolve may charge a slot
+        /// rematch transitions, and its decision IS the commit: the
+        /// marker it settled on lands on the flow and the bookkeeping it
+        /// deferred is tallied exactly once — the caller never re-scans
         /// (issues #882, #974). The stub `direct-nameserver` is what
         /// proves the probe ran: without one `resolve_udp_dst` returns
         /// before routing, and every assertion here passes vacuously.
         #[tokio::test]
-        async fn udp_route_probe_sees_rematch_without_hits() {
+        async fn udp_route_probe_commits_rematch_decision() {
             use meow_dns::HostEntry;
             use std::net::IpAddr;
 
@@ -5244,7 +5346,12 @@ sub-rules:
                 network: Network::Udp,
                 ..Default::default()
             };
-            tunnel.inner().resolve_udp_dst(&mut md).await;
+            let target = tunnel
+                .inner()
+                .resolve_udp_dst(&mut md)
+                .await
+                .expect("a probe that ran returns the committed decision");
+            assert_eq!(target.adapter.name(), "DIRECT");
             assert_eq!(
                 md.dst_ip,
                 Some(direct_ip),
@@ -5252,27 +5359,19 @@ sub-rules:
             );
             assert_eq!(
                 md.rematch_name(),
-                "",
-                "the probe's transition must not leak onto the flow"
+                "stage1",
+                "the committed decision carries the transition's marker"
             );
             let route = tunnel.inner().route();
             assert_eq!(
                 route.rule_stats.view(0).hits,
-                0,
-                "the probe records no rule hit"
-            );
-            assert!(
-                tunnel.inner().stats.rule_match.snapshot().is_empty(),
-                "the probe records no aggregate outcome"
-            );
-
-            let target = tunnel.inner().resolve_proxy_flow(&mut md).await.unwrap();
-            assert_eq!(target.adapter.name(), "DIRECT");
-            assert_eq!(md.rematch_name(), "stage1");
-            assert_eq!(
-                route.rule_stats.view(0).hits,
                 1,
-                "probe plus committed resolve tally exactly one hit"
+                "the kept decision tallies its transition slot exactly once"
+            );
+            assert_eq!(
+                tunnel.inner().stats.rule_match.snapshot(),
+                vec![(("REMATCH-NAME", "DIRECT"), 1)],
+                "the kept decision tallies its terminal outcome once"
             );
         }
 

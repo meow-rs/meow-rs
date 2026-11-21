@@ -127,7 +127,7 @@ pub(super) mod flow {
         // packet API needs a resolved dst_ip regardless of what the rules
         // demand — including after a fake-IP was rewritten back to a hostname.
         inner.pre_resolve(&mut metadata).await;
-        let probe_route = inner.resolve_udp_dst(&mut metadata).await;
+        let probed = inner.resolve_udp_dst(&mut metadata).await;
         let Some(dst_ip) = metadata.dst_ip else {
             return Err(format!(
                 "dst_ip not resolved for {}",
@@ -143,11 +143,11 @@ pub(super) mod flow {
         // flow dies and the datagrams drop; a UDP-incapable outbound errors
         // at dial. Either way datagrams are never silently diverted to
         // DIRECT.
-        // When `resolve_udp_dst` probed, commit on its pinned generation —
-        // the direct-nameserver verdict and the route must come from one
-        // table (issue #974).
-        let resolved = match probe_route.as_ref() {
-            Some(route) => inner.resolve_proxy_flow_on(route, &mut metadata).await,
+        // When `resolve_udp_dst` probed it produced the committed
+        // decision — use it so the direct-nameserver verdict and the
+        // route agree (issue #974).
+        let resolved = match probed {
+            Some(target) => Some(target),
             None => inner.resolve_proxy_flow(&mut metadata).await,
         };
         let Some(meow_tunnel::ResolvedTarget {
