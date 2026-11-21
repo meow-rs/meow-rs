@@ -1670,10 +1670,18 @@ impl RouteTargetProbe<'_> {
                 None => return false,
             }
         }
-        debug!(
-            "{}: unwrap chain exceeded {MAX_UNWRAP_HOPS} hops probing for {want}",
-            cur.name()
-        );
+        // The cap guards hand-built cycles, not the verdict — the leaf it
+        // lands on still answers, and only a chain truly running past it
+        // reports an overflow (issue #974).
+        if cur.adapter_type() == want {
+            return true;
+        }
+        if cur.unwrap_proxy(self.metadata, false).is_some() {
+            debug!(
+                "{}: unwrap chain exceeded {MAX_UNWRAP_HOPS} hops probing for {want}",
+                cur.name()
+            );
+        }
         false
     }
 
@@ -1684,21 +1692,32 @@ impl RouteTargetProbe<'_> {
     /// to apply.
     fn rematch_leaf(&self, start: Arc<dyn Proxy>) -> Option<RematchCandidate> {
         const MAX_UNWRAP_HOPS: usize = 16;
+        let candidate = |p: &Arc<dyn Proxy>| {
+            p.rematch_action().map(|action| RematchCandidate {
+                name: SmolStr::from(p.name()),
+                rematch_name: action.rematch_name.map(SmolStr::from),
+                sub_rule: action.sub_rule.map(SmolStr::from),
+            })
+        };
         let mut cur = start;
         for _ in 0..MAX_UNWRAP_HOPS {
-            if let Some(action) = cur.rematch_action() {
-                return Some(RematchCandidate {
-                    name: SmolStr::from(cur.name()),
-                    rematch_name: action.rematch_name.map(SmolStr::from),
-                    sub_rule: action.sub_rule.map(SmolStr::from),
-                });
+            if let Some(found) = candidate(&cur) {
+                return Some(found);
             }
             cur = cur.unwrap_proxy(self.metadata, false)?;
         }
-        debug!(
-            "{}: unwrap chain exceeded {MAX_UNWRAP_HOPS} hops probing for rematch",
-            cur.name()
-        );
+        // Same terminal-leaf check as `unwraps_to`: the cap guards cycles,
+        // not the verdict — a pick chain exactly MAX deep still surfaces
+        // its rematch leaf (issue #974).
+        if let Some(found) = candidate(&cur) {
+            return Some(found);
+        }
+        if cur.unwrap_proxy(self.metadata, false).is_some() {
+            debug!(
+                "{}: unwrap chain exceeded {MAX_UNWRAP_HOPS} hops probing for rematch",
+                cur.name()
+            );
+        }
         None
     }
 }
@@ -4812,6 +4831,51 @@ sub-rules:
             );
             let (adapter, _) = routed(&tunnel, "any.test").await;
             assert_eq!(adapter, "REJECT", "a→G(b)→a is a routing cycle");
+        }
+
+        /// A pick chain exactly at the unwrap cap still surfaces its
+        /// rematch leaf: g1 → … → g16 → inspect is 16 hops — the probe
+        /// must inspect the leaf it terminates on, not only the first 15
+        /// hops, or the group reads as a dialable target (issue #974).
+        #[tokio::test]
+        async fn sixteen_hop_pick_chain_still_surfaces_rematch() {
+            let mut groups =
+                String::from("proxy-groups:\n  - {name: g16, type: select, proxies: [inspect]}\n");
+            for i in (1..16).rev() {
+                groups.push_str(&format!(
+                    "  - {{name: g{i}, type: select, proxies: [g{}]}}\n",
+                    i + 1
+                ));
+            }
+            let yaml = format!(
+                "proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: stage1}}\n\
+                 {groups}rules:\n  - MATCH,g1\n",
+            );
+            let tunnel = rematch_tunnel(&yaml);
+            let (adapter, _) = routed(&tunnel, "any.test").await;
+            // The found leaf transitions, the re-scan picks it again, and
+            // the visited-name guard rejects — all of which only happens
+            // when the depth-16 leaf answers the probe.
+            assert_eq!(adapter, "REJECT", "the depth-16 rematch leaf must surface");
+        }
+
+        /// The same boundary for the `PASS` walk: a chain p1 → … → p16 →
+        /// PASS still reads as `Pass`, so `MATCH,p1` skips instead of
+        /// committing a group whose selection cannot carry the flow.
+        #[tokio::test]
+        async fn sixteen_hop_pick_chain_still_surfaces_pass() {
+            let mut groups =
+                String::from("proxy-groups:\n  - {name: p16, type: select, proxies: [PASS]}\n");
+            for i in (1..16).rev() {
+                groups.push_str(&format!(
+                    "  - {{name: p{i}, type: select, proxies: [p{}]}}\n",
+                    i + 1
+                ));
+            }
+            let yaml = format!("{groups}rules:\n  - MATCH,p1\n  - MATCH,DIRECT\n");
+            let tunnel = rematch_tunnel(&yaml);
+            let (adapter, _) = routed(&tunnel, "any.test").await;
+            assert_eq!(adapter, "DIRECT", "the depth-16 PASS must skip the rule");
         }
 
         /// Two distinct nodes restamping the *same* marker chain freely —
