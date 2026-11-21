@@ -13,7 +13,10 @@ use std::sync::Arc;
 use meow_trie::DomainTrie;
 use tracing::warn;
 
-use crate::mrs_parser::{parse_header, stream_geosite_payload, GeositeItem, MrsError, TYPE_DOMAIN};
+use crate::mrs_parser::{
+    legacy_zstd_version, parse_header, stream_geosite_payload, zstd_decoder, GeositeItem, MrsError,
+    TYPE_DOMAIN,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GeositeError {
@@ -226,6 +229,11 @@ impl GeositeDB {
         data: &[u8],
         allowed: Option<&HashSet<String>>,
     ) -> Result<Self, GeositeError> {
+        // A whole-file legacy zstd stream would fall through to the .dat
+        // fallback and report WrongFormat; name it by its real format.
+        if let Some(version) = legacy_zstd_version(data) {
+            return Err(MrsError::LegacyZstd(version).into());
+        }
         match parse_header(data) {
             Ok((header, rest)) => {
                 if header.type_tag != TYPE_DOMAIN {
@@ -234,8 +242,7 @@ impl GeositeDB {
                 // Stream straight from the zstd decoder into per-category
                 // tries: neither the decompressed payload nor a per-domain
                 // string list is ever held in memory.
-                let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(rest))
-                    .map_err(MrsError::Zstd)?;
+                let decoder = zstd_decoder(rest)?;
                 let mut categories: HashMap<String, DomainTrie<()>> = HashMap::new();
                 let mut counts: HashMap<String, usize> = HashMap::new();
                 let mut current: Option<(String, DomainTrie<()>, usize)> = None;
@@ -448,6 +455,28 @@ mod tests {
             Err(GeositeError::WrongFormat) => {}
             other => panic!("expected WrongFormat, got {:?}", other.err()),
         }
+    }
+
+    /// Legacy zstd reports by name both as an `MRS!`-wrapped payload and
+    /// as a whole-file stream that would otherwise hit the .dat fallback.
+    #[test]
+    fn legacy_zstd_reports_by_name() {
+        use crate::mrs_parser::{MRS_MAGIC, MRS_VERSION};
+
+        let mut wrapped = Vec::new();
+        wrapped.extend_from_slice(&MRS_MAGIC);
+        wrapped.push(MRS_VERSION);
+        wrapped.push(TYPE_DOMAIN);
+        wrapped.extend_from_slice(&0u32.to_be_bytes());
+        wrapped.extend_from_slice(&[0x23, 0xB5, 0x2F, 0xFD]); // v0.3 frame magic
+        wrapped.extend_from_slice(b"garbage");
+        let err = GeositeDB::from_bytes(&wrapped, None).unwrap_err();
+        assert!(err.to_string().contains("legacy zstd"), "unexpected: {err}");
+
+        let mut whole_file = Vec::from([0xFD, 0x2F, 0xB5, 0x1E]); // v0.1 frame magic
+        whole_file.extend_from_slice(b"garbage");
+        let err = GeositeDB::from_bytes(&whole_file, None).unwrap_err();
+        assert!(err.to_string().contains("legacy zstd"), "unexpected: {err}");
     }
 
     #[test]

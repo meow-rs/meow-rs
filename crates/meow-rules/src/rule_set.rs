@@ -146,11 +146,15 @@ pub fn build_rule_set_checked(
     }
 }
 
-/// Return `true` if `bytes` starts with the MRS magic `"MRS!"`.
+/// Return `true` if `bytes` opens a recognised mrs container: the `"MRS!"`
+/// header, an upstream-format zstd frame, or a legacy zstd frame — the
+/// last routes to the mrs parser so it fails with the named
+/// `LegacyZstd` error rather than a format-mismatch.
 pub fn is_mrs_bytes(bytes: &[u8]) -> bool {
     bytes.len() >= 4
         && (bytes[..4] == crate::mrs_parser::MRS_MAGIC
-            || bytes[..4] == crate::mrs_parser::ZSTD_MAGIC)
+            || bytes[..4] == crate::mrs_parser::ZSTD_MAGIC
+            || crate::mrs_parser::legacy_zstd_version(bytes).is_some())
 }
 
 /// Parse an MRS binary payload and return the appropriate `RuleSet`.
@@ -180,9 +184,14 @@ pub fn build_rule_set_from_mrs_with_behavior(
     strict: bool,
 ) -> Result<Box<dyn RuleSet>, String> {
     use crate::mrs_parser::{
-        parse_header, stream_ipcidr_list, stream_string_list, UpstreamRuleSetReader,
-        TYPE_CLASSICAL, TYPE_DOMAIN, TYPE_IPCIDR, ZSTD_MAGIC,
+        legacy_zstd_version, parse_header, stream_ipcidr_list, stream_string_list, zstd_decoder,
+        MrsError, UpstreamRuleSetReader, TYPE_CLASSICAL, TYPE_DOMAIN, TYPE_IPCIDR, ZSTD_MAGIC,
     };
+    // A whole-file legacy zstd stream fails the `ZSTD_MAGIC` dispatch below
+    // and would report "not an mrs file"; name it by its real format.
+    if let Some(version) = legacy_zstd_version(bytes) {
+        return Err(MrsError::LegacyZstd(version).to_string());
+    }
     if bytes.len() >= 4 && bytes[..4] == ZSTD_MAGIC {
         let reader = UpstreamRuleSetReader::open(bytes).map_err(|e| e.to_string())?;
         let actual = behavior_from_type_tag(reader.behavior())?;
@@ -244,8 +253,7 @@ pub fn build_rule_set_from_mrs_with_behavior(
             ));
         }
     }
-    let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(compressed))
-        .map_err(|e| format!("mrs: zstd decompression failed: {e}"))?;
+    let decoder = zstd_decoder(compressed).map_err(|e| e.to_string())?;
     let mut first_err = None;
     let result = match hdr.type_tag {
         TYPE_DOMAIN => {
@@ -1143,5 +1151,34 @@ mod tests {
             panic!("strict must reject a malformed mrs entry");
         };
         assert!(err.contains("+."), "unexpected: {err}");
+    }
+
+    /// Legacy zstd frames report by name at both mrs entry points: a
+    /// legacy *payload* inside an `MRS!` container, and a whole-file
+    /// legacy stream that fails the `ZSTD_MAGIC` dispatch.
+    #[test]
+    fn mrs_legacy_zstd_reports_by_name() {
+        use crate::mrs_parser::{MRS_MAGIC, MRS_VERSION, TYPE_DOMAIN};
+        let ctx = ParserContext::default();
+
+        let mut wrapped = Vec::new();
+        wrapped.extend_from_slice(&MRS_MAGIC);
+        wrapped.push(MRS_VERSION);
+        wrapped.push(TYPE_DOMAIN);
+        wrapped.extend_from_slice(&1u32.to_be_bytes());
+        wrapped.extend_from_slice(&[0x26, 0xB5, 0x2F, 0xFD]); // v0.6 frame magic
+        wrapped.extend_from_slice(b"garbage");
+        let Err(err) = build_rule_set_from_mrs_with_behavior(&wrapped, &ctx, None, false) else {
+            panic!("legacy payload must not parse");
+        };
+        assert!(err.contains("legacy zstd frame (v0.6"), "unexpected: {err}");
+
+        let mut whole_file = Vec::from([0x24, 0xB5, 0x2F, 0xFD]); // v0.4 frame magic
+        whole_file.extend_from_slice(b"garbage");
+        assert!(is_mrs_bytes(&whole_file));
+        let Err(err) = build_rule_set_from_mrs_with_behavior(&whole_file, &ctx, None, false) else {
+            panic!("whole-file legacy stream must not parse");
+        };
+        assert!(err.contains("legacy zstd frame (v0.4"), "unexpected: {err}");
     }
 }
