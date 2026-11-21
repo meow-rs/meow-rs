@@ -10,11 +10,16 @@
 # -DCMAKE_C_FLAGS/-DCMAKE_CXX_FLAGS — so setting them here reaches every
 # C object without wrapper scripts or patches.
 #
-# The target-qualified names confine the effect to cross builds of that
-# target: host compilations look up CFLAGS_<host-triple>, so these vars
-# are inert for host builds and build-script (host) compilations.
-# [env] does not override values already present in the environment —
-# an operator's own CFLAGS still wins. -fno-exceptions joins CXXFLAGS
+# The target-qualified names scope the effect to compilations *for*
+# those triples — which includes native builds when the host triple
+# matches (an x86_64-musl host compiles its target objects under
+# CFLAGS_x86_64_unknown_linux_musl too, build-script outputs included).
+# Compilations for any other triple — all gnu/darwin host builds and
+# their build scripts — look up CFLAGS_<that-triple> and see nothing.
+# [env] does not override a variable already set in the environment,
+# and both frontends prefer the qualified name over a bare CFLAGS, so
+# an operator overrides only by exporting the same-named variable —
+# a generic CFLAGS/CXXFLAGS does not win. -fno-exceptions joins CXXFLAGS
 # because nothing in the dep tree throws (BoringSSL disables exceptions
 # in its own crypto/fipsmodule flags already); it removes the remaining
 # .gcc_except_table payload and the dead landing-pad code.

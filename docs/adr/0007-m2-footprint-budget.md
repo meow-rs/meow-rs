@@ -557,10 +557,23 @@ strip=true, codegen-units=1, panic=abort, opt-level="z"`):
   libmimalloc-sys, ring and blake3 all compile table-free with no
   wrapper scripts or vendored patches (`flags.make` and per-object
   section scans verified). Measured: **−163,272 B on aarch64-musl**
-  (8,290,952 → 8,127,680), **−170,312 B on x86_64-musl**
-  (10,054,968 → 9,884,656): .eh_frame −117.6 KB, .eh_frame_hdr
-  −25.2 KB, .gcc_except_table −12.4 KB, plus ~7.8 KB of dead
-  landing-pad `.text`.
+  (8,290,952 → 8,127,680; per section: .eh_frame −117.6 KB,
+  .eh_frame_hdr −25.2 KB, .gcc_except_table −12.4 KB, plus ~7.8 KB of
+  dead landing-pad `.text`), **−170,312 B on x86_64-musl**
+  (10,054,968 → 9,884,656; .eh_frame −126.6 KB, .eh_frame_hdr
+  −25.7 KB, .gcc_except_table −11.5 KB).
+
+Dropping `legacy` is a deliberate rejection boundary, not unreachable
+code removal: the `.mrs` loaders (`rule_set.rs`, `geosite.rs`) verify
+only the outer `MRS!` magic and hand the remainder to a bare
+`zstd::stream::Decoder`, so a payload whose zstd stream is a v0.1–v0.7
+(2016-era) frame decoded before and now fails the load. The failure
+takes the normal load-error path — a rule-provider warns and registers
+empty (recorded in the logbook), a geosite DB logs an error and loads
+as absent; startup continues, nothing crashes and nothing degrades
+silently. No public mrs/geosite feed ships pre-0.8 frames — payloads
+are produced with current zstd — so accepting them was reachable
+surface, not a contract worth keeping.
 
 The combined head-of-branch result is 8,002,048 B — the aarch64
 `minimal` cap is unchanged and now has ~377 KiB of headroom.
