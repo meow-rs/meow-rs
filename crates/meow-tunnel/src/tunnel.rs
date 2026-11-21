@@ -5193,22 +5193,49 @@ sub-rules:
 
         /// The `resolve_udp_dst` probe resolves the route including
         /// rematch transitions — on a throwaway metadata clone, so the
-        /// flow's real marker stays unset for the kept resolution.
+        /// flow's real marker stays unset for the kept resolution — and
+        /// counts nothing: only the committed resolve may charge a slot
+        /// (issues #882, #974). The stub `direct-nameserver` is what
+        /// proves the probe ran: without one `resolve_udp_dst` returns
+        /// before routing, and every assertion here passes vacuously.
         #[tokio::test]
-        async fn udp_route_probe_keeps_marker_off_flow() {
-            let tunnel = rematch_tunnel(
+        async fn udp_route_probe_sees_rematch_without_hits() {
+            use meow_dns::HostEntry;
+            use std::net::IpAddr;
+
+            let direct_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 3));
+            let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+            hosts.insert("example.test", vec![direct_ip].into());
+            let direct = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+            // No upstreams and no hosts: every main lookup fails, so the
+            // direct-resolver probe runs.
+            let mut main = Resolver::new(
+                vec![],
+                vec![],
+                DnsMode::Normal,
+                DomainTrie::new(),
+                false,
+                true,
+            );
+            main.set_direct_resolver(Arc::new(direct));
+            let tunnel = Tunnel::new(Arc::new(main));
+            tunnel.set_mode(TunnelMode::Rule);
+            let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
                 r#"
 proxies:
   - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: b}
 rules:
   - DOMAIN-SUFFIX,example.test,inspect
-  - MATCH,DIRECT
+  - MATCH,REJECT
 sub-rules:
   b:
-    - REMATCH-NAME,stage1,REJECT
-    - MATCH,DIRECT
+    - REMATCH-NAME,stage1,DIRECT
 "#,
-            );
+            )
+            .unwrap();
+            let res = meow_config::rebuild_from_raw(&raw).expect("config builds");
+            tunnel.update_routing(res.proxies, res.rules, res.sub_rules, res.dialer_registry);
+
             let mut md = Metadata {
                 host: "example.test".into(),
                 dst_port: 53,
@@ -5217,13 +5244,34 @@ sub-rules:
             };
             tunnel.inner().resolve_udp_dst(&mut md).await;
             assert_eq!(
+                md.dst_ip,
+                Some(direct_ip),
+                "the probe must see rematch → DIRECT and consult direct-nameserver"
+            );
+            assert_eq!(
                 md.rematch_name(),
                 "",
                 "the probe's transition must not leak onto the flow"
             );
+            let route = tunnel.inner().route();
+            assert_eq!(
+                route.rule_stats.view(0).hits,
+                0,
+                "the probe records no rule hit"
+            );
+            assert!(
+                tunnel.inner().stats.rule_match.snapshot().is_empty(),
+                "the probe records no aggregate outcome"
+            );
+
             let target = tunnel.inner().resolve_proxy_flow(&mut md).await.unwrap();
-            assert_eq!(target.adapter.name(), "REJECT");
+            assert_eq!(target.adapter.name(), "DIRECT");
             assert_eq!(md.rematch_name(), "stage1");
+            assert_eq!(
+                route.rule_stats.view(0).hits,
+                1,
+                "probe plus committed resolve tally exactly one hit"
+            );
         }
 
         /// A `SUB-RULE` reference is a predicate, not a `SpecialRules`
