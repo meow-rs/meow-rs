@@ -1020,12 +1020,14 @@ impl TunnelInner {
             }
             if let Some(block) = candidate.sub_rule {
                 active = block;
+                // Whatever seeded this scan no longer owns the policy: a
+                // rematch-chosen block is an ordinary list — a
+                // UDP-incapable match slides like the main rules — only
+                // the listener's own selection fails closed. A name-only
+                // transition restarts the *same* list, so the provenance
+                // must survive untouched.
+                listener_seeded = false;
             }
-            // Whatever seeded this scan no longer owns the policy: a
-            // rematch-chosen block is an ordinary list — a UDP-incapable
-            // match slides like the main rules — only the listener's own
-            // selection fails closed.
-            listener_seeded = false;
         }
     }
 
@@ -4538,6 +4540,50 @@ rules:
             let (adapter, md) = routed(&tunnel, "example.test").await;
             assert_eq!(adapter, "REJECT");
             assert_eq!(md.rematch_name(), "stage1");
+        }
+
+        /// A name-only rematch restarts the *listener-seeded* list, so
+        /// its provenance survives: the `rule:` override still owns the
+        /// flow's whole policy and a UDP-incapable match fails closed
+        /// instead of sliding to block-exhaustion DIRECT. Clearing the
+        /// flag on a transition that never named a new list would drop
+        /// exactly that pin (issue #974).
+        #[tokio::test]
+        async fn name_only_transition_keeps_listener_fail_closed_udp() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1}
+  - {name: noupd, type: socks5, server: 127.0.0.1, port: 1080, udp: false}
+rules:
+  - MATCH,DIRECT
+sub-rules:
+  blk:
+    - REMATCH-NAME,stage1,noupd
+    - NOT,((REMATCH-NAME,stage1)),inspect
+    - MATCH,DIRECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            md.set_special_route(None, Some("blk"));
+            let target = tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("route resolves");
+            // A block match on a UDP-incapable target materializes as
+            // REJECT when the scan kept the listener's fail-closed
+            // contract; the dropped-provenance bug slides to DIRECT.
+            assert_eq!(
+                target.adapter.name(),
+                "REJECT",
+                "the listener-owned scan must fail closed on the UDP-incapable match"
+            );
         }
 
         /// `target-sub-rule` alone enters the block without touching the
