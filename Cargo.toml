@@ -245,7 +245,10 @@ regex = "1"
 bytes = "1"
 
 # Compression (mrs geosite / rule-provider binary format)
-zstd = "0.14"
+# default-features=false drops the "legacy" (v0.1-v0.7 frame decoders),
+# "arrays" and "zdict_builder" features — meow only uses stream::Decoder/
+# Encoder and encode_all on current-version frames (ADR-0007 size trim).
+zstd = { version = "0.14", default-features = false }
 
 # Randomness
 rand = "0.9"
