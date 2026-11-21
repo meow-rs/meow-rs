@@ -546,6 +546,18 @@ impl ProxyAdapter for RelayGroup {
             network: meow_common::Network::Udp,
             ..Default::default()
         };
+        // A chain resolved to a `type: rematch` leaf is a control hop,
+        // not a transport — the transition decides the flow's route, so
+        // the capability bit must not filter it first (issue #974).
+        // `flatten_hops` still rejects the hop as undialable, which stays
+        // the dial path's correct verdict for a chain that skipped the
+        // transition.
+        if self
+            .unwrap_proxy(&peek, false)
+            .is_some_and(|leaf| leaf.rematch_action().is_some())
+        {
+            return true;
+        }
         flatten_hops(&self.proxies, &peek, false)
             .is_ok_and(|hops| udp_exit(&hops).is_some_and(|exit| exit.support_udp()))
     }
@@ -608,6 +620,12 @@ impl ProxyAdapter for RelayGroup {
             }
             if let Some(next) = cur.unwrap_proxy(metadata, false) {
                 stack.push(next);
+            } else if !is_transparent_hop(&cur) && cur.addr().is_empty() {
+                // A resolved hop that can never dial (REJECT, an
+                // unresolvable group) fails the whole chain at
+                // `flatten_hops_at` — the walk must not skip it and
+                // report a later rematch leaf the flow cannot reach.
+                return None;
             }
         }
         None

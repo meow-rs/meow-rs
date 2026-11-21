@@ -5192,6 +5192,92 @@ sub-rules:
             assert_eq!(md.rematch_name(), "stage1");
         }
 
+        /// The rematch walk must not step over a hop that can never
+        /// dial: an undialable non-terminal member (REJECT here) fails
+        /// the whole chain at `flatten_hops`, so reporting a later
+        /// rematch leaf would commit a transition onto a dead chain —
+        /// the flow must stay on the relay and fail loudly at dial
+        /// (issue #974 review).
+        #[tokio::test]
+        async fn relay_undialable_first_hop_blocks_rematch_peek() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1}
+proxy-groups:
+  - {name: sel, type: select, proxies: [inspect]}
+  - {name: chain, type: relay, proxies: [REJECT, sel]}
+rules:
+  - REMATCH-NAME,stage1,REJECT
+  - DOMAIN-SUFFIX,example.test,chain
+  - MATCH,DIRECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 443,
+                network: Network::Tcp,
+                ..Default::default()
+            };
+            let target = tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("route resolves");
+            assert_eq!(
+                target.adapter.name(),
+                "chain",
+                "the dead chain stays the committed target — no rematch \
+                 leaf may be reported past its undialable hop"
+            );
+            assert_eq!(md.rematch_name(), "");
+            assert!(
+                target.adapter.dial_tcp(&md).await.is_err(),
+                "the undialable hop fails the chain at dial, the same \
+                 verdict flatten's gate would give"
+            );
+        }
+
+        /// A relay tail's `type: rematch` leaf is a control hop, not a
+        /// transport — an LB's `support_udp` member precheck must not
+        /// filter it before the probe peek can surface the transition,
+        /// or a UDP flow slides to a later `MATCH,DIRECT` (issue #974
+        /// review).
+        #[tokio::test]
+        async fn udp_lb_wrapped_relay_rematch_transitions() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: b}
+  - {name: node, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+proxy-groups:
+  - {name: sel, type: select, proxies: [inspect]}
+  - {name: chain, type: relay, proxies: [node, sel]}
+  - {name: lb, type: load-balance, proxies: [chain]}
+rules:
+  - DOMAIN-SUFFIX,example.test,lb
+  - MATCH,DIRECT
+sub-rules:
+  b:
+    - REMATCH-NAME,stage1,REJECT
+    - MATCH,DIRECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            let target = tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("route resolves");
+            assert_eq!(target.adapter.name(), "REJECT");
+            assert_eq!(md.rematch_name(), "stage1");
+        }
+
         /// A UDP flow takes the transition too — the leaf's
         /// `support_udp()` claim exists so the capability gate never
         /// preempts it — and the terminal target then applies the
