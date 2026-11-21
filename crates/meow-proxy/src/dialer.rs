@@ -986,7 +986,8 @@ pub(crate) fn front_hop_counters(
 /// The member a hop dialed through `front` for `metadata` takes, the one
 /// [`note_front_hop`] names: the last pick of `front`'s groups, or `front`
 /// when it is no group. `None` for a pick that sends nothing (REJECT,
-/// PASS).
+/// PASS) — a rematch control outbound included (issue #974): its dial
+/// fails closed at the leaf and nothing is charged to it.
 pub(crate) fn front_hop_carrier(
     front: &Arc<dyn Proxy>,
     metadata: &Metadata,
@@ -998,7 +999,8 @@ pub(crate) fn front_hop_carrier(
         AdapterType::Reject
         | AdapterType::RejectDrop
         | AdapterType::Pass
-        | AdapterType::PassRule => None,
+        | AdapterType::PassRule
+        | AdapterType::Rematch => None,
         _ => Some(leaf),
     }
 }
