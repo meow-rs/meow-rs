@@ -565,15 +565,24 @@ strip=true, codegen-units=1, panic=abort, opt-level="z"`):
 
 Dropping `legacy` is a deliberate rejection boundary, not unreachable
 code removal: the `.mrs` loaders (`rule_set.rs`, `geosite.rs`) verify
-only the outer `MRS!` magic and hand the remainder to a bare
-`zstd::stream::Decoder`, so a payload whose zstd stream is a v0.1–v0.7
-(2016-era) frame decoded before and now fails the load. The failure
-takes the normal load-error path — a rule-provider warns and registers
-empty (recorded in the logbook), a geosite DB logs an error and loads
-as absent; startup continues, nothing crashes and nothing degrades
-silently. No public mrs/geosite feed ships pre-0.8 frames — payloads
-are produced with current zstd — so accepting them was reachable
-surface, not a contract worth keeping.
+the outer `MRS!` magic or the upstream whole-file zstd magic and feed
+the compressed bytes to a `zstd::stream::Decoder`, so a payload whose
+zstd stream is a v0.1–v0.7 (2016-era) frame decoded before and now
+fails the load. The blast radius is private/archived rulesets — no
+public mrs/geosite feed ships pre-0.8 frames — and the failure names
+the cause: `mrs_parser::legacy_zstd_version` sniffs the frame magic
+ahead of every decoder entry point (`FD 2F B5 1E` for v0.1, which wrote
+the word big-endian; `NN B5 2F FD` for v0.2–v0.7), so the load error
+reads "unsupported legacy zstd frame (v0.N, pre-1.0 format); regenerate
+the file with a current zstd version" rather than the decoder's bare
+"unknown frame descriptor". The failure still takes the normal
+load-error path — a rule-provider warns and registers empty (recorded
+in the logbook), a geosite DB logs an error and loads as absent;
+startup continues, nothing crashes and nothing degrades silently. Note
+that a green `meow -t` is no counter-evidence for an HTTP provider:
+remote payload defects register the provider empty rather than fail
+validation, and offline `-t` parses the on-disk payload cache when one
+exists without fetching at all.
 
 The combined head-of-branch result is 8,002,048 B — the aarch64
 `minimal` cap is unchanged and now has ~377 KiB of headroom.
@@ -589,6 +598,13 @@ workaround because the payload lives inside `PT_LOAD` segments (the
 file shrank by only 232 B in a direct experiment). `RUSTFLAGS=
 -Cforce-unwind-tables=no` was also verified a no-op here — the Rust
 side already emits nothing.
+
+One debugging trade-off is accepted with the flag trim: musl C objects
+ship no unwind tables, so a crash inside boringssl/zstd/ring/blake3
+cannot be walked back through the C frames from a core dump or debugger
+— diagnosing one needs a rebuild that keeps the unwind tables (and
+debug symbols), e.g. via the packager opt-out in
+`docs/benchmarks/binary-size.md`.
 
 ## References
 

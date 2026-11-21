@@ -362,8 +362,23 @@ Two changes landed:
    our flags sit *inside* the same `-D` value after `--target=…`, so the
    cross-compile flags are preserved; an appended standalone `-D` would
    have overridden them). `[env]` does not override an operator-set
-   variable and the triple-qualified names are inert for host builds
-   and host-side build-script compilations.
+   variable, and the scoping is by compiled-for triple, not by
+   host/target role: the qualified names reach *every* musl
+   compilation — a native musl→musl build eats the same flags, its
+   build-script outputs included — while compilations for any other
+   triple (gnu/darwin target objects and host-side build-script tool
+   compilations, which resolve `CFLAGS_<host-triple>`) never read them.
+
+   Packager opt-out: exporting the same `CFLAGS_<triple>`/
+   `CXXFLAGS_<triple>` names — to the desired flags, or empty to
+   suppress them — replaces the repo defaults, because `[env]` never
+   clobbers a variable already set. A generic `CFLAGS`/`CXXFLAGS` does
+   *not* win: cc appends flag vars in the order bare →
+   `HOST_`/`TARGET_`-prefixed → underscore-qualified →
+   hyphenated-qualified so the qualified value lands last, and
+   cmake-rs takes the first hit of the same qualified-first sequence.
+   Rebuild in a fresh `CARGO_TARGET_DIR`: the boring-sys and blake3
+   warm object caches do not sense flag changes.
 
 Per-dep consumption evidence (exp-u1, `zig ar` member scans):
 `libzstd.a` 36 members, `libblake3_neon.a`, `libmimalloc` object,
