@@ -202,10 +202,14 @@ jobs:
       # cache records the zigbuild wrapper paths, which are versioned, so a
       # cache built by another zigbuild points CMAKE_ASM_COMPILER at a
       # wrapper that no longer exists. Bump both together.
+      # `.cargo/config.toml` is hashed in explicitly: the [env] C-flags it
+      # sets reach the dep C objects cached under target/ but appear in no
+      # dep build fingerprint, so a flags-only edit would otherwise restore
+      # a warm cache of objects compiled with the old flags.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          key: release-${{ matrix.target }}-zigbuild-0.23.2
+          key: release-${{ matrix.target }}-zigbuild-0.23.2-${{ hashFiles('.cargo/config.toml') }}
 
       - name: Install cargo-zigbuild and zig
         if: runner.os == 'Linux' && matrix.toolchain == ''

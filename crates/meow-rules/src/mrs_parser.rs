@@ -42,7 +42,7 @@
 //! available. Unit tests here use a round-trip via `write_geosite()` to
 //! confirm the parser reverses its own encoder.
 
-use std::io::{Cursor, Read};
+use std::io::{BufReader, Cursor, Read};
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 pub const MRS_MAGIC: [u8; 4] = *b"MRS!";
@@ -78,6 +78,10 @@ pub enum MrsError {
     },
     #[error("mrs: zstd decompression failed: {0}")]
     Zstd(#[from] std::io::Error),
+    /// Legacy frames are a format boundary, not corruption — the error
+    /// must name the version and the regeneration step to be actionable.
+    #[error("mrs: unsupported legacy zstd frame (v0.{0}, pre-1.0 format); regenerate the file with a current zstd version")]
+    LegacyZstd(u8),
     #[error("mrs: invalid UTF-8 in {0}: {1}")]
     Utf8(&'static str, std::string::FromUtf8Error),
     #[error("mrs: invalid domain-set version {0}")]
@@ -138,13 +142,48 @@ pub fn parse_header(data: &[u8]) -> Result<(MrsHeader, &[u8]), MrsError> {
 /// (issue #513).
 const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 
+/// Sniff the first bytes of a buffer for a zstd "legacy" frame magic
+/// (v0.1–v0.7, the 2016-era pre-1.0 formats), returning the version on a
+/// hit. Only the leading frame is inspected — a legacy frame later in a
+/// concatenated/skippable-prefixed stream still surfaces the decoder's
+/// generic error. Magics per the vendored zstd `lib/legacy/zstd_v0*.h`,
+/// where `ZSTD_isLegacy` reads the first word little-endian: v0.1 wrote
+/// the word big-endian (wire bytes `FD 2F B5 1E`); v0.2–v0.7 are
+/// `0xFD2FB5NN` little-endian (wire bytes `NN B5 2F FD`, `NN` =
+/// `0x20 + version`).
+pub fn legacy_zstd_version(bytes: &[u8]) -> Option<u8> {
+    let magic: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
+    if magic == [0xFD, 0x2F, 0xB5, 0x1E] {
+        return Some(1);
+    }
+    if magic[1..] == ZSTD_MAGIC[1..] && (0x22..=0x27).contains(&magic[0]) {
+        return Some(magic[0] - 0x20);
+    }
+    None
+}
+
+/// Build a streaming decoder over a compressed payload.
+///
+/// Every `.mrs`/geosite zstd stream funnels here so a legacy *first*
+/// frame reports [`MrsError::LegacyZstd`] by name instead of surfacing
+/// from the `ZSTD_LEGACY_SUPPORT=0` decoder as a bare "unknown frame
+/// descriptor" that points at nothing.
+pub fn zstd_decoder(
+    compressed: &[u8],
+) -> Result<zstd::stream::Decoder<'static, BufReader<Cursor<&[u8]>>>, MrsError> {
+    if let Some(version) = legacy_zstd_version(compressed) {
+        return Err(MrsError::LegacyZstd(version));
+    }
+    Ok(zstd::stream::Decoder::new(Cursor::new(compressed))?)
+}
+
 /// Decompress the zstd-compressed payload that follows an mrs header.
 pub fn decompress_payload(compressed: &[u8]) -> Result<Vec<u8>, MrsError> {
     decompress_payload_bounded(compressed, MAX_DECOMPRESSED_BYTES)
 }
 
 fn decompress_payload_bounded(compressed: &[u8], max: u64) -> Result<Vec<u8>, MrsError> {
-    let mut decoder = zstd::stream::Decoder::new(Cursor::new(compressed))?;
+    let mut decoder = zstd_decoder(compressed)?;
     let mut out = Vec::new();
     // Read one byte past the bound so an over-limit payload is an error rather
     // than silently truncated input.
@@ -1328,6 +1367,59 @@ mod tests {
             decompress_payload_bounded(&compressed, 1024).unwrap(),
             inner
         );
+    }
+
+    /// A legacy (pre-1.0) zstd frame must be diagnosed by name — version
+    /// plus the regeneration step — not as the decoder's bare "unknown
+    /// frame descriptor".
+    #[test]
+    fn legacy_zstd_frames_report_as_legacy() {
+        for (magic, version) in [
+            ([0xFD, 0x2F, 0xB5, 0x1E], 1), // v0.1 wrote the word big-endian
+            ([0x22, 0xB5, 0x2F, 0xFD], 2),
+            ([0x25, 0xB5, 0x2F, 0xFD], 5),
+            ([0x27, 0xB5, 0x2F, 0xFD], 7),
+        ] {
+            let mut frame = Vec::from(magic);
+            frame.extend_from_slice(b"trailing-garbage");
+            let Err(err) = decompress_payload(&frame) else {
+                panic!("legacy v0.{version} magic must not decode");
+            };
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "mrs: unsupported legacy zstd frame (v0.{version}, pre-1.0 format); \
+                     regenerate the file with a current zstd version"
+                )
+            );
+        }
+    }
+
+    /// The legacy sniff must not misfire on frames a decoder accepts —
+    /// modern magic, skippable frames — nor on the unassigned holes in
+    /// the legacy magic range or on short/unrelated inputs.
+    #[test]
+    fn legacy_zstd_sniff_ignores_other_frames() {
+        let cases: [&[u8]; 7] = [
+            &ZSTD_MAGIC,
+            &[0x50, 0x2A, 0x4D, 0x18], // skippable-frame magic 0x184D2A50
+            &[0x1F, 0xB5, 0x2F, 0xFD], // no legacy version ever used 0x1F–0x21
+            &[0x21, 0xB5, 0x2F, 0xFD],
+            b"MRS!",
+            b"yaml payload",
+            &[0xFD, 0x2F], // short
+        ];
+        for bytes in cases {
+            assert_eq!(legacy_zstd_version(bytes), None, "input {bytes:?}");
+        }
+    }
+
+    /// Modern frames still decode — the sniff is a pre-check, not a
+    /// rejection of the normal path.
+    #[test]
+    fn modern_zstd_frame_still_decodes() {
+        let compressed = zstd::encode_all(Cursor::new(b"payload"), 0).unwrap();
+        assert_eq!(decompress_payload(&compressed).unwrap(), b"payload");
     }
 
     /// A crafted label graph can chain one traversal frame per few input

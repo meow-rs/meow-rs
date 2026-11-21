@@ -336,3 +336,77 @@ re-bundled, so release binaries keep `plugin: obfs`/`simple-obfs`/
 placeholder + feature-named dial error. `obfs-local` follows `ss-obfs`:
 compiled in it keeps spawning the SIP003 binary; compiled out it reports
 "rebuild with `--features ss-obfs`" before `Plugin::start` can run.
+
+## C-dep unwind-table suppression + zstd `default-features = false` (2026-11-21)
+
+Measured 2026-11-21 on macOS/Apple Silicon with cargo-zigbuild + zig
+0.17.1, `--no-default-features --features minimal`, same release
+profile, A/B against a same-tree baseline build (`exp-u0`/`exp-x0`).
+Baseline stripped sizes: aarch64-musl **8,290,952 B**, x86_64-musl
+**10,054,968 B**.
+
+Two changes landed:
+
+1. `zstd = { version = "0.14", default-features = false }` in the
+   workspace Cargo.toml — drops `legacy` (v0.1–v0.7 frame decoders that
+   `ZSTD_decompress` dispatches into, keeping them LTO-live), `arrays`
+   and `zdict_builder`. meow uses only `zstd::encode_all` and
+   `zstd::stream::Decoder` on current-version frames; `cargo fetch`
+   leaves `Cargo.lock` byte-identical.
+2. `.cargo/config.toml` `[env]` — target-qualified
+   `CFLAGS_<triple>` = `-fno-unwind-tables -fno-asynchronous-unwind-tables`,
+   `CXXFLAGS_<triple>` = same + ` -fno-exceptions`, for the two musl
+   triples. Both C frontends consume them: the cc crate reads the vars
+   directly, cmake-rs merges them into its `-DCMAKE_C_FLAGS`/`-DCMAKE_CXX_FLAGS`
+   configure args (verified in boring-sys's generated `flags.make` —
+   our flags sit *inside* the same `-D` value after `--target=…`, so the
+   cross-compile flags are preserved; an appended standalone `-D` would
+   have overridden them). `[env]` does not override an operator-set
+   variable, and the scoping is by compiled-for triple, not by
+   host/target role: the qualified names reach *every* musl
+   compilation — a native musl→musl build eats the same flags, its
+   build-script outputs included — while compilations for any other
+   triple (gnu/darwin target objects and host-side build-script tool
+   compilations, which resolve `CFLAGS_<host-triple>`) never read them.
+
+   Packager opt-out: exporting the same `CFLAGS_<triple>`/
+   `CXXFLAGS_<triple>` names — to the desired flags, or empty to
+   suppress them — replaces the repo defaults, because `[env]` never
+   clobbers a variable already set. A generic `CFLAGS`/`CXXFLAGS`
+   cannot remove them: cc accumulates flag vars in the order bare →
+   `HOST_`/`TARGET_`-prefixed → underscore-qualified →
+   hyphenated-qualified so the qualified value lands last, and cmake-rs
+   merges `cc::Build::get_compiler()`'s arg list — the same accumulated
+   flags — into `CMAKE_*_FLAGS`. Rebuild in a fresh
+   `CARGO_TARGET_DIR`: the boring-sys and blake3 warm object caches do
+   not sense flag changes.
+
+Per-dep consumption evidence (exp-u1, `zig ar` member scans):
+`libzstd.a` 36 members, `libblake3_neon.a`, `libmimalloc` object,
+`libssl.a` 38 members and `libcrypto.a` 76 members — all with **zero**
+`.eh_frame`; ring/boringssl hand-written `.S` objects keep 192+72 B of
+assembler CFI each (cosmetic, unavoidable).
+
+| Build | Target | Stripped | Δ vs baseline | .eh_frame | .eh_frame_hdr | .gcc_except_table |
+|-------|--------|----------|---------------|-----------|---------------|-------------------|
+| baseline | aarch64-musl | 8,290,952 B | — | 1,010,868 | 300,948 | 21,392 |
+| env flags | aarch64-musl | 8,127,680 B | **−163,272 B** | 893,304 | 275,724 | 8,964 |
+| baseline | x86_64-musl | 10,054,968 B | — | 1,093,724 | 167,716 | 19,972 |
+| env flags | x86_64-musl | 9,884,656 B | **−170,312 B** | 967,140 | 141,988 | 8,476 |
+| landed (flags + zstd) | aarch64-musl | **8,002,048 B** | **−288,904 B** | 893,280 | 275,716 | 8,964 |
+
+The zstd delta inside the landed build is −125,632 B (its earlier
+isolated A/B measured −130,752 B); both trims compose cleanly — the
+aarch64 minimal binary now sits **386,560 B under the 8 MiB hard cap**.
+
+Residual attribution (a deliberate non-result, recorded so nobody
+re-chases it): ~1.1 MiB of unwind data remains, all *outside* C-dep
+control — prebuilt std-family rlib objects ship `.eh_frame` (a libcore
+member object alone carries 21,784 B; locally compiled workspace rlibs
+emit none, so `RUSTFLAGS=-Cforce-unwind-tables=no` was verified a
+no-op), and zig compiles its bundled musl with unwind tables (174/400
+sampled cache objects carry it). Reaching those needs `-Zbuild-std` on
+nightly or upstream zig flags. Post-link `llvm-objcopy --remove-section`
+of all three sections shrank the file only 232 B — the payload bytes
+live inside `PT_LOAD` segments and cannot be reclaimed without
+relinking.

@@ -1,0 +1,35 @@
+# Suppress DWARF unwind tables in C dependencies of the musl builds
+# (ADR-0007 addendum 2026-11-21; see docs/benchmarks/binary-size.md).
+#
+# panic=abort already stops rustc from emitting unwind tables for
+# workspace crates, but C deps (boring-sys, zstd-sys, libmimalloc-sys,
+# ring, blake3) compile with their toolchain defaults, which emit
+# ~1.3 MiB of .eh_frame/.eh_frame_hdr/.gcc_except_table into the linked
+# binary. Both build frontends read target-qualified env vars — cc reads
+# CFLAGS_<target>/CXXFLAGS_<target> and cmake-rs merges them into
+# -DCMAKE_C_FLAGS/-DCMAKE_CXX_FLAGS — so setting them here reaches every
+# C object without wrapper scripts or patches.
+#
+# The target-qualified names scope the effect to compilations *for*
+# those triples — which includes native builds when the host triple
+# matches (an x86_64-musl host compiles its target objects under
+# CFLAGS_x86_64_unknown_linux_musl too, build-script outputs included).
+# Compilations for any other triple — all gnu/darwin host builds and
+# their build scripts — look up CFLAGS_<that-triple> and see nothing.
+# [env] does not override a variable already set in the environment,
+# and both frontends prefer the qualified name over a bare CFLAGS, so
+# an operator overrides only by exporting the same-named variable —
+# a generic CFLAGS/CXXFLAGS does not win. -fno-exceptions joins CXXFLAGS
+# because nothing in the dep tree throws (BoringSSL disables exceptions
+# in its own crypto/fipsmodule flags already); it removes the remaining
+# .gcc_except_table payload and the dead landing-pad code.
+#
+# Residual: prebuilt std-family rlib objects and zig-bundled musl libc
+# objects still ship .eh_frame (~0.9 MiB on aarch64) — removing those
+# needs -Zbuild-std (nightly) or upstream zig changes; post-link section
+# removal cannot reclaim bytes inside PT_LOAD segments.
+[env]
+CFLAGS_aarch64_unknown_linux_musl = "-fno-unwind-tables -fno-asynchronous-unwind-tables"
+CXXFLAGS_aarch64_unknown_linux_musl = "-fno-unwind-tables -fno-asynchronous-unwind-tables -fno-exceptions"
+CFLAGS_x86_64_unknown_linux_musl = "-fno-unwind-tables -fno-asynchronous-unwind-tables"
+CXXFLAGS_x86_64_unknown_linux_musl = "-fno-unwind-tables -fno-asynchronous-unwind-tables -fno-exceptions"

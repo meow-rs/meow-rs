@@ -13,7 +13,10 @@ use std::sync::Arc;
 use meow_trie::DomainTrie;
 use tracing::warn;
 
-use crate::mrs_parser::{parse_header, stream_geosite_payload, GeositeItem, MrsError, TYPE_DOMAIN};
+use crate::mrs_parser::{
+    legacy_zstd_version, parse_header, stream_geosite_payload, zstd_decoder, GeositeItem, MrsError,
+    TYPE_DOMAIN,
+};
 
 #[derive(Debug, thiserror::Error)]
 pub enum GeositeError {
@@ -234,8 +237,7 @@ impl GeositeDB {
                 // Stream straight from the zstd decoder into per-category
                 // tries: neither the decompressed payload nor a per-domain
                 // string list is ever held in memory.
-                let decoder = zstd::stream::Decoder::new(std::io::Cursor::new(rest))
-                    .map_err(MrsError::Zstd)?;
+                let decoder = zstd_decoder(rest)?;
                 let mut categories: HashMap<String, DomainTrie<()>> = HashMap::new();
                 let mut counts: HashMap<String, usize> = HashMap::new();
                 let mut current: Option<(String, DomainTrie<()>, usize)> = None;
@@ -277,9 +279,18 @@ impl GeositeDB {
             Err(MrsError::WrongFormat(_)) => {
                 // Try the V2Ray .dat protobuf format. On any dat-parse
                 // error, surface `WrongFormat` so the callsite can log a
-                // single actionable message without internal noise.
-                crate::geosite_dat::from_dat_bytes(data, allowed)
-                    .map_err(|_| GeositeError::WrongFormat)
+                // single actionable message without internal noise —
+                // unless the bytes open a legacy zstd frame, which names
+                // the real format. The sniff runs only after .dat has
+                // failed: protobuf tolerates unknown fields, so a valid
+                // .dat can legitimately start with the same 4 bytes
+                // (e.g. field 767's fixed32 tag `FD 2F`).
+                crate::geosite_dat::from_dat_bytes(data, allowed).map_err(|_| {
+                    match legacy_zstd_version(data) {
+                        Some(version) => MrsError::LegacyZstd(version).into(),
+                        None => GeositeError::WrongFormat,
+                    }
+                })
             }
             Err(e) => Err(GeositeError::Mrs(e)),
         }
@@ -448,6 +459,50 @@ mod tests {
             Err(GeositeError::WrongFormat) => {}
             other => panic!("expected WrongFormat, got {:?}", other.err()),
         }
+    }
+
+    /// Legacy zstd reports by name both as an `MRS!`-wrapped payload and
+    /// as a whole-file stream that would otherwise hit the .dat fallback.
+    #[test]
+    fn legacy_zstd_reports_by_name() {
+        use crate::mrs_parser::{MRS_MAGIC, MRS_VERSION};
+
+        let mut wrapped = Vec::new();
+        wrapped.extend_from_slice(&MRS_MAGIC);
+        wrapped.push(MRS_VERSION);
+        wrapped.push(TYPE_DOMAIN);
+        wrapped.extend_from_slice(&0u32.to_be_bytes());
+        wrapped.extend_from_slice(&[0x23, 0xB5, 0x2F, 0xFD]); // v0.3 frame magic
+        wrapped.extend_from_slice(b"garbage");
+        let err = GeositeDB::from_bytes(&wrapped, None).unwrap_err();
+        assert!(err.to_string().contains("legacy zstd"), "unexpected: {err}");
+
+        let mut whole_file = Vec::from([0xFD, 0x2F, 0xB5, 0x1E]); // v0.1 frame magic
+        whole_file.extend_from_slice(b"garbage");
+        let err = GeositeDB::from_bytes(&whole_file, None).unwrap_err();
+        assert!(err.to_string().contains("legacy zstd"), "unexpected: {err}");
+    }
+
+    /// A `.dat` whose first bytes coincide with the v0.1 legacy magic
+    /// still loads: `FD 2F` is a valid protobuf tag (field 767, fixed32)
+    /// the parser skips, so the legacy sniff must only run after the
+    /// `.dat` parse fails.
+    #[test]
+    fn dat_starting_with_legacy_magic_bytes_still_loads() {
+        let mut bytes = Vec::from([0xFD, 0x2F]); // tag: field 767, wire 5
+        bytes.extend_from_slice(&[0xB5, 0x1E, 0x00, 0x00]); // skipped fixed32 payload
+        let entry = [
+            0x0A, 0x02, 0x63, 0x6E, // country_code "cn"
+            0x12, 0x0D, // domain field, len 13
+            0x08, 0x02, // type = Domain (suffix)
+            0x12, 0x09, 0x62, 0x61, 0x69, 0x64, 0x75, 0x2E, 0x63, 0x6F,
+            0x6D, // value "baidu.com"
+        ];
+        bytes.push(0x0A); // field 1, length-delimited
+        bytes.push(entry.len() as u8);
+        bytes.extend_from_slice(&entry);
+        let db = GeositeDB::from_bytes(&bytes, None).unwrap();
+        assert!(db.lookup("cn", "baidu.com"));
     }
 
     #[test]
