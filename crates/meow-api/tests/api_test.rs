@@ -12213,3 +12213,265 @@ async fn put_configs_refuses_undeclared_listener_proxy_under_force() {
         );
     }
 }
+
+// ─── `type: rematch` / `REMATCH-NAME` API surface (issue #974) ─────────
+
+fn rematch_state() -> Arc<AppState> {
+    let raw: RawConfig = meow_config::parse_raw_yaml(
+        "proxies:\n\
+         \x20 - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: blk}\n\
+         rules:\n\
+         \x20 - DOMAIN-SUFFIX,example.test,inspect\n\
+         \x20 - REMATCH-NAME,stage1/alternative,REJECT\n\
+         \x20 - MATCH,DIRECT\n",
+    )
+    .unwrap();
+    test_state(raw)
+}
+
+/// `/proxies` reports the control leaf like any node — `type: Rematch`,
+/// `udp: true` (the capability gate never preempts a transition), the
+/// ordinary alive/history fields — and never the action fields, which
+/// are routing directives, not transport facts.
+#[tokio::test]
+async fn rematch_node_shows_on_proxies() {
+    let state = rematch_state();
+    let (status, json) = get_json(&state, "/proxies").await;
+    assert_eq!(status, StatusCode::OK);
+    let node = &json["proxies"]["inspect"];
+    assert_eq!(node["type"], "Rematch");
+    assert_eq!(node["udp"], true, "capability display matches mihomo");
+    assert_eq!(node["name"], "inspect");
+    assert!(
+        node.get("target-rematch-name").is_none() && node.get("target-sub-rule").is_none(),
+        "action fields are not transport fields: {node}"
+    );
+    // No built-in `REMATCH` node appeared — rematch is a node type, not
+    // a reserved registry name.
+    assert!(json["proxies"].get("REMATCH").is_none());
+
+    let (status, one) = get_json(&state, "/proxies/inspect").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one["type"], "Rematch");
+}
+
+/// `/rules` reports the API spelling `RematchName` with the raw payload
+/// preserved.
+#[tokio::test]
+async fn rematch_name_rule_shows_on_rules() {
+    let state = rematch_state();
+    let (status, json) = get_json(&state, "/rules").await;
+    assert_eq!(status, StatusCode::OK);
+    let rules = json["rules"].as_array().unwrap();
+    let rematch = rules
+        .iter()
+        .find(|r| r["type"] == "RematchName")
+        .expect("the REMATCH-NAME rule must be listed");
+    assert_eq!(rematch["payload"], "stage1/alternative");
+    assert_eq!(rematch["proxy"], "REJECT");
+}
+
+/// A delay probe of the control leaf fails through ordinary transport
+/// failure — no socket opens, no rule scan runs, no routing side
+/// effects. mihomo reports it as a generic delay-test error (503).
+#[tokio::test]
+async fn rematch_leaf_delay_fails_as_transport_error() {
+    let state = rematch_state();
+    let (status, _) = get_json(
+        &state,
+        "/proxies/inspect/delay?url=http://cp.cloudflare.com&timeout=2000",
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "the leaf's control-outbound dial error maps to mihomo's delay-test 503"
+    );
+}
+
+/// A structurally unsafe rematch document must never commit verbatim:
+/// under `?force`, an environmentally unbuildable candidate retains the
+/// old live routing — but only after the verbatim store is gated. Both
+/// shapes below (malformed node, malformed predicate) are *shape*, so
+/// the fallback refuses them and the committed document does not move
+/// (issue #974).
+#[tokio::test]
+async fn put_configs_force_gates_malformed_rematch() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    // Duplicate group names fail strict AND lenient — the verbatim
+    // fallback is the only path the candidates below can reach.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+
+    // A rematch node with neither target field.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{name: inspect, type: rematch}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A `dialer-proxy` on a rematch node — same class of shape defect.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: x, dialer-proxy: front}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A malformed REMATCH-NAME predicate (empty alternative) — no
+    // `sub-rules:` section needed for the gate to see it.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             rules:\n  - REMATCH-NAME,a//b,REJECT\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The same predicate nested inside a `sub-rules:` block — the gate
+    // reaches predicate leaves through the block map too.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             rules:\n  - SUB-RULE,(DOMAIN-SUFFIX,x.test),blk\n  - MATCH,DIRECT\n\
+             sub-rules:\n  blk:\n    - REMATCH-NAME,,REJECT\n    - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        state.raw_config.read().rules.as_deref()
+            == Some(&[
+                "DOMAIN,example.com,DIRECT".to_string(),
+                "MATCH,REJECT".to_string()
+            ]),
+        "the rejected documents must not replace the committed rules"
+    );
+
+    // Structurally sound rematch content still commits verbatim.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: stage1}}\n\
+             rules:\n  - REMATCH-NAME,stage1,REJECT\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "sound rematch shape commits even when the live build cannot"
+    );
+    {
+        let raw = state.raw_config.read();
+        assert!(
+            raw.proxies.as_deref().is_some_and(|p| p
+                .iter()
+                .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("rematch"))),
+            "the committed document keeps the rematch node"
+        );
+    }
+
+    // …but the live route table is untouched — the verbatim commit
+    // must not report the rematch graph as installed.
+    let (status, json) = get_json(&state, "/proxies").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json["proxies"].get("inspect").is_none(),
+        "live routing still runs the retained generation: {json}"
+    );
+    let (status, json) = get_json(&state, "/rules").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|r| r["type"] != "RematchName"),
+        "live rules are still the retained generation's: {json}"
+    );
+}
+
+/// A plain `PUT /configs` (no `force`) rebuilds rematch content live:
+/// the node is dialed by the route engine and the rule is listed in
+/// the new generation.
+#[tokio::test]
+async fn put_configs_reloads_rematch_live() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    let resp = put_configs_payload(
+        &state,
+        "mode: rule\n\
+         proxies:\n  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: blk}\n\
+         rules:\n  - DOMAIN-SUFFIX,example.test,inspect\n  - REMATCH-NAME,stage1,REJECT\n  - MATCH,DIRECT\n\
+         sub-rules:\n  blk:\n    - REMATCH-NAME,stage1,REJECT\n    - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let (status, json) = get_json(&state, "/proxies/inspect").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["type"], "Rematch");
+    let (status, json) = get_json(&state, "/rules").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        json["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["type"] == "RematchName" && r["payload"] == "stage1"),
+        "the rebuilt generation installs the predicate: {json}"
+    );
+}
+
+/// A group delay round probes a rematch member like any other — it is
+/// scheduled, fails through the ordinary transport-error path, is left
+/// out of the result map, and records the failed probe. mihomo has no
+/// rematch-type exclusion in its health check; the leaf's own control
+/// error is what stops the dial — no socket, rule scan, or DNS lookup
+/// runs for it.
+#[tokio::test]
+async fn rematch_member_group_delay_reports_failed_probe() {
+    let ok = TestAdapter::new("ok", DialBehavior::InstantOk).into_proxy();
+    let rematch: Arc<dyn Proxy> = Arc::new(meow_config::proxy_parser::WrappedProxy::new(Box::new(
+        meow_proxy::RematchAdapter::new("inspect", Some("stage1"), None),
+    )));
+    let group = fallback_group("G", vec![Arc::clone(&rematch), Arc::clone(&ok)]);
+    let state = state_with_proxies(vec![
+        ("inspect", Arc::clone(&rematch)),
+        ("ok", Arc::clone(&ok)),
+        ("G", group),
+    ]);
+    let app = create_router(state);
+    let resp = delay_req(app, format!("/group/G/delay?url={}&timeout=1000", url_q())).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: serde_json::Value = body_json(resp).await;
+    assert_eq!(
+        body.as_object().unwrap().keys().collect::<Vec<_>>(),
+        ["ok"],
+        "the rematch member's probe fails and is left out: {body}"
+    );
+    let history = rematch.delay_history();
+    assert_eq!(history.len(), 1, "the failed probe is still recorded");
+    assert_eq!(history[0].delay, 0, "recorded as down");
+}

@@ -5411,40 +5411,74 @@ async fn put_configs(
         // the other document checks; declared rule-provider names stand
         // in for sets the failed builds could not produce (their
         // availability is environment, not shape) — issue #974 review.
+        let stand_ins: meow_rules::RuleSets = raw_config
+            .rule_providers
+            .as_ref()
+            .map(|providers| {
+                providers
+                    .keys()
+                    .map(|name| {
+                        let set: Arc<dyn meow_rules::RuleSet> =
+                            Arc::from(meow_rules::build_rule_set(
+                                meow_rules::RuleSetBehavior::Classical,
+                                &[],
+                                &meow_rules::ParserContext::empty(),
+                            ));
+                        (name.clone(), set)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let shape_ctx = meow_rules::ParserContext {
+            geoip: Some(Arc::new(meow_rules::country_index::CountryIndex::default())),
+            asn: Some(Arc::new(meow_rules::asn_index::AsnIndex::default())),
+            geosite: None,
+        };
         if let Some(sub_map) = raw_config.sub_rules.as_ref().filter(|m| !m.is_empty()) {
-            let stand_ins: std::collections::HashMap<_, _> = raw_config
-                .rule_providers
-                .as_ref()
-                .map(|providers| {
-                    providers
-                        .keys()
-                        .map(|name| {
-                            let set: Arc<dyn meow_rules::RuleSet> =
-                                Arc::from(meow_rules::build_rule_set(
-                                    meow_rules::RuleSetBehavior::Classical,
-                                    &[],
-                                    &meow_rules::ParserContext::empty(),
-                                ));
-                            (name.clone(), set)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
             if let Err(e) = meow_config::sub_rules_parser::check_sub_rules_shape(
                 raw_config.rules.as_deref().unwrap_or(&[]),
                 sub_map,
                 &stand_ins,
-                &meow_rules::ParserContext {
-                    geoip: Some(Arc::new(meow_rules::country_index::CountryIndex::default())),
-                    asn: Some(Arc::new(meow_rules::asn_index::AsnIndex::default())),
-                    geosite: None,
-                },
+                &shape_ctx,
             ) {
                 return reload_rejected(
                     StatusCode::BAD_REQUEST,
                     &format!(
                         "config validation failed under force, and the candidate's \
                               sub-rules are structurally unsafe to commit verbatim: {e}"
+                    ),
+                );
+            }
+        }
+        // The rematch pair is strict in both modes the same way — a
+        // malformed `type: rematch` action or `REMATCH-NAME` predicate
+        // committed verbatim would hard-fail the next boot. Check them
+        // with or without a `sub-rules:` section; rule lines go through
+        // the ordinary parser, so nested condition leaves and logic
+        // legs get the same verdict as the build did (issue #974).
+        for node in raw_config.proxies.as_deref().unwrap_or(&[]) {
+            if node.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+                if let Err(e) = meow_config::proxy_parser::check_rematch_node(node) {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "config validation failed under force, and the candidate's \
+                             rematch nodes are structurally unsafe to commit verbatim: {e}"
+                        ),
+                    );
+                }
+            }
+        }
+        for line in raw_config.rules.as_deref().unwrap_or(&[]) {
+            if !meow_rules::line_mentions_rematch_name(line) {
+                continue;
+            }
+            if let Err(e) = meow_rules::parse_rule_with_rule_sets(line, &shape_ctx, &stand_ins) {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "config validation failed under force, and the candidate's \
+                         REMATCH-NAME rules are structurally unsafe to commit verbatim: {e}"
                     ),
                 );
             }
