@@ -4642,8 +4642,10 @@ fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> boo
 /// `map` — the shared pre-registry proxy layer with `dialer-proxy` chains
 /// applied at startup, the candidate's freshly built proxies on a rebuild
 /// (needed in regions where the CDN is blocked; issue #533). When no map
-/// exists — a config without `proxies:` or `proxy-groups:` — fetches go
-/// direct, since a rejected layer aborts the build before this runs.
+/// exists — a config without `proxies:` or `proxy-groups:` — the
+/// resolution runs against an empty map: named outbounds can only warn
+/// and fall back, while `geodata.proxy`/`MATCH` builtins still gate the
+/// download (a rejected layer aborts the build before this runs).
 /// Download failures are
 /// logged as warnings — the subsequent parser-context build hard-errors on
 /// a missing GeoIP/ASN file (geosite is tolerated absent, per spec), giving
@@ -4665,9 +4667,18 @@ async fn ensure_geodata(
         return;
     }
 
-    let egress = map.map_or(GeodataEgress::Direct, |m| {
-        resolve_geodata_egress(raw, geo, configured_mode(raw), m, chained_providers)
-    });
+    // No layer means no `proxies:`/`proxy-groups:` at all, so a named
+    // outbound can never resolve — but a `geodata.proxy`/`MATCH` builtin
+    // (`REJECT`, `REJECT-DROP`, `DIRECT`) still must, since it needs no
+    // map entry to classify (issue #974 review).
+    let empty = HashMap::new();
+    let egress = resolve_geodata_egress(
+        raw,
+        geo,
+        configured_mode(raw),
+        map.unwrap_or(&empty),
+        chained_providers,
+    );
 
     for (url, dest) in downloads {
         info!("geodata: downloading {} to {}", url, dest.display());
@@ -10351,6 +10362,49 @@ mod geoip_context_tests {
         assert!(
             !mmdb_target.exists(),
             "the failed target leaves no partial file"
+        );
+    }
+
+    /// With no proxy layer at all (no `proxies:`/`proxy-groups:`), a
+    /// `geodata.proxy`/`MATCH` builtin still classifies: `REJECT` gates
+    /// the download instead of falling back to direct egress (issue
+    /// #974 review).
+    #[tokio::test]
+    async fn ensure_geodata_builtins_apply_without_a_proxy_map() {
+        let (addr, hits) = crate::test_support::serve_body(b"mmdb").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mmdb_target = dir.path().join("absent.mmdb");
+        let geo = GeoDataConfig {
+            mmdb_path: Some(mmdb_target.clone()),
+            mmdb_url: format!("http://{addr}/country.mmdb"),
+            proxy: Some("REJECT".to_string()),
+            ..GeoDataConfig::default()
+        };
+        let raw = raw_with_rules(vec!["GEOIP,CN,DIRECT", "MATCH,DIRECT"]);
+        let scan = collect_geo_scan_lines(&raw, &rule_provider::PrefetchedPayloads::default());
+        assert_eq!(
+            super::missing_geodata_downloads(&geo, geo_references(&raw, &scan)).len(),
+            1,
+            "the mmdb is referenced and missing"
+        );
+
+        super::ensure_geodata(&raw, &geo, &scan, None, &std::collections::HashSet::new()).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "geodata.proxy: REJECT skips the download even without a map"
+        );
+        assert!(!mmdb_target.exists());
+
+        // The same gate through the mode's default route: MATCH,REJECT.
+        let geo = GeoDataConfig { proxy: None, ..geo };
+        let raw = raw_with_rules(vec!["GEOIP,CN,DIRECT", "MATCH,REJECT"]);
+        let scan = collect_geo_scan_lines(&raw, &rule_provider::PrefetchedPayloads::default());
+        super::ensure_geodata(&raw, &geo, &scan, None, &std::collections::HashSet::new()).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "MATCH,REJECT gates the download without a map too"
         );
     }
 
