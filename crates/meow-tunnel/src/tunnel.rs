@@ -652,9 +652,7 @@ impl TunnelInner {
         if metadata.dst_ip.is_some() {
             return None;
         }
-        let Some(direct) = resolver.direct_resolver().map(Arc::clone) else {
-            return None;
-        };
+        let direct = resolver.direct_resolver().map(Arc::clone)?;
         // Probe only — "does this route end DIRECT?" — so it must not
         // record the hit `resolve_proxy` counts: every UDP caller resolves
         // for real right after (a double hit per flow), and a packet this
@@ -4847,13 +4845,15 @@ sub-rules:
         /// hops, or the group reads as a dialable target (issue #974).
         #[tokio::test]
         async fn sixteen_hop_pick_chain_still_surfaces_rematch() {
+            use std::fmt::Write as _;
             let mut groups =
                 String::from("proxy-groups:\n  - {name: g16, type: select, proxies: [inspect]}\n");
             for i in (1..16).rev() {
-                groups.push_str(&format!(
-                    "  - {{name: g{i}, type: select, proxies: [g{}]}}\n",
+                let _ = writeln!(
+                    groups,
+                    "  - {{name: g{i}, type: select, proxies: [g{}]}}",
                     i + 1
-                ));
+                );
             }
             let yaml = format!(
                 "proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: stage1}}\n\
@@ -4872,13 +4872,15 @@ sub-rules:
         /// committing a group whose selection cannot carry the flow.
         #[tokio::test]
         async fn sixteen_hop_pick_chain_still_surfaces_pass() {
+            use std::fmt::Write as _;
             let mut groups =
                 String::from("proxy-groups:\n  - {name: p16, type: select, proxies: [PASS]}\n");
             for i in (1..16).rev() {
-                groups.push_str(&format!(
-                    "  - {{name: p{i}, type: select, proxies: [p{}]}}\n",
+                let _ = writeln!(
+                    groups,
+                    "  - {{name: p{i}, type: select, proxies: [p{}]}}",
                     i + 1
-                ));
+                );
             }
             let yaml = format!("{groups}rules:\n  - MATCH,p1\n  - MATCH,DIRECT\n");
             let tunnel = rematch_tunnel(&yaml);

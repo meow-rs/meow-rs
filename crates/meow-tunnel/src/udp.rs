@@ -688,7 +688,7 @@ mod tests {
             "proxies:\n  - {{name: {name}, type: rematch, target-rematch-name: stage1}}\n"
         ))
         .unwrap();
-        meow_config::rebuild_from_raw(&raw).unwrap().proxies[name].clone()
+        Arc::clone(&meow_config::rebuild_from_raw(&raw).unwrap().proxies[name])
     }
 
     /// A front that peeks like `inner` but whose dial lets a racing flow

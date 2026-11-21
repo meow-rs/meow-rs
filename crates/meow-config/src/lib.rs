@@ -9664,7 +9664,7 @@ mod geoip_context_tests {
             "DOMAIN-KEYWORD,IP-ASN,13335,DIRECT",
         ]
         .iter()
-        .map(|s| s.to_string())
+        .map(ToString::to_string)
         .collect();
         assert!(
             collect_geoip_countries(&lines).is_empty(),
