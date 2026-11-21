@@ -3585,11 +3585,17 @@ fn prefetch_proxy_map(
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selection: Option<&meow_proxy::SelectorWriter>,
 ) -> Result<Option<PrefetchProxies>, anyhow::Error> {
-    // No `proxies:` entries means nothing to tunnel through — named `proxy:`
-    // lookups and the default proxy all come back empty either way. Such a
-    // config's provider `proxy:` names (a group, or GLOBAL) simply defer to
-    // the load pass, which resolves them against the pass-1 registry.
-    if raw.proxies.as_deref().unwrap_or(&[]).is_empty() {
+    // No `proxies:` and no `proxy-groups:` means nothing to tunnel
+    // through — named `proxy:` lookups and the default proxy all come
+    // back empty either way, and provider `proxy:` names defer to the
+    // load pass, which resolves them against the pass-1 registry. Groups
+    // alone still justify the layer: a provider-fed group can be a
+    // `geodata.proxy`/provider `proxy:` target, and one selecting a
+    // provider's rematch leaf must fail the fetch loudly instead of
+    // leaking it direct (issue #974).
+    if raw.proxies.as_deref().unwrap_or(&[]).is_empty()
+        && raw.proxy_groups.as_deref().unwrap_or(&[]).is_empty()
+    {
         return Ok(None);
     }
     let registry = meow_proxy::dialer::ProxyRegistry::default();
@@ -4575,9 +4581,13 @@ fn configured_mode(raw: &raw::RawConfig) -> TunnelMode {
 /// field resolves later against the published `provider_dialer_registry`
 /// at fetch time (issue #625) — not through this prefetch layer.
 fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> bool {
-    // No `proxies:` entries → the layer can never exist; skip the
-    // spawn_blocking hop to a deterministic `Ok(None)`.
-    if raw.proxies.as_deref().unwrap_or(&[]).is_empty() {
+    // Neither `proxies:` nor `proxy-groups:` → the layer can never
+    // exist; skip the spawn_blocking hop to a deterministic `Ok(None)`.
+    // Groups without `proxies:` still count — a provider-fed group can
+    // resolve the `geodata.proxy`/provider `proxy:` names below.
+    if raw.proxies.as_deref().unwrap_or(&[]).is_empty()
+        && raw.proxy_groups.as_deref().unwrap_or(&[]).is_empty()
+    {
         return false;
     }
     let has_fetchable_provider = raw
@@ -4602,8 +4612,9 @@ fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> boo
 /// `map` — the shared pre-registry proxy layer with `dialer-proxy` chains
 /// applied at startup, the candidate's freshly built proxies on a rebuild
 /// (needed in regions where the CDN is blocked; issue #533). When no map
-/// exists — a config without `proxies:` — fetches go direct, since a
-/// rejected layer aborts the build before this runs. Download failures are
+/// exists — a config without `proxies:` or `proxy-groups:` — fetches go
+/// direct, since a rejected layer aborts the build before this runs.
+/// Download failures are
 /// logged as warnings — the subsequent parser-context build hard-errors on
 /// a missing GeoIP/ASN file (geosite is tolerated absent, per spec), giving
 /// a clear diagnostic.
@@ -8261,6 +8272,85 @@ mod dialer_proxy_tests {
             ..geo
         };
         assert!(!prefetch_proxy_layer_needed(&geoip_rules, &present_mmdb));
+    }
+
+    /// Issue #974 — a config with no `proxies:` but provider-fed
+    /// `proxy-groups:` still owns a prefetch layer: `geodata.proxy`
+    /// naming the group must resolve. Selecting a provider's rematch
+    /// leaf then fails the dial loudly (`direct_fallback: false`)
+    /// instead of the download silently egressing direct off an
+    /// unresolved map.
+    #[tokio::test]
+    async fn prefetch_layer_resolves_group_egress_without_proxies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - { name: inspect, type: rematch, target-rematch-name: stage1 }\n",
+        )
+        .unwrap();
+        let def: raw::RawProxyProvider = serde_saphyr::from_str(&format!(
+            "type: file\npath: '{}'",
+            dir.path().join("nodes.yaml").display()
+        ))
+        .unwrap();
+        let provider = ProxyProvider::new(
+            "p",
+            &def,
+            Some(dir.path()),
+            false,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        provider.refresh().await.unwrap();
+        let providers: HashMap<String, Arc<ProxyProvider>> =
+            [("p".to_string(), Arc::new(provider))]
+                .into_iter()
+                .collect();
+
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
+            "geodata:\n  mmdb-path: '{}'\n  proxy: G\n\
+             proxy-groups:\n  - {{ name: G, type: select, use: [p] }}\n\
+             rules:\n  - GEOIP,CN,DIRECT",
+            dir.path().join("absent.mmdb").display()
+        ))
+        .unwrap();
+        let geo = geodata::parse_geodata(&raw).unwrap();
+        assert!(
+            prefetch_proxy_layer_needed(&raw, &geo),
+            "groups alone must not short-circuit the layer"
+        );
+
+        let layer = prefetch_proxy_map(&raw, &providers, None)
+            .expect("layer builds")
+            .expect("provider-fed groups produce a layer");
+        let GeodataEgress::Proxy {
+            proxy,
+            direct_fallback,
+        } = super::resolve_geodata_egress(
+            &raw,
+            &geo,
+            TunnelMode::Rule,
+            &layer.map,
+            &std::collections::HashSet::new(),
+        )
+        else {
+            panic!("explicit geodata.proxy must resolve to the group");
+        };
+        assert!(
+            !direct_fallback,
+            "an explicit geodata.proxy never falls back"
+        );
+
+        // The group selects the provider's rematch leaf — the dial must
+        // fail loudly rather than carry the download anywhere.
+        let metadata = meow_common::Metadata {
+            network: meow_common::Network::Tcp,
+            host: "example.invalid".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        assert!(proxy.dial_tcp(&metadata).await.is_err());
     }
 
     /// End-to-end wiring: a provider's `proxy:` key resolves through the
