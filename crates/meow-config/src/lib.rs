@@ -3488,11 +3488,21 @@ fn build_proxy_layer(
             .collect();
         all_proxy_names.sort();
         let primary = primary_global_target(raw, &proxies).map(str::to_string);
-        if let Some(primary) = primary.as_deref() {
-            if let Some(position) = all_proxy_names.iter().position(|name| name == primary) {
-                all_proxy_names.remove(position);
-                all_proxy_names.insert(0, primary.to_string());
-            }
+        // The member at index 0 is the selector's default pick: the
+        // primary when it resolves, else the first non-rematch member —
+        // a sorted-first rematch leaf is a control outbound and can
+        // never be a dialable default (issue #974 review).
+        let default_position = match primary.as_deref() {
+            Some(primary) => all_proxy_names.iter().position(|name| name == primary),
+            None => all_proxy_names.iter().position(|name| {
+                proxies
+                    .get(name.as_str())
+                    .is_some_and(|p| p.adapter_type() != AdapterType::Rematch)
+            }),
+        };
+        if let Some(position) = default_position {
+            let name = all_proxy_names.remove(position);
+            all_proxy_names.insert(0, name);
         }
         let global_config = raw::RawProxyGroup {
             name: "GLOBAL".to_string(),

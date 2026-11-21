@@ -399,6 +399,34 @@ rules:
     }
 }
 
+/// A rematch leaf that sorts before DIRECT would open the member list —
+/// and `members[0]` is the auto-GLOBAL selector's default pick. A control
+/// outbound can never be the default: the first non-rematch member opens
+/// the list instead, while the leaf stays selectable like upstream
+/// `proxyList` members (issue #974 review).
+#[test]
+fn auto_global_default_never_lands_on_a_rematch_leaf() {
+    let raw: RawConfig = serde_saphyr::from_str(
+        r#"
+proxies:
+  - {name: "AAA-rm", type: rematch, target-rematch-name: stage1}
+rules:
+  - DOMAIN,example.com,DIRECT
+"#,
+    )
+    .unwrap();
+    let proxies = rebuild_from_raw(&raw).unwrap().proxies;
+    let global = proxies.get("GLOBAL").expect("auto-created GLOBAL");
+
+    assert_eq!(global.current().as_deref(), Some("DIRECT"));
+    let members = global.members().expect("GLOBAL selector members");
+    assert_eq!(members.first().map(String::as_str), Some("DIRECT"));
+    assert!(
+        members.iter().any(|m| m == "AAA-rm"),
+        "the rematch leaf stays a member"
+    );
+}
+
 /// Issue #533: a `proxies:` leaf named after a built-in must not shadow
 /// it — a shadowed `PASS` would silently invert "skip this rule" into
 /// "proxy it". The built-in survives; the shadowing leaf is dropped with
