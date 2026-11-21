@@ -4758,6 +4758,38 @@ mod tests {
             (target.adapter.name().to_string(), md)
         }
 
+        /// A tunnel whose `resolve_udp_dst` route probe actually runs:
+        /// the main resolver misses every lookup and a direct-nameserver
+        /// owns `example.test` — without one the probe returns before
+        /// routing and every assertion on the decision passes vacuously.
+        fn udp_probe_tunnel(yaml: &str) -> Tunnel {
+            use meow_dns::HostEntry;
+            use std::net::IpAddr;
+
+            let direct_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 3));
+            let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+            hosts.insert("example.test", vec![direct_ip].into());
+            let direct = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+            // No upstreams and no hosts: every main lookup fails, so the
+            // direct-resolver probe runs.
+            let mut main = Resolver::new(
+                vec![],
+                vec![],
+                DnsMode::Normal,
+                DomainTrie::new(),
+                false,
+                true,
+            );
+            main.set_direct_resolver(Arc::new(direct));
+            let tunnel = Tunnel::new(Arc::new(main));
+            tunnel.set_mode(TunnelMode::Rule);
+            let raw: meow_config::raw::RawConfig =
+                serde_saphyr::from_str(yaml).expect("yaml parses");
+            let res = meow_config::rebuild_from_raw(&raw).expect("config builds");
+            tunnel.update_routing(res.proxies, res.rules, res.sub_rules, res.dialer_registry);
+            tunnel
+        }
+
         /// The spec example end-to-end: `example.test` selects `inspect`,
         /// enters `second-pass` with `rematchName = stage1`, and the
         /// `REMATCH-NAME,stage1/alternative` member sends it to REJECT.
@@ -5463,32 +5495,10 @@ sub-rules:
         /// rematch transitions, and its decision IS the commit: the
         /// marker it settled on lands on the flow and the bookkeeping it
         /// deferred is tallied exactly once — the caller never re-scans
-        /// (issues #882, #974). The stub `direct-nameserver` is what
-        /// proves the probe ran: without one `resolve_udp_dst` returns
-        /// before routing, and every assertion here passes vacuously.
+        /// (issues #882, #974).
         #[tokio::test]
         async fn udp_route_probe_commits_rematch_decision() {
-            use meow_dns::HostEntry;
-            use std::net::IpAddr;
-
-            let direct_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 3));
-            let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
-            hosts.insert("example.test", vec![direct_ip].into());
-            let direct = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
-            // No upstreams and no hosts: every main lookup fails, so the
-            // direct-resolver probe runs.
-            let mut main = Resolver::new(
-                vec![],
-                vec![],
-                DnsMode::Normal,
-                DomainTrie::new(),
-                false,
-                true,
-            );
-            main.set_direct_resolver(Arc::new(direct));
-            let tunnel = Tunnel::new(Arc::new(main));
-            tunnel.set_mode(TunnelMode::Rule);
-            let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
+            let tunnel = udp_probe_tunnel(
                 r#"
 proxies:
   - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: b}
@@ -5499,11 +5509,7 @@ sub-rules:
   b:
     - REMATCH-NAME,stage1,DIRECT
 "#,
-            )
-            .unwrap();
-            let res = meow_config::rebuild_from_raw(&raw).expect("config builds");
-            tunnel.update_routing(res.proxies, res.rules, res.sub_rules, res.dialer_registry);
-
+            );
             let mut md = Metadata {
                 host: "example.test".into(),
                 dst_port: 53,
@@ -5518,7 +5524,7 @@ sub-rules:
             assert_eq!(target.adapter.name(), "DIRECT");
             assert_eq!(
                 md.dst_ip,
-                Some(direct_ip),
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 3))),
                 "the probe must see rematch → DIRECT and consult direct-nameserver"
             );
             assert_eq!(
@@ -5536,6 +5542,95 @@ sub-rules:
                 tunnel.inner().stats.rule_match.snapshot(),
                 vec![(("REMATCH-NAME", "DIRECT"), 1)],
                 "the kept decision tallies its terminal outcome once"
+            );
+        }
+
+        /// The same probe commits the block's terminal verdict, not only
+        /// a rematch inside it: `b` ends `MATCH,REJECT` while the main
+        /// list would answer DIRECT — a decision that ignored the
+        /// transition's block reads DIRECT and the assertion fails
+        /// (issue #974 review).
+        #[tokio::test]
+        async fn udp_route_probe_commits_block_reject_decision() {
+            let tunnel = udp_probe_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: b}
+rules:
+  - DOMAIN-SUFFIX,example.test,inspect
+  - MATCH,DIRECT
+sub-rules:
+  b:
+    - MATCH,REJECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            let target = tunnel
+                .inner()
+                .resolve_udp_dst(&mut md)
+                .await
+                .expect("a probe that ran returns the committed decision");
+            assert_eq!(
+                target.adapter.name(),
+                "REJECT",
+                "the probe commits the block's MATCH,REJECT, not main's DIRECT"
+            );
+            assert_eq!(md.rematch_name(), "stage1");
+            assert_eq!(
+                md.dst_ip, None,
+                "REJECT never consults the direct-nameserver"
+            );
+            assert_eq!(
+                tunnel.inner().stats.rule_match.snapshot(),
+                vec![(("MATCH", "REJECT"), 1)],
+                "the kept decision tallies the block's terminal outcome once"
+            );
+        }
+
+        /// The listener's `rule:` block keeps its fail-closed contract on
+        /// the UDP probe too: a block match to a UDP-incapable target
+        /// materializes REJECT in the committed decision — sliding past
+        /// it would read main's `MATCH,DIRECT` instead (issue #974
+        /// review).
+        #[tokio::test]
+        async fn udp_route_probe_seeded_block_fails_closed() {
+            let tunnel = udp_probe_tunnel(
+                r#"
+proxies:
+  - {name: noupd, type: socks5, server: 127.0.0.1, port: 1080, udp: false}
+rules:
+  - MATCH,DIRECT
+sub-rules:
+  blk:
+    - MATCH,noupd
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            md.set_special_route(None, Some("blk"));
+            let target = tunnel
+                .inner()
+                .resolve_udp_dst(&mut md)
+                .await
+                .expect("a probe that ran returns the committed decision");
+            assert_eq!(
+                target.adapter.name(),
+                "REJECT",
+                "the listener-seeded scan fails closed on the UDP-incapable match"
+            );
+            assert_eq!(
+                tunnel.inner().stats.rule_match.snapshot(),
+                vec![(("MATCH", "REJECT"), 1)],
+                "the kept decision tallies the seeded block's outcome once"
             );
         }
 

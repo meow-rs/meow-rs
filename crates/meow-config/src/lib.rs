@@ -8415,16 +8415,29 @@ mod dialer_proxy_tests {
             !direct_fallback,
             "an explicit geodata.proxy never falls back"
         );
+        assert_eq!(proxy.name(), "G", "the egress binds the named group");
 
         // The group selects the provider's rematch leaf — the dial must
-        // fail loudly rather than carry the download anywhere.
+        // fail loudly rather than carry the download anywhere, and the
+        // failure must be *that* one: a rematch has no socket to open.
+        // Bare `is_err()` would also pass on an unrelated dial error.
         let metadata = meow_common::Metadata {
             network: meow_common::Network::Tcp,
             host: "example.invalid".into(),
             dst_port: 443,
             ..Default::default()
         };
-        assert!(proxy.dial_tcp(&metadata).await.is_err());
+        let err = proxy
+            .dial_tcp(&metadata)
+            .await
+            .err()
+            .expect("a rematch leaf owns no socket to dial with");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("control outbound") && msg.contains("inspect"),
+            "the group dialled the provider's rematch leaf and it failed \
+             as a control node: {msg}"
+        );
     }
 
     /// A provider node's `dialer-proxy` binds the provider's registry
@@ -8479,7 +8492,13 @@ mod dialer_proxy_tests {
         let layer = prefetch_proxy_map(&raw, &providers, None, &provider_registry)
             .expect("layer builds")
             .expect("proxies configured");
-        let _ = prefetch_rule_provider_payloads_async(&raw, None, Some(Arc::new(layer))).await;
+        let payloads =
+            prefetch_rule_provider_payloads_async(&raw, None, Some(Arc::new(layer))).await;
+        assert_eq!(
+            payloads.iter().count(),
+            0,
+            "the counting listener accepts then drops — the fetch ran and got nothing"
+        );
         assert!(
             hits(&b_hits) >= 1,
             "the provider node's dialer-proxy front resolves via the prefetch publish"
