@@ -114,13 +114,20 @@ pub struct Metadata {
     /// string mihomo emits on `/connections` metadata (`""` when unset,
     /// so dashboards read it unconditionally) and defaults back to
     /// unset on older JSON that lacks the key.
+    ///
+    /// Held behind a pointer like `special_route`: the marker rides on
+    /// the rare flow a `type: rematch` leaf actually stamped, and it is
+    /// per-clone state — each transition stamps its own copy — so it
+    /// cannot live in the clones-shared `flow_lookup` `Arc` where one
+    /// hop's stamp would leak into the next. `None` keeps the field one
+    /// pointer wide on the ordinary path.
     #[serde(
         rename = "rematchName",
         default,
         serialize_with = "rematch_name_json::serialize",
         deserialize_with = "rematch_name_json::deserialize"
     )]
-    pub rematch_name: Option<SmolStr>,
+    pub rematch_name: Option<Arc<SmolStr>>,
     /// Flow-local lookup state (issue #974 `find-process-mode`): the
     /// owning-process scan's one-shot memo and submission lock,
     /// `Arc`-shared with every clone the routing passes, the UDP route
@@ -169,19 +176,20 @@ mod special_proxy_json {
 mod rematch_name_json {
     use serde::{Deserialize, Deserializer, Serializer};
     use smol_str::SmolStr;
+    use std::sync::Arc;
 
     pub(super) fn serialize<S: Serializer>(
-        name: &Option<SmolStr>,
+        name: &Option<Arc<SmolStr>>,
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
-        serializer.serialize_str(name.as_deref().unwrap_or_default())
+        serializer.serialize_str(name.as_deref().map_or("", SmolStr::as_str))
     }
 
     pub(super) fn deserialize<'de, D: Deserializer<'de>>(
         deserializer: D,
-    ) -> Result<Option<SmolStr>, D::Error> {
+    ) -> Result<Option<Arc<SmolStr>>, D::Error> {
         let name = SmolStr::deserialize(deserializer)?;
-        Ok((!name.is_empty()).then_some(name))
+        Ok((!name.is_empty()).then(|| Arc::from(name)))
     }
 }
 
@@ -250,7 +258,7 @@ impl Metadata {
     /// `Metadata.RematchName`), `""` when unset. `REMATCH-NAME` rules
     /// compare against it exactly; an unset marker never matches.
     pub fn rematch_name(&self) -> &str {
-        self.rematch_name.as_deref().unwrap_or_default()
+        self.rematch_name.as_deref().map_or("", |s| s.as_str())
     }
 
     /// Apply a rematch leaf's `target-rematch-name`: `Some("")` clears
@@ -260,7 +268,7 @@ impl Metadata {
     /// The caller unwraps `Option`-vs-supplied itself; this setter only
     /// receives a *supplied* value.
     pub fn set_rematch_name(&mut self, name: &str) {
-        self.rematch_name = (!name.is_empty()).then(|| SmolStr::from(name));
+        self.rematch_name = (!name.is_empty()).then(|| Arc::from(SmolStr::from(name)));
     }
 
     /// Stamp `proxy`/`rule` as this flow's listener override, replacing

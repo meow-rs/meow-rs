@@ -1877,11 +1877,18 @@ fn matches_op(op: &RuleOp, input: &MatchInput<'_>, helper: &RuleMatchHelper) -> 
         // trimmed and compared exactly (case-sensitive) — the same
         // semantics `RematchNameRule::match_metadata` applies. An unset
         // marker matches nothing, including an empty alternative.
-        RuleOp::RematchName(payload) => input
-            .metadata
-            .rematch_name
-            .as_deref()
-            .is_some_and(|marker| payload.split('/').map(str::trim).any(|alt| alt == marker)),
+        RuleOp::RematchName(payload) => {
+            input
+                .metadata
+                .rematch_name
+                .as_deref()
+                .is_some_and(|marker| {
+                    payload
+                        .split('/')
+                        .map(str::trim)
+                        .any(|alt| alt == marker.as_str())
+                })
+        }
         RuleOp::InType(mask) => in_type_matches(*mask, input.metadata.conn_type),
         RuleOp::InUser(user) => input.metadata.in_user.as_deref() == Some(&**user),
         RuleOp::Match => true,
