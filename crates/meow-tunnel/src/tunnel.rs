@@ -5595,5 +5595,32 @@ sub-rules:
                 "the lookup ran once, inside the pass that demanded it"
             );
         }
+
+        /// A malformed `REMATCH-NAME` line drops itself, not the
+        /// provider: the sibling rule still installs, `RULE-SET` keeps
+        /// routing to its declared target, and the flow does not lose
+        /// the whole set to one bad entry (issue #974 review).
+        #[tokio::test]
+        async fn provider_malformed_marker_drops_line_not_set() {
+            let tunnel = rematch_tunnel(
+                r#"
+rule-providers:
+  prov:
+    type: inline
+    behavior: classical
+    payload:
+      - "REMATCH-NAME,a//b"
+      - "DOMAIN-SUFFIX,x.com"
+rules:
+  - RULE-SET,prov,REJECT
+  - MATCH,DIRECT
+"#,
+            );
+            let (adapter, _) = routed(&tunnel, "x.com").await;
+            assert_eq!(
+                adapter, "REJECT",
+                "the valid sibling rule keeps the provider alive"
+            );
+        }
     }
 }

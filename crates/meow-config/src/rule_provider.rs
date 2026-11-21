@@ -1284,26 +1284,32 @@ fn empty_rule_set(behavior: RuleSetBehavior, ctx: &ParserContext) -> Box<dyn Rul
 }
 
 /// A line naming `REMATCH-NAME` that fails entry validation is a
-/// structural error on a *local* payload, mirroring the `rules:` gate in
-/// `rule_parser` — warn-skipping it silently routes the flow's first
-/// decision by a different rule than written (issue #974). Remote
-/// payloads keep the lenient skip: feed noise must not veto the build.
-fn reject_malformed_rematch_entries(
-    behavior: RuleSetBehavior,
+/// structural defect on a *local* payload, mirroring the `rules:` gate in
+/// `rule_parser` — silently warn-skipping it would route the flow's
+/// first decision by a different rule than written (issue #974). Drop it
+/// line-wise like the lenient build does every other entry: one
+/// malformed marker must not veto the sibling rules a provider
+/// legitimately supplies (issue #974 review). Remote payloads keep the
+/// lenient skip: feed noise must not veto the build.
+fn filter_malformed_rematch_entries(
     entries: &[String],
+    behavior: RuleSetBehavior,
     ctx: &ParserContext,
-) -> Result<(), anyhow::Error> {
-    let suspect: Vec<String> = entries
+) -> Vec<String> {
+    entries
         .iter()
-        .filter(|e| meow_rules::line_mentions_rematch_name(e))
+        .filter(|entry| {
+            if !meow_rules::line_mentions_rematch_name(entry) {
+                return true;
+            }
+            let valid = build_rule_set_checked(behavior, std::slice::from_ref(entry), ctx).is_ok();
+            if !valid {
+                warn!("rule-set payload: dropping malformed REMATCH-NAME entry '{entry}'");
+            }
+            valid
+        })
         .cloned()
-        .collect();
-    if suspect.is_empty() {
-        return Ok(());
-    }
-    build_rule_set_checked(behavior, &suspect, ctx)
-        .map(|_| ())
-        .map_err(|e| anyhow!("malformed REMATCH-NAME predicate in rule-set payload: {e}"))
+        .collect()
 }
 
 /// Parse payload bytes into a rule set, honoring `strict` per-entry: strict
@@ -1319,9 +1325,10 @@ fn entries_to_rule_set(
         build_rule_set_checked(behavior, entries, ctx)
             .map_err(|e| LoadError::Payload(anyhow!("{e}")))
     } else {
-        // Inline `payload:` is authored in the config itself — local.
-        reject_malformed_rematch_entries(behavior, entries, ctx).map_err(LoadError::Payload)?;
-        Ok(build_rule_set(behavior, entries, ctx))
+        // Inline `payload:` is authored in the config itself — local: a
+        // malformed REMATCH-NAME line drops itself, not the payload.
+        let entries = filter_malformed_rematch_entries(entries, behavior, ctx);
+        Ok(build_rule_set(behavior, &entries, ctx))
     }
 }
 
@@ -1760,8 +1767,9 @@ fn parse_bytes_to_ruleset_with_format(
             .map(|rules| (rules, format))
             .map_err(|e| anyhow!("rule-set entry error: {e}"));
     }
+    let mut entries = entries;
     if local {
-        reject_malformed_rematch_entries(behavior, &entries, ctx)?;
+        entries = filter_malformed_rematch_entries(&entries, behavior, ctx);
     }
     Ok((build_rule_set(behavior, &entries, ctx), format))
 }
@@ -3702,27 +3710,26 @@ header:
         .await;
     }
 
-    /// A local payload line naming `REMATCH-NAME` that fails to parse is a
-    /// structural defect, like the `rules:` gate — lenient warn-and-skip
-    /// would silently route the flow's first decision by a different rule
-    /// than written. Remote bytes keep the lenient skip (issue #974).
+    /// A local payload line naming `REMATCH-NAME` that fails to parse
+    /// drops itself — a structural defect, not feed noise — but it does
+    /// not veto the sibling entries the provider legitimately supplies
+    /// (issue #974 review). Remote bytes keep the lenient skip
+    /// (issue #974).
     #[test]
-    fn local_payloads_gate_malformed_rematch_predicates() {
+    fn local_payloads_filter_malformed_rematch_predicates() {
         let ctx = ParserContext::empty();
         let bytes = b"payload:\n  - DOMAIN,x.com\n  - REMATCH-NAME,a//b\n";
 
-        assert!(
-            parse_bytes_to_ruleset_with_format(
-                bytes,
-                RuleSetBehavior::Classical,
-                None,
-                &ctx,
-                false,
-                true,
-            )
-            .is_err(),
-            "a malformed REMATCH-NAME line in a local payload must fail"
-        );
+        let (set, _) = parse_bytes_to_ruleset_with_format(
+            bytes,
+            RuleSetBehavior::Classical,
+            None,
+            &ctx,
+            false,
+            true,
+        )
+        .expect("a malformed REMATCH-NAME line drops itself, not the payload");
+        assert_eq!(set.len(), 1, "only the DOMAIN entry installs");
 
         let (set, _) = parse_bytes_to_ruleset_with_format(
             bytes,
@@ -3749,11 +3756,11 @@ header:
     }
 
     /// The provider-level shape of the same verdict: a file or inline
-    /// payload with a malformed REMATCH-NAME entry does not register — the
-    /// defect is recorded instead of installing a partial set, and strict
-    /// fails the build.
+    /// payload with a malformed REMATCH-NAME entry still registers — the
+    /// valid sibling installs while only the malformed line drops — and
+    /// strict fails the build.
     #[test]
-    fn local_providers_drop_on_malformed_rematch_entry() {
+    fn local_providers_drop_line_on_malformed_rematch_entry() {
         let classical =
             |provider_type: &str, path: Option<String>, payload: Option<Vec<String>>| {
                 RawRuleProvider {
@@ -3784,10 +3791,12 @@ header:
             ),
         ]);
         let out = load_providers(&providers, Some(dir.path()), &ctx(), None, false)
-            .expect("lenient records the defect instead of failing");
-        assert!(
-            out.is_empty(),
-            "neither provider registers with a malformed REMATCH-NAME entry"
+            .expect("lenient registers providers, dropping only the bad line");
+        assert_eq!(out.len(), 2, "both providers register");
+        assert_eq!(
+            out["file"].rule_count() + out["inline"].rule_count(),
+            2,
+            "one valid entry survives on each provider"
         );
         let err = load_providers(&providers, Some(dir.path()), &ctx(), None, true)
             .expect_err("strict fails the build");
