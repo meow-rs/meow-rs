@@ -763,6 +763,21 @@ pub fn parse_proxy_with_dialer_and_fp(
         .get("type")
         .and_then(|v| v.as_str())
         .ok_or("missing proxy type")?;
+    // `type: rematch` — a control outbound consumed by the rule
+    // scanner, not a transport (issue #974). Dispatch before the
+    // transport-only option parse: a rematch node owns no
+    // `routing-mark`/`interface-name`/`tfo` semantics, so a malformed
+    // value there is warn-ignored by `parse_rematch`'s ignored-key
+    // warnings — not a hard node error that drops the flow's routing
+    // decision on a relaxed build. No server/port, no node dialer opts,
+    // no chain wrapper: `collect_dialer_edges` already rejects a
+    // `dialer-proxy` on it structurally, and `parse_rematch` re-rejects
+    // the key for the provider paths this dispatch also serves.
+    if proxy_type == "rematch" {
+        reject_unthreaded_dialer(name, "rematch", dialer)?;
+        let adapter = parse_rematch(name, config)?;
+        return Ok(Arc::new(WrappedProxy::new(Box::new(adapter))));
+    }
     // The shared per-node dialer fields (issue #974) — protocol-agnostic,
     // so they parse once before the type dispatch and attach to whichever
     // wrapper the leaf produces. Provider nodes reach the same fields
@@ -961,17 +976,8 @@ pub fn parse_proxy_with_dialer_and_fp(
                 WrappedProxy::new(Box::new(adapter)).with_node_dialer_opts(node_opts),
             ))
         }
-        // `type: rematch` — a control outbound consumed by the rule
-        // scanner, not a transport (issue #974). No server/port, no node
-        // dialer opts, no chain wrapper: `collect_dialer_edges` already
-        // rejects a `dialer-proxy` on it structurally, and `parse_rematch`
-        // re-rejects the key for the provider paths this dispatch also
-        // serves.
-        "rematch" => {
-            reject_unthreaded_dialer(name, "rematch", dialer)?;
-            let adapter = parse_rematch(name, config)?;
-            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
-        }
+        // `type: rematch` dispatched above `parse_node_dialer_opts` — a
+        // control outbound owns no transport-only options to validate.
         #[cfg(feature = "anytls")]
         "anytls" => {
             let adapter = parse_anytls(name, config, global_client_fingerprint)?;
@@ -8393,6 +8399,22 @@ tls: true
         let action = proxy.rematch_action().expect("action reported");
         assert_eq!(action.rematch_name, Some(" stage1 "));
         assert_eq!(action.sub_rule, Some("second-pass"));
+    }
+
+    /// Transport-only keys on a rematch node are warn-ignored, never
+    /// validated: the control leaf opens no sockets, so a value that
+    /// would fail `parse_node_dialer_opts` on a real transport must not
+    /// error the node here (issue #974).
+    #[test]
+    fn rematch_ignores_transport_only_options() {
+        let node = proxy_config(
+            "name: inspect\ntype: rematch\ntarget-rematch-name: stage1\n\
+             routing-mark: bogus\ninterface-name: 7\ntfo: maybe\nip-version: mars\n",
+        );
+        let proxy = parse_proxy(&node).expect("rematch node parses despite bogus socket opts");
+        assert_eq!(proxy.adapter_type(), meow_common::AdapterType::Rematch);
+        let action = proxy.rematch_action().expect("action reported");
+        assert_eq!(action.rematch_name, Some("stage1"));
     }
 
     /// `dialer-proxy` on rematch fails through the same dispatcher the
