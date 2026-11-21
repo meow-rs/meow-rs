@@ -28,6 +28,7 @@ use crate::port::PortRule;
 use crate::process::ProcessRule;
 use crate::process_path::ProcessPathRule;
 use crate::process_pattern::ProcessPatternRule;
+use crate::rematch_name::RematchNameRule;
 use crate::rule_set::RuleSet;
 use crate::rule_set_rule::RuleSetRule;
 use crate::src_geoip::SrcGeoIpRule;
@@ -152,6 +153,15 @@ fn parse_rule_depth(
     let rule_type: &str = match meow_common::RuleType::from_mihomo_name(rule_type) {
         Some(t) => t.as_str(),
         None => rule_type,
+    };
+    // Upstream dispatches the type field through `strings.ToUpper`, so
+    // `rematch-name` parses too (issue #974). Folding every token would
+    // widen the grammar past upstream's for types meow has always matched
+    // exactly — keep the fold to the one token upstream guarantees.
+    let rule_type: &str = if rule_type.eq_ignore_ascii_case("REMATCH-NAME") {
+        "REMATCH-NAME"
+    } else {
+        rule_type
     };
 
     // MATCH only needs adapter
@@ -297,6 +307,15 @@ fn parse_rule_depth(
         "IN-NAME" => InNameRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
         "IN-TYPE" => InTypeRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
         "IN-USER" => InUserRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
+        "REMATCH-NAME" => {
+            // Field three is always the target — `splitn(4)` leaves
+            // trailing params (`no-resolve` included) in `extra`, ignored
+            // exactly like upstream's `ParseParams` leftovers (issue #974).
+            if adapter.is_empty() {
+                return Err(format!("REMATCH-NAME: missing target in '{line}'"));
+            }
+            RematchNameRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>)
+        }
         "DSCP" => DscpRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
         "UID" => UidRule::new(payload, adapter).map(|r| Box::new(r) as Box<dyn Rule>),
         "PROCESS-PATH" => {
@@ -393,6 +412,25 @@ pub fn parse_rule_flags(extra: Option<&str>) -> RuleFlags {
 
 fn split_once_trimmed(s: &str, sep: char) -> Option<(&str, &str)> {
     s.split_once(sep).map(|(l, r)| (l.trim(), r.trim_start()))
+}
+
+/// Whether a rule line references `REMATCH-NAME` anywhere — as the head
+/// type (any spelling, config or API) or as a `(REMATCH-NAME,…)`
+/// predicate inside a logic group or `SUB-RULE` condition. meow-config
+/// uses it to fail malformed rematch grammar *structurally* instead of
+/// warn-skipping the line (issue #974): a typo'd rematch predicate that
+/// silently disappears takes the flow's first routing decision with it.
+/// Payload bytes mentioning the name (`DOMAIN-KEYWORD,REMATCH-NAME,…`)
+/// report true as well — the caller only consults this on a line that
+/// already failed to parse, where being conservative is the safe side.
+pub fn line_mentions_rematch_name(line: &str) -> bool {
+    line.split([',', '(', ')']).map(str::trim).any(|tok| {
+        tok.eq_ignore_ascii_case("REMATCH-NAME")
+            || matches!(
+                meow_common::RuleType::from_mihomo_name(tok),
+                Some(meow_common::RuleType::RematchName)
+            )
+    })
 }
 
 /// Parse `AND,((r1),(r2),...),ADAPTER` / `OR,(...)`, / `NOT,((r1)),ADAPTER`.
@@ -1275,5 +1313,118 @@ mod depth_tests {
             panic!("overlong line must error");
         };
         assert!(err.contains("exceeds"), "unexpected error: {err}");
+    }
+}
+
+#[cfg(test)]
+mod rematch_name_tests {
+    use super::*;
+    use meow_common::{Metadata, RuleMatchHelper, RuleType};
+
+    fn ctx() -> ParserContext {
+        ParserContext::empty()
+    }
+
+    /// Config and API spellings plus upstream's `ToUpper` fold all reach
+    /// the one rule type, adapter in field three (issue #974).
+    #[test]
+    fn parses_every_spelling() {
+        for line in [
+            "REMATCH-NAME,stage1,REJECT",
+            "rematch-name,stage1,REJECT",
+            "RematchName,stage1,REJECT",
+        ] {
+            let rule =
+                parse_rule(line, &ctx()).unwrap_or_else(|e| panic!("'{line}' must parse: {e}"));
+            assert_eq!(rule.rule_type(), RuleType::RematchName, "'{line}'");
+            assert_eq!(rule.adapter(), "REJECT", "'{line}'");
+            assert_eq!(rule.payload(), "stage1", "'{line}'");
+        }
+    }
+
+    /// A missing target and an empty alternative list both fail — the
+    /// latter would otherwise read as "also match the unset marker".
+    #[test]
+    fn rejects_missing_target_and_empty_alternatives() {
+        assert!(parse_rule("REMATCH-NAME,stage1", &ctx()).is_err());
+        assert!(parse_rule("REMATCH-NAME,a//b,REJECT", &ctx()).is_err());
+        assert!(parse_rule("REMATCH-NAME,,REJECT", &ctx()).is_err());
+    }
+
+    /// Extra fields after the adapter are ignored like every leaf type's
+    /// `ParseParams` leftovers upstream — `no-resolve` included.
+    #[test]
+    fn trailing_suffixes_ignored() {
+        let rule = parse_rule("REMATCH-NAME,stage1,REJECT,no-resolve", &ctx()).unwrap();
+        assert_eq!(rule.rule_type(), RuleType::RematchName);
+        assert_eq!(rule.adapter(), "REJECT");
+    }
+
+    /// `*` and `|` are literal bytes — no wildcard, regex, substring or
+    /// pipe-alternation semantics (issue #974): `a|b` matches only the
+    /// marker literally spelled `a|b`.
+    #[test]
+    fn special_bytes_stay_literal() {
+        let rule = parse_rule("REMATCH-NAME,a|b,REJECT", &ctx()).unwrap();
+        let mut m = Metadata::default();
+        m.set_rematch_name("a|b");
+        assert!(rule.match_metadata(&m, &RuleMatchHelper));
+        for miss in ["a", "b", "a|", "|b"] {
+            m.set_rematch_name(miss);
+            assert!(
+                !rule.match_metadata(&m, &RuleMatchHelper),
+                "'{miss}' must not match 'a|b'"
+            );
+        }
+    }
+
+    /// A `(REMATCH-NAME,…)` leg inside a logic group parses through the
+    /// shared inner-leg grammar with the group's adapter (issue #974).
+    #[test]
+    fn logic_leg_parses_and_matches() {
+        let rule = parse_rule(
+            "AND,((REMATCH-NAME,stage1),(DOMAIN-SUFFIX,x.test)),REJECT",
+            &ctx(),
+        )
+        .unwrap();
+        let mut m = Metadata {
+            host: "a.x.test".into(),
+            ..Default::default()
+        };
+        m.set_rematch_name("stage1");
+        assert!(rule.match_metadata(&m, &RuleMatchHelper));
+        m.set_rematch_name("other");
+        assert!(!rule.match_metadata(&m, &RuleMatchHelper));
+    }
+
+    /// The `sub-rules` conditional form shares the same leg grammar — a
+    /// REMATCH-NAME leaf inside `(cond)` reaches the block dispatch.
+    #[test]
+    fn sub_rule_condition_leaf_parses() {
+        let leaf = parse_inner_leg("REMATCH-NAME,stage1", &ctx(), &Default::default(), 0)
+            .expect("condition leaf parses");
+        assert_eq!(leaf.rule_type(), RuleType::RematchName);
+    }
+
+    /// `line_mentions_rematch_name` is the conservative gate meow-config
+    /// applies to lines that already failed to parse (issue #974): true
+    /// on head spellings and nested predicates, false on unrelated lines
+    /// — a `DOMAIN-KEYWORD,REMATCH-NAME` payload byte-match reporting
+    /// true is the safe side on a line that failed anyway.
+    #[test]
+    fn mentions_gate_flags_rematch_lines() {
+        for line in [
+            "REMATCH-NAME,stage1,REJECT",
+            "rematch-name,stage1,REJECT",
+            "RematchName,stage1,REJECT",
+            "AND,((REMATCH-NAME,a),(DOMAIN,x)),REJECT",
+            "SUB-RULE,(REMATCH-NAME,a),blk",
+            "REMATCH-NAME,a//b,REJECT",
+        ] {
+            assert!(line_mentions_rematch_name(line), "'{line}'");
+        }
+        for line in ["DOMAIN,x,REJECT", "MATCH,DIRECT", "REMATCHNAMES,x,D"] {
+            assert!(!line_mentions_rematch_name(line), "'{line}'");
+        }
     }
 }

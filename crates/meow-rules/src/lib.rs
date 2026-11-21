@@ -34,6 +34,7 @@ pub mod port;
 pub mod process;
 pub mod process_path;
 pub mod process_pattern;
+pub mod rematch_name;
 pub mod rule_set;
 pub mod rule_set_rule;
 pub mod src_geoip;
@@ -47,7 +48,8 @@ pub use domain_key::{
     domain_rule_payload_is_dead, domain_wildcard_payload_is_dead, DomainKeyDefect,
 };
 pub use parser::{
-    parse_rule, parse_rule_flags, parse_rule_with_rule_sets, ParserContext, RuleFlags, RuleSets,
+    line_mentions_rematch_name, parse_rule, parse_rule_flags, parse_rule_with_rule_sets,
+    ParserContext, RuleFlags, RuleSets,
 };
 pub use rule_set::{
     build_rule_set, build_rule_set_checked, build_rule_set_from_mrs,
