@@ -156,8 +156,10 @@ impl TunnelInner {
         // that was a rematch at peek time can have been swapped for a real
         // member, which the `counted` gate would leave uncounted.
         // Attribute the member the dial went through when a conn-path
-        // group committed one; a dialer-front member the peek never named
-        // is unrecoverable, not guessed.
+        // group committed one. When nothing reported — a node, or a front
+        // the pick channel does not reach — keep the original peek: a
+        // post-dial read would only name the *current* selection, which is
+        // not evidence of what the dial spent (issue #974 review).
         let counted = match pick {
             Some(pick) => {
                 let leaf = crate::tcp::leaf_proxy(pick.as_ref(), metadata).unwrap_or(pick);
@@ -169,14 +171,7 @@ impl TunnelInner {
                     (Some(leaf), via)
                 })
             }
-            None => counted.map(|leaf| (leaf, via)).or_else(|| {
-                // No conn-path group picked — a node or a selector over
-                // one — yet a peeked rematch/PASS leaf produced a conn:
-                // its selection changed under the dial. Read the leaf
-                // once more rather than lose the flow's accounting; the
-                // front its dial spent is likewise unrecoverable.
-                udp_leaf(proxy, metadata).map(|leaf| (leaf, None))
-            }),
+            None => counted.map(|leaf| (leaf, via)),
         };
         let Some((leaf, via)) = counted else {
             return Ok(conn);
@@ -816,11 +811,13 @@ mod tests {
         );
     }
 
-    /// Same accounting for the flip no conn-path group reports: the peek
-    /// read a rematch leaf, the dial still landed a transport — the
-    /// surviving conn is counted under the leaf it ends at.
+    /// The same flip behind a front the pick channel cannot reach keeps
+    /// the peek's verdict: a rematch leaf at peek time means no transport
+    /// attribution — a post-dial re-read would only name the selection
+    /// *now*, which says nothing about the member the dial spent (issue
+    /// #974 review). Nothing is guessed, so nothing is counted.
     #[tokio::test]
-    async fn dial_udp_counts_a_selection_flipped_under_the_peek() {
+    async fn dial_udp_unreported_flip_counts_nothing() {
         let tunnel = mk_tunnel();
         let front = FlippedPick {
             leaves: [
@@ -842,8 +839,106 @@ mod tests {
             .expect("the committed member is a real transport");
         conn.write_packet(b"ping", &dst).await.unwrap();
         let by_proxy = tunnel.statistics().proxy_traffic();
-        assert_eq!(by_proxy.get("transport"), Some(&(4, 0)));
-        assert_eq!(by_proxy.len(), 1);
+        assert!(by_proxy.is_empty());
+    }
+
+    /// A selector member whose own dial flips the group's selection — the
+    /// mid-dial window the in-band pick report closes: post-dial the
+    /// group's `unwrap_proxy` names `other`; only the pick recorded at
+    /// the member-dial point knows the conn went through `flip`.
+    struct FlipOnDial {
+        sel: std::sync::OnceLock<Arc<meow_proxy::SelectorGroup>>,
+        inner: UdpStubProxy,
+        health: ProxyHealth,
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for FlipOnDial {
+        fn name(&self) -> &str {
+            self.inner.name
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyConn>> {
+            Err(MeowError::NotSupported("stub".into()))
+        }
+        async fn dial_udp(&self, metadata: &Metadata) -> MeowResult<Box<dyn ProxyPacketConn>> {
+            assert!(
+                self.sel.get().unwrap().select("other"),
+                "member flips the group's selection mid-dial"
+            );
+            self.inner.dial_udp(metadata).await
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for FlipOnDial {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// A selector's dial reports the member it committed, so the mid-dial
+    /// flip above cannot rename the flow: `sel` dialled `flip`, `flip`'s
+    /// own dial re-selected `other`, and the stats land on `flip` — what
+    /// the conn went through — not `other`, what a post-dial peek reads.
+    #[tokio::test]
+    async fn dial_udp_attributes_the_member_the_selector_dialled() {
+        let tunnel = mk_tunnel();
+        let flip = Arc::new(FlipOnDial {
+            sel: std::sync::OnceLock::new(),
+            inner: UdpStubProxy {
+                name: "flip",
+                health: ProxyHealth::default(),
+            },
+            health: ProxyHealth::default(),
+        });
+        let sel = Arc::new(meow_proxy::SelectorGroup::new(
+            "sel",
+            vec![
+                Arc::clone(&flip) as Arc<dyn Proxy>,
+                Arc::new(UdpStubProxy {
+                    name: "other",
+                    health: ProxyHealth::default(),
+                }),
+            ],
+        ));
+        assert!(flip.sel.set(Arc::clone(&sel)).is_ok());
+        let src: SocketAddr = "127.0.0.1:41002".parse().unwrap();
+        let dst: SocketAddr = "8.8.8.8:53".parse().unwrap();
+        let conn = tunnel
+            .inner()
+            .dial_udp(sel.as_ref(), &mk_metadata(src, dst))
+            .await
+            .expect("the committed member is a real transport");
+        conn.write_packet(b"ping", &dst).await.unwrap();
+        let by_proxy = tunnel.statistics().proxy_traffic();
+        assert_eq!(
+            by_proxy.iter().collect::<Vec<_>>(),
+            vec![(&Arc::from("flip"), &(4, 0))],
+            "counted under the member the dial went through, not the post-dial selection"
+        );
     }
 
     struct NoopPacketConn;
@@ -1477,7 +1572,10 @@ mod tests {
         }));
 
         let src: SocketAddr = "127.0.0.1:45678".parse().unwrap();
-        let dst: SocketAddr = "198.51.100.9:443".parse().unwrap();
+        // Not 198.51.100.9: the ledger tests query that host and this
+        // flow's counters would land in their install when they run
+        // alongside this test.
+        let dst: SocketAddr = "198.51.100.99:443".parse().unwrap();
         let key = (src, dst);
         let writes = Arc::new(AtomicUsize::new(0));
         tunnel.inner().nat_table.insert(

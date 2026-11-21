@@ -863,6 +863,13 @@ mod tests {
         let (_, pick) = watch_dial_pick(outer.dial_tcp(&meta)).await;
         assert!(["A", "B"].contains(&pick.unwrap().name()));
 
+        // A selector reports the member its dial went through too — a
+        // later re-selection must not rename it (issue #974 review).
+        let sel: Vec<Arc<dyn Proxy>> = vec![MockProxy::new("M1"), MockProxy::new("M2")];
+        let sel = crate::group::selector::SelectorGroup::new("Sel", sel);
+        let (_, pick) = watch_dial_pick(sel.dial_tcp(&meta)).await;
+        assert_eq!(pick.unwrap().name(), "M1");
+
         // A node dials no group.
         let node = MockProxy::new("C");
         let (_, pick) = watch_dial_pick(node.dial_tcp(&meta)).await;

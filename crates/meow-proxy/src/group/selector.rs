@@ -203,6 +203,10 @@ impl ProxyAdapter for SelectorGroup {
         let proxy = self
             .selected_proxy()
             .ok_or_else(|| MeowError::Proxy("no proxy selected".into()))?;
+        // Report the member the dial goes through *now* — a later
+        // re-selection must not rename the flow that already committed
+        // (issue #974 review).
+        super::note_dial_pick(&proxy);
         proxy.dial_tcp(metadata).await
     }
 
@@ -210,6 +214,7 @@ impl ProxyAdapter for SelectorGroup {
         let proxy = self
             .selected_proxy()
             .ok_or_else(|| MeowError::Proxy("no proxy selected".into()))?;
+        super::note_dial_pick(&proxy);
         proxy.dial_udp(metadata).await
     }
 
