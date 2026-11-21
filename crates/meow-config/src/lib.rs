@@ -2503,7 +2503,12 @@ fn is_usable_global_target(name: &str, proxies: &HashMap<SmolStr, Arc<dyn Proxy>
     !BUILTIN_GLOBAL_POLICIES
         .iter()
         .any(|policy| name.eq_ignore_ascii_case(policy))
-        && proxies.contains_key(name)
+        // A rematch leaf is a routing control, not a dialable outbound —
+        // it stays in the member list (upstream `proxyList` semantics)
+        // but can never be the selector's default pick (issue #974).
+        && proxies
+            .get(name)
+            .is_some_and(|p| p.adapter_type() != AdapterType::Rematch)
 }
 
 /// The target of the LAST top-level `MATCH,<target>` rule — the config's
@@ -11335,6 +11340,33 @@ rules:
             err.to_string().contains("rematch control outbound"),
             "unexpected: {err}"
         );
+    }
+
+    /// A `type: rematch` leaf must not become the synthesized GLOBAL's
+    /// primary: the first member is global mode's default pick, and a
+    /// control outbound cannot carry traffic. It still lists as a member
+    /// (upstream `proxyList` semantics) so an explicit selection fails
+    /// closed at dial (issue #974).
+    #[test]
+    fn auto_global_never_primes_a_rematch_leaf() {
+        let yaml = r#"
+proxies:
+  - { name: inspect, type: rematch, target-rematch-name: stage1 }
+  - { name: node, type: socks5, server: 127.0.0.1, port: 1 }
+rules:
+  - "MATCH,inspect"
+"#;
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw_config(yaml)).expect("a rematch leaf beside a transport builds");
+        let members = proxies["GLOBAL"]
+            .member_proxies()
+            .expect("a select group exposes members");
+        let names: Vec<&str> = members.iter().map(|p| p.name()).collect();
+        assert!(
+            names.contains(&"inspect"),
+            "the rematch leaf stays a GLOBAL member: {names:?}"
+        );
+        assert_eq!(names[0], "node", "the primary is a dialable outbound");
     }
 
     /// A blank `dialer-proxy` on a `type: rematch` node is unset, not a
