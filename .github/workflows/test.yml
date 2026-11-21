@@ -3,9 +3,9 @@ name: Test
 on:
   push:
     branches: [main]
-    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
+    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/**"]
   pull_request:
-    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".github/workflows/**"]
+    paths: ["crates/**", "tests/**", "openwrt/**", "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml", ".github/workflows/**"]
 
 # One active run per ref: a superseded push to the same PR/branch cancels the
 # in-flight run instead of racing it to completion. `push` is limited to
@@ -933,12 +933,12 @@ jobs:
           toolchain: ${{ steps.tc.outputs.channel }}
           targets: x86_64-unknown-linux-musl
 
-      # Keyed on the cargo-zigbuild pin, as in build.yml (see the comment
-      # there).
+      # Keyed on the cargo-zigbuild pin and the `.cargo/config.toml` hash,
+      # as in build.yml (see the comment there for why both are in the key).
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          key: openwrt-e2e-zigbuild-0.23.2
+          key: openwrt-e2e-zigbuild-0.23.2-${{ hashFiles('.cargo/config.toml') }}
 
       - name: Install cargo-zigbuild and zig
         uses: mlugg/setup-zig@v1
@@ -1008,12 +1008,12 @@ jobs:
           toolchain: ${{ steps.tc.outputs.channel }}
           targets: ${{ env.TARGET }}
 
-      # Keyed on the cargo-zigbuild pin, as in build.yml (see the comment
-      # there).
+      # Keyed on the cargo-zigbuild pin and the `.cargo/config.toml` hash,
+      # as in build.yml (see the comment there for why both are in the key).
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          key: size-${{ env.TARGET }}-zigbuild-0.23.2
+          key: size-${{ env.TARGET }}-zigbuild-0.23.2-${{ hashFiles('.cargo/config.toml') }}
 
       - name: Install cargo-zigbuild and zig
         uses: mlugg/setup-zig@v1
