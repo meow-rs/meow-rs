@@ -144,10 +144,13 @@ const MAX_DECOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Sniff the first bytes of a buffer for a zstd "legacy" frame magic
 /// (v0.1–v0.7, the 2016-era pre-1.0 formats), returning the version on a
-/// hit. Magics per the vendored zstd `lib/legacy/zstd_v0*.h`, where
-/// `ZSTD_isLegacy` reads the first word little-endian: v0.1 wrote the word
-/// big-endian (wire bytes `FD 2F B5 1E`); v0.2–v0.7 are `0xFD2FB5NN`
-/// little-endian (wire bytes `NN B5 2F FD`, `NN` = `0x20 + version`).
+/// hit. Only the leading frame is inspected — a legacy frame later in a
+/// concatenated/skippable-prefixed stream still surfaces the decoder's
+/// generic error. Magics per the vendored zstd `lib/legacy/zstd_v0*.h`,
+/// where `ZSTD_isLegacy` reads the first word little-endian: v0.1 wrote
+/// the word big-endian (wire bytes `FD 2F B5 1E`); v0.2–v0.7 are
+/// `0xFD2FB5NN` little-endian (wire bytes `NN B5 2F FD`, `NN` =
+/// `0x20 + version`).
 pub fn legacy_zstd_version(bytes: &[u8]) -> Option<u8> {
     let magic: [u8; 4] = bytes.get(..4)?.try_into().ok()?;
     if magic == [0xFD, 0x2F, 0xB5, 0x1E] {
@@ -161,10 +164,10 @@ pub fn legacy_zstd_version(bytes: &[u8]) -> Option<u8> {
 
 /// Build a streaming decoder over a compressed payload.
 ///
-/// Every `.mrs`/geosite zstd stream funnels here so a legacy frame reports
-/// [`MrsError::LegacyZstd`] by name instead of surfacing from the
-/// `ZSTD_LEGACY_SUPPORT=0` decoder as a bare "unknown frame descriptor"
-/// that points at nothing.
+/// Every `.mrs`/geosite zstd stream funnels here so a legacy *first*
+/// frame reports [`MrsError::LegacyZstd`] by name instead of surfacing
+/// from the `ZSTD_LEGACY_SUPPORT=0` decoder as a bare "unknown frame
+/// descriptor" that points at nothing.
 pub fn zstd_decoder(
     compressed: &[u8],
 ) -> Result<zstd::stream::Decoder<'static, BufReader<Cursor<&[u8]>>>, MrsError> {
