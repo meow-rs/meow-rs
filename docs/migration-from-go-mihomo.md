@@ -62,6 +62,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `proxies:` — AnyTLS | ✓ | TCP + UDP (udp-over-tcp v2, opt in with `udp: true`). In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. |
 | `proxies:` — WireGuard | ✓ | Userspace WG client (vendored boringtun + smoltcp): standard WG + Cloudflare WARP `reserved`. In the `full` bundle, and therefore in the release binaries; excluded from `minimal`. Phase-1: `dns` is ignored and `amnezia-wg-option` is a hard error; `dialer-proxy` is supported (UDP-capable fronts only — a TCP-only front fails the bind at dial time) — see [wireguard.md](wireguard.md). |
 | `proxies:` — TUIC / SSH | ✗ | Not implemented. |
+| `proxies:` — rematch | ✓ | Control outbound (upstream `C.Rematch`): carries no address and never dials — a rule that selects it stamps `Metadata.rematchName` (`target-rematch-name`) and/or switches the active rule list (`target-sub-rule`) and re-enters the scan iteratively. At least one `target-*` field required; `""` is the explicit clear form (clears the marker / returns to the top-level rules), `null`/omitted leaves the field unchanged. No `server`/`port`; `udp:` is ignored (the transition precedes the capability check) and `dialer-proxy` is a hard error. Re-visiting an adapter or exceeding 32 transitions rejects the flow — no slide to a later rule. |
 | `proxy-groups:` — selector, url-test, fallback | ✓ | Fully supported. |
 | `proxy-groups:` — load-balance | ✓ | round-robin + consistent-hashing (M1.C-1). |
 | `proxy-groups:` — relay | ✓ | Chain multiple outbounds (M1.C-2). |
@@ -76,6 +77,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `rules:` — PROCESS-NAME-WILDCARD, PROCESS-PATH-WILDCARD | ✓ | Whole-field `*`/`?` glob (`,`-unprotected fixed fields; a fourth field is parsed as upstream params and ignored). |
 | `rules:` — IN-NAME, IN-TYPE, IN-PORT, IN-USER | ✓ | Named listeners and auth metadata are wired. |
 | `rules:` — SUB-RULE | ✓ | Named rule subsets with cycle detection, including the conditional `SUB-RULE,(<cond>),<name>` form. Condition leaves accept every rule type except `MATCH`/`SUB-RULE` — upstream's logic-leg exclusion set. **Extensions:** a fourth field `SUB-RULE,(<cond>),<name>,<target>` applies a fallback target when the entered block exhausts (upstream has no such field); conditions additionally accept infix `&`/`|`/`!` (upstream parses only the prefix `AND`/`OR`/`NOT` forms). |
+| `rules:` — REMATCH-NAME | ✓ | Exact, case-sensitive compare against `Metadata.rematchName` — the marker a `type: rematch` node stamps on the flow. `/` separates alternatives (each token trimmed); an unset marker never matches, and `*`/`|` are literal bytes. Works standalone, inside `AND`/`OR`/`NOT` legs and `SUB-RULE` conditions, and through rule providers. |
 | `rules:` — AND, OR, NOT | ✓ | Logic composition supported. |
 | `rules:` — MATCH | ✓ | Fully supported. |
 | `rule-providers:` — http | ✓ | With interval refresh (M1.D-5). |

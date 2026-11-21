@@ -442,6 +442,31 @@ A configurable direct outbound. Useful to pin specific DNS servers for a route.
 
 ---
 
+## Rematch — `rematch`
+
+A control outbound, not a transport: it carries no `server`/`port` and never
+opens a socket. When a [rule](./rules#rematch-routing) selects it, the flow
+re-enters the rule scan with the named fields applied.
+
+| Field | Type | Required | Default | Notes |
+| --- | --- | --- | --- | --- |
+| `target-rematch-name` | string | * | — | Stamps the flow's `rematchName` marker — what `REMATCH-NAME` rules compare. `""` clears the marker |
+| `target-sub-rule` | string | * | — | Makes the named `sub-rules:` block the active list. `""` returns to the top-level rules |
+
+\* At least one of the two is required. Omitted or `null` leaves the
+corresponding field unchanged; strings are used verbatim (quote numbers).
+`udp:` and socket options are ignored, and `dialer-proxy` is rejected — there
+is no connection to carry it.
+
+```yaml
+- name: inspect
+  type: rematch
+  target-rematch-name: stage1
+  target-sub-rule: second-pass
+```
+
+---
+
 ## TLS & privacy features
 
 Across the TLS-capable protocols meow-rs supports:
