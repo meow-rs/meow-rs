@@ -2210,6 +2210,19 @@ fn collect_dialer_edges(
     Ok(DialerEdges { declared, by_index })
 }
 
+/// The `dialer-proxy` edges [`collect_dialer_edges`] will actually bind
+/// at build — the verbatim/validation view of the same graph, so a
+/// shadowed duplicate's, a built-in-shadowing entry's or a rematch
+/// node's raw `dialer-proxy` key is not judged as an edge it never
+/// becomes (issue #974 review). Lenient collection: a malformed value
+/// resolves to the sentinel target instead of erroring, matching the
+/// lenient boot it would commit under.
+pub fn declared_dialer_edges(
+    raw_proxies: &[HashMap<String, serde_json::Value>],
+) -> Result<Vec<(SmolStr, SmolStr)>, anyhow::Error> {
+    collect_dialer_edges(raw_proxies, false).map(|edges| edges.declared)
+}
+
 /// Validate the `dialer-proxy` edges [`collect_dialer_edges`] declared, now
 /// that every leaf has been built — the check half of the old
 /// `apply_dialer_proxies` pass. The chains themselves are already applied:

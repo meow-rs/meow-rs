@@ -5485,21 +5485,31 @@ async fn put_configs(
         // The reverse edge is the same hard defect the build's
         // `apply_dialer_proxies_validate` reports: a `dialer-proxy`
         // naming a statically known rematch leaf can never carry the
-        // hop — a rematch re-enters routing, it does not dial. A
-        // group-named front keeps its dial-time verdict, as in the
-        // build (issue #974).
-        for node in raw_config.proxies.as_deref().unwrap_or(&[]) {
-            let Some(dialer) = node.get("dialer-proxy").and_then(|v| v.as_str()) else {
-                continue;
-            };
-            if rematch_names.contains(dialer.trim()) {
+        // hop — a rematch re-enters routing, it does not dial. Judge the
+        // edges that will actually bind — last-wins dedupe, built-in
+        // shadows and rematch nodes skipped like the build does — not
+        // every raw `dialer-proxy` key (issue #974).
+        match meow_config::declared_dialer_edges(raw_config.proxies.as_deref().unwrap_or(&[])) {
+            Ok(edges) => {
+                for (_, dialer) in edges {
+                    if rematch_names.contains(dialer.as_str()) {
+                        return reload_rejected(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "config validation failed under force, and the candidate's \
+                                 dialer-proxy edges are structurally unsafe to commit verbatim: \
+                                 dialer-proxy '{dialer}' is a rematch control outbound",
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
                 return reload_rejected(
                     StatusCode::BAD_REQUEST,
                     &format!(
                         "config validation failed under force, and the candidate's \
-                         dialer-proxy edges are structurally unsafe to commit verbatim: \
-                         dialer-proxy '{}' is a rematch control outbound",
-                        dialer.trim(),
+                         dialer-proxy edges are structurally unsafe to commit verbatim: {e}"
                     ),
                 );
             }

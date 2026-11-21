@@ -12503,6 +12503,49 @@ async fn put_configs_force_gates_malformed_rematch() {
         StatusCode::NO_CONTENT,
         "a group member's dynamic rematch pick is not a static-membership defect"
     );
+
+    // The gate judges the edges that will actually bind, like the
+    // build: a shadowed duplicate's raw `dialer-proxy` never becomes an
+    // edge — the last declaration wins — so the candidate commits
+    // rather than tripping the rematch-edge check (issue #974).
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: inspect, type: rematch, target-rematch-name: x}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: inspect}}\n\
+             \x20 - {{name: node, type: direct}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a shadowed duplicate's dialer-proxy is no edge the build binds"
+    );
+
+    // Same for a leaf shadowing a built-in: the build drops the entry,
+    // so its `dialer-proxy` never becomes an edge either.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: inspect, type: rematch, target-rematch-name: x}}\n\
+             \x20 - {{name: DIRECT, type: direct, dialer-proxy: inspect}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a built-in-shadowed node's dialer-proxy is no edge the build binds"
+    );
 }
 
 /// A plain `PUT /configs` (no `force`) rebuilds rematch content live:
