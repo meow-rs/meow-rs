@@ -571,17 +571,53 @@ impl ProxyAdapter for RelayGroup {
     fn health(&self) -> &ProxyHealth {
         &self.health
     }
+
+    /// A relay resolves its hops lazily per-dial (metadata may differ per
+    /// connection), so there is no single member to report — upstream
+    /// `Relay` likewise never overrode `Unwrap`, and a PASS hop deep in a
+    /// chain still surfaces as a loud `RelayHopFailed` at dial rather
+    /// than a silent rule skip.
+    ///
+    /// The one hop this walk must surface is a resolved `type: rematch`
+    /// leaf: it can never act as a transport hop, and reporting it lets
+    /// the match-time probe commit the transition instead of scanning
+    /// the chain as a dialable target (issue #974). A re-pick of the
+    /// same chain after the transition then trips the visited-name
+    /// cycle guard — fail-closed, the same verdict the dial path's
+    /// undialable-hop gate would reach.
+    ///
+    /// The walk is always a peek (`touch` ignored): `flatten_hops` owns
+    /// member resolution on the real dial, and committing here would
+    /// advance round-robin picks a second time when the splice later
+    /// resolves the same members. Member picks are popped DFS in
+    /// declared order so the answer is the *first* rematch hop; nested
+    /// relays splice their members inline through the downcast, and the
+    /// shared pop budget bounds hand-built cyclic graphs config already
+    /// rejects (`resolve_proxy` carries the same assumption).
+    fn unwrap_proxy(&self, metadata: &Metadata, _touch: bool) -> Option<Arc<dyn Proxy>> {
+        const MAX_PROBE_POPS: usize = 256;
+        let mut stack: Vec<Arc<dyn Proxy>> = self.proxies.iter().rev().cloned().collect();
+        for _ in 0..MAX_PROBE_POPS {
+            let cur = stack.pop()?;
+            if cur.rematch_action().is_some() {
+                return Some(cur);
+            }
+            if let Some(relay) = cur
+                .as_any()
+                .and_then(|a| a.downcast_ref::<RelayGroup>())
+            {
+                stack.extend(relay.proxies.iter().rev().cloned());
+                continue;
+            }
+            if let Some(next) = cur.unwrap_proxy(metadata, false) {
+                stack.push(next);
+            }
+        }
+        None
+    }
 }
 
 impl Proxy for RelayGroup {
-    // Deliberately no `unwrap_proxy` override: a relay resolves its hops
-    // lazily per-dial (metadata may differ per connection), so a
-    // match-time peek cannot name "the" member. Upstream `Relay` likewise
-    // never overrode `Unwrap` — a PASS hop deep in a chain surfaces as a
-    // loud `RelayHopFailed` at dial (flattening rejects nop hops) rather
-    // than a silent rule skip. Match-time `unwraps_to(Pass)` therefore
-    // sees a relay group as opaque — the rule materializes and fails
-    // closed at dial.
     fn alive(&self) -> bool {
         self.health.alive()
     }

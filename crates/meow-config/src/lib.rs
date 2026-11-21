@@ -3223,6 +3223,49 @@ fn build_proxy_layer(
         .map(|(_, proxy)| proxy)
         .collect();
 
+    // A statically known `type: rematch` hop can never carry a relay
+    // chain — the leaf's only action is a routing re-entry, not a dial
+    // (issue #974: "Rematch is not a meow relay transport hop; reject
+    // statically known uses"). Both static memberships a relay can have
+    // — a declared `proxies:` name resolving to the leaf, and the
+    // `include-all-proxies` expansion — are checked here so the verdict
+    // is a hard error in both build modes, ahead of the lenient group
+    // passes that would warn-drop it. `parse_relay_group` repeats the
+    // member-vec check for its own callers. A *group* member's dynamic
+    // rematch pick is the probe's business instead:
+    // `RelayGroup::unwrap_proxy` surfaces it and the cycle guard closes
+    // the loop.
+    for group in raw_groups {
+        if group.group_type != "relay" {
+            continue;
+        }
+        for member in group.proxies.as_deref().unwrap_or(&[]) {
+            if proxies
+                .get(member.as_str())
+                .is_some_and(|p| p.rematch_action().is_some())
+            {
+                anyhow::bail!(
+                    "relay group '{}': member '{member}' is a rematch control \
+                     outbound — it cannot be a relay transport hop",
+                    group.name
+                );
+            }
+        }
+        if group.include_all_proxies.unwrap_or(false) {
+            if let Some(hop) = include_all_proxies
+                .iter()
+                .find(|p| p.rematch_action().is_some())
+            {
+                anyhow::bail!(
+                    "relay group '{}': include-all-proxies supplies rematch control \
+                     outbound '{}' — it cannot be a relay transport hop",
+                    group.name,
+                    hop.name()
+                );
+            }
+        }
+    }
+
     // Strict mode: a `use:` name that resolves to nothing is a permanent
     // miss — providers are all loaded before groups, so check upfront rather
     // than letting the lenient group passes silently drop the reference.
@@ -11140,6 +11183,58 @@ rules:
         };
         assert!(
             err.to_string().contains("duplicate name") && err.to_string().contains('s'),
+            "unexpected: {err}"
+        );
+    }
+
+    /// A `type: rematch` leaf is a routing control, never a relay
+    /// transport hop (issue #974): a declared member naming one is a
+    /// structural error in *both* modes — a relaxed warn-drop would
+    /// silently remove the chain's fail-closed semantics.
+    #[test]
+    fn rejects_static_rematch_relay_member() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: inspect, type: rematch, target-rematch-name: stage1 }}
+  - {{ name: node, type: direct }}
+proxy-groups:
+  - {{ name: chain, type: relay, proxies: [node, inspect] }}
+rules:
+  - "MATCH,chain"
+"#,
+            );
+            let Err(err) = rebuild_from_raw(&raw_config(&yaml)) else {
+                panic!("strict={strict}: a static rematch relay hop must fail the build");
+            };
+            assert!(
+                err.to_string().contains("rematch control outbound"),
+                "strict={strict}: unexpected: {err}"
+            );
+        }
+    }
+
+    /// The same membership arriving through `include-all-proxies` keeps
+    /// the gate — the expansion feeds the member vec `parse_relay_group`
+    /// checks.
+    #[test]
+    fn rejects_include_all_rematch_relay_member() {
+        let yaml = r#"
+proxies:
+  - { name: inspect, type: rematch, target-rematch-name: stage1 }
+  - { name: node, type: direct }
+proxy-groups:
+  - { name: chain, type: relay, include-all-proxies: true }
+rules:
+  - "MATCH,chain"
+"#;
+        let Err(err) = rebuild_from_raw(&raw_config(yaml)) else {
+            panic!("an include-all rematch relay hop must fail the build");
+        };
+        assert!(
+            err.to_string().contains("rematch control outbound"),
             "unexpected: {err}"
         );
     }

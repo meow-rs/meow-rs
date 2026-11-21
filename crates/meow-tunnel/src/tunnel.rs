@@ -4796,6 +4796,95 @@ proxy-groups:
             assert_eq!(md.rematch_name(), "");
         }
 
+        /// A relay chain is opaque to the match-time walk only for
+        /// transports — a member *group* selecting a `type: rematch`
+        /// leaf is the one pick it must surface so the scan transitions
+        /// instead of treating the chain as a dialable target (issue
+        /// #974). Here pass 2's marker steers the flow to DIRECT.
+        #[tokio::test]
+        async fn relay_member_group_pick_of_rematch_transitions() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1}
+  - {name: node, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+proxy-groups:
+  - {name: sel, type: select, proxies: [inspect]}
+  - {name: chain, type: relay, proxies: [node, sel]}
+rules:
+  - REMATCH-NAME,stage1,DIRECT
+  - DOMAIN-SUFFIX,example.test,chain
+  - MATCH,REJECT
+"#,
+            );
+            let (adapter, md) = routed(&tunnel, "example.test").await;
+            assert_eq!(
+                adapter, "DIRECT",
+                "the picked rematch hop must transition, not dial the chain"
+            );
+            assert_eq!(md.rematch_name(), "stage1");
+        }
+
+        /// The same chain with nothing steering the marker away: the
+        /// second pass re-picks `inspect`, tripping the visited-name
+        /// guard — fail-closed, the verdict the dial path's
+        /// undialable-hop gate would have reached anyway (issue #974).
+        #[tokio::test]
+        async fn relay_rematch_repick_fails_closed_via_cycle_guard() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1}
+  - {name: node, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+proxy-groups:
+  - {name: sel, type: select, proxies: [inspect]}
+  - {name: chain, type: relay, proxies: [node, sel]}
+rules:
+  - MATCH,chain
+"#,
+            );
+            let (adapter, _) = routed(&tunnel, "any.test").await;
+            assert_eq!(adapter, "REJECT");
+        }
+
+        /// A UDP flow to a relay whose resolved chain ends in rematch
+        /// transitions too — previously the `support_udp` peek read the
+        /// undialable chain as `false` and the scan slid to a later
+        /// `MATCH,DIRECT` (issue #974 fail-open).
+        #[tokio::test]
+        async fn udp_relay_rematch_transitions_instead_of_sliding() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: b}
+  - {name: node, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+proxy-groups:
+  - {name: sel, type: select, proxies: [inspect]}
+  - {name: chain, type: relay, proxies: [node, sel]}
+rules:
+  - DOMAIN-SUFFIX,example.test,chain
+  - MATCH,DIRECT
+sub-rules:
+  b:
+    - REMATCH-NAME,stage1,REJECT
+    - MATCH,DIRECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            let target = tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("route resolves");
+            assert_eq!(target.adapter.name(), "REJECT");
+            assert_eq!(md.rematch_name(), "stage1");
+        }
+
         /// A UDP flow takes the transition too — the leaf's
         /// `support_udp()` claim exists so the capability gate never
         /// preempts it — and the terminal target then applies the

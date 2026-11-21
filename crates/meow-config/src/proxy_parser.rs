@@ -4867,6 +4867,21 @@ fn parse_relay_group(
         ));
     }
 
+    // Hard-error: a statically declared `type: rematch` hop can never
+    // carry the chain — the leaf's only action is a routing re-entry,
+    // not a dial (issue #974: "Rematch is not a meow relay transport
+    // hop; reject statically known uses"). A *group* member's dynamic
+    // rematch pick is the probe's business: `RelayGroup::unwrap_proxy`
+    // surfaces it so the scan transitions, and the cycle guard then
+    // closes the loop fail-closed.
+    if let Some(hop) = proxies.iter().find(|p| p.rematch_action().is_some()) {
+        return Err(format!(
+            "relay group '{name}': member '{}' is a rematch control outbound — \
+             it cannot be a relay transport hop",
+            hop.name()
+        ));
+    }
+
     // Warn-once on inert fields (Class B — relay has no probe loop and
     // consumes no provider slots).
     warn_inert_health_fields("relay", name, config);
