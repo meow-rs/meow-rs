@@ -3597,6 +3597,12 @@ fn prefetch_proxy_map(
     raw: &raw::RawConfig,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selection: Option<&meow_proxy::SelectorWriter>,
+    // The cell provider-sourced nodes' `dialer-proxy` targets resolve
+    // against — the same handle the providers were loaded with. The
+    // layer's own `registry` covers static `proxies:` chains only, so
+    // without publishing here a provider node's front hop resolves to
+    // nothing during the prefetch window (issue #974 review).
+    provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
 ) -> Result<Option<PrefetchProxies>, anyhow::Error> {
     // No `proxies:` and no `proxy-groups:` means nothing to tunnel
     // through — named `proxy:` lookups and the default proxy all come
@@ -3625,6 +3631,10 @@ fn prefetch_proxy_map(
         raw.strict.unwrap_or(false),
     )?;
     registry.publish(Arc::new(map.clone()));
+    // The same snapshot into the provider-node cell: their front hops
+    // resolve against it until the first routing install publishes the
+    // live map over it.
+    provider_dialer_registry.publish(Arc::new(map.clone()));
     Ok(Some(PrefetchProxies {
         map,
         _registry: registry,
@@ -3641,12 +3651,19 @@ async fn prefetch_proxy_layer_async(
     raw: &raw::RawConfig,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selection: Option<&meow_proxy::SelectorWriter>,
+    provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
 ) -> Result<Option<Arc<PrefetchProxies>>, anyhow::Error> {
     let raw = raw.clone();
     let providers = providers.clone();
     let selection = selection.cloned();
+    let provider_dialer_registry = provider_dialer_registry.clone();
     spawn_blocking_with_current_dispatcher(move || {
-        prefetch_proxy_map(&raw, &providers, selection.as_ref())
+        prefetch_proxy_map(
+            &raw,
+            &providers,
+            selection.as_ref(),
+            &provider_dialer_registry,
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("prefetch proxy-layer build task failed: {e}"))?
@@ -7367,7 +7384,13 @@ async fn build_config_inner(
     // only when at least one of them could need it — a full layer costs an
     // adapter construction per `proxies:` entry (issue #533).
     let prefetch_proxies = if prefetch_proxy_layer_needed(&raw, &geodata) {
-        prefetch_proxy_layer_async(&raw, &proxy_providers, selector_writer.as_ref()).await?
+        prefetch_proxy_layer_async(
+            &raw,
+            &proxy_providers,
+            selector_writer.as_ref(),
+            &provider_dialer_registry,
+        )
+        .await?
     } else {
         None
     };
@@ -8117,7 +8140,7 @@ mod dialer_proxy_tests {
         .unwrap();
 
         let providers = HashMap::new();
-        let mini = prefetch_proxy_map(&raw, &providers, None)
+        let mini = prefetch_proxy_map(&raw, &providers, None, &Default::default())
             .expect("layer builds")
             .expect("proxies configured");
         let metadata = meow_common::Metadata {
@@ -8177,7 +8200,7 @@ mod dialer_proxy_tests {
         let store = meow_proxy::SelectorStore::open(dir.path().join("sel.json"));
         store.set("G", "B2");
         let writer = meow_proxy::SelectorWriter::standalone(store);
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&writer))
+        let layer = prefetch_proxy_map(&raw, &providers, Some(&writer), &Default::default())
             .expect("layer builds")
             .expect("proxies configured");
         let geo = geodata::parse_geodata(&raw).unwrap();
@@ -8204,7 +8227,7 @@ mod dialer_proxy_tests {
         let empty_dir = tempfile::tempdir().unwrap();
         let empty_store = meow_proxy::SelectorStore::open(empty_dir.path().join("sel.json"));
         let empty_writer = meow_proxy::SelectorWriter::standalone(empty_store);
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_writer))
+        let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_writer), &Default::default())
             .expect("layer builds")
             .expect("proxies configured");
         let geo = geodata::parse_geodata(&raw).unwrap();
@@ -8338,7 +8361,7 @@ mod dialer_proxy_tests {
             "groups alone must not short-circuit the layer"
         );
 
-        let layer = prefetch_proxy_map(&raw, &providers, None)
+        let layer = prefetch_proxy_map(&raw, &providers, None, &Default::default())
             .expect("layer builds")
             .expect("provider-fed groups produce a layer");
         let GeodataEgress::Proxy {
@@ -8368,6 +8391,65 @@ mod dialer_proxy_tests {
             ..Default::default()
         };
         assert!(proxy.dial_tcp(&metadata).await.is_err());
+    }
+
+    /// A provider node's `dialer-proxy` binds the provider's registry
+    /// cell, not the prefetch layer's own: the publish must reach that
+    /// cell too or the node's front hop resolves to nothing and a fetch
+    /// through it cannot dial (issue #974 review). The fetch itself
+    /// fails — the counting listener accepts then drops — but the TCP
+    /// connect to B proves `pn` dialled its front hop.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
+    #[tokio::test]
+    async fn prefetch_layer_resolves_provider_node_front_hops() {
+        let (port_b, b_hits) = counting_listener().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - { name: pn, type: trojan, server: 127.0.0.1, port: 9, \
+             password: x, dialer-proxy: B }\n",
+        )
+        .unwrap();
+        let def: raw::RawProxyProvider = serde_saphyr::from_str(&format!(
+            "type: file\npath: '{}'",
+            dir.path().join("nodes.yaml").display()
+        ))
+        .unwrap();
+        let provider_registry = meow_proxy::dialer::ProxyRegistry::default();
+        let provider = ProxyProvider::new(
+            "p",
+            &def,
+            Some(dir.path()),
+            false,
+            false,
+            provider_registry.clone(),
+        )
+        .unwrap();
+        provider.refresh().await.unwrap();
+        let providers: HashMap<String, Arc<ProxyProvider>> =
+            [("p".to_string(), Arc::new(provider))]
+                .into_iter()
+                .collect();
+
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
+            "proxies:\n\
+             \x20 - {{ name: B, type: trojan, server: 127.0.0.1, port: {port_b}, password: x }}\n\
+             proxy-groups:\n  - {{ name: G, type: select, use: [p] }}\n\
+             rule-providers:\n\
+             \x20 rs:\n    type: http\n    behavior: domain\n    \
+             url: http://127.0.0.1:9/rs.yaml\n    path: ./rs.yaml\n    proxy: G\n"
+        ))
+        .unwrap();
+
+        let layer = prefetch_proxy_map(&raw, &providers, None, &provider_registry)
+            .expect("layer builds")
+            .expect("proxies configured");
+        let _ = prefetch_rule_provider_payloads_async(&raw, None, Some(Arc::new(layer))).await;
+        assert!(
+            hits(&b_hits) >= 1,
+            "the provider node's dialer-proxy front resolves via the prefetch publish"
+        );
     }
 
     /// End-to-end wiring: a provider's `proxy:` key resolves through the
@@ -8401,7 +8483,7 @@ mod dialer_proxy_tests {
 
         let providers = HashMap::new();
         let layer = Arc::new(
-            prefetch_proxy_map(&raw, &providers, None)
+            prefetch_proxy_map(&raw, &providers, None, &Default::default())
                 .expect("layer builds")
                 .expect("proxies configured"),
         );
