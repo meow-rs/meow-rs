@@ -126,7 +126,7 @@ pub(super) async fn run_flow(args: FlowArgs, mut rx: mpsc::Receiver<Bytes>) -> R
         return Err("unmapped fake-ip destination".into());
     }
     inner.pre_resolve(&mut metadata).await;
-    inner.resolve_udp_dst(&mut metadata).await;
+    let probe_route = inner.resolve_udp_dst(&mut metadata).await;
     let Some(dst_ip) = metadata.dst_ip else {
         return Err(format!(
             "dst_ip not resolved for {}",
@@ -135,12 +135,18 @@ pub(super) async fn run_flow(args: FlowArgs, mut rx: mpsc::Receiver<Bytes>) -> R
     };
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
 
+    // A `resolve_udp_dst` probe pins its generation — commit on it so the
+    // direct-nameserver verdict and the route agree (issue #974).
+    let resolved = match probe_route.as_ref() {
+        Some(route) => inner.resolve_proxy_flow_on(route, &mut metadata).await,
+        None => inner.resolve_proxy_flow(&mut metadata).await,
+    };
     let Some(meow_tunnel::ResolvedTarget {
         adapter: proxy,
         rule_name,
         rule_payload,
         route: _route,
-    }) = inner.resolve_proxy_flow(&mut metadata).await
+    }) = resolved
     else {
         return Err(format!(
             "no matching rule for {}",

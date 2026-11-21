@@ -1228,7 +1228,7 @@ async fn run_ss_udp_flow<S>(
     // UDP keeps the eager pre_resolve (no lazy enrichment): the writer
     // needs a resolved dst_ip regardless of what the rules demand.
     inner.pre_resolve(&mut metadata).await;
-    inner.resolve_udp_dst(&mut metadata).await;
+    let probe_route = inner.resolve_udp_dst(&mut metadata).await;
     let Some(dst_ip) = metadata.dst_ip else {
         debug!(
             "ss udp flow: dst_ip not resolved for {}",
@@ -1247,12 +1247,18 @@ async fn run_ss_udp_flow<S>(
     // retain a stale route table (or adapter/rule Arcs) for its whole
     // idle window.
     let conn: Arc<dyn ProxyPacketConn> = {
+        // A `resolve_udp_dst` probe pins its generation — commit on it so
+        // the direct-nameserver verdict and the route agree (issue #974).
+        let resolved = match probe_route.as_ref() {
+            Some(route) => inner.resolve_proxy_flow_on(route, &mut metadata).await,
+            None => inner.resolve_proxy_flow(&mut metadata).await,
+        };
         let Some(ResolvedTarget {
             adapter: proxy,
             rule_name,
             rule_payload,
             route: _route,
-        }) = inner.resolve_proxy_flow(&mut metadata).await
+        }) = resolved
         else {
             debug!(
                 "ss udp flow: no matching rule for {}",

@@ -670,6 +670,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     // UDP keeps the eager pre_resolve (no lazy enrichment): the outbound
     // packet API below needs a resolved dst_ip regardless of what the rules
     // demand — including after a fake-IP was rewritten back to a hostname.
+    let mut probe_route = None;
     tokio::select! {
         biased;
         () = flush.flushed() => {
@@ -680,7 +681,7 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
         }
         () = async {
             inner.pre_resolve(&mut metadata).await;
-            inner.resolve_udp_dst(&mut metadata).await;
+            probe_route = inner.resolve_udp_dst(&mut metadata).await;
         } => {}
     }
     let Some(dst_ip) = metadata.dst_ip else {
@@ -693,13 +694,21 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
     let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
 
     // Non-hijacked client traffic follows the same policy on every port.
+    // A `resolve_udp_dst` probe pins its route generation — commit on it
+    // so the direct-nameserver verdict and the route agree (issue #974).
+    let resolve = async {
+        match probe_route.as_ref() {
+            Some(route) => inner.resolve_proxy_flow_on(route, &mut metadata).await,
+            None => inner.resolve_proxy_flow(&mut metadata).await,
+        }
+    };
     let target = tokio::select! {
         biased;
         () = flush.flushed() => {
             drop_held(&held);
             return Ok(());
         }
-        target = inner.resolve_proxy_flow(&mut metadata) => target,
+        target = resolve => target,
     };
     let Some(ResolvedTarget {
         adapter: proxy,

@@ -637,17 +637,23 @@ impl TunnelInner {
     /// `ListenPacketContext` resolves via `DirectHostResolver`), so a
     /// main-side failure must not drop it. Other routes never reach the
     /// direct resolver, which keeps proxied names off that upstream.
-    pub async fn resolve_udp_dst(&self, metadata: &mut Metadata) {
+    /// Returns the pinned route-table generation when the probe ran: the
+    /// caller's committed resolve must reuse it via
+    /// [`Self::resolve_proxy_flow_on`] — a reload landing between the two
+    /// must not split the "ends DIRECT" verdict from the route the flow
+    /// actually commits to (issue #974). `None` means no probe ran, so a
+    /// live-generation resolve carries no split window.
+    pub async fn resolve_udp_dst(&self, metadata: &mut Metadata) -> Option<Arc<RouteTable>> {
         if metadata.dst_ip.is_some() || metadata.host.is_empty() {
-            return;
+            return None;
         }
         let resolver = self.resolver();
         metadata.dst_ip = resolver.resolve_ip_real(&metadata.host).await;
         if metadata.dst_ip.is_some() {
-            return;
+            return None;
         }
         let Some(direct) = resolver.direct_resolver().map(Arc::clone) else {
-            return;
+            return None;
         };
         // Probe only — "does this route end DIRECT?" — so it must not
         // record the hit `resolve_proxy` counts: every UDP caller resolves
@@ -656,12 +662,16 @@ impl TunnelInner {
         // review). The probe runs on a clone: its rematch transitions
         // stamp `rematch_name`, which only the kept resolution may write.
         // The shared `flow_lookup` memo still carries across.
+        let route = self.route();
         let mut probe_metadata = metadata.clone();
-        let Some(target) = self.resolve_proxy_inner(&mut probe_metadata, false).await else {
-            return;
+        let Some(target) = self
+            .resolve_proxy_inner_on(&route, &mut probe_metadata, false)
+            .await
+        else {
+            return Some(route);
         };
         if !routes_direct(target.adapter.as_ref(), &probe_metadata) {
-            return;
+            return Some(route);
         }
         metadata.dst_ip = direct.resolve_ip_real(&metadata.host).await;
         if let Some(ip) = metadata.dst_ip {
@@ -670,6 +680,7 @@ impl TunnelInner {
                 metadata.host, ip
             );
         }
+        Some(route)
     }
 
     /// Resolve which proxy to use for the given metadata.
@@ -708,6 +719,18 @@ impl TunnelInner {
         self.resolve_proxy_inner(metadata, true).await
     }
 
+    /// [`Self::resolve_proxy_flow`] resolved against a caller-pinned route
+    /// generation — pair it with the snapshot [`Self::resolve_udp_dst`]
+    /// returns so the probe and the committed decision cannot split
+    /// across a reload (issue #974).
+    pub async fn resolve_proxy_flow_on(
+        &self,
+        route: &Arc<RouteTable>,
+        metadata: &mut Metadata,
+    ) -> Option<ResolvedTarget> {
+        self.resolve_proxy_inner_on(route, metadata, true).await
+    }
+
     /// [`Self::resolve_proxy_flow`] with the hit bookkeeping optional:
     /// `record_hit = false` for the `resolve_udp_dst` "does this route end
     /// DIRECT" probe, whose caller resolves for real right after — counting
@@ -723,8 +746,12 @@ impl TunnelInner {
     /// table fails closed ("proxy NAME not found" upstream) rather than
     /// slide to DIRECT. A UDP flow whose forced target cannot relay UDP
     /// fails the same way — it must not fall back to the main rules.
-    fn resolve_listener_proxy(&self, metadata: &Metadata, record_hit: bool) -> ResolvedTarget {
-        let route = self.route();
+    fn resolve_listener_proxy(
+        &self,
+        route: &Arc<RouteTable>,
+        metadata: &Metadata,
+        record_hit: bool,
+    ) -> ResolvedTarget {
         let name = metadata.special_proxy();
         // Built-ins resolve through the map like any other name: the
         // published DIRECT carries the build's resolver slot and
@@ -758,7 +785,7 @@ impl TunnelInner {
             adapter,
             rule_name: SmolStr::new_static("ListenerProxy"),
             rule_payload: SmolStr::from(name),
-            route,
+            route: Arc::clone(route),
         }
     }
 
@@ -824,6 +851,21 @@ impl TunnelInner {
         metadata: &mut Metadata,
         record_hit: bool,
     ) -> Option<ResolvedTarget> {
+        let route = self.route();
+        self.resolve_proxy_inner_on(&route, metadata, record_hit)
+            .await
+    }
+
+    /// [`Self::resolve_proxy_inner`] against a caller-pinned route
+    /// generation — `resolve_udp_dst`'s probe and the flow's committed
+    /// resolve share one snapshot so a mid-window reload cannot split the
+    /// direct-nameserver verdict from the routing decision (issue #974).
+    async fn resolve_proxy_inner_on(
+        &self,
+        route: &Arc<RouteTable>,
+        metadata: &mut Metadata,
+        record_hit: bool,
+    ) -> Option<ResolvedTarget> {
         // Sample the live `find-process-mode` once for the whole
         // resolution — a PATCH lands on the next flow, not mid-scan
         // (issue #974).
@@ -840,7 +882,7 @@ impl TunnelInner {
             if process_mode == ProcessLookupMode::Always {
                 metadata.flow_lookup.record_process(None);
             }
-            return Some(self.resolve_listener_proxy(metadata, record_hit));
+            return Some(self.resolve_listener_proxy(route, metadata, record_hit));
         }
         if record_hit {
             self.maybe_lookup_flow_process(metadata, process_mode).await;
@@ -853,11 +895,10 @@ impl TunnelInner {
                     adapter: Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
                     rule_name: SmolStr::new_static("Direct"),
                     rule_payload: SmolStr::default(),
-                    route: self.route(),
+                    route: Arc::clone(route),
                 })
             }
             TunnelMode::Global => {
-                let route = self.route();
                 let (adapter, rule_name) = if let Some(proxy) = route.proxies.get("GLOBAL") {
                     (
                         Arc::clone(proxy) as Arc<dyn ProxyAdapter>,
@@ -874,18 +915,17 @@ impl TunnelInner {
                     adapter,
                     rule_name,
                     rule_payload: SmolStr::default(),
-                    route,
+                    route: Arc::clone(route),
                 })
             }
             TunnelMode::Rule => {
                 // One route-table snapshot — rules + index + proxies all read
                 // from a consistent table. Replaces three RwLock acquisitions.
-                let route = self.route();
                 // Eager callers own destination resolution (the UDP NAT key
                 // is built from `resolve_udp_dst` output), so IP demand may
                 // not stop the scan — only process demand may.
                 Some(
-                    self.rule_route(&route, metadata, false, process_mode, record_hit)
+                    self.rule_route(route, metadata, false, process_mode, record_hit)
                         .await,
                 )
             }
@@ -3382,6 +3422,97 @@ mod tests {
             1,
             "the real resolution counts once"
         );
+    }
+
+    /// The probe's route generation is pinned for the commit: a reload
+    /// between `resolve_udp_dst` and `resolve_proxy_flow_on` must not
+    /// split the direct-nameserver verdict from the route the flow
+    /// actually takes (issue #974).
+    #[tokio::test]
+    async fn resolve_udp_dst_pins_the_probe_generation() {
+        use meow_dns::HostEntry;
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+        use std::net::IpAddr;
+
+        let direct_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+        hosts.insert("swap.test", vec![direct_ip].into());
+        let direct = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+        // No upstreams and no hosts: the direct-resolver probe runs.
+        let mut main = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+        );
+        main.set_direct_resolver(Arc::new(direct));
+        let tunnel = Tunnel::new(Arc::new(main));
+
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies.clone(),
+            vec![
+                Box::new(DomainSuffixRule::new("swap.test", "DIRECT")),
+                Box::new(FinalRule::new("REJECT")),
+            ],
+            Default::default(),
+            Default::default(),
+        );
+        let probed = tunnel.route_snapshot();
+
+        let mut meta = Metadata {
+            network: Network::Udp,
+            host: "swap.test".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let pin = tunnel
+            .inner()
+            .resolve_udp_dst(&mut meta)
+            .await
+            .expect("a direct-route probe returns its pinned generation");
+        assert!(
+            Arc::ptr_eq(&pin, &probed),
+            "the pin is the generation the probe consulted"
+        );
+        assert_eq!(meta.dst_ip, Some(direct_ip));
+
+        // A reload lands mid-window: the same host now routes to REJECT.
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("swap.test", "REJECT")),
+                Box::new(FinalRule::new("DIRECT")),
+            ],
+            Default::default(),
+            Default::default(),
+        );
+        assert!(!Arc::ptr_eq(&pin, &tunnel.route_snapshot()));
+
+        let committed = tunnel
+            .inner()
+            .resolve_proxy_flow_on(&pin, &mut meta)
+            .await
+            .expect("a rule-mode flow resolves");
+        assert_eq!(
+            committed.adapter.adapter_type(),
+            AdapterType::Direct,
+            "the commit follows the generation that answered 'ends DIRECT'"
+        );
+
+        // The live generation — what an unpinned commit would see —
+        // disagrees, proving the pin is what kept the verdict coherent.
+        let mut live = meta.clone();
+        let unpinned = tunnel
+            .inner()
+            .resolve_proxy_flow(&mut live)
+            .await
+            .expect("a rule-mode flow resolves");
+        assert_eq!(unpinned.adapter.adapter_type(), AdapterType::Reject);
     }
 
     /// Front-hop mock for the provider-dialer e2e: records every
