@@ -322,6 +322,14 @@ impl ProxyAdapter for DialerProxyAdapter {
     fn client_fingerprint(&self) -> Option<&str> {
         self.inner.client_fingerprint()
     }
+
+    /// Transparent like the rest of this wrapper — a rematch leaf must
+    /// keep reporting its action to the match-time probe even wrapped,
+    /// or the chain silently reads as an ordinary dialable target
+    /// (issue #974).
+    fn rematch_action(&self) -> Option<meow_common::RematchAction<'_>> {
+        self.inner.rematch_action()
+    }
 }
 
 impl Proxy for DialerProxyAdapter {

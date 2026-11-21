@@ -59,7 +59,7 @@ use meow_common::{
 };
 use smol_str::SmolStr;
 use std::sync::Arc;
-use tracing::debug;
+use tracing::{debug, warn};
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -546,6 +546,18 @@ impl ProxyAdapter for RelayGroup {
             network: meow_common::Network::Udp,
             ..Default::default()
         };
+        // A chain resolved to a `type: rematch` leaf is a control hop,
+        // not a transport — the transition decides the flow's route, so
+        // the capability bit must not filter it first (issue #974).
+        // `flatten_hops` still rejects the hop as undialable, which stays
+        // the dial path's correct verdict for a chain that skipped the
+        // transition.
+        if self
+            .unwrap_proxy(&peek, false)
+            .is_some_and(|leaf| leaf.rematch_action().is_some())
+        {
+            return true;
+        }
         flatten_hops(&self.proxies, &peek, false)
             .is_ok_and(|hops| udp_exit(&hops).is_some_and(|exit| exit.support_udp()))
     }
@@ -571,17 +583,65 @@ impl ProxyAdapter for RelayGroup {
     fn health(&self) -> &ProxyHealth {
         &self.health
     }
+
+    /// A relay resolves its hops lazily per-dial (metadata may differ per
+    /// connection), so there is no single member to report — upstream
+    /// `Relay` likewise never overrode `Unwrap`, and a PASS hop deep in a
+    /// chain still surfaces as a loud `RelayHopFailed` at dial rather
+    /// than a silent rule skip.
+    ///
+    /// The one hop this walk must surface is a resolved `type: rematch`
+    /// leaf: it can never act as a transport hop, and reporting it lets
+    /// the match-time probe commit the transition instead of scanning
+    /// the chain as a dialable target (issue #974). A re-pick of the
+    /// same chain after the transition then trips the visited-name
+    /// cycle guard — fail-closed, the same verdict the dial path's
+    /// undialable-hop gate would reach.
+    ///
+    /// The walk is always a peek (`touch` ignored): `flatten_hops` owns
+    /// member resolution on the real dial, and committing here would
+    /// advance round-robin picks a second time when the splice later
+    /// resolves the same members. Member picks are popped DFS in
+    /// declared order so the answer is the *first* rematch hop; nested
+    /// relays splice their members inline through the downcast, and the
+    /// shared pop budget bounds hand-built cyclic graphs config already
+    /// rejects (`resolve_proxy` carries the same assumption).
+    fn unwrap_proxy(&self, metadata: &Metadata, _touch: bool) -> Option<Arc<dyn Proxy>> {
+        const MAX_PROBE_POPS: usize = 256;
+        let mut stack: Vec<Arc<dyn Proxy>> = self.proxies.iter().rev().cloned().collect();
+        for _ in 0..MAX_PROBE_POPS {
+            let cur = stack.pop()?;
+            if cur.rematch_action().is_some() {
+                return Some(cur);
+            }
+            if let Some(relay) = cur.as_any().and_then(|a| a.downcast_ref::<RelayGroup>()) {
+                stack.extend(relay.proxies.iter().rev().cloned());
+                continue;
+            }
+            if let Some(next) = cur.unwrap_proxy(metadata, false) {
+                stack.push(next);
+            } else if !is_transparent_hop(&cur) && cur.addr().is_empty() {
+                // A resolved hop that can never dial (REJECT, an
+                // unresolvable group) fails the whole chain at
+                // `flatten_hops_at` — the walk must not skip it and
+                // report a later rematch leaf the flow cannot reach.
+                return None;
+            }
+        }
+        // Ran out of pops with work outstanding — `None` reads as
+        // "no rematch hop" to the probe, but it is the budget's answer,
+        // not the chain's: say so loudly rather than let the dial meet
+        // a leaf the probe pretended was absent (issue #974 review).
+        warn!(
+            "{}: relay probe truncated after {MAX_PROBE_POPS} pops; \
+             reporting no rematch leaf",
+            self.name
+        );
+        None
+    }
 }
 
 impl Proxy for RelayGroup {
-    // Deliberately no `unwrap_proxy` override: a relay resolves its hops
-    // lazily per-dial (metadata may differ per connection), so a
-    // match-time peek cannot name "the" member. Upstream `Relay` likewise
-    // never overrode `Unwrap` — a PASS hop deep in a chain surfaces as a
-    // loud `RelayHopFailed` at dial (flattening rejects nop hops) rather
-    // than a silent rule skip. Match-time `unwraps_to(Pass)` therefore
-    // sees a relay group as opaque — the rule materializes and fails
-    // closed at dial.
     fn alive(&self) -> bool {
         self.health.alive()
     }
@@ -656,7 +716,9 @@ impl Proxy for RelayGroup {
 mod tests {
     use super::*;
     use crate::{LbStrategy, LoadBalanceGroup, SelectorGroup};
-    use meow_common::{DelayHistory, MeowError, ProxyConn, ProxyHealth, ProxyPacketConn};
+    use meow_common::{
+        DelayHistory, MeowError, ProxyConn, ProxyHealth, ProxyPacketConn, RematchAction,
+    };
     use std::net::SocketAddr;
     use std::sync::Arc;
 
@@ -687,6 +749,11 @@ mod tests {
         dial_fail_with: Arc<parking_lot::Mutex<Option<MeowError>>>,
         /// Each `dial_udp` call records its target host here.
         udp_dials: Arc<parking_lot::Mutex<Vec<String>>>,
+        /// `target-rematch-name` — set turns the mock into a rematch
+        /// control leaf (`rematch_action` reports it). The real
+        /// `RematchAdapter` implements `ProxyAdapter` only; config wraps
+        /// it before it can sit in a member list, hence the flag here.
+        rematch: Option<String>,
     }
 
     /// Recorded dial target: `host` for domains, `dst_ip` for IP literals —
@@ -713,6 +780,7 @@ mod tests {
                 fail_with: Arc::new(parking_lot::Mutex::new(None)),
                 dial_fail_with: Arc::new(parking_lot::Mutex::new(None)),
                 udp_dials: Arc::new(parking_lot::Mutex::new(Vec::new())),
+                rematch: None,
             })
         }
 
@@ -735,6 +803,17 @@ mod tests {
                 adapter_type: AdapterType::Direct,
                 addr_str: String::new(),
                 udp: true,
+                ..inner
+            })
+        }
+
+        /// A rematch control leaf.
+        fn rematch(name: &str) -> Arc<Self> {
+            let proxy = Self::direct();
+            let inner = Arc::try_unwrap(proxy).ok().unwrap();
+            Arc::new(Self {
+                proxy_name: name.to_string(),
+                rematch: Some(name.to_string()),
                 ..inner
             })
         }
@@ -881,6 +960,13 @@ mod tests {
 
         fn health(&self) -> &ProxyHealth {
             &self.health
+        }
+
+        fn rematch_action(&self) -> Option<RematchAction<'_>> {
+            self.rematch.as_deref().map(|rematch_name| RematchAction {
+                rematch_name: Some(rematch_name),
+                sub_rule: None,
+            })
         }
     }
 
@@ -2435,4 +2521,105 @@ mod tests {
     // permissive (trait has a default body). The guard-rail is enforced by code
     // review: relay tests MUST use connect_over on every hop and will observe
     // wrong visit counts if connect_over is not called.
+
+    // ─── Probe truncation ─────────────────────────────────────────────────
+
+    /// Scoped WARN capture plus a process-wide fallback that keeps callsite
+    /// interest live across parallel tests — the same pair meow-tunnel's
+    /// `capture_warns`/`install_capture_fallback` provide, duplicated here
+    /// because they are `pub(crate)`-scoped to that crate.
+    fn install_capture_fallback() {
+        use tracing::span::{Attributes, Id, Record};
+        use tracing::subscriber::Interest;
+        use tracing::{Event, Metadata, Subscriber};
+
+        struct Fallback;
+
+        impl Subscriber for Fallback {
+            fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+                Interest::sometimes()
+            }
+            fn enabled(&self, _: &Metadata<'_>) -> bool {
+                false
+            }
+            fn new_span(&self, _: &Attributes<'_>) -> Id {
+                Id::from_u64(1)
+            }
+            fn record(&self, _: &Id, _: &Record<'_>) {}
+            fn record_follows_from(&self, _: &Id, _: &Id) {}
+            fn event(&self, _: &Event<'_>) {}
+            fn enter(&self, _: &Id) {}
+            fn exit(&self, _: &Id) {}
+        }
+
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            let _ = tracing::subscriber::set_global_default(Fallback);
+        });
+    }
+
+    fn capture_warns<R>(f: impl FnOnce() -> R) -> (R, String) {
+        install_capture_fallback();
+        #[derive(Clone)]
+        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+            type Writer = Sink;
+            fn make_writer(&'a self) -> Sink {
+                self.clone()
+            }
+        }
+        let sink = Sink(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .finish();
+        let out = tracing::subscriber::with_default(subscriber, f);
+        let captured = sink.0.lock().unwrap();
+        (out, String::from_utf8_lossy(&captured).into_owned())
+    }
+
+    /// Running out of DFS pops must not read as "no rematch hop": 256
+    /// transparent members consume the budget before the rematch leaf at
+    /// position 257 is ever popped, so `None` is the budget's answer, not
+    /// the chain's — the walk warns instead of letting the dial meet a
+    /// leaf the probe pretended was absent (issue #974 review).
+    #[test]
+    fn probe_pop_budget_exhaustion_warns() {
+        let mut members: Vec<Arc<dyn Proxy>> = (0..256)
+            .map(|_| MockProxy::direct() as Arc<dyn Proxy>)
+            .collect();
+        members.push(MockProxy::rematch("late-rematch"));
+        let group = RelayGroup::new("deep-relay", members);
+        let (leaf, warns) = capture_warns(|| group.unwrap_proxy(&Metadata::default(), false));
+        assert!(leaf.is_none(), "the leaf sits past the pop budget");
+        assert!(
+            warns.contains("probe truncated"),
+            "truncation must say so loudly: {warns}"
+        );
+    }
+
+    /// Within the budget the walk still terminates quietly: a rematch leaf
+    /// two members deep surfaces with no warning.
+    #[test]
+    fn probe_within_budget_finds_rematch_quietly() {
+        let members: Vec<Arc<dyn Proxy>> =
+            vec![MockProxy::direct(), MockProxy::rematch("early-rematch")];
+        let group = RelayGroup::new("shallow-relay", members);
+        let (leaf, warns) = capture_warns(|| group.unwrap_proxy(&Metadata::default(), false));
+        assert_eq!(
+            leaf.map(|p| p.name().to_string()).as_deref(),
+            Some("early-rematch")
+        );
+        assert!(warns.is_empty(), "a terminated walk is silent: {warns}");
+    }
 }

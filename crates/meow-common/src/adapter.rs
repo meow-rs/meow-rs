@@ -81,6 +81,20 @@ pub struct ProxyState {
     pub history: Vec<DelayHistory>,
 }
 
+/// The re-entry a `type: rematch` control outbound applies when a routing
+/// scan selects it (issue #974, mihomo's `RematchParams`): which fields it
+/// overwrites on the flow before the rule scan restarts. `None` leaves the
+/// field unchanged; `Some("")` is the explicit-empty form that *clears* it
+/// (mihomo serializes an empty `target-rematch-name` as a clear).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RematchAction<'a> {
+    /// `target-rematch-name` — stamps `Metadata.rematch_name`.
+    pub rematch_name: Option<&'a str>,
+    /// `target-sub-rule` — replaces the active rule list (`""` returns
+    /// the scan to the top-level rules).
+    pub sub_rule: Option<&'a str>,
+}
+
 /// Per-adapter liveness + rolling delay history. Owned by every concrete
 /// adapter and accessed via [`ProxyAdapter::health`]. Writers use interior
 /// mutability so the trait method can return `&ProxyHealth`.
@@ -272,6 +286,14 @@ pub trait ProxyAdapter: Send + Sync {
     /// Observational: parsers and wrappers forward the leaf's answer.
     #[doc(hidden)]
     fn client_fingerprint(&self) -> Option<&str> {
+        None
+    }
+    /// The re-entry this adapter applies when a routing scan selects it:
+    /// `Some` only for `type: rematch` control outbounds (issue #974);
+    /// every transport answers `None`. The tunnel's match probe reads it
+    /// off the *unwrapped* leaf so a group pick of a rematch member
+    /// reports the same action as a direct rule target.
+    fn rematch_action(&self) -> Option<RematchAction<'_>> {
         None
     }
 }

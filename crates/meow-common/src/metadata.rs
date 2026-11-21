@@ -107,6 +107,27 @@ pub struct Metadata {
     /// claiming it.
     #[serde(skip)]
     pub internal: bool,
+    /// The marker a `type: rematch` control outbound stamped on this flow
+    /// (issue #974, upstream `Metadata.RematchName`/`C.Rematch`): the
+    /// value `REMATCH-NAME` rules compare against. `None` costs the
+    /// ordinary flow nothing; serializes as the flat `rematchName`
+    /// string mihomo emits on `/connections` metadata (`""` when unset,
+    /// so dashboards read it unconditionally) and defaults back to
+    /// unset on older JSON that lacks the key.
+    ///
+    /// Held behind a pointer like `special_route`: the marker rides on
+    /// the rare flow a `type: rematch` leaf actually stamped, and it is
+    /// per-clone state — each transition stamps its own copy — so it
+    /// cannot live in the clones-shared `flow_lookup` `Arc` where one
+    /// hop's stamp would leak into the next. `None` keeps the field one
+    /// pointer wide on the ordinary path.
+    #[serde(
+        rename = "rematchName",
+        default,
+        serialize_with = "rematch_name_json::serialize",
+        deserialize_with = "rematch_name_json::deserialize"
+    )]
+    pub rematch_name: Option<Arc<SmolStr>>,
     /// Flow-local lookup state (issue #974 `find-process-mode`): the
     /// owning-process scan's one-shot memo and submission lock,
     /// `Arc`-shared with every clone the routing passes, the UDP route
@@ -145,6 +166,30 @@ mod special_proxy_json {
     ) -> Result<Option<Arc<InboundRouteOverride>>, D::Error> {
         let proxy = SmolStr::deserialize(deserializer)?;
         Ok(InboundRouteOverride::new(Some(proxy.as_str()), None).map(Arc::new))
+    }
+}
+
+/// The JSON form of [`Metadata::rematch_name`]: mihomo's flat
+/// `rematchName` string, always emitted (`""` when unset). Reading
+/// back, an empty or missing value stays unset — the marker only ever
+/// carries a nonempty name.
+mod rematch_name_json {
+    use serde::{Deserialize, Deserializer, Serializer};
+    use smol_str::SmolStr;
+    use std::sync::Arc;
+
+    pub(super) fn serialize<S: Serializer>(
+        name: &Option<Arc<SmolStr>>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(name.as_deref().map_or("", SmolStr::as_str))
+    }
+
+    pub(super) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<Arc<SmolStr>>, D::Error> {
+        let name = SmolStr::deserialize(deserializer)?;
+        Ok((!name.is_empty()).then(|| Arc::from(name)))
     }
 }
 
@@ -209,6 +254,23 @@ impl Metadata {
             .unwrap_or_default()
     }
 
+    /// The marker a `type: rematch` hop stamped on this flow (upstream
+    /// `Metadata.RematchName`), `""` when unset. `REMATCH-NAME` rules
+    /// compare against it exactly; an unset marker never matches.
+    pub fn rematch_name(&self) -> &str {
+        self.rematch_name.as_deref().map_or("", |s| s.as_str())
+    }
+
+    /// Apply a rematch leaf's `target-rematch-name`: `Some("")` clears
+    /// the marker (an explicit empty field, issue #974), `Some(name)`
+    /// stamps it verbatim — no trimming or case folding, matching
+    /// upstream's `Metadata.SetRematchName` — and `None` leaves it.
+    /// The caller unwraps `Option`-vs-supplied itself; this setter only
+    /// receives a *supplied* value.
+    pub fn set_rematch_name(&mut self, name: &str) {
+        self.rematch_name = (!name.is_empty()).then(|| Arc::from(SmolStr::from(name)));
+    }
+
     /// Stamp `proxy`/`rule` as this flow's listener override, replacing
     /// whatever it carried — the same normalization
     /// [`InboundRouteOverride::new`] applies: an empty half means unset,
@@ -259,6 +321,7 @@ impl Default for Metadata {
             in_port: 0,
             in_user: None,
             special_route: None,
+            rematch_name: None,
             internal: false,
             flow_lookup: Arc::default(),
         }
@@ -396,6 +459,9 @@ impl Metadata {
             in_port: 0,
             in_user: None,
             special_route: None,
+            // The final rematch marker is part of the flow's API-visible
+            // routing story — `/connections` reports it like mihomo.
+            rematch_name: self.rematch_name.clone(),
             internal: self.internal,
             // The tracked copy shares the flow's lookup memo: the ledger
             // reuses an `always` scan (miss included) instead of rescanning.
@@ -672,5 +738,52 @@ mod tests {
         );
         assert_eq!(long.len(), 254);
         assert!(!is_valid_host(&long));
+    }
+
+    /// `rematchName` serializes like mihomo — a flat string, `""` when
+    /// unset, emitted unconditionally — and older JSON that lacks the
+    /// key defaults back to unset (issue #974).
+    #[test]
+    fn rematch_name_json_round_trip() {
+        let mut m = Metadata::default();
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["rematchName"], "", "unset serializes as empty");
+        m.set_rematch_name("stage1");
+        let json = serde_json::to_value(&m).unwrap();
+        assert_eq!(json["rematchName"], "stage1");
+
+        // Read back: a stamped marker survives; "" and a missing key
+        // (older JSON) both stay unset.
+        let back: Metadata = serde_json::from_value(json).unwrap();
+        assert_eq!(back.rematch_name(), "stage1");
+        let mut old = serde_json::to_value(Metadata::default()).unwrap();
+        old.as_object_mut().unwrap().remove("rematchName");
+        let old: Metadata = serde_json::from_value(old).unwrap();
+        assert_eq!(old.rematch_name(), "");
+        let mut doc = serde_json::to_value(Metadata::default()).unwrap();
+        doc["rematchName"] = serde_json::json!("");
+        let empty: Metadata = serde_json::from_value(doc).unwrap();
+        assert_eq!(empty.rematch_name(), "");
+    }
+
+    /// `set_rematch_name` verbatim: no trimming or case folding —
+    /// `Some("")` clears, a nonempty string stamps exactly (issue #974).
+    #[test]
+    fn set_rematch_name_verbatim() {
+        let mut m = Metadata::default();
+        m.set_rematch_name(" Stage1 ");
+        assert_eq!(m.rematch_name(), " Stage1 ");
+        m.set_rematch_name("");
+        assert_eq!(m.rematch_name(), "", "explicit empty clears");
+        assert!(m.rematch_name.is_none());
+    }
+
+    /// The `pure()` tracked copy carries the marker to `/connections`,
+    /// like the rest of the flow's routing story (issue #974).
+    #[test]
+    fn tracking_copy_keeps_the_marker() {
+        let mut m = Metadata::default();
+        m.set_rematch_name("stage1");
+        assert_eq!(m.pure().rematch_name(), "stage1");
     }
 }

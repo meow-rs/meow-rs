@@ -39,6 +39,7 @@ pub enum RuleType {
     InName,
     InType,
     InUser,
+    RematchName,
 }
 
 impl RuleType {
@@ -79,6 +80,7 @@ impl RuleType {
             RuleType::InName => "IN-NAME",
             RuleType::InType => "IN-TYPE",
             RuleType::InUser => "IN-USER",
+            RuleType::RematchName => "REMATCH-NAME",
         }
     }
 
@@ -122,6 +124,7 @@ impl RuleType {
             RuleType::And => "AND",
             RuleType::Or => "OR",
             RuleType::Not => "NOT",
+            RuleType::RematchName => "RematchName",
         }
     }
 
@@ -164,6 +167,7 @@ impl RuleType {
             "AND" => RuleType::And,
             "OR" => RuleType::Or,
             "NOT" => RuleType::Not,
+            "RematchName" => RuleType::RematchName,
             _ => return None,
         })
     }
@@ -207,6 +211,7 @@ impl fmt::Display for RuleType {
             RuleType::InName => write!(f, "IN-NAME"),
             RuleType::InType => write!(f, "IN-TYPE"),
             RuleType::InUser => write!(f, "IN-USER"),
+            RuleType::RematchName => write!(f, "REMATCH-NAME"),
         }
     }
 }
@@ -243,6 +248,12 @@ pub enum TargetCheck {
     /// The adapter unwraps to the `PASS` built-in — the rule is skipped
     /// silently (upstream `continue GetRules` on `C.Pass`).
     Pass,
+    /// The adapter unwraps to a `type: rematch` control outbound — the
+    /// match is terminal for this pass but commits a routing re-entry:
+    /// the leaf's `target-rematch-name`/`target-sub-rule` are applied to
+    /// the metadata and the rule scan restarts (issue #974, mihomo's
+    /// `C.Rematch` unwrap verdict).
+    Rematch,
 }
 
 /// Registry probe consulted by the match engines for every matched rule.

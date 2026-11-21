@@ -637,36 +637,56 @@ impl TunnelInner {
     /// `ListenPacketContext` resolves via `DirectHostResolver`), so a
     /// main-side failure must not drop it. Other routes never reach the
     /// direct resolver, which keeps proxied names off that upstream.
-    pub async fn resolve_udp_dst(&self, metadata: &mut Metadata) {
+    /// Returns `Some` carrying the probe's *committed decision* when one
+    /// ran: the caller MUST use it as the flow's route rather than
+    /// re-resolve. Pinning only the generation would still split — the
+    /// direct-nameserver fill lands `dst_ip` after the scan, so a commit
+    /// re-scan can match a slot the probe legitimately skipped
+    /// (`IP-CIDR,…,no-resolve` front rules), and live mode/process-policy
+    /// reads and group selections can diverge again (issue #974 review).
+    /// `None` means no probe ran; a live resolve carries no split window.
+    pub async fn resolve_udp_dst(&self, metadata: &mut Metadata) -> Option<ResolvedTarget> {
         if metadata.dst_ip.is_some() || metadata.host.is_empty() {
-            return;
+            return None;
         }
         let resolver = self.resolver();
         metadata.dst_ip = resolver.resolve_ip_real(&metadata.host).await;
         if metadata.dst_ip.is_some() {
-            return;
+            return None;
         }
-        let Some(direct) = resolver.direct_resolver().map(Arc::clone) else {
-            return;
-        };
-        // Probe only — "does this route end DIRECT?" — so it must not
-        // record the hit `resolve_proxy` counts: every UDP caller resolves
-        // for real right after (a double hit per flow), and a packet this
-        // probe leaves undialling would still have tallied (issue #882
-        // review).
-        let Some(target) = self.resolve_proxy_inner(metadata, false).await else {
-            return;
-        };
-        if !routes_direct(target.adapter.as_ref(), metadata) {
-            return;
+        let direct = resolver.direct_resolver().map(Arc::clone)?;
+        // The probe scans on a metadata clone so its rematch transition
+        // writes stay visible for adoption below, while `dst_ip` and the
+        // shared `flow_lookup` memo carry through either way. Hit
+        // bookkeeping is deferred into `hits` and tallied here exactly
+        // once — the probe IS the flow's resolve, so its outcome is
+        // counted but never doubled by a second scan (issue #882/#974).
+        let route = self.route();
+        let mut probe_metadata = metadata.clone();
+        let mut hits = DecisionHits::default();
+        let target = self
+            .resolve_proxy_inner_on(&route, &mut probe_metadata, false, Some(&mut hits))
+            .await?;
+        if routes_direct(target.adapter.as_ref(), &probe_metadata) {
+            metadata.dst_ip = direct.resolve_ip_real(&metadata.host).await;
+            if let Some(ip) = metadata.dst_ip {
+                debug!(
+                    "resolve_udp_dst: {} -> {} via direct-nameserver",
+                    metadata.host, ip
+                );
+            }
         }
-        metadata.dst_ip = direct.resolve_ip_real(&metadata.host).await;
-        if let Some(ip) = metadata.dst_ip {
-            debug!(
-                "resolve_udp_dst: {} -> {} via direct-nameserver",
-                metadata.host, ip
-            );
-        }
+        // Adopt the probe's marker state — a transition's
+        // `target-rematch-name` is part of the committed decision — and
+        // charge the deferred bookkeeping.
+        metadata.set_rematch_name(probe_metadata.rematch_name());
+        hits.record(&route, &self.stats);
+        // The probe skipped the pre-dispatch lookup (`record_hit = false`
+        // in `resolve_proxy_inner_on`); the kept decision still owes
+        // `always` mode its one scan, memo-shared like any flow's.
+        self.maybe_lookup_flow_process(metadata, self.process_policy.get())
+            .await;
+        Some(target)
     }
 
     /// Resolve which proxy to use for the given metadata.
@@ -720,8 +740,13 @@ impl TunnelInner {
     /// table fails closed ("proxy NAME not found" upstream) rather than
     /// slide to DIRECT. A UDP flow whose forced target cannot relay UDP
     /// fails the same way — it must not fall back to the main rules.
-    fn resolve_listener_proxy(&self, metadata: &Metadata, record_hit: bool) -> ResolvedTarget {
-        let route = self.route();
+    fn resolve_listener_proxy(
+        &self,
+        route: &Arc<RouteTable>,
+        metadata: &Metadata,
+        record_hit: bool,
+        hits: &mut DecisionHits,
+    ) -> ResolvedTarget {
         let name = metadata.special_proxy();
         // Built-ins resolve through the map like any other name: the
         // published DIRECT carries the build's resolver slot and
@@ -748,14 +773,15 @@ impl TunnelInner {
                 (Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>, "REJECT")
             }
         };
+        hits.outcome = Some(("ListenerProxy", action));
         if record_hit {
-            self.stats.rule_match.increment("ListenerProxy", action);
+            hits.record(route, &self.stats);
         }
         ResolvedTarget {
             adapter,
             rule_name: SmolStr::new_static("ListenerProxy"),
             rule_payload: SmolStr::from(name),
-            route,
+            route: Arc::clone(route),
         }
     }
 
@@ -768,11 +794,13 @@ impl TunnelInner {
         route: &Arc<RouteTable>,
         metadata: &Metadata,
         record_hit: bool,
+        hits: &mut DecisionHits,
     ) -> ResolvedTarget {
         let name = metadata.special_rules();
         warn!("listener sub-rules block '{name}' is not in the route table; rejecting flow");
+        hits.outcome = Some(("ListenerProxy", "REJECT"));
         if record_hit {
-            self.stats.rule_match.increment("ListenerProxy", "REJECT");
+            hits.record(route, &self.stats);
         }
         ResolvedTarget {
             adapter: Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>,
@@ -782,17 +810,23 @@ impl TunnelInner {
         }
     }
 
-    /// The `(rules, compiled, stats)` a rule-mode scan runs over for
-    /// `metadata` — the named `sub-rules` block `special_rules` selects,
-    /// or the top-level set when unset. `Err(())` = the named block is
-    /// missing from the table: the caller fails the flow closed.
-    fn rule_scan<'a>(route: &'a RouteTable, metadata: &Metadata) -> Result<RuleScan<'a>, ()> {
-        let name = metadata.special_rules();
+    /// The `(rules, compiled, stats)` a rule-mode scan runs over for the
+    /// active block name — the named `sub-rules` block, or the top-level
+    /// set on `""`. `Err(())` = the named block is missing from the
+    /// table; the caller decides the failure mode (listener-seeded
+    /// selections fail closed, rematch selections re-read the main list —
+    /// issue #974).
+    fn rule_scan<'a>(
+        route: &'a RouteTable,
+        name: &str,
+        fail_closed_udp: bool,
+    ) -> Result<RuleScan<'a>, ()> {
         if name.is_empty() {
             return Ok(RuleScan {
                 rules: route.rules.as_slice(),
                 compiled: &route.compiled_rules,
                 stats: Some(&route.rule_stats),
+                fail_closed_udp,
             });
         }
         route
@@ -805,6 +839,7 @@ impl TunnelInner {
                 // disabled, and a block-local index must not alias the
                 // top-level stats.
                 stats: None,
+                fail_closed_udp,
             })
             .ok_or(())
     }
@@ -814,6 +849,26 @@ impl TunnelInner {
         metadata: &mut Metadata,
         record_hit: bool,
     ) -> Option<ResolvedTarget> {
+        let route = self.route();
+        self.resolve_proxy_inner_on(&route, metadata, record_hit, None)
+            .await
+    }
+
+    /// [`Self::resolve_proxy_inner`] against a caller-pinned route
+    /// generation — `resolve_udp_dst`'s probe runs on one snapshot so a
+    /// mid-window reload cannot split its decision. `deferred` receives
+    /// the hit bookkeeping a `record_hit = false` scan leaves uncounted;
+    /// callers that keep the decision tally it exactly once
+    /// (`resolve_udp_dst`), callers that discard it pass `None`.
+    async fn resolve_proxy_inner_on(
+        &self,
+        route: &Arc<RouteTable>,
+        metadata: &mut Metadata,
+        record_hit: bool,
+        deferred: Option<&mut DecisionHits>,
+    ) -> Option<ResolvedTarget> {
+        let mut scratch = DecisionHits::default();
+        let hits = deferred.unwrap_or(&mut scratch);
         // Sample the live `find-process-mode` once for the whole
         // resolution — a PATCH lands on the next flow, not mid-scan
         // (issue #974).
@@ -830,7 +885,7 @@ impl TunnelInner {
             if process_mode == ProcessLookupMode::Always {
                 metadata.flow_lookup.record_process(None);
             }
-            return Some(self.resolve_listener_proxy(metadata, record_hit));
+            return Some(self.resolve_listener_proxy(route, metadata, record_hit, hits));
         }
         if record_hit {
             self.maybe_lookup_flow_process(metadata, process_mode).await;
@@ -843,11 +898,10 @@ impl TunnelInner {
                     adapter: Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
                     rule_name: SmolStr::new_static("Direct"),
                     rule_payload: SmolStr::default(),
-                    route: self.route(),
+                    route: Arc::clone(route),
                 })
             }
             TunnelMode::Global => {
-                let route = self.route();
                 let (adapter, rule_name) = if let Some(proxy) = route.proxies.get("GLOBAL") {
                     (
                         Arc::clone(proxy) as Arc<dyn ProxyAdapter>,
@@ -864,28 +918,19 @@ impl TunnelInner {
                     adapter,
                     rule_name,
                     rule_payload: SmolStr::default(),
-                    route,
+                    route: Arc::clone(route),
                 })
             }
             TunnelMode::Rule => {
                 // One route-table snapshot — rules + index + proxies all read
                 // from a consistent table. Replaces three RwLock acquisitions.
-                let route = self.route();
-                // The listener `rule:` override selects its sub-rules block
-                // for this scan; a present block replaces the top-level
-                // list, and exhausting it falls to DIRECT (no main-list
-                // consult) — a MISSING block rejects instead of upstream's
-                // top-level fallback.
-                let Ok(scan) = Self::rule_scan(&route, metadata) else {
-                    return Some(self.missing_block_reject(&route, metadata, record_hit));
-                };
                 // Eager callers own destination resolution (the UDP NAT key
                 // is built from `resolve_udp_dst` output), so IP demand may
-                // not stop this scan — only process demand may.
-                let result = self
-                    .match_rule_route(&route, scan, metadata, false, process_mode)
-                    .await;
-                Some(self.materialize_rule_match(&route, result, record_hit, scan.stats, metadata))
+                // not stop the scan — only process demand may.
+                Some(
+                    self.rule_route(route, metadata, false, process_mode, record_hit, hits)
+                        .await,
+                )
             }
         }
     }
@@ -911,14 +956,121 @@ impl TunnelInner {
         let process_mode = self.process_policy.get();
         self.maybe_lookup_flow_process(metadata, process_mode).await;
         let route = self.route();
-        // Same `rule:` block selection the eager path makes.
-        let Ok(scan) = Self::rule_scan(&route, metadata) else {
-            return Some(self.missing_block_reject(&route, metadata, true));
-        };
-        let result = self
-            .match_rule_route(&route, scan, metadata, true, process_mode)
-            .await;
-        Some(self.materialize_rule_match(&route, result, true, scan.stats, metadata))
+        let mut hits = DecisionHits::default();
+        Some(
+            self.rule_route(&route, metadata, true, process_mode, true, &mut hits)
+                .await,
+        )
+    }
+
+    /// The iterative rematch transition loop (issue #974): each pass scans
+    /// the active rule vector — the listener's `rule:` block selection
+    /// first, then whatever the last committed transition named — and a
+    /// matched `type: rematch` leaf applies its `target-rematch-name` /
+    /// `target-sub-rule` to `metadata` and re-enters the scan. Iterative,
+    /// never recursive: the flow's enrichment state (`dst_ip`, the shared
+    /// process memo, the `ip_attempted` flag) carries across passes so a
+    /// transition never repeats a lookup — including a failed one.
+    ///
+    /// Two guards make every transition finite and terminal: a
+    /// re-visited *adapter name* means a routing cycle, and 32 hops is
+    /// upstream's recursion budget. Either rejects the flow where it is —
+    /// no slide to a later rule, no direct-dial fallback.
+    ///
+    /// A listener-seeded block that is absent rejects (the override owns
+    /// the flow's whole policy); a rematch-selected block that is absent
+    /// warns once at build and scans the main list instead.
+    async fn rule_route(
+        &self,
+        route: &Arc<RouteTable>,
+        metadata: &mut Metadata,
+        allow_ip: bool,
+        process_mode: ProcessLookupMode,
+        record_hit: bool,
+        hits: &mut DecisionHits,
+    ) -> ResolvedTarget {
+        const MAX_REMATCH_TRANSITIONS: usize = 32;
+        let mut active = SmolStr::from(metadata.special_rules());
+        let mut listener_seeded = !active.is_empty();
+        let mut ip_attempted = false;
+        let mut visited: std::collections::HashSet<SmolStr> = std::collections::HashSet::new();
+        loop {
+            let scan = match Self::rule_scan(route, &active, listener_seeded) {
+                Ok(scan) => scan,
+                Err(()) if listener_seeded => {
+                    return self.missing_block_reject(route, metadata, record_hit, hits);
+                }
+                Err(()) => {
+                    // The build warned once already; a rematch-selected
+                    // name that resolves to nothing re-reads the main
+                    // list (upstream `parseRules` semantics).
+                    debug!("rematch target-sub-rule '{active}' is not a declared block; scanning the main rules");
+                    active = SmolStr::default();
+                    Self::rule_scan(route, "", false).expect("the main rule list always resolves")
+                }
+            };
+            let (result, candidate) = self
+                .match_rule_route(
+                    route,
+                    scan,
+                    metadata,
+                    allow_ip,
+                    process_mode,
+                    &mut ip_attempted,
+                )
+                .await;
+            let Some(candidate) = candidate else {
+                return self
+                    .materialize_rule_match(route, result, record_hit, scan.stats, metadata, hits);
+            };
+            let m = result.expect("a rematch verdict only rides a terminal match");
+            // The chosen slot commits this pass — count it exactly like a
+            // terminal match on this vector. A block-local index never
+            // reaches the top-level counters.
+            if scan.stats.is_some() {
+                hits.slots.push(m.rule_index);
+            }
+            conn_note!(
+                Rule,
+                "Rematch via '{}' (rule #{}) — re-entering rule scan",
+                candidate.name,
+                m.rule_index + 1
+            );
+            let guard_tripped =
+                !visited.insert(candidate.name.clone()) || visited.len() > MAX_REMATCH_TRANSITIONS;
+            if guard_tripped {
+                warn!(
+                    "rematch transition loop or depth limit at '{}'; rejecting flow",
+                    candidate.name
+                );
+                hits.outcome = Some((m.rule_type.as_str(), "REJECT"));
+                if record_hit {
+                    hits.record(route, &self.stats);
+                }
+                return ResolvedTarget {
+                    adapter: Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>,
+                    rule_name: SmolStr::new_static(m.rule_type.mihomo_name()),
+                    rule_payload: SmolStr::from(m.rule_payload),
+                    route: Arc::clone(route),
+                };
+            }
+            // Only the fields the leaf supplies move — an omitted
+            // `target-sub-rule` keeps scanning the active block, and an
+            // explicit "" selects the main list / clears the marker.
+            if let Some(name) = candidate.rematch_name {
+                metadata.set_rematch_name(&name);
+            }
+            if let Some(block) = candidate.sub_rule {
+                active = block;
+                // Whatever seeded this scan no longer owns the policy: a
+                // rematch-chosen block is an ordinary list — a
+                // UDP-incapable match slides like the main rules — only
+                // the listener's own selection fails closed. A name-only
+                // transition restarts the *same* list, so the provenance
+                // must survive untouched.
+                listener_seeded = false;
+            }
+        }
     }
 
     /// The rule-table scan both dispatch paths share: a demand-stop pass,
@@ -935,6 +1087,11 @@ impl TunnelInner {
     /// one lookup, and applies the outcome to the match-only copy —
     /// upstream's "a reached process-dependent predicate invokes it";
     /// `off` never lets process demand stop the scan at all.
+    ///
+    /// The second tuple item carries the rematch transition the terminal
+    /// match commits — [`Self::rule_route`] consumes it; a plain match
+    /// leaves it `None`. `ip_attempted` lives with the caller so a failed
+    /// resolve is cached across rematch passes too.
     async fn match_rule_route<'a>(
         &self,
         route: &'a Arc<RouteTable>,
@@ -942,27 +1099,32 @@ impl TunnelInner {
         metadata: &mut Metadata,
         allow_ip: bool,
         process_mode: ProcessLookupMode,
-    ) -> Option<CompiledMatchResult<'a>> {
+        ip_attempted: &mut bool,
+    ) -> (Option<CompiledMatchResult<'a>>, Option<RematchCandidate>) {
         // A prior pass of this flow — or its UDP route probe — may already
         // hold the one lookup's outcome: apply a hit to the match-only
         // copy so the scan sees it without a second OS walk.
         let mut enriched = stored_process_clone(metadata);
-        let mut ip_attempted = false;
+        let rematch = std::cell::Cell::new(None);
         loop {
             let input = enriched.as_ref().unwrap_or(&*metadata);
             let gate = DemandGate {
-                ip: allow_ip && !ip_attempted,
+                ip: allow_ip && !*ip_attempted,
                 process: process_mode != ProcessLookupMode::Off
                     && !input.flow_lookup.process_attempted(),
             };
-            match scan.compiled.match_rules_lazy(
+            // Bind the outcome first: the probe's `&Cell` would otherwise
+            // live as a match scrutinee temporary across the enrichment
+            // awaits below, and `&Cell` is not `Send`.
+            let outcome = scan.compiled.match_rules_lazy(
                 input,
                 scan.rules,
-                &Self::target_probe(route, input, scan.stats),
+                &Self::target_probe(route, input, scan.stats, scan.fail_closed_udp, &rematch),
                 gate,
-            ) {
-                LazyMatchOutcome::Matched(m) => return Some(m),
-                LazyMatchOutcome::NoMatch => return None,
+            );
+            match outcome {
+                LazyMatchOutcome::Matched(m) => return (Some(m), rematch.take()),
+                LazyMatchOutcome::NoMatch => return (None, rematch.take()),
                 LazyMatchOutcome::NeedsEnrichment {
                     needs_ip,
                     needs_process,
@@ -996,8 +1158,10 @@ impl TunnelInner {
                     }
                     if needs_ip {
                         // `needs_ip` already encodes the `pre_resolve` guards:
-                        // host present, dst_ip absent.
-                        ip_attempted = true;
+                        // host present, dst_ip absent. The flag lives with
+                        // the caller so a miss is not re-resolved on the
+                        // next rematch pass either.
+                        *ip_attempted = true;
                         let started = std::time::Instant::now();
                         if let Some(real_ip) = self.resolver().resolve_ip_real(&metadata.host).await
                         {
@@ -1110,11 +1274,15 @@ impl TunnelInner {
         route: &'a RouteTable,
         metadata: &'a Metadata,
         stats: Option<&'a crate::rule_stats::RuleStats>,
+        fail_closed_udp: bool,
+        rematch: &'a std::cell::Cell<Option<RematchCandidate>>,
     ) -> RouteTargetProbe<'a> {
         RouteTargetProbe {
             route,
             metadata,
             stats,
+            fail_closed_udp,
+            rematch,
         }
     }
 
@@ -1135,6 +1303,7 @@ impl TunnelInner {
         record_hit: bool,
         hit_stats: Option<&crate::rule_stats::RuleStats>,
         metadata: &Metadata,
+        hits: &mut DecisionHits,
     ) -> ResolvedTarget {
         match result {
             Some(m) => {
@@ -1192,17 +1361,16 @@ impl TunnelInner {
                         Arc::clone(&self.reject) as Arc<dyn ProxyAdapter>
                     }
                 };
+                // A `sub-rules` block match carries no stats — never
+                // stamp a block-local index onto the top-level /rules
+                // counters or switches (the spec's "no fictitious rule
+                // hit"). The aggregate metric still counts it.
+                if hit_stats.is_some() {
+                    hits.slots.push(m.rule_index);
+                }
+                hits.outcome = Some((m.rule_type.as_str(), action));
                 if record_hit {
-                    // A `sub-rules` block match carries no stats — never
-                    // stamp a block-local index onto the top-level /rules
-                    // counters or switches (the spec's "no fictitious rule
-                    // hit"). The aggregate metric still counts it.
-                    if let Some(stats) = hit_stats {
-                        stats.record_hit(m.rule_index);
-                    }
-                    self.stats
-                        .rule_match
-                        .increment(m.rule_type.as_str(), action);
+                    hits.record(route, &self.stats);
                 }
                 conn_note!(
                     Rule,
@@ -1222,6 +1390,15 @@ impl TunnelInner {
             None => {
                 // No rule matched, use DIRECT
                 conn_note!(Rule, "No rule matched → DIRECT");
+                // The implicit terminal is still the committed
+                // routing outcome — a rematch-selected block that
+                // exhausts ends here too — so the aggregate counts it
+                // under the tail's "Final" name. There is no rule
+                // slot to charge: no `record_hit` index applies.
+                hits.outcome = Some(("Final", "DIRECT"));
+                if record_hit {
+                    hits.record(route, &self.stats);
+                }
                 ResolvedTarget {
                     adapter: Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
                     rule_name: SmolStr::new_static("Final"),
@@ -1400,10 +1577,40 @@ pub enum PreHandleVerdict {
     Drop,
 }
 
+/// The `record_hit` bookkeeping a resolution accumulated, tallied once by
+/// whoever keeps the decision. `record_hit = true` paths drain it inline
+/// at the terminal; `resolve_udp_dst`'s probe leaves it populated for its
+/// caller-side commit to charge — never doubled by a second scan.
+#[derive(Default)]
+struct DecisionHits {
+    /// Top-level rule slots each committed pass chose — transition picks
+    /// included. `sub-rules` block matches add nothing: a block-local
+    /// index must not alias the top-level /rules counters.
+    slots: Vec<usize>,
+    /// The terminal outcome's `rule_match` bucket — absent on the
+    /// mode-dispatch early outs, which tally nothing.
+    outcome: Option<(&'static str, &'static str)>,
+}
+
+impl DecisionHits {
+    /// Tally the deferred bookkeeping: slots to the pinned generation's
+    /// /rules counters, the outcome to the aggregate. Draining makes a
+    /// second call a no-op, so the inline and deferred sites share it.
+    fn record(&mut self, route: &RouteTable, stats: &Statistics) {
+        for index in self.slots.drain(..) {
+            route.rule_stats.record_hit(index);
+        }
+        if let Some((rule_type, action)) = self.outcome.take() {
+            stats.rule_match.increment(rule_type, action);
+        }
+    }
+}
+
 /// The `(rules, compiled, stats)` a rule-mode scan runs over for `metadata`
-/// — the named `sub-rules` block `special_rules()` selects, or the top-level
-/// set when unset. `Err(())` = the named block is missing from the table:
-/// the caller fails the flow closed.
+/// — the named `sub-rules` block the active selection picks, or the
+/// top-level set when unset. `Err(())` = the named block is missing from
+/// the table: the caller fails the flow closed on a listener-seeded
+/// selection and falls back to the main list on a rematch one (issue #974).
 #[derive(Clone, Copy)]
 struct RuleScan<'a> {
     rules: &'a [Box<dyn Rule>],
@@ -1411,6 +1618,25 @@ struct RuleScan<'a> {
     /// The scanned vector's own disable table — `None` for a `sub-rules`
     /// block, whose rules are never disabled and never hit-counted.
     stats: Option<&'a crate::rule_stats::RuleStats>,
+    /// Fail a UDP flow closed on a matched UDP-incapable target — the
+    /// listener-seeded `rule:` block selection's contract only. A
+    /// rematch-selected block scan uses the ordinary skip instead
+    /// (issue #974): the transition, not the listener, selected it.
+    fail_closed_udp: bool,
+}
+
+/// The re-entry a matched rematch target commits (issue #974): the leaf's
+/// configured fields plus its registry name — the cycle guard keys on the
+/// *adapter* name, not the marker text, so two leaves sharing one
+/// `target-rematch-name` chain legally while a node re-picked through a
+/// group is still caught.
+struct RematchCandidate {
+    /// The selected rematch adapter's registry name — the visited-set key.
+    name: SmolStr,
+    /// `target-rematch-name` verbatim — `Some("")` clears the marker.
+    rematch_name: Option<SmolStr>,
+    /// `target-sub-rule` verbatim — `Some("")` returns to the main rules.
+    sub_rule: Option<SmolStr>,
 }
 
 /// The rule_match metric bucket for an adapter kind — the `action` half of
@@ -1432,6 +1658,14 @@ struct RouteTargetProbe<'a> {
     /// The scanned vector's own disable table — `None` for a `sub-rules`
     /// block, whose rules have no /rules surface and are never disabled.
     stats: Option<&'a crate::rule_stats::RuleStats>,
+    /// Fail a UDP flow closed on a matched UDP-incapable target — the
+    /// listener-seeded `rule:` block selection's contract only. A
+    /// rematch-selected block scan uses the ordinary skip instead
+    /// (issue #974): the transition, not the listener, selected it.
+    fail_closed_udp: bool,
+    /// The rematch leaf a matched target unwrapped to — stashed so the
+    /// caller can commit its re-entry after the scan returns it.
+    rematch: &'a std::cell::Cell<Option<RematchCandidate>>,
 }
 
 /// `true` when `adapter` dials through a DIRECT/COMPATIBLE hop for
@@ -1476,11 +1710,58 @@ impl RouteTargetProbe<'_> {
                 None => return false,
             }
         }
-        debug!(
-            "{}: unwrap chain exceeded {MAX_UNWRAP_HOPS} hops probing for {want}",
-            cur.name()
-        );
+        // The cap guards hand-built cycles, not the verdict — the leaf it
+        // lands on still answers, and only a chain truly running past it
+        // reports an overflow (issue #974).
+        if cur.adapter_type() == want {
+            return true;
+        }
+        if cur.unwrap_proxy(self.metadata, false).is_some() {
+            // `false` here is the cap's answer, not the chain's — the
+            // dial may still reach a `want` hop the probe never saw;
+            // the failure lands loudly there instead (issue #974 review).
+            warn!(
+                "{}: unwrap chain exceeded {MAX_UNWRAP_HOPS} hops probing for {want}",
+                cur.name()
+            );
+        }
         false
+    }
+
+    /// The rematch leaf `start`'s pick chain ends at, if any — the same
+    /// peek the `PASS` walk uses, so a group *selecting* a rematch member
+    /// transitions while a group merely containing one does not
+    /// (issue #974). The leaf's own `RematchAction` supplies the fields
+    /// to apply.
+    fn rematch_leaf(&self, start: Arc<dyn Proxy>) -> Option<RematchCandidate> {
+        const MAX_UNWRAP_HOPS: usize = 16;
+        let candidate = |p: &Arc<dyn Proxy>| {
+            p.rematch_action().map(|action| RematchCandidate {
+                name: SmolStr::from(p.name()),
+                rematch_name: action.rematch_name.map(SmolStr::from),
+                sub_rule: action.sub_rule.map(SmolStr::from),
+            })
+        };
+        let mut cur = start;
+        for _ in 0..MAX_UNWRAP_HOPS {
+            if let Some(found) = candidate(&cur) {
+                return Some(found);
+            }
+            cur = cur.unwrap_proxy(self.metadata, false)?;
+        }
+        // Same terminal-leaf check as `unwraps_to`: the cap guards cycles,
+        // not the verdict — a pick chain exactly MAX deep still surfaces
+        // its rematch leaf (issue #974).
+        if let Some(found) = candidate(&cur) {
+            return Some(found);
+        }
+        if cur.unwrap_proxy(self.metadata, false).is_some() {
+            warn!(
+                "{}: unwrap chain exceeded {MAX_UNWRAP_HOPS} hops probing for rematch",
+                cur.name()
+            );
+        }
+        None
     }
 }
 
@@ -1506,6 +1787,13 @@ impl TargetProbe for RouteTargetProbe<'_> {
         if self.unwraps_to(Arc::clone(p), AdapterType::Pass) {
             return TargetCheck::Pass;
         }
+        // A rematch leaf redirects the scan before any transport check —
+        // it claims `support_udp()` for exactly that reason, so it must be
+        // unwrapped ahead of the capability gate (issue #974).
+        if let Some(candidate) = self.rematch_leaf(Arc::clone(p)) {
+            self.rematch.set(Some(candidate));
+            return TargetCheck::Rematch;
+        }
         if self.metadata.network == Network::Udp && !p.support_udp() {
             // mihomo `continue`s a UDP-incapable target: a plain node's
             // `udp: false` is a routing preference, so the scan slides
@@ -1518,12 +1806,14 @@ impl TargetProbe for RouteTargetProbe<'_> {
             if p.is_dialer_proxy_non_transparent() {
                 return TargetCheck::Unusable;
             }
-            // A `sub-rules` block scan (`stats` is `None`) fails closed
-            // the same way: the listener's `rule:` override replaced the
-            // whole policy for this flow, so sliding past a matched rule
-            // to block-exhaustion DIRECT would silently reroute what the
+            // A listener-seeded `sub-rules` block scan fails closed the
+            // same way: the `rule:` override replaced the whole policy
+            // for this flow, so sliding past a matched rule to
+            // block-exhaustion DIRECT would silently reroute what the
             // override pinned — matching the forced `proxy:` contract.
-            if self.stats.is_none() {
+            // A rematch-selected block keeps the ordinary slide: the
+            // transition, not the listener, chose that list (issue #974).
+            if self.fail_closed_udp {
                 return TargetCheck::Unusable;
             }
             return TargetCheck::Missing;
@@ -3134,11 +3424,12 @@ mod tests {
         );
     }
 
-    /// `resolve_udp_dst`'s route probe is bookkeeping-free: the flow's
-    /// real `resolve_proxy` right after is what counts the hit — the pair
-    /// must tally one, not two (issue #882 review).
+    /// `resolve_udp_dst`'s route probe IS the flow's committed decision:
+    /// it tallies the hit exactly once — the caller uses the returned
+    /// target verbatim instead of a second resolve that would double it
+    /// (issues #882, #974 reviews).
     #[tokio::test]
-    async fn resolve_udp_dst_probe_records_no_hit() {
+    async fn resolve_udp_dst_commits_probe_bookkeeping() {
         use meow_dns::HostEntry;
         use meow_rules::domain_suffix::DomainSuffixRule;
         use meow_rules::final_rule::FinalRule;
@@ -3180,20 +3471,178 @@ mod tests {
             dst_port: 443,
             ..Default::default()
         };
-        tunnel.inner().resolve_udp_dst(&mut meta).await;
+        let target = tunnel
+            .inner()
+            .resolve_udp_dst(&mut meta)
+            .await
+            .expect("a probe that ran returns the committed decision");
         assert_eq!(meta.dst_ip, Some(direct_ip));
+        assert_eq!(target.adapter.adapter_type(), AdapterType::Direct);
         let route = tunnel.route_snapshot();
         assert_eq!(
             route.rule_stats.view(0).hits,
-            0,
-            "the probe must not record a hit"
-        );
-        tunnel.inner().resolve_proxy(&meta).await.unwrap();
-        assert_eq!(
-            route.rule_stats.view(0).hits,
             1,
-            "the real resolution counts once"
+            "the probe's kept decision tallies its slot exactly once"
         );
+    }
+
+    /// The probe's decision stays the committed route even when the
+    /// direct-nameserver fill it performs would change a later scan: an
+    /// `IP-CIDR,…,no-resolve` front slot sees no `dst_ip` at probe time,
+    /// so the flow falls to `MATCH,DIRECT` — the fill must not make a
+    /// commit re-scan land the flow on REJECT (issue #974 review).
+    #[tokio::test]
+    async fn resolve_udp_dst_decision_survives_its_own_ip_fill() {
+        use meow_dns::HostEntry;
+        use meow_rules::final_rule::FinalRule;
+        use meow_rules::ipcidr::IpCidrRule;
+        use std::net::IpAddr;
+
+        let direct_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 7));
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+        hosts.insert("split.test", vec![direct_ip].into());
+        let direct = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+        let mut main = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+        );
+        main.set_direct_resolver(Arc::new(direct));
+        let tunnel = Tunnel::new(Arc::new(main));
+
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(IpCidrRule::new("192.0.2.0/24", "REJECT", false, true).unwrap()),
+                Box::new(FinalRule::new("DIRECT")),
+            ],
+            Default::default(),
+            Default::default(),
+        );
+
+        let mut meta = Metadata {
+            network: Network::Udp,
+            host: "split.test".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let target = tunnel
+            .inner()
+            .resolve_udp_dst(&mut meta)
+            .await
+            .expect("a probe that ran returns the committed decision");
+        assert_eq!(meta.dst_ip, Some(direct_ip));
+        assert_eq!(
+            target.adapter.adapter_type(),
+            AdapterType::Direct,
+            "the commit keeps the probe's DIRECT verdict — the filled dst_ip \
+             must not feed a re-scan that matches the front slot"
+        );
+        assert_eq!(
+            target.rule_name.as_str(),
+            "Match",
+            "the flow commits the tail the probe reached, not rule #1"
+        );
+        let route = tunnel.route_snapshot();
+        assert_eq!(route.rule_stats.view(0).hits, 0);
+        assert_eq!(
+            route.rule_stats.view(1).hits,
+            1,
+            "the MATCH slot the probe committed tallies once"
+        );
+    }
+
+    /// The probe's whole decision — not only its route generation — is
+    /// what the caller commits: a reload landing after `resolve_udp_dst`
+    /// cannot re-decide the flow, and the returned target still pins the
+    /// table the probe consulted for its dialer registry (issue #974).
+    #[tokio::test]
+    async fn resolve_udp_dst_pins_the_probe_decision() {
+        use meow_dns::HostEntry;
+        use meow_rules::{domain_suffix::DomainSuffixRule, final_rule::FinalRule};
+        use std::net::IpAddr;
+
+        let direct_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 2));
+        let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+        hosts.insert("swap.test", vec![direct_ip].into());
+        let direct = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+        // No upstreams and no hosts: the direct-resolver probe runs.
+        let mut main = Resolver::new(
+            vec![],
+            vec![],
+            DnsMode::Normal,
+            DomainTrie::new(),
+            false,
+            true,
+        );
+        main.set_direct_resolver(Arc::new(direct));
+        let tunnel = Tunnel::new(Arc::new(main));
+
+        let proxies = meow_config::rebuild_from_raw(&Default::default())
+            .unwrap()
+            .proxies;
+        tunnel.update_routing(
+            proxies.clone(),
+            vec![
+                Box::new(DomainSuffixRule::new("swap.test", "DIRECT")),
+                Box::new(FinalRule::new("REJECT")),
+            ],
+            Default::default(),
+            Default::default(),
+        );
+        let probed = tunnel.route_snapshot();
+
+        let mut meta = Metadata {
+            network: Network::Udp,
+            host: "swap.test".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let pin = tunnel
+            .inner()
+            .resolve_udp_dst(&mut meta)
+            .await
+            .expect("a direct-route probe returns its committed decision");
+        assert!(
+            Arc::ptr_eq(&pin.route, &probed),
+            "the target pins the generation the probe consulted"
+        );
+        assert_eq!(meta.dst_ip, Some(direct_ip));
+
+        // A reload lands mid-window: the same host now routes to REJECT.
+        tunnel.update_routing(
+            proxies,
+            vec![
+                Box::new(DomainSuffixRule::new("swap.test", "REJECT")),
+                Box::new(FinalRule::new("DIRECT")),
+            ],
+            Default::default(),
+            Default::default(),
+        );
+        assert!(!Arc::ptr_eq(&pin.route, &tunnel.route_snapshot()));
+        assert_eq!(
+            pin.adapter.adapter_type(),
+            AdapterType::Direct,
+            "the committed decision is the one the probe reached — the \
+             reload cannot re-decide this flow"
+        );
+
+        // The live generation — what an unpinned re-decision would see —
+        // disagrees, proving the pinned decision is what kept the
+        // direct-nameserver verdict coherent.
+        let mut live = meta.clone();
+        let unpinned = tunnel
+            .inner()
+            .resolve_proxy_flow(&mut live)
+            .await
+            .expect("a rule-mode flow resolves");
+        assert_eq!(unpinned.adapter.adapter_type(), AdapterType::Reject);
     }
 
     /// Front-hop mock for the provider-dialer e2e: records every
@@ -4273,5 +4722,1078 @@ mod tests {
         tunnel.inner().resolve_proxy_flow(&mut off_flow).await;
         assert_eq!(scan_count(&calls), 1, "off scans nothing");
         assert_eq!(off_flow.process, "");
+    }
+
+    /// `type: rematch` + `REMATCH-NAME` end-to-end through the real
+    /// YAML → parse → build → route pipeline (issue #974 acceptance
+    /// matrix): the same `rebuild_from_raw` the boot and `PUT /configs`
+    /// lanes run, so parser, registry and route-table semantics agree.
+    mod rematch {
+        use super::*;
+
+        /// Build a tunnel straight from a YAML document — one literal
+        /// config per case keeps parser surface covered too.
+        fn rematch_tunnel(yaml: &str) -> Tunnel {
+            let raw: meow_config::raw::RawConfig =
+                serde_saphyr::from_str(yaml).expect("yaml parses");
+            let res = meow_config::rebuild_from_raw(&raw).expect("rematch config builds");
+            let tunnel = test_tunnel();
+            tunnel.set_mode(TunnelMode::Rule);
+            tunnel.update_routing(res.proxies, res.rules, res.sub_rules, res.dialer_registry);
+            tunnel
+        }
+
+        async fn routed(tunnel: &Tunnel, host: &str) -> (String, Metadata) {
+            let mut md = Metadata {
+                host: host.into(),
+                dst_port: 443,
+                network: Network::Tcp,
+                ..Default::default()
+            };
+            let target = tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("a route always resolves");
+            (target.adapter.name().to_string(), md)
+        }
+
+        /// A tunnel whose `resolve_udp_dst` route probe actually runs:
+        /// the main resolver misses every lookup and a direct-nameserver
+        /// owns `example.test` — without one the probe returns before
+        /// routing and every assertion on the decision passes vacuously.
+        fn udp_probe_tunnel(yaml: &str) -> Tunnel {
+            use meow_dns::HostEntry;
+            use std::net::IpAddr;
+
+            let direct_ip = IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 3));
+            let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+            hosts.insert("example.test", vec![direct_ip].into());
+            let direct = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+            // No upstreams and no hosts: every main lookup fails, so the
+            // direct-resolver probe runs.
+            let mut main = Resolver::new(
+                vec![],
+                vec![],
+                DnsMode::Normal,
+                DomainTrie::new(),
+                false,
+                true,
+            );
+            main.set_direct_resolver(Arc::new(direct));
+            let tunnel = Tunnel::new(Arc::new(main));
+            tunnel.set_mode(TunnelMode::Rule);
+            let raw: meow_config::raw::RawConfig =
+                serde_saphyr::from_str(yaml).expect("yaml parses");
+            let res = meow_config::rebuild_from_raw(&raw).expect("config builds");
+            tunnel.update_routing(res.proxies, res.rules, res.sub_rules, res.dialer_registry);
+            tunnel
+        }
+
+        /// The spec example end-to-end: `example.test` selects `inspect`,
+        /// enters `second-pass` with `rematchName = stage1`, and the
+        /// `REMATCH-NAME,stage1/alternative` member sends it to REJECT.
+        /// An unrelated flow walks the ordinary `MATCH,DIRECT`.
+        #[tokio::test]
+        async fn spec_example_rejects_via_second_pass() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: second-pass}
+rules:
+  - DOMAIN-SUFFIX,example.test,inspect
+  - MATCH,DIRECT
+sub-rules:
+  second-pass:
+    - REMATCH-NAME,stage1/alternative,REJECT
+    - MATCH,DIRECT
+"#,
+            );
+            let (adapter, md) = routed(&tunnel, "example.test").await;
+            assert_eq!(adapter, "REJECT");
+            assert_eq!(md.rematch_name(), "stage1", "the stamped marker survives");
+            let (adapter, _) = routed(&tunnel, "other.test").await;
+            assert_eq!(adapter, "DIRECT");
+        }
+
+        /// `target-rematch-name` alone restarts the *active* list — the
+        /// marker is visible to every predicate on the re-entry pass.
+        #[tokio::test]
+        async fn name_only_transition_rescans_active_list() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1}
+rules:
+  - REMATCH-NAME,stage1,REJECT
+  - DOMAIN-SUFFIX,example.test,inspect
+  - MATCH,DIRECT
+"#,
+            );
+            let (adapter, md) = routed(&tunnel, "example.test").await;
+            assert_eq!(adapter, "REJECT");
+            assert_eq!(md.rematch_name(), "stage1");
+        }
+
+        /// A name-only rematch restarts the *listener-seeded* list, so
+        /// its provenance survives: the `rule:` override still owns the
+        /// flow's whole policy and a UDP-incapable match fails closed
+        /// instead of sliding to block-exhaustion DIRECT. Clearing the
+        /// flag on a transition that never named a new list would drop
+        /// exactly that pin (issue #974).
+        #[tokio::test]
+        async fn name_only_transition_keeps_listener_fail_closed_udp() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1}
+  - {name: noupd, type: socks5, server: 127.0.0.1, port: 1080, udp: false}
+rules:
+  - MATCH,DIRECT
+sub-rules:
+  blk:
+    - REMATCH-NAME,stage1,noupd
+    - NOT,((REMATCH-NAME,stage1)),inspect
+    - MATCH,DIRECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            md.set_special_route(None, Some("blk"));
+            let target = tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("route resolves");
+            // A block match on a UDP-incapable target materializes as
+            // REJECT when the scan kept the listener's fail-closed
+            // contract; the dropped-provenance bug slides to DIRECT.
+            assert_eq!(
+                target.adapter.name(),
+                "REJECT",
+                "the listener-owned scan must fail closed on the UDP-incapable match"
+            );
+        }
+
+        /// `target-sub-rule` alone enters the block without touching the
+        /// marker; an unset marker matches no `REMATCH-NAME` alternative.
+        #[tokio::test]
+        async fn sub_rule_only_leaves_marker_unset() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: hop, type: rematch, target-sub-rule: blk}
+rules:
+  - MATCH,hop
+sub-rules:
+  blk:
+    - REMATCH-NAME,stage1,REJECT
+    - MATCH,DIRECT
+"#,
+            );
+            let (adapter, md) = routed(&tunnel, "any.test").await;
+            assert_eq!(adapter, "DIRECT");
+            assert_eq!(md.rematch_name(), "");
+        }
+
+        /// `target-rematch-name: ""` is the explicit clear form — a
+        /// downstream `REMATCH-NAME` sees the marker as unset again.
+        #[tokio::test]
+        async fn explicit_empty_clears_the_marker() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: stamp, type: rematch, target-rematch-name: stage1, target-sub-rule: b1}
+  - {name: clear, type: rematch, target-rematch-name: "", target-sub-rule: b2}
+rules:
+  - DOMAIN-SUFFIX,example.test,stamp
+  - MATCH,DIRECT
+sub-rules:
+  b1:
+    - REMATCH-NAME,stage1,clear
+    - MATCH,REJECT
+  b2:
+    - REMATCH-NAME,stage1,REJECT
+    - MATCH,DIRECT
+"#,
+            );
+            let (adapter, md) = routed(&tunnel, "example.test").await;
+            assert_eq!(
+                adapter, "DIRECT",
+                "cleared marker must not match b2's REMATCH-NAME"
+            );
+            assert_eq!(md.rematch_name(), "");
+        }
+
+        /// A re-visited adapter name is a routing cycle — terminal REJECT,
+        /// never a slide to the next rule or a direct dial.
+        #[tokio::test]
+        async fn cycle_guard_rejects() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: loop, type: rematch, target-sub-rule: b1}
+rules:
+  - MATCH,loop
+sub-rules:
+  b1:
+    - MATCH,loop
+"#,
+            );
+            let (adapter, _) = routed(&tunnel, "any.test").await;
+            assert_eq!(
+                adapter, "REJECT",
+                "the second pick of 'loop' must trip the guard"
+            );
+        }
+
+        /// The visited set keys on the selected leaf's registry name, so
+        /// a→G→b→a trips on the *third* hop even though the group's name
+        /// never repeats.
+        #[tokio::test]
+        async fn a_b_a_through_a_group_rejects() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: a, type: rematch, target-sub-rule: b1}
+  - {name: b, type: rematch, target-sub-rule: b2}
+proxy-groups:
+  - {name: G, type: select, proxies: [b]}
+rules:
+  - MATCH,a
+sub-rules:
+  b1:
+    - MATCH,G
+  b2:
+    - MATCH,a
+"#,
+            );
+            let (adapter, _) = routed(&tunnel, "any.test").await;
+            assert_eq!(adapter, "REJECT", "a→G(b)→a is a routing cycle");
+        }
+
+        /// A pick chain exactly at the unwrap cap still surfaces its
+        /// rematch leaf: g1 → … → g16 → inspect is 16 hops — the probe
+        /// must inspect the leaf it terminates on, not only the first 15
+        /// hops, or the group reads as a dialable target (issue #974).
+        #[tokio::test]
+        async fn sixteen_hop_pick_chain_still_surfaces_rematch() {
+            use std::fmt::Write as _;
+            let mut groups =
+                String::from("proxy-groups:\n  - {name: g16, type: select, proxies: [inspect]}\n");
+            for i in (1..16).rev() {
+                let _ = writeln!(
+                    groups,
+                    "  - {{name: g{i}, type: select, proxies: [g{}]}}",
+                    i + 1
+                );
+            }
+            let yaml = format!(
+                "proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: stage1}}\n\
+                 {groups}rules:\n  - MATCH,g1\n",
+            );
+            let tunnel = rematch_tunnel(&yaml);
+            let (adapter, _) = routed(&tunnel, "any.test").await;
+            // The found leaf transitions, the re-scan picks it again, and
+            // the visited-name guard rejects — all of which only happens
+            // when the depth-16 leaf answers the probe.
+            assert_eq!(adapter, "REJECT", "the depth-16 rematch leaf must surface");
+        }
+
+        /// The same boundary for the `PASS` walk: a chain p1 → … → p16 →
+        /// PASS still reads as `Pass`, so `MATCH,p1` skips instead of
+        /// committing a group whose selection cannot carry the flow.
+        #[tokio::test]
+        async fn sixteen_hop_pick_chain_still_surfaces_pass() {
+            use std::fmt::Write as _;
+            let mut groups =
+                String::from("proxy-groups:\n  - {name: p16, type: select, proxies: [PASS]}\n");
+            for i in (1..16).rev() {
+                let _ = writeln!(
+                    groups,
+                    "  - {{name: p{i}, type: select, proxies: [p{}]}}",
+                    i + 1
+                );
+            }
+            let yaml = format!("{groups}rules:\n  - MATCH,p1\n  - MATCH,DIRECT\n");
+            let tunnel = rematch_tunnel(&yaml);
+            let (adapter, _) = routed(&tunnel, "any.test").await;
+            assert_eq!(adapter, "DIRECT", "the depth-16 PASS must skip the rule");
+        }
+
+        /// One hop past the cap the probe cannot know whether a rematch
+        /// leaf sits at g18 — `None` is the horizon's answer, not the
+        /// chain's, so the walk says so loudly rather than let the dial
+        /// meet a leaf it pretended was absent (issue #974 review).
+        #[test]
+        fn seventeen_hop_pick_chain_warns_on_truncated_rematch_probe() {
+            use std::fmt::Write as _;
+            let mut groups =
+                String::from("proxy-groups:\n  - {name: g17, type: select, proxies: [inspect]}\n");
+            for i in (1..17).rev() {
+                let _ = writeln!(
+                    groups,
+                    "  - {{name: g{i}, type: select, proxies: [g{}]}}",
+                    i + 1
+                );
+            }
+            let yaml = format!(
+                "proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: stage1}}\n\
+                 {groups}rules:\n  - MATCH,g1\n",
+            );
+            let tunnel = rematch_tunnel(&yaml);
+            let route = tunnel.inner().route();
+            let md = Metadata {
+                host: "any.test".into(),
+                dst_port: 443,
+                network: Network::Tcp,
+                ..Default::default()
+            };
+            let rematch = std::cell::Cell::new(None);
+            let probe = TunnelInner::target_probe(&route, &md, None, false, &rematch);
+            let g1 = Arc::clone(route.proxies.get("g1").unwrap());
+            let (leaf, warns) = crate::capture_warns(|| probe.rematch_leaf(g1));
+            assert!(leaf.is_none(), "the leaf sits past the probe horizon");
+            assert!(
+                warns.contains("exceeded 16 hops"),
+                "truncation must say so loudly: {warns}"
+            );
+        }
+
+        /// The same horizon on the `PASS` walk: p1 → … → p17 → PASS
+        /// answers `false` from the budget, not from the chain — and says
+        /// so, so a swallowed PASS leaf never reads as an ordinary miss.
+        #[test]
+        fn seventeen_hop_pick_chain_warns_on_truncated_pass_probe() {
+            use std::fmt::Write as _;
+            let mut groups =
+                String::from("proxy-groups:\n  - {name: p17, type: select, proxies: [PASS]}\n");
+            for i in (1..17).rev() {
+                let _ = writeln!(
+                    groups,
+                    "  - {{name: p{i}, type: select, proxies: [p{}]}}",
+                    i + 1
+                );
+            }
+            let yaml = format!("{groups}rules:\n  - MATCH,p1\n  - MATCH,DIRECT\n");
+            let tunnel = rematch_tunnel(&yaml);
+            let route = tunnel.inner().route();
+            let md = Metadata {
+                host: "any.test".into(),
+                dst_port: 443,
+                network: Network::Tcp,
+                ..Default::default()
+            };
+            let rematch = std::cell::Cell::new(None);
+            let probe = TunnelInner::target_probe(&route, &md, None, false, &rematch);
+            let p1 = Arc::clone(route.proxies.get("p1").unwrap());
+            let (is_pass, warns) =
+                crate::capture_warns(|| probe.unwraps_to(p1, AdapterType::PassRule));
+            assert!(!is_pass, "the PASS leaf sits past the probe horizon");
+            assert!(
+                warns.contains("exceeded 16 hops"),
+                "truncation must say so loudly: {warns}"
+            );
+        }
+
+        /// Two distinct nodes restamping the *same* marker chain freely —
+        /// the guard watches adapter names, not marker values.
+        #[tokio::test]
+        async fn shared_marker_on_different_names_is_not_a_cycle() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: a, type: rematch, target-rematch-name: shared, target-sub-rule: blk}
+  - {name: b, type: rematch, target-rematch-name: shared, target-sub-rule: done}
+rules:
+  - MATCH,a
+sub-rules:
+  blk:
+    - REMATCH-NAME,shared,b
+    - MATCH,DIRECT
+  done:
+    - MATCH,DIRECT
+"#,
+            );
+            let (adapter, md) = routed(&tunnel, "any.test").await;
+            assert_eq!(adapter, "DIRECT");
+            assert_eq!(md.rematch_name(), "shared");
+        }
+
+        /// Thirty-three distinct hops exceeds upstream's recursion
+        /// budget — the 33rd committed transition rejects. One shared
+        /// block chains them: each hop restamps the marker the next
+        /// `REMATCH-NAME` leg reads.
+        #[tokio::test]
+        async fn transition_cap_rejects_at_32() {
+            use std::fmt::Write as _;
+            let mut yaml = String::from("proxies:\n");
+            for i in 1..=33 {
+                let _ = writeln!(
+                    yaml,
+                    "  - {{name: r{i}, type: rematch, target-rematch-name: m{i}, target-sub-rule: chain}}"
+                );
+            }
+            yaml.push_str("rules:\n  - MATCH,r1\nsub-rules:\n  chain:\n");
+            for i in 1..33 {
+                let _ = writeln!(yaml, "    - REMATCH-NAME,m{i},r{}", i + 1);
+            }
+            yaml.push_str("    - MATCH,DIRECT\n");
+            let tunnel = rematch_tunnel(&yaml);
+            let (adapter, _) = routed(&tunnel, "any.test").await;
+            assert_eq!(adapter, "REJECT", "the 33rd transition must trip the cap");
+        }
+
+        /// A `target-sub-rule` naming no declared block warns at build and
+        /// re-reads the main list — different from the listener `rule:`
+        /// override's fail-closed contract.
+        #[tokio::test]
+        async fn unknown_block_falls_back_to_main() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: hop, type: rematch, target-rematch-name: stage1, target-sub-rule: missing}
+rules:
+  - MATCH,hop
+  - REMATCH-NAME,stage1,REJECT
+  - MATCH,DIRECT
+"#,
+            );
+            let (adapter, md) = routed(&tunnel, "any.test").await;
+            // Main list rescans in order: the now-stamped marker hits
+            // REMATCH-NAME on the *second* committed pass.
+            assert_eq!(adapter, "REJECT");
+            assert_eq!(md.rematch_name(), "stage1");
+        }
+
+        /// Membership alone never transitions: a selector whose pick is
+        /// an ordinary member dials it; a selector *picking* the rematch
+        /// member re-enters — the probe peeks the pick chain.
+        #[tokio::test]
+        async fn group_pick_of_rematch_member_transitions() {
+            let rules = r#"
+rules:
+  - REMATCH-NAME,stage1,REJECT
+  - DOMAIN-SUFFIX,example.test,grp
+  - MATCH,DIRECT
+"#;
+            let tunnel = rematch_tunnel(&format!(
+                r#"
+proxies:
+  - {{name: inspect, type: rematch, target-rematch-name: stage1}}
+proxy-groups:
+  - {{name: grp, type: select, proxies: [inspect, DIRECT]}}
+{rules}"#
+            ));
+            let (adapter, _) = routed(&tunnel, "example.test").await;
+            assert_eq!(
+                adapter, "REJECT",
+                "the picked rematch member must transition"
+            );
+
+            let tunnel = rematch_tunnel(&format!(
+                r#"
+proxies:
+  - {{name: inspect, type: rematch, target-rematch-name: stage1}}
+proxy-groups:
+  - {{name: grp, type: select, proxies: [DIRECT, inspect]}}
+{rules}"#
+            ));
+            let (adapter, md) = routed(&tunnel, "example.test").await;
+            // The group itself is the terminal adapter — its DIRECT pick
+            // never tripped the rematch probe, and the marker stayed off.
+            assert_eq!(
+                adapter, "grp",
+                "an unpicked rematch member must not transition"
+            );
+            assert_eq!(md.rematch_name(), "");
+        }
+
+        /// A relay chain is opaque to the match-time walk only for
+        /// transports — a member *group* selecting a `type: rematch`
+        /// leaf is the one pick it must surface so the scan transitions
+        /// instead of treating the chain as a dialable target (issue
+        /// #974). Here pass 2's marker steers the flow to DIRECT.
+        #[tokio::test]
+        async fn relay_member_group_pick_of_rematch_transitions() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1}
+  - {name: node, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+proxy-groups:
+  - {name: sel, type: select, proxies: [inspect]}
+  - {name: chain, type: relay, proxies: [node, sel]}
+rules:
+  - REMATCH-NAME,stage1,DIRECT
+  - DOMAIN-SUFFIX,example.test,chain
+  - MATCH,REJECT
+"#,
+            );
+            let (adapter, md) = routed(&tunnel, "example.test").await;
+            assert_eq!(
+                adapter, "DIRECT",
+                "the picked rematch hop must transition, not dial the chain"
+            );
+            assert_eq!(md.rematch_name(), "stage1");
+        }
+
+        /// The same chain with nothing steering the marker away: the
+        /// second pass re-picks `inspect`, tripping the visited-name
+        /// guard — fail-closed, the verdict the dial path's
+        /// undialable-hop gate would have reached anyway (issue #974).
+        #[tokio::test]
+        async fn relay_rematch_repick_fails_closed_via_cycle_guard() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1}
+  - {name: node, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+proxy-groups:
+  - {name: sel, type: select, proxies: [inspect]}
+  - {name: chain, type: relay, proxies: [node, sel]}
+rules:
+  - MATCH,chain
+"#,
+            );
+            let (adapter, _) = routed(&tunnel, "any.test").await;
+            assert_eq!(adapter, "REJECT");
+        }
+
+        /// A UDP flow to a relay whose resolved chain ends in rematch
+        /// transitions too — previously the `support_udp` peek read the
+        /// undialable chain as `false` and the scan slid to a later
+        /// `MATCH,DIRECT` (issue #974 fail-open).
+        #[tokio::test]
+        async fn udp_relay_rematch_transitions_instead_of_sliding() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: b}
+  - {name: node, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+proxy-groups:
+  - {name: sel, type: select, proxies: [inspect]}
+  - {name: chain, type: relay, proxies: [node, sel]}
+rules:
+  - DOMAIN-SUFFIX,example.test,chain
+  - MATCH,DIRECT
+sub-rules:
+  b:
+    - REMATCH-NAME,stage1,REJECT
+    - MATCH,DIRECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            let target = tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("route resolves");
+            assert_eq!(target.adapter.name(), "REJECT");
+            assert_eq!(md.rematch_name(), "stage1");
+        }
+
+        /// The rematch walk must not step over a hop that can never
+        /// dial: an undialable non-terminal member (REJECT here) fails
+        /// the whole chain at `flatten_hops`, so reporting a later
+        /// rematch leaf would commit a transition onto a dead chain —
+        /// the flow must stay on the relay and fail loudly at dial
+        /// (issue #974 review).
+        #[tokio::test]
+        async fn relay_undialable_first_hop_blocks_rematch_peek() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1}
+proxy-groups:
+  - {name: sel, type: select, proxies: [inspect]}
+  - {name: chain, type: relay, proxies: [REJECT, sel]}
+rules:
+  - REMATCH-NAME,stage1,REJECT
+  - DOMAIN-SUFFIX,example.test,chain
+  - MATCH,DIRECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 443,
+                network: Network::Tcp,
+                ..Default::default()
+            };
+            let target = tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("route resolves");
+            assert_eq!(
+                target.adapter.name(),
+                "chain",
+                "the dead chain stays the committed target — no rematch \
+                 leaf may be reported past its undialable hop"
+            );
+            assert_eq!(md.rematch_name(), "");
+            assert!(
+                target.adapter.dial_tcp(&md).await.is_err(),
+                "the undialable hop fails the chain at dial, the same \
+                 verdict flatten's gate would give"
+            );
+        }
+
+        /// A relay tail's `type: rematch` leaf is a control hop, not a
+        /// transport — an LB's `support_udp` member precheck must not
+        /// filter it before the probe peek can surface the transition,
+        /// or a UDP flow slides to a later `MATCH,DIRECT` (issue #974
+        /// review).
+        #[tokio::test]
+        async fn udp_lb_wrapped_relay_rematch_transitions() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: b}
+  - {name: node, type: socks5, server: 127.0.0.1, port: 1080, udp: true}
+proxy-groups:
+  - {name: sel, type: select, proxies: [inspect]}
+  - {name: chain, type: relay, proxies: [node, sel]}
+  - {name: lb, type: load-balance, proxies: [chain]}
+rules:
+  - DOMAIN-SUFFIX,example.test,lb
+  - MATCH,DIRECT
+sub-rules:
+  b:
+    - REMATCH-NAME,stage1,REJECT
+    - MATCH,DIRECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            let target = tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("route resolves");
+            assert_eq!(target.adapter.name(), "REJECT");
+            assert_eq!(md.rematch_name(), "stage1");
+        }
+
+        /// A UDP flow takes the transition too — the leaf's
+        /// `support_udp()` claim exists so the capability gate never
+        /// preempts it — and the terminal target then applies the
+        /// ordinary UDP policy.
+        #[tokio::test]
+        async fn udp_flow_transitions() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: b}
+rules:
+  - DOMAIN-SUFFIX,example.test,inspect
+  - MATCH,DIRECT
+sub-rules:
+  b:
+    - REMATCH-NAME,stage1,REJECT
+    - MATCH,DIRECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            let target = tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("route resolves");
+            assert_eq!(target.adapter.name(), "REJECT");
+            assert_eq!(md.rematch_name(), "stage1");
+        }
+
+        /// Committed passes count once each on their own vector: the
+        /// main-list rule that selected `inspect` records exactly one
+        /// hit, and the intermediate control hop never registers a
+        /// connection outcome of its own.
+        #[tokio::test]
+        async fn hit_counts_land_on_committed_slots() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: b}
+rules:
+  - DOMAIN-SUFFIX,example.test,inspect
+  - MATCH,DIRECT
+sub-rules:
+  b:
+    - REMATCH-NAME,stage1,REJECT
+    - MATCH,DIRECT
+"#,
+            );
+            let (adapter, _) = routed(&tunnel, "example.test").await;
+            assert_eq!(adapter, "REJECT");
+            let route = tunnel.inner().route();
+            assert_eq!(
+                route.rule_stats.view(0).hits,
+                1,
+                "the committed main-list slot counts one hit"
+            );
+            assert_eq!(route.rule_stats.view(1).hits, 0, "MATCH was never reached");
+        }
+
+        /// A rematch-selected block that exhausts still commits the
+        /// flow's one routing outcome: the aggregate `rule_match` sees
+        /// the implicit DIRECT once, the transition itself is not a
+        /// second outcome, and no rule slot invents a hit for the miss.
+        #[tokio::test]
+        async fn exhausted_block_counts_one_final_outcome() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: hop, type: rematch, target-sub-rule: blk}
+rules:
+  - DOMAIN-SUFFIX,example.test,hop
+  - MATCH,DIRECT
+sub-rules:
+  blk:
+    - DOMAIN-SUFFIX,never-matches.invalid,REJECT
+"#,
+            );
+            let (adapter, _) = routed(&tunnel, "example.test").await;
+            assert_eq!(adapter, "DIRECT", "block exhaustion ends implicit DIRECT");
+            let snapshot = tunnel.inner().stats.rule_match.snapshot();
+            assert_eq!(
+                snapshot,
+                vec![(("Final", "DIRECT"), 1)],
+                "one aggregate outcome only, got {snapshot:?}"
+            );
+            let route = tunnel.inner().route();
+            assert_eq!(
+                route.rule_stats.view(0).hits,
+                1,
+                "the transition's committed slot keeps its own hit"
+            );
+            assert_eq!(
+                route.rule_stats.view(1).hits,
+                0,
+                "main-list MATCH was never reached"
+            );
+        }
+
+        /// The `resolve_udp_dst` probe resolves the route including
+        /// rematch transitions, and its decision IS the commit: the
+        /// marker it settled on lands on the flow and the bookkeeping it
+        /// deferred is tallied exactly once — the caller never re-scans
+        /// (issues #882, #974).
+        #[tokio::test]
+        async fn udp_route_probe_commits_rematch_decision() {
+            let tunnel = udp_probe_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: b}
+rules:
+  - DOMAIN-SUFFIX,example.test,inspect
+  - MATCH,REJECT
+sub-rules:
+  b:
+    - REMATCH-NAME,stage1,DIRECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            let target = tunnel
+                .inner()
+                .resolve_udp_dst(&mut md)
+                .await
+                .expect("a probe that ran returns the committed decision");
+            assert_eq!(target.adapter.name(), "DIRECT");
+            assert_eq!(
+                md.dst_ip,
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(192, 0, 2, 3))),
+                "the probe must see rematch → DIRECT and consult direct-nameserver"
+            );
+            assert_eq!(
+                md.rematch_name(),
+                "stage1",
+                "the committed decision carries the transition's marker"
+            );
+            let route = tunnel.inner().route();
+            assert_eq!(
+                route.rule_stats.view(0).hits,
+                1,
+                "the kept decision tallies its transition slot exactly once"
+            );
+            assert_eq!(
+                tunnel.inner().stats.rule_match.snapshot(),
+                vec![(("REMATCH-NAME", "DIRECT"), 1)],
+                "the kept decision tallies its terminal outcome once"
+            );
+        }
+
+        /// The same probe commits the block's terminal verdict, not only
+        /// a rematch inside it: `b` ends `MATCH,REJECT` while the main
+        /// list would answer DIRECT — a decision that ignored the
+        /// transition's block reads DIRECT and the assertion fails
+        /// (issue #974 review).
+        #[tokio::test]
+        async fn udp_route_probe_commits_block_reject_decision() {
+            let tunnel = udp_probe_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1, target-sub-rule: b}
+rules:
+  - DOMAIN-SUFFIX,example.test,inspect
+  - MATCH,DIRECT
+sub-rules:
+  b:
+    - MATCH,REJECT
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            let target = tunnel
+                .inner()
+                .resolve_udp_dst(&mut md)
+                .await
+                .expect("a probe that ran returns the committed decision");
+            assert_eq!(
+                target.adapter.name(),
+                "REJECT",
+                "the probe commits the block's MATCH,REJECT, not main's DIRECT"
+            );
+            assert_eq!(md.rematch_name(), "stage1");
+            assert_eq!(
+                md.dst_ip, None,
+                "REJECT never consults the direct-nameserver"
+            );
+            assert_eq!(
+                tunnel.inner().stats.rule_match.snapshot(),
+                vec![(("MATCH", "REJECT"), 1)],
+                "the kept decision tallies the block's terminal outcome once"
+            );
+        }
+
+        /// The listener's `rule:` block keeps its fail-closed contract on
+        /// the UDP probe too: a block match to a UDP-incapable target
+        /// materializes REJECT in the committed decision — sliding past
+        /// it would read main's `MATCH,DIRECT` instead (issue #974
+        /// review).
+        #[tokio::test]
+        async fn udp_route_probe_seeded_block_fails_closed() {
+            let tunnel = udp_probe_tunnel(
+                r#"
+proxies:
+  - {name: noupd, type: socks5, server: 127.0.0.1, port: 1080, udp: false}
+rules:
+  - MATCH,DIRECT
+sub-rules:
+  blk:
+    - MATCH,noupd
+"#,
+            );
+            let mut md = Metadata {
+                host: "example.test".into(),
+                dst_port: 53,
+                network: Network::Udp,
+                ..Default::default()
+            };
+            md.set_special_route(None, Some("blk"));
+            let target = tunnel
+                .inner()
+                .resolve_udp_dst(&mut md)
+                .await
+                .expect("a probe that ran returns the committed decision");
+            assert_eq!(
+                target.adapter.name(),
+                "REJECT",
+                "the listener-seeded scan fails closed on the UDP-incapable match"
+            );
+            assert_eq!(
+                tunnel.inner().stats.rule_match.snapshot(),
+                vec![(("MATCH", "REJECT"), 1)],
+                "the kept decision tallies the seeded block's outcome once"
+            );
+        }
+
+        /// A `SUB-RULE` reference is a predicate, not a `SpecialRules`
+        /// change: its member selecting a rematch leaf without
+        /// `target-sub-rule` restarts the active *outer* list.
+        #[tokio::test]
+        async fn sub_rule_member_rematch_restarts_outer() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: inspect, type: rematch, target-rematch-name: stage1}
+rules:
+  - SUB-RULE,(DOMAIN-SUFFIX,example.test),b1
+  - REMATCH-NAME,stage1,REJECT
+  - MATCH,DIRECT
+sub-rules:
+  b1:
+    - MATCH,inspect
+"#,
+            );
+            let (adapter, md) = routed(&tunnel, "example.test").await;
+            assert_eq!(adapter, "REJECT");
+            assert_eq!(md.rematch_name(), "stage1");
+        }
+
+        /// Demand staging persists across rematch passes: the flow's one
+        /// process lookup runs once — pass two's block scan reuses the
+        /// memo (hit *and* miss are cached alike), never rescanning the
+        /// socket table (issue #974).
+        #[tokio::test]
+        async fn process_lookup_once_across_rematch_passes() {
+            let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
+                "proxies:\n  - {name: inspect, type: rematch, target-sub-rule: blk}\n",
+            )
+            .unwrap();
+            let res = meow_config::rebuild_from_raw(&raw).expect("config builds");
+            let tunnel = test_tunnel();
+            tunnel.set_mode(TunnelMode::Rule);
+            tunnel.set_process_lookup_mode(ProcessLookupMode::Strict);
+            // The block reaches its own process demand — a second scan
+            // would trip the counter; the memo must answer instead.
+            let sub_rules = HashMap::from([(
+                "blk".to_string(),
+                Arc::new(vec![
+                    Box::new(DemandProcess::new("other-owner", "REJECT")) as Box<dyn Rule>,
+                    Box::new(FinalRule::new("DIRECT")) as Box<dyn Rule>,
+                ]) as meow_rules::sub_rule::SubRuleBlock,
+            )]);
+            let rules: Vec<Box<dyn Rule>> = vec![
+                Box::new(DemandProcess::new("stub-owner", "inspect")),
+                Box::new(FinalRule::new("DIRECT")),
+            ];
+            tunnel.update_routing(res.proxies, rules, sub_rules, res.dialer_registry);
+            let calls = counting_hook(&tunnel, Some(owner()));
+            let mut md = flow_meta();
+            let target = tunnel
+                .inner()
+                .resolve_proxy_flow(&mut md)
+                .await
+                .expect("route resolves");
+            // Pass 1: stub-owner → inspect → transition into blk.
+            // Pass 2: the memo's stub-owner ≠ other-owner → MATCH,DIRECT.
+            assert_eq!(target.adapter.name(), "DIRECT");
+            assert_eq!(
+                scan_count(&calls),
+                1,
+                "the transition must carry the lookup outcome, not rescan"
+            );
+        }
+
+        /// A demand first reached on a *later* pass resolves then and
+        /// only then: `ip_attempted` lives at flow scope, so pass 2's
+        /// IP-CIDR rule runs the one lookup the first pass never needed.
+        #[tokio::test]
+        async fn ip_demand_first_reached_on_the_second_pass() {
+            use meow_dns::HostEntry;
+            use meow_rules::ipcidr::IpCidrRule;
+            let mut hosts: DomainTrie<HostEntry> = DomainTrie::new();
+            hosts.insert(
+                "need-ip.test",
+                vec![std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    93, 184, 216, 34,
+                ))]
+                .into(),
+            );
+            let resolver = Resolver::new(vec![], vec![], DnsMode::Normal, hosts, true, true);
+            let tunnel = Tunnel::new(Arc::new(resolver));
+            let raw: meow_config::raw::RawConfig = serde_saphyr::from_str(
+                "proxies:\n  - {name: inspect, type: rematch, target-sub-rule: blk}\n",
+            )
+            .unwrap();
+            let res = meow_config::rebuild_from_raw(&raw).expect("config builds");
+            tunnel.set_mode(TunnelMode::Rule);
+            tunnel.update_routing(
+                res.proxies,
+                vec![
+                    Box::new(DomainSuffixRule::new("need-ip.test", "inspect")),
+                    Box::new(FinalRule::new("DIRECT")),
+                ],
+                HashMap::from([(
+                    "blk".to_string(),
+                    Arc::new(vec![
+                        Box::new(
+                            IpCidrRule::new("93.184.216.0/24", "REJECT", false, false).unwrap(),
+                        ) as Box<dyn Rule>,
+                        Box::new(FinalRule::new("DIRECT")) as Box<dyn Rule>,
+                    ]) as meow_rules::sub_rule::SubRuleBlock,
+                )]),
+                res.dialer_registry,
+            );
+            let mut md = Metadata {
+                host: "need-ip.test".into(),
+                dst_port: 443,
+                network: Network::Tcp,
+                ..Default::default()
+            };
+            // The lazy TCP path: pass 1 never reached an IP slot, so the
+            // resolve happens when pass 2's IP-CIDR rule gates the scan.
+            let target = tunnel
+                .inner()
+                .resolve_proxy_lazy(&mut md)
+                .await
+                .expect("route resolves");
+            assert_eq!(
+                target.adapter.name(),
+                "REJECT",
+                "pass 2's IP-CIDR rule resolved the host and matched"
+            );
+            assert_eq!(
+                md.dst_ip,
+                Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(
+                    93, 184, 216, 34
+                ))),
+                "the lookup ran once, inside the pass that demanded it"
+            );
+        }
+
+        /// A malformed `REMATCH-NAME` line drops itself, not the
+        /// provider: the sibling rule still installs, `RULE-SET` keeps
+        /// routing to its declared target, and the flow does not lose
+        /// the whole set to one bad entry (issue #974 review).
+        #[tokio::test]
+        async fn provider_malformed_marker_drops_line_not_set() {
+            let tunnel = rematch_tunnel(
+                r#"
+rule-providers:
+  prov:
+    type: inline
+    behavior: classical
+    payload:
+      - "REMATCH-NAME,a//b"
+      - "DOMAIN-SUFFIX,x.com"
+rules:
+  - RULE-SET,prov,REJECT
+  - MATCH,DIRECT
+"#,
+            );
+            let (adapter, _) = routed(&tunnel, "x.com").await;
+            assert_eq!(
+                adapter, "REJECT",
+                "the valid sibling rule keeps the provider alive"
+            );
+        }
     }
 }

@@ -339,13 +339,13 @@ struct DialPick {
 }
 
 /// Run `dial`, a connection's dial through its rule's outbound, and name the
-/// member the last automatic group on the connection's path committed to:
-/// the member the dial went through, where an `unwrap_proxy` peek beforehand
-/// can name another (a concurrent dial moves a round-robin load-balance
-/// group on between the peek and the dial). Groups on a `dialer-proxy`
-/// front hop's path leave it as it is. `None` when no automatic group
-/// dialled: the outbound is a node or a selector over one, or the dial
-/// failed before a group picked.
+/// member the last group on the connection's path committed to at its dial
+/// point: the member the dial went through, where an `unwrap_proxy` peek
+/// beforehand can name another (a concurrent dial moves a round-robin
+/// load-balance group on between the peek and the dial). Groups on a
+/// `dialer-proxy` front hop's path leave it as it is. `None` when no group
+/// dialled: the outbound is a node, or the dial failed before a group
+/// picked.
 ///
 /// A separate scope from `MEMBER_DIAL`, which a group's own member dial
 /// and a front hop's blame read: setting that one for a whole connection
@@ -862,6 +862,13 @@ mod tests {
         let outer = crate::group::fallback::FallbackGroup::new("Auto", vec![rr]);
         let (_, pick) = watch_dial_pick(outer.dial_tcp(&meta)).await;
         assert!(["A", "B"].contains(&pick.unwrap().name()));
+
+        // A selector reports the member its dial went through too — a
+        // later re-selection must not rename it (issue #974 review).
+        let sel: Vec<Arc<dyn Proxy>> = vec![MockProxy::new("M1"), MockProxy::new("M2")];
+        let sel = crate::group::selector::SelectorGroup::new("Sel", sel);
+        let (_, pick) = watch_dial_pick(sel.dial_tcp(&meta)).await;
+        assert_eq!(pick.unwrap().name(), "M1");
 
         // A node dials no group.
         let node = MockProxy::new("C");

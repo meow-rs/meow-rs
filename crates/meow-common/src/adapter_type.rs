@@ -34,6 +34,10 @@ pub enum AdapterType {
     /// Direct-dialing built-in named `COMPATIBLE` — upstream registers it
     /// as GLOBAL's default member (upstream `C.Compatible`).
     Compatible,
+    /// `type: rematch` control outbound (issue #974) — re-enters the rule
+    /// scan with `Metadata.rematch_name`/`special_rules` updated. Carries
+    /// no address and can never open a socket (upstream `C.Rematch`).
+    Rematch,
 }
 
 impl fmt::Display for AdapterType {
@@ -61,6 +65,7 @@ impl fmt::Display for AdapterType {
             AdapterType::Pass => write!(f, "Pass"),
             AdapterType::PassRule => write!(f, "PassRule"),
             AdapterType::Compatible => write!(f, "Compatible"),
+            AdapterType::Rematch => write!(f, "Rematch"),
         }
     }
 }

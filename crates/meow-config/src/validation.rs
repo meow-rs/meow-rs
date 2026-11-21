@@ -282,6 +282,11 @@ const SOCKS5_NODE_KEYS: &[&str] = &[
 
 const DIRECT_NODE_KEYS: &[&str] = &["connect-timeout", "dns"];
 
+/// `type: rematch` (issue #974) — a control outbound: no `server`/`port`,
+/// no `udp` (the transition preempts the capability check, so `udp: false`
+/// reads as an ignored unknown key), just the two re-entry targets.
+const REMATCH_NODE_KEYS: &[&str] = &["target-rematch-name", "target-sub-rule"];
+
 const TRUSTTUNNEL_NODE_KEYS: &[&str] = &[
     "server",
     "port",
@@ -437,6 +442,7 @@ fn known_node_keys(proxy_type: &str) -> Option<&'static [&'static str]> {
         "http" => HTTP_NODE_KEYS,
         "socks5" => SOCKS5_NODE_KEYS,
         "direct" => DIRECT_NODE_KEYS,
+        "rematch" => REMATCH_NODE_KEYS,
         "trusttunnel" => TRUSTTUNNEL_NODE_KEYS,
         "anytls" => ANYTLS_NODE_KEYS,
         "hysteria2" => HYSTERIA2_NODE_KEYS,

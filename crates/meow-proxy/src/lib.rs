@@ -24,6 +24,7 @@ pub mod http_adapter;
 #[cfg(feature = "mux")]
 pub mod mux;
 pub mod reject;
+pub mod rematch;
 pub mod socks5_adapter;
 pub mod stream_conn;
 #[cfg(any(feature = "vmess", feature = "vless-encryption"))]
@@ -115,6 +116,7 @@ pub use group::selector_store::{SelectionBacking, SelectorStore, SelectorWriter}
 pub use group::urltest::UrlTestGroup;
 pub use http_adapter::HttpAdapter;
 pub use reject::RejectAdapter;
+pub use rematch::RematchAdapter;
 #[cfg(feature = "ss")]
 pub use shadowsocks_adapter::ShadowsocksAdapter;
 pub use socks5_adapter::Socks5Adapter;

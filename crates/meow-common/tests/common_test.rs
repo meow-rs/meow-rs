@@ -554,7 +554,14 @@ fn test_error_from_io() {
 /// flow. The payload is the same `InboundRouteOverride` the listener
 /// config holds, Arc'd once per stamped flow (wireguard/tproxy-UDP pass
 /// their listener Arc straight through — zero per-flow alloc there).
+///
+/// 264 → 272 B (issue #974): `rematch_name: Option<Arc<SmolStr>>` — the
+/// marker a `type: rematch` hop stamps, `None` on the ordinary flow and
+/// one pointer wide for it. It is per-clone state (each transition
+/// stamps its own copy), so it cannot fold into the clones-shared
+/// `flow_lookup` payload; an inline `Option<SmolStr>` would instead
+/// cost every flow 24 B for a field rematch flows alone carry.
 #[test]
-fn metadata_stays_264_bytes() {
-    assert_eq!(std::mem::size_of::<meow_common::Metadata>(), 264);
+fn metadata_stays_272_bytes() {
+    assert_eq!(std::mem::size_of::<meow_common::Metadata>(), 272);
 }

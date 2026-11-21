@@ -1371,8 +1371,17 @@ impl ProxyProvider {
                 // (mihomo's `len > 0` check treats `""` as unset). A
                 // whitespace-only value is remote-controlled garbage, not a
                 // usable name — reject the node rather than dial direct.
+                // `type: rematch` is the exception: `check_rematch_node`
+                // treats blank-or-null as absent, and the node owns no
+                // transport to chain (issue #974).
                 Some("") => None,
                 None if value.is_null() => None,
+                Some(s)
+                    if s.trim().is_empty()
+                        && raw_map.get("type").and_then(|v| v.as_str()) == Some("rematch") =>
+                {
+                    None
+                }
                 _ => {
                     return Err(
                         "malformed `dialer-proxy` value — expected a proxy/group name".to_string(),
@@ -1403,6 +1412,26 @@ impl ProxyProvider {
         // knob — the override wrote over both lower levels, so the node
         // dials direct by operator intent, not by a missing field.
         if dialer_name.is_empty() {
+            return proxy_parser::parse_proxy_provider_node_with_fp(
+                raw_map,
+                self.ipv6,
+                self.allow_external_plugin,
+                &direct,
+                self.global_client_fingerprint.as_deref(),
+            );
+        }
+        // A `dialer-proxy` chain is a transport knob a `type: rematch`
+        // node cannot carry — parse the control leaf bare rather than
+        // wrap it in `DialerProxyAdapter`, which does not report the
+        // rematch action (issue #974). A non-blank `dialer-proxy` on the
+        // node itself still fails in `check_rematch_node` below.
+        if raw_map.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+            warn!(
+                provider = %self.name,
+                proxy = raw_name,
+                "rematch node ignores `dialer-proxy` '{dialer_name}' — \
+                 a rematch is a routing control, not a transport"
+            );
             return proxy_parser::parse_proxy_provider_node_with_fp(
                 raw_map,
                 self.ipv6,
@@ -3083,6 +3112,50 @@ header:
             ["empty"],
             "whitespace dialer-proxy must reject the node; empty stays unset"
         );
+    }
+
+    /// A `type: rematch` node can never carry the chain — a provider-
+    /// or override-level `dialer-proxy` parses it bare instead of
+    /// wrapping it in `DialerProxyAdapter` (which hides the rematch
+    /// action), and a blank node-level `dialer-proxy` is unset like
+    /// `check_rematch_node` says, not malformed (issue #974).
+    #[tokio::test]
+    async fn provider_dialer_never_wraps_rematch_nodes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n\
+             \x20 - {name: inspect, type: rematch, target-rematch-name: s}\n\
+             \x20 - {name: blank, type: rematch, target-rematch-name: s, dialer-proxy: ' '}\n\
+             \x20 - {name: bad, type: rematch, target-rematch-name: s, dialer-proxy: front}\n",
+        )
+        .unwrap();
+        let mut raw = raw_file_provider("nodes.yaml");
+        raw.dialer_proxy = Some("front".to_string());
+        let p = ProxyProvider::new(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        let members = p.proxies();
+        // `bad` (a non-blank node-level `dialer-proxy`) drops on
+        // `check_rematch_node`; the kept leaves report their action —
+        // the provider-level chain must not have wrapped them.
+        let mut names: Vec<String> = members.iter().map(|n| n.name().to_string()).collect();
+        names.sort();
+        assert_eq!(names, ["blank", "inspect"]);
+        for member in &members {
+            assert!(
+                member.rematch_action().is_some(),
+                "{} must keep its rematch action",
+                member.name()
+            );
+        }
     }
 
     /// A refresh that *changes* the `dialer-proxy` name must retarget the

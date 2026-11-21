@@ -196,6 +196,69 @@ infix `&`, `|` and `!` extension (`!` binds tightest, `&` before `|`,
 parentheses override; upstream parses only the prefix forms), e.g.
 `SUB-RULE,((DOMAIN-SUFFIX,example.com)|!(GEOIP,CN)),my-block`.
 
+## Rematch routing
+
+A `type: rematch` node is a **control outbound**: it carries no address and
+never opens a socket. When a rule selects it, routing re-enters the rule scan
+with the fields the node names applied to the flow:
+
+```yaml
+proxies:
+  - name: inspect
+    type: rematch
+    target-rematch-name: stage1      # stamps the flow's rematch marker
+    target-sub-rule: second-pass     # and/or switches the active rule list
+```
+
+- `target-rematch-name` — stamps `Metadata.rematchName`, the value
+  `REMATCH-NAME` rules compare against.
+- `target-sub-rule` — makes the named `sub-rules:` block the active list;
+  `""` returns the scan to the top-level `rules:`.
+- At least one field is required. Omitted/`null` leaves that field untouched;
+  an explicit `""` **clears** it. Values are used verbatim — no trimming or
+  case folding — and must be strings (quote numbers).
+- A `target-sub-rule` naming an undeclared block warns at load and falls back
+  to the top-level rules at match time.
+
+| Type | Example | Matches |
+| --- | --- | --- |
+| `REMATCH-NAME` | `REMATCH-NAME,stage1,REJECT` | The flow's rematch marker equals an alternative |
+
+The payload is a `/`-separated list of alternatives — `stage1/alternative`
+matches either. Each token is trimmed and compared **exactly and
+case-sensitively**: there is no wildcard, regex, substring or `|` alternation
+(`*` and `|` stay literal). An empty alternative is rejected, and a flow whose
+marker is unset matches nothing. `REMATCH-NAME` also works inside
+`AND`/`OR`/`NOT` legs and `SUB-RULE` conditions.
+
+```yaml
+proxies:
+  - name: inspect
+    type: rematch
+    target-rematch-name: stage1
+    target-sub-rule: second-pass
+
+rules:
+  - DOMAIN-SUFFIX,example.test,inspect
+  - MATCH,DIRECT
+
+sub-rules:
+  second-pass:
+    - REMATCH-NAME,stage1/alternative,REJECT
+    - MATCH,DIRECT
+```
+
+Here `example.test` selects `inspect`, the scan re-enters inside `second-pass`
+with the marker stamped `stage1`, and the first block rule sends the flow to
+`REJECT`; unrelated flows take the top-level `MATCH,DIRECT`.
+
+Re-entry is iterative with two safety guards, both terminal: selecting a
+rematch node already visited in this flow — or exceeding 32 transitions —
+rejects the connection rather than sliding to a later rule. A group whose
+*selected* member is a rematch node transitions the same way (mere membership
+does nothing), and a rematch leaf can never be a `dialer-proxy` front — it has
+no transport to carry.
+
 ## Logic rules
 
 `AND`, `OR`, and `NOT` compose other rules. Inner rules are wrapped in balanced

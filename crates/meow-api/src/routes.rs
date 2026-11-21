@@ -5411,40 +5411,169 @@ async fn put_configs(
         // the other document checks; declared rule-provider names stand
         // in for sets the failed builds could not produce (their
         // availability is environment, not shape) — issue #974 review.
-        if let Some(sub_map) = raw_config.sub_rules.as_ref().filter(|m| !m.is_empty()) {
-            let stand_ins: std::collections::HashMap<_, _> = raw_config
-                .rule_providers
-                .as_ref()
-                .map(|providers| {
-                    providers
-                        .keys()
-                        .map(|name| {
-                            let set: Arc<dyn meow_rules::RuleSet> =
-                                Arc::from(meow_rules::build_rule_set(
-                                    meow_rules::RuleSetBehavior::Classical,
-                                    &[],
-                                    &meow_rules::ParserContext::empty(),
-                                ));
-                            (name.clone(), set)
-                        })
-                        .collect()
-                })
-                .unwrap_or_default();
-            if let Err(e) = meow_config::sub_rules_parser::check_sub_rules_shape(
-                raw_config.rules.as_deref().unwrap_or(&[]),
-                sub_map,
-                &stand_ins,
-                &meow_rules::ParserContext {
-                    geoip: Some(Arc::new(meow_rules::country_index::CountryIndex::default())),
-                    asn: Some(Arc::new(meow_rules::asn_index::AsnIndex::default())),
-                    geosite: None,
-                },
-            ) {
+        let stand_ins: meow_rules::RuleSets = raw_config
+            .rule_providers
+            .as_ref()
+            .map(|providers| {
+                providers
+                    .keys()
+                    .map(|name| {
+                        let set: Arc<dyn meow_rules::RuleSet> =
+                            Arc::from(meow_rules::build_rule_set(
+                                meow_rules::RuleSetBehavior::Classical,
+                                &[],
+                                &meow_rules::ParserContext::empty(),
+                            ));
+                        (name.clone(), set)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let shape_ctx = meow_rules::ParserContext {
+            geoip: Some(Arc::new(meow_rules::country_index::CountryIndex::default())),
+            asn: Some(Arc::new(meow_rules::asn_index::AsnIndex::default())),
+            geosite: None,
+        };
+        // Run unconditionally — the rebuild's undefined-block gate does
+        // too (a `SUB-RULE` reference with no `sub-rules:` section fails
+        // the next boot the same way). The resolved blocks also feed the
+        // REMATCH-NAME check below, whose conditional
+        // `SUB-RULE,(cond),<name>` lines only parse block-aware
+        // (issue #974).
+        let empty_sub_map = HashMap::new();
+        let shape_blocks = match meow_config::sub_rules_parser::check_sub_rules_shape(
+            raw_config.rules.as_deref().unwrap_or(&[]),
+            raw_config.sub_rules.as_ref().unwrap_or(&empty_sub_map),
+            &stand_ins,
+            &shape_ctx,
+        ) {
+            Ok(blocks) => blocks,
+            Err(e) => {
                 return reload_rejected(
                     StatusCode::BAD_REQUEST,
                     &format!(
                         "config validation failed under force, and the candidate's \
                               sub-rules are structurally unsafe to commit verbatim: {e}"
+                    ),
+                );
+            }
+        };
+        // The rematch pair is strict in both modes the same way — a
+        // malformed `type: rematch` action or `REMATCH-NAME` predicate
+        // committed verbatim would hard-fail the next boot. Check them
+        // with or without a `sub-rules:` section; rule lines go through
+        // the build's block-aware parser, so a `(cond)` inside
+        // `SUB-RULE` and the legs inside logic groups get the same
+        // verdict as the build did (issue #974).
+        for node in raw_config.proxies.as_deref().unwrap_or(&[]) {
+            if node.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+                if let Err(e) = meow_config::proxy_parser::check_rematch_node(node) {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "config validation failed under force, and the candidate's \
+                             rematch nodes are structurally unsafe to commit verbatim: {e}"
+                        ),
+                    );
+                }
+            }
+        }
+        // The name set the edges are judged against is the map the build
+        // produces — last-wins and built-in shadows included — not every
+        // raw `type: rematch` declaration: a rematch shadowed by a later
+        // same-named transport never becomes the leaf a member or
+        // `dialer-proxy` binds (issue #974).
+        let rematch_names =
+            meow_config::declared_rematch_names(raw_config.proxies.as_deref().unwrap_or(&[]));
+        // The reverse edge is the same hard defect the build's
+        // `apply_dialer_proxies_validate` reports: a `dialer-proxy`
+        // naming a statically known rematch leaf can never carry the
+        // hop — a rematch re-enters routing, it does not dial. Judge the
+        // edges that will actually bind — last-wins dedupe, built-in
+        // shadows and rematch nodes skipped like the build does — not
+        // every raw `dialer-proxy` key (issue #974).
+        match meow_config::declared_dialer_edges(raw_config.proxies.as_deref().unwrap_or(&[])) {
+            Ok(edges) => {
+                for (_, dialer) in edges {
+                    if rematch_names.contains(dialer.as_str()) {
+                        return reload_rejected(
+                            StatusCode::BAD_REQUEST,
+                            &format!(
+                                "config validation failed under force, and the candidate's \
+                                 dialer-proxy edges are structurally unsafe to commit verbatim: \
+                                 dialer-proxy '{dialer}' is a rematch control outbound",
+                            ),
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "config validation failed under force, and the candidate's \
+                         dialer-proxy edges are structurally unsafe to commit verbatim: {e}"
+                    ),
+                );
+            }
+        }
+        // Relay membership is the same hard defect the build reports at
+        // `rebuild_from_raw`: a relay hop must dial and a rematch leaf
+        // never does — both a static `proxies:` member and an
+        // `include-all-proxies` expansion picking a declared leaf.
+        // A *group* member's dynamic rematch pick is the probe's
+        // business instead, exactly as in the build (issue #974).
+        for group in raw_config.proxy_groups.as_deref().unwrap_or(&[]) {
+            if group.group_type != "relay" {
+                continue;
+            }
+            for member in group.proxies.as_deref().unwrap_or(&[]) {
+                // Untrimmed like the build's `proxies.get(member)` — a
+                // padded member name the registry never binds must not
+                // collide with a leaf it never becomes.
+                if rematch_names.contains(member.as_str()) {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "config validation failed under force, and the candidate's \
+                             relay groups are structurally unsafe to commit verbatim: \
+                             relay group '{}' member '{member}' is a rematch \
+                             control outbound",
+                            group.name,
+                        ),
+                    );
+                }
+            }
+            if group.include_all_proxies.unwrap_or(false) {
+                if let Some(leaf) = rematch_names.iter().next() {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "config validation failed under force, and the candidate's \
+                             relay groups are structurally unsafe to commit verbatim: \
+                             relay group '{}' include-all-proxies supplies rematch \
+                             control outbound '{leaf}'",
+                            group.name,
+                        ),
+                    );
+                }
+            }
+        }
+        for line in raw_config.rules.as_deref().unwrap_or(&[]) {
+            if !meow_rules::line_mentions_rematch_name(line) {
+                continue;
+            }
+            if let Err(e) = meow_config::rule_parser::parse_one_rule_or_subrule(
+                line,
+                &stand_ins,
+                &shape_ctx,
+                &shape_blocks,
+            ) {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    &format!(
+                        "config validation failed under force, and the candidate's \
+                         REMATCH-NAME rules are structurally unsafe to commit verbatim: {e}"
                     ),
                 );
             }

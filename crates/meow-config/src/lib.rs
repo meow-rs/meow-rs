@@ -2136,6 +2136,14 @@ fn collect_dialer_edges(
         if BUILTIN_ADAPTER_NAMES.contains(&name) {
             continue;
         }
+        // `type: rematch` owns no dialer — `check_rematch_node` already
+        // rejected a non-blank `dialer-proxy`, so a leftover blank value
+        // is unset, not malformed. Binding the sentinel here would wrap
+        // the control leaf in `DialerProxyAdapter` and hide its rematch
+        // action (issue #974).
+        if raw_proxy.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+            continue;
+        }
         let dialer: SmolStr = match raw_proxy.get("dialer-proxy") {
             None => continue,
             Some(v) => match v.as_str() {
@@ -2202,6 +2210,43 @@ fn collect_dialer_edges(
     Ok(DialerEdges { declared, by_index })
 }
 
+/// The `dialer-proxy` edges `collect_dialer_edges` will actually bind
+/// at build — the verbatim/validation view of the same graph, so a
+/// shadowed duplicate's, a built-in-shadowing entry's or a rematch
+/// node's raw `dialer-proxy` key is not judged as an edge it never
+/// becomes (issue #974 review). Lenient collection: a malformed value
+/// resolves to the sentinel target instead of erroring, matching the
+/// lenient boot it would commit under.
+pub fn declared_dialer_edges(
+    raw_proxies: &[HashMap<String, serde_json::Value>],
+) -> Result<Vec<(SmolStr, SmolStr)>, anyhow::Error> {
+    collect_dialer_edges(raw_proxies, false).map(|edges| edges.declared)
+}
+
+/// The names whose final `proxies:` binding is a rematch leaf — the
+/// verbatim/validation view of the map `insert_parsed_leaves` produces:
+/// last-wins like its `proxies.insert` (a later same-name declaration
+/// replaces the earlier type), and an entry named after a built-in
+/// never binds at all (issue #974 review).
+pub fn declared_rematch_names(
+    raw_proxies: &[HashMap<String, serde_json::Value>],
+) -> std::collections::HashSet<SmolStr> {
+    let mut rematch = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    for node in raw_proxies.iter().rev() {
+        let Some(name) = node.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !seen.insert(name) || BUILTIN_ADAPTER_NAMES.contains(&name) {
+            continue;
+        }
+        if node.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+            rematch.insert(SmolStr::from(name));
+        }
+    }
+    rematch
+}
+
 /// Validate the `dialer-proxy` edges [`collect_dialer_edges`] declared, now
 /// that every leaf has been built — the check half of the old
 /// `apply_dialer_proxies` pass. The chains themselves are already applied:
@@ -2235,6 +2280,19 @@ fn apply_dialer_proxies_validate(
     for (name, dialer) in dialer_edges {
         if !dialable.contains(dialer.as_str()) && !dialer.starts_with(MALFORMED_DIALER_PREFIX) {
             anyhow::bail!("proxy '{name}': dialer-proxy '{dialer}' not found");
+        }
+        // A statically resolvable rematch leaf can never carry the hop —
+        // a rematch's only action is a routing re-entry, not a dial
+        // (issue #974). Group fronts resolve their pick at dial time,
+        // where the leaf's own dial fails closed instead.
+        if proxies
+            .get(dialer.as_str())
+            .is_some_and(|p| p.adapter_type() == meow_common::AdapterType::Rematch)
+        {
+            anyhow::bail!(
+                "proxy '{name}': dialer-proxy '{dialer}' is a rematch control \
+                 outbound — it cannot carry a dialer front"
+            );
         }
     }
     Ok(())
@@ -2482,7 +2540,12 @@ fn is_usable_global_target(name: &str, proxies: &HashMap<SmolStr, Arc<dyn Proxy>
     !BUILTIN_GLOBAL_POLICIES
         .iter()
         .any(|policy| name.eq_ignore_ascii_case(policy))
-        && proxies.contains_key(name)
+        // A rematch leaf is a routing control, not a dialable outbound —
+        // it stays in the member list (upstream `proxyList` semantics)
+        // but can never be the selector's default pick (issue #974).
+        && proxies
+            .get(name)
+            .is_some_and(|p| p.adapter_type() != AdapterType::Rematch)
 }
 
 /// The target of the LAST top-level `MATCH,<target>` rule — the config's
@@ -3113,6 +3176,17 @@ fn build_proxy_layer(
     // build-bare-then-re-parse pass, whose double construction could spawn an
     // `ss` node's external SIP003 subprocess twice.
     let raw_proxies = raw.proxies.as_deref().unwrap_or(&[]);
+    // A malformed `type: rematch` action fails the whole load in either
+    // mode — warn-dropping it would silently remove the flow's first
+    // routing decision (issue #974). Run the structural gate before the
+    // leaf pass so `-t`, boot, PUT and provider-less rebuilds agree.
+    for raw_proxy in raw_proxies {
+        if raw_proxy.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+            if let Err(e) = proxy_parser::check_rematch_node(raw_proxy) {
+                anyhow::bail!("proxies: {e}");
+            }
+        }
+    }
     let dialer_edges = collect_dialer_edges(raw_proxies, strict)?;
 
     // `global-client-fingerprint` (issue #974) is normalized once per
@@ -3198,6 +3272,49 @@ fn build_proxy_layer(
         .into_iter()
         .map(|(_, proxy)| proxy)
         .collect();
+
+    // A statically known `type: rematch` hop can never carry a relay
+    // chain — the leaf's only action is a routing re-entry, not a dial
+    // (issue #974: "Rematch is not a meow relay transport hop; reject
+    // statically known uses"). Both static memberships a relay can have
+    // — a declared `proxies:` name resolving to the leaf, and the
+    // `include-all-proxies` expansion — are checked here so the verdict
+    // is a hard error in both build modes, ahead of the lenient group
+    // passes that would warn-drop it. `parse_relay_group` repeats the
+    // member-vec check for its own callers. A *group* member's dynamic
+    // rematch pick is the probe's business instead:
+    // `RelayGroup::unwrap_proxy` surfaces it and the cycle guard closes
+    // the loop.
+    for group in raw_groups {
+        if group.group_type != "relay" {
+            continue;
+        }
+        for member in group.proxies.as_deref().unwrap_or(&[]) {
+            if proxies
+                .get(member.as_str())
+                .is_some_and(|p| p.rematch_action().is_some())
+            {
+                anyhow::bail!(
+                    "relay group '{}': member '{member}' is a rematch control \
+                     outbound — it cannot be a relay transport hop",
+                    group.name
+                );
+            }
+        }
+        if group.include_all_proxies.unwrap_or(false) {
+            if let Some(hop) = include_all_proxies
+                .iter()
+                .find(|p| p.rematch_action().is_some())
+            {
+                anyhow::bail!(
+                    "relay group '{}': include-all-proxies supplies rematch control \
+                     outbound '{}' — it cannot be a relay transport hop",
+                    group.name,
+                    hop.name()
+                );
+            }
+        }
+    }
 
     // Strict mode: a `use:` name that resolves to nothing is a permanent
     // miss — providers are all loaded before groups, so check upfront rather
@@ -3408,11 +3525,21 @@ fn build_proxy_layer(
             .collect();
         all_proxy_names.sort();
         let primary = primary_global_target(raw, &proxies).map(str::to_string);
-        if let Some(primary) = primary.as_deref() {
-            if let Some(position) = all_proxy_names.iter().position(|name| name == primary) {
-                all_proxy_names.remove(position);
-                all_proxy_names.insert(0, primary.to_string());
-            }
+        // The member at index 0 is the selector's default pick: the
+        // primary when it resolves, else the first non-rematch member —
+        // a sorted-first rematch leaf is a control outbound and can
+        // never be a dialable default (issue #974 review).
+        let default_position = match primary.as_deref() {
+            Some(primary) => all_proxy_names.iter().position(|name| name == primary),
+            None => all_proxy_names.iter().position(|name| {
+                proxies
+                    .get(name.as_str())
+                    .is_some_and(|p| p.adapter_type() != AdapterType::Rematch)
+            }),
+        };
+        if let Some(position) = default_position {
+            let name = all_proxy_names.remove(position);
+            all_proxy_names.insert(0, name);
         }
         let global_config = raw::RawProxyGroup {
             name: "GLOBAL".to_string(),
@@ -3517,12 +3644,24 @@ fn prefetch_proxy_map(
     raw: &raw::RawConfig,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selection: Option<&meow_proxy::SelectorWriter>,
+    // The cell provider-sourced nodes' `dialer-proxy` targets resolve
+    // against — the same handle the providers were loaded with. The
+    // layer's own `registry` covers static `proxies:` chains only, so
+    // without publishing here a provider node's front hop resolves to
+    // nothing during the prefetch window (issue #974 review).
+    provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
 ) -> Result<Option<PrefetchProxies>, anyhow::Error> {
-    // No `proxies:` entries means nothing to tunnel through — named `proxy:`
-    // lookups and the default proxy all come back empty either way. Such a
-    // config's provider `proxy:` names (a group, or GLOBAL) simply defer to
-    // the load pass, which resolves them against the pass-1 registry.
-    if raw.proxies.as_deref().unwrap_or(&[]).is_empty() {
+    // No `proxies:` and no `proxy-groups:` means nothing to tunnel
+    // through — named `proxy:` lookups and the default proxy all come
+    // back empty either way, and provider `proxy:` names defer to the
+    // load pass, which resolves them against the pass-1 registry. Groups
+    // alone still justify the layer: a provider-fed group can be a
+    // `geodata.proxy`/provider `proxy:` target, and one selecting a
+    // provider's rematch leaf must fail the fetch loudly instead of
+    // leaking it direct (issue #974).
+    if raw.proxies.as_deref().unwrap_or(&[]).is_empty()
+        && raw.proxy_groups.as_deref().unwrap_or(&[]).is_empty()
+    {
         return Ok(None);
     }
     let registry = meow_proxy::dialer::ProxyRegistry::default();
@@ -3539,6 +3678,10 @@ fn prefetch_proxy_map(
         raw.strict.unwrap_or(false),
     )?;
     registry.publish(Arc::new(map.clone()));
+    // The same snapshot into the provider-node cell: their front hops
+    // resolve against it until the first routing install publishes the
+    // live map over it.
+    provider_dialer_registry.publish(Arc::new(map.clone()));
     Ok(Some(PrefetchProxies {
         map,
         _registry: registry,
@@ -3555,12 +3698,19 @@ async fn prefetch_proxy_layer_async(
     raw: &raw::RawConfig,
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selection: Option<&meow_proxy::SelectorWriter>,
+    provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
 ) -> Result<Option<Arc<PrefetchProxies>>, anyhow::Error> {
     let raw = raw.clone();
     let providers = providers.clone();
     let selection = selection.cloned();
+    let provider_dialer_registry = provider_dialer_registry.clone();
     spawn_blocking_with_current_dispatcher(move || {
-        prefetch_proxy_map(&raw, &providers, selection.as_ref())
+        prefetch_proxy_map(
+            &raw,
+            &providers,
+            selection.as_ref(),
+            &provider_dialer_registry,
+        )
     })
     .await
     .map_err(|e| anyhow::anyhow!("prefetch proxy-layer build task failed: {e}"))?
@@ -3827,6 +3977,29 @@ fn rebuild_from_raw_impl(
                         reference.name
                     ));
                 }
+            }
+        }
+    }
+
+    // A rematch node's `target-sub-rule` names a block by reference only —
+    // like `SUB-RULE` references, a miss falls back to the main rule list
+    // at match time, so warn once here rather than failing (issue #974).
+    if let Some(raw_proxies) = raw.proxies.as_deref() {
+        for node in raw_proxies {
+            if node.get("type").and_then(|v| v.as_str()) != Some("rematch") {
+                continue;
+            }
+            let Some(block) = node.get("target-sub-rule").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !block.is_empty() && !sub_rules.contains_key(block) {
+                warn!(
+                    "rematch '{}': target-sub-rule '{block}' is not a declared \
+                     sub-rules block — flows selecting it fall back to the main rules",
+                    node.get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<unnamed>")
+                );
             }
         }
     }
@@ -4485,9 +4658,13 @@ fn configured_mode(raw: &raw::RawConfig) -> TunnelMode {
 /// field resolves later against the published `provider_dialer_registry`
 /// at fetch time (issue #625) — not through this prefetch layer.
 fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> bool {
-    // No `proxies:` entries → the layer can never exist; skip the
-    // spawn_blocking hop to a deterministic `Ok(None)`.
-    if raw.proxies.as_deref().unwrap_or(&[]).is_empty() {
+    // Neither `proxies:` nor `proxy-groups:` → the layer can never
+    // exist; skip the spawn_blocking hop to a deterministic `Ok(None)`.
+    // Groups without `proxies:` still count — a provider-fed group can
+    // resolve the `geodata.proxy`/provider `proxy:` names below.
+    if raw.proxies.as_deref().unwrap_or(&[]).is_empty()
+        && raw.proxy_groups.as_deref().unwrap_or(&[]).is_empty()
+    {
         return false;
     }
     let has_fetchable_provider = raw
@@ -4512,8 +4689,11 @@ fn prefetch_proxy_layer_needed(raw: &raw::RawConfig, geo: &GeoDataConfig) -> boo
 /// `map` — the shared pre-registry proxy layer with `dialer-proxy` chains
 /// applied at startup, the candidate's freshly built proxies on a rebuild
 /// (needed in regions where the CDN is blocked; issue #533). When no map
-/// exists — a config without `proxies:` — fetches go direct, since a
-/// rejected layer aborts the build before this runs. Download failures are
+/// exists — a config without `proxies:` or `proxy-groups:` — the
+/// resolution runs against an empty map: named outbounds can only warn
+/// and fall back, while `geodata.proxy`/`MATCH` builtins still gate the
+/// download (a rejected layer aborts the build before this runs).
+/// Download failures are
 /// logged as warnings — the subsequent parser-context build hard-errors on
 /// a missing GeoIP/ASN file (geosite is tolerated absent, per spec), giving
 /// a clear diagnostic.
@@ -4534,9 +4714,18 @@ async fn ensure_geodata(
         return;
     }
 
-    let egress = map.map_or(GeodataEgress::Direct, |m| {
-        resolve_geodata_egress(raw, geo, configured_mode(raw), m, chained_providers)
-    });
+    // No layer means no `proxies:`/`proxy-groups:` at all, so a named
+    // outbound can never resolve — but a `geodata.proxy`/`MATCH` builtin
+    // (`REJECT`, `REJECT-DROP`, `DIRECT`) still must, since it needs no
+    // map entry to classify (issue #974 review).
+    let empty = HashMap::new();
+    let egress = resolve_geodata_egress(
+        raw,
+        geo,
+        configured_mode(raw),
+        map.unwrap_or(&empty),
+        chained_providers,
+    );
 
     for (url, dest) in downloads {
         info!("geodata: downloading {} to {}", url, dest.display());
@@ -4741,11 +4930,14 @@ fn load_mmdb_mmap(
 /// per-country ranges for codes no rule cares about.
 fn geoip_scan_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
-    // `\bGEOIP` matches both `GEOIP,CN` and `SRC-GEOIP,CN` because the `-`
-    // before `GEOIP` is a non-word boundary.
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\bGEOIP\s*,\s*([A-Za-z0-9]+)").expect("compile GEOIP scan regex")
+        // `SRC-GEOIP` keys the same country index; the `^` anchor keeps
+        // `GEOIP` in the type field — scan texts are type-first strings,
+        // so a payload mention (`DOMAIN-KEYWORD,GEOIP,x`) is data, not a
+        // declaration (issue #974).
+        regex::Regex::new(r"(?i)^\s*(?:SRC-)?GEOIP\s*,\s*([A-Za-z0-9]+)")
+            .expect("compile GEOIP scan regex")
     })
 }
 
@@ -4875,7 +5067,7 @@ fn geosite_scan_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\bGEOSITE\s*,\s*([A-Za-z0-9_!\-]+)(?:@[A-Za-z0-9_!\-]+)*")
+        regex::Regex::new(r"(?i)^\s*GEOSITE\s*,\s*([A-Za-z0-9_!\-]+)(?:@[A-Za-z0-9_!\-]+)*")
             .expect("compile GEOSITE scan regex")
     })
 }
@@ -4946,7 +5138,8 @@ fn asn_scan_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(?:SRC-)?IP-ASN\s*,\s*(\d+)").expect("compile IP-ASN scan regex")
+        regex::Regex::new(r"(?i)^\s*(?:SRC-)?IP-ASN\s*,\s*(\d+)")
+            .expect("compile IP-ASN scan regex")
     })
 }
 
@@ -7249,7 +7442,13 @@ async fn build_config_inner(
     // only when at least one of them could need it — a full layer costs an
     // adapter construction per `proxies:` entry (issue #533).
     let prefetch_proxies = if prefetch_proxy_layer_needed(&raw, &geodata) {
-        prefetch_proxy_layer_async(&raw, &proxy_providers, selector_writer.as_ref()).await?
+        prefetch_proxy_layer_async(
+            &raw,
+            &proxy_providers,
+            selector_writer.as_ref(),
+            &provider_dialer_registry,
+        )
+        .await?
     } else {
         None
     };
@@ -7999,7 +8198,7 @@ mod dialer_proxy_tests {
         .unwrap();
 
         let providers = HashMap::new();
-        let mini = prefetch_proxy_map(&raw, &providers, None)
+        let mini = prefetch_proxy_map(&raw, &providers, None, &Default::default())
             .expect("layer builds")
             .expect("proxies configured");
         let metadata = meow_common::Metadata {
@@ -8059,7 +8258,7 @@ mod dialer_proxy_tests {
         let store = meow_proxy::SelectorStore::open(dir.path().join("sel.json"));
         store.set("G", "B2");
         let writer = meow_proxy::SelectorWriter::standalone(store);
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&writer))
+        let layer = prefetch_proxy_map(&raw, &providers, Some(&writer), &Default::default())
             .expect("layer builds")
             .expect("proxies configured");
         let geo = geodata::parse_geodata(&raw).unwrap();
@@ -8086,7 +8285,7 @@ mod dialer_proxy_tests {
         let empty_dir = tempfile::tempdir().unwrap();
         let empty_store = meow_proxy::SelectorStore::open(empty_dir.path().join("sel.json"));
         let empty_writer = meow_proxy::SelectorWriter::standalone(empty_store);
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_writer))
+        let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_writer), &Default::default())
             .expect("layer builds")
             .expect("proxies configured");
         let geo = geodata::parse_geodata(&raw).unwrap();
@@ -8173,6 +8372,163 @@ mod dialer_proxy_tests {
         assert!(!prefetch_proxy_layer_needed(&geoip_rules, &present_mmdb));
     }
 
+    /// Issue #974 — a config with no `proxies:` but provider-fed
+    /// `proxy-groups:` still owns a prefetch layer: `geodata.proxy`
+    /// naming the group must resolve. Selecting a provider's rematch
+    /// leaf then fails the dial loudly (`direct_fallback: false`)
+    /// instead of the download silently egressing direct off an
+    /// unresolved map.
+    #[tokio::test]
+    async fn prefetch_layer_resolves_group_egress_without_proxies() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - { name: inspect, type: rematch, target-rematch-name: stage1 }\n",
+        )
+        .unwrap();
+        let def: raw::RawProxyProvider = serde_saphyr::from_str(&format!(
+            "type: file\npath: '{}'",
+            dir.path().join("nodes.yaml").display()
+        ))
+        .unwrap();
+        let provider = ProxyProvider::new(
+            "p",
+            &def,
+            Some(dir.path()),
+            false,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        provider.refresh().await.unwrap();
+        let providers: HashMap<String, Arc<ProxyProvider>> =
+            [("p".to_string(), Arc::new(provider))]
+                .into_iter()
+                .collect();
+
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
+            "geodata:\n  mmdb-path: '{}'\n  proxy: G\n\
+             proxy-groups:\n  - {{ name: G, type: select, use: [p] }}\n\
+             rules:\n  - GEOIP,CN,DIRECT",
+            dir.path().join("absent.mmdb").display()
+        ))
+        .unwrap();
+        let geo = geodata::parse_geodata(&raw).unwrap();
+        assert!(
+            prefetch_proxy_layer_needed(&raw, &geo),
+            "groups alone must not short-circuit the layer"
+        );
+
+        let layer = prefetch_proxy_map(&raw, &providers, None, &Default::default())
+            .expect("layer builds")
+            .expect("provider-fed groups produce a layer");
+        let GeodataEgress::Proxy {
+            proxy,
+            direct_fallback,
+        } = super::resolve_geodata_egress(
+            &raw,
+            &geo,
+            TunnelMode::Rule,
+            &layer.map,
+            &std::collections::HashSet::new(),
+        )
+        else {
+            panic!("explicit geodata.proxy must resolve to the group");
+        };
+        assert!(
+            !direct_fallback,
+            "an explicit geodata.proxy never falls back"
+        );
+        assert_eq!(proxy.name(), "G", "the egress binds the named group");
+
+        // The group selects the provider's rematch leaf — the dial must
+        // fail loudly rather than carry the download anywhere, and the
+        // failure must be *that* one: a rematch has no socket to open.
+        // Bare `is_err()` would also pass on an unrelated dial error.
+        let metadata = meow_common::Metadata {
+            network: meow_common::Network::Tcp,
+            host: "example.invalid".into(),
+            dst_port: 443,
+            ..Default::default()
+        };
+        let err = proxy
+            .dial_tcp(&metadata)
+            .await
+            .err()
+            .expect("a rematch leaf owns no socket to dial with");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("control outbound") && msg.contains("inspect"),
+            "the group dialled the provider's rematch leaf and it failed \
+             as a control node: {msg}"
+        );
+    }
+
+    /// A provider node's `dialer-proxy` binds the provider's registry
+    /// cell, not the prefetch layer's own: the publish must reach that
+    /// cell too or the node's front hop resolves to nothing and a fetch
+    /// through it cannot dial (issue #974 review). The fetch itself
+    /// fails — the counting listener accepts then drops — but the TCP
+    /// connect to B proves `pn` dialled its front hop.
+    #[cfg(all(feature = "ss", feature = "trojan"))]
+    #[tokio::test]
+    async fn prefetch_layer_resolves_provider_node_front_hops() {
+        let (port_b, b_hits) = counting_listener().await;
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - { name: pn, type: trojan, server: 127.0.0.1, port: 9, \
+             password: x, dialer-proxy: B }\n",
+        )
+        .unwrap();
+        let def: raw::RawProxyProvider = serde_saphyr::from_str(&format!(
+            "type: file\npath: '{}'",
+            dir.path().join("nodes.yaml").display()
+        ))
+        .unwrap();
+        let provider_registry = meow_proxy::dialer::ProxyRegistry::default();
+        let provider = ProxyProvider::new(
+            "p",
+            &def,
+            Some(dir.path()),
+            false,
+            false,
+            provider_registry.clone(),
+        )
+        .unwrap();
+        provider.refresh().await.unwrap();
+        let providers: HashMap<String, Arc<ProxyProvider>> =
+            [("p".to_string(), Arc::new(provider))]
+                .into_iter()
+                .collect();
+
+        let raw: raw::RawConfig = serde_saphyr::from_str(&format!(
+            "proxies:\n\
+             \x20 - {{ name: B, type: trojan, server: 127.0.0.1, port: {port_b}, password: x }}\n\
+             proxy-groups:\n  - {{ name: G, type: select, use: [p] }}\n\
+             rule-providers:\n\
+             \x20 rs:\n    type: http\n    behavior: domain\n    \
+             url: http://127.0.0.1:9/rs.yaml\n    path: ./rs.yaml\n    proxy: G\n"
+        ))
+        .unwrap();
+
+        let layer = prefetch_proxy_map(&raw, &providers, None, &provider_registry)
+            .expect("layer builds")
+            .expect("proxies configured");
+        let payloads =
+            prefetch_rule_provider_payloads_async(&raw, None, Some(Arc::new(layer))).await;
+        assert_eq!(
+            payloads.iter().count(),
+            0,
+            "the counting listener accepts then drops — the fetch ran and got nothing"
+        );
+        assert!(
+            hits(&b_hits) >= 1,
+            "the provider node's dialer-proxy front resolves via the prefetch publish"
+        );
+    }
+
     /// End-to-end wiring: a provider's `proxy:` key resolves through the
     /// shared prefetch layer, so its HTTP fetch dials the chained front
     /// hop rather than the leaf's own (or a direct) egress.
@@ -8204,7 +8560,7 @@ mod dialer_proxy_tests {
 
         let providers = HashMap::new();
         let layer = Arc::new(
-            prefetch_proxy_map(&raw, &providers, None)
+            prefetch_proxy_map(&raw, &providers, None, &Default::default())
                 .expect("layer builds")
                 .expect("proxies configured"),
         );
@@ -9454,6 +9810,46 @@ mod geoip_context_tests {
         );
     }
 
+    /// Issue #974 review — the scan must read type fields only: a
+    /// `GEOIP,…` in a payload slot is data, not a declaration, and must
+    /// not trigger an MMDB load or an allowlist entry.
+    #[test]
+    fn geo_scan_ignores_payload_position_mentions() {
+        let lines: Vec<String> = [
+            "DOMAIN-KEYWORD,GEOIP,CN,REJECT",
+            "IP-CIDR,GEOIP,x,DIRECT",
+            "AND,((DOMAIN-KEYWORD,GEOIP,CN),(DST-PORT,443)),Proxy",
+            "DOMAIN-SUFFIX,GEOSITE,x,DIRECT",
+            "DOMAIN-KEYWORD,IP-ASN,13335,DIRECT",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert!(
+            collect_geoip_countries(&lines).is_empty(),
+            "payload-position GEOIP must not bin a country"
+        );
+        assert!(
+            collect_geosite_categories(&lines).is_empty(),
+            "payload-position GEOSITE must not bin a category"
+        );
+        assert!(
+            collect_asn_numbers(&lines).is_empty(),
+            "payload-position IP-ASN must not bin an ASN"
+        );
+        for line in &lines {
+            assert!(
+                !line_references_geoip(line),
+                "'{line}' must not trigger GeoIP"
+            );
+            assert!(
+                !line_references_geosite(line),
+                "'{line}' must not trigger geosite"
+            );
+            assert!(!line_references_asn(line), "'{line}' must not trigger ASN");
+        }
+    }
+
     /// Issue #974 review — the scan descends logic nesting *before* the
     /// rule parser sees the line, so it must apply the parser's own
     /// bounds: a line over `MAX_RULE_LINE_LEN` contributes nothing, and
@@ -10032,6 +10428,49 @@ mod geoip_context_tests {
         assert!(
             !mmdb_target.exists(),
             "the failed target leaves no partial file"
+        );
+    }
+
+    /// With no proxy layer at all (no `proxies:`/`proxy-groups:`), a
+    /// `geodata.proxy`/`MATCH` builtin still classifies: `REJECT` gates
+    /// the download instead of falling back to direct egress (issue
+    /// #974 review).
+    #[tokio::test]
+    async fn ensure_geodata_builtins_apply_without_a_proxy_map() {
+        let (addr, hits) = crate::test_support::serve_body(b"mmdb").await;
+        let dir = tempfile::tempdir().unwrap();
+        let mmdb_target = dir.path().join("absent.mmdb");
+        let geo = GeoDataConfig {
+            mmdb_path: Some(mmdb_target.clone()),
+            mmdb_url: format!("http://{addr}/country.mmdb"),
+            proxy: Some("REJECT".to_string()),
+            ..GeoDataConfig::default()
+        };
+        let raw = raw_with_rules(vec!["GEOIP,CN,DIRECT", "MATCH,DIRECT"]);
+        let scan = collect_geo_scan_lines(&raw, &rule_provider::PrefetchedPayloads::default());
+        assert_eq!(
+            super::missing_geodata_downloads(&geo, geo_references(&raw, &scan)).len(),
+            1,
+            "the mmdb is referenced and missing"
+        );
+
+        super::ensure_geodata(&raw, &geo, &scan, None, &std::collections::HashSet::new()).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "geodata.proxy: REJECT skips the download even without a map"
+        );
+        assert!(!mmdb_target.exists());
+
+        // The same gate through the mode's default route: MATCH,REJECT.
+        let geo = GeoDataConfig { proxy: None, ..geo };
+        let raw = raw_with_rules(vec!["GEOIP,CN,DIRECT", "MATCH,REJECT"]);
+        let scan = collect_geo_scan_lines(&raw, &rule_provider::PrefetchedPayloads::default());
+        super::ensure_geodata(&raw, &geo, &scan, None, &std::collections::HashSet::new()).await;
+        assert_eq!(
+            hits.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "MATCH,REJECT gates the download without a map too"
         );
     }
 
@@ -11095,6 +11534,110 @@ rules:
             err.to_string().contains("duplicate name") && err.to_string().contains('s'),
             "unexpected: {err}"
         );
+    }
+
+    /// A `type: rematch` leaf is a routing control, never a relay
+    /// transport hop (issue #974): a declared member naming one is a
+    /// structural error in *both* modes — a relaxed warn-drop would
+    /// silently remove the chain's fail-closed semantics.
+    #[test]
+    fn rejects_static_rematch_relay_member() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: inspect, type: rematch, target-rematch-name: stage1 }}
+  - {{ name: node, type: direct }}
+proxy-groups:
+  - {{ name: chain, type: relay, proxies: [node, inspect] }}
+rules:
+  - "MATCH,chain"
+"#,
+            );
+            let Err(err) = rebuild_from_raw(&raw_config(&yaml)) else {
+                panic!("strict={strict}: a static rematch relay hop must fail the build");
+            };
+            assert!(
+                err.to_string().contains("rematch control outbound"),
+                "strict={strict}: unexpected: {err}"
+            );
+        }
+    }
+
+    /// The same membership arriving through `include-all-proxies` keeps
+    /// the gate — the expansion feeds the member vec `parse_relay_group`
+    /// checks.
+    #[test]
+    fn rejects_include_all_rematch_relay_member() {
+        let yaml = r#"
+proxies:
+  - { name: inspect, type: rematch, target-rematch-name: stage1 }
+  - { name: node, type: direct }
+proxy-groups:
+  - { name: chain, type: relay, include-all-proxies: true }
+rules:
+  - "MATCH,chain"
+"#;
+        let Err(err) = rebuild_from_raw(&raw_config(yaml)) else {
+            panic!("an include-all rematch relay hop must fail the build");
+        };
+        assert!(
+            err.to_string().contains("rematch control outbound"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// A `type: rematch` leaf must not become the synthesized GLOBAL's
+    /// primary: the first member is global mode's default pick, and a
+    /// control outbound cannot carry traffic. It still lists as a member
+    /// (upstream `proxyList` semantics) so an explicit selection fails
+    /// closed at dial (issue #974).
+    #[test]
+    fn auto_global_never_primes_a_rematch_leaf() {
+        let yaml = r#"
+proxies:
+  - { name: inspect, type: rematch, target-rematch-name: stage1 }
+  - { name: node, type: socks5, server: 127.0.0.1, port: 1 }
+rules:
+  - "MATCH,inspect"
+"#;
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw_config(yaml)).expect("a rematch leaf beside a transport builds");
+        let members = proxies["GLOBAL"]
+            .member_proxies()
+            .expect("a select group exposes members");
+        let names: Vec<&str> = members.iter().map(|p| p.name()).collect();
+        assert!(
+            names.contains(&"inspect"),
+            "the rematch leaf stays a GLOBAL member: {names:?}"
+        );
+        assert_eq!(names[0], "node", "the primary is a dialable outbound");
+    }
+
+    /// A blank `dialer-proxy` on a `type: rematch` node is unset, not a
+    /// malformed edge — `check_rematch_node` treats blank-or-null as
+    /// absent, and binding the fail-at-dial sentinel would wrap the leaf
+    /// in `DialerProxyAdapter` and hide its rematch action (issue #974).
+    #[test]
+    fn blank_dialer_proxy_on_rematch_node_is_unset() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: inspect, type: rematch, target-rematch-name: stage1, dialer-proxy: " " }}
+rules:
+  - "MATCH,DIRECT"
+"#,
+            );
+            let RebuildResult { proxies, .. } = rebuild_from_raw(&raw_config(&yaml))
+                .expect("a blank dialer-proxy on a rematch node is unset");
+            assert!(
+                proxies["inspect"].rematch_action().is_some(),
+                "strict={strict}: the rematch leaf must keep its action"
+            );
+        }
     }
 
     #[test]

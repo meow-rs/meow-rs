@@ -67,12 +67,23 @@ pub fn parse_rules_full(
                 }
                 rules.push(rule);
             }
-            Err(e) if strict => {
-                return Err(anyhow::anyhow!(
-                    "rules: failed to parse '{line}' (strict mode): {e}"
-                ));
+            Err(e) => {
+                // A malformed REMATCH-NAME predicate fails the whole load
+                // in either mode (issue #974): it rewires the flow's
+                // first routing decision, so warn-and-skip would silently
+                // route by a different rule than written.
+                if meow_rules::line_mentions_rematch_name(line) {
+                    return Err(anyhow::anyhow!(
+                        "rules: malformed REMATCH-NAME predicate in '{line}': {e}"
+                    ));
+                }
+                if strict {
+                    return Err(anyhow::anyhow!(
+                        "rules: failed to parse '{line}' (strict mode): {e}"
+                    ));
+                }
+                warn!("Failed to parse rule '{}': {}", line, e);
             }
-            Err(e) => warn!("Failed to parse rule '{}': {}", line, e),
         }
     }
     Ok(rules)
@@ -312,6 +323,30 @@ mod tests {
                     .expect("malformed reference must be rejected");
             assert!(err.contains(needle), "{line}: unexpected error {err}");
         }
+    }
+
+    /// A `(` inside a payload token is data, not a predicate opener:
+    /// `x(REMATCH-NAME` in a regex payload must not reach the strict
+    /// rematch gate — lenient warn-skips the unparseable line like any
+    /// other dead rule, and strict fails it with the generic parse
+    /// error, never "malformed REMATCH-NAME" (issue #974 review).
+    #[test]
+    fn regex_payload_paren_does_not_trip_the_rematch_gate() {
+        let ctx = ParserContext::default();
+        let raw = vec![
+            "DOMAIN-REGEX,x(REMATCH-NAME".to_string(),
+            "MATCH,DIRECT".to_string(),
+        ];
+
+        let rules =
+            parse_rules(&raw, &ctx, false).expect("lenient mode warn-skips the unparseable line");
+        assert_eq!(rules.len(), 1, "only MATCH survives the skipped line");
+
+        let err = parse_rules(&raw, &ctx, true).err().unwrap();
+        assert!(
+            !err.to_string().contains("malformed REMATCH-NAME predicate"),
+            "strict must report the generic parse failure, got: {err}"
+        );
     }
 
     /// A dead domain payload inside a conditional predicate draws the
