@@ -5504,6 +5504,45 @@ async fn put_configs(
                 );
             }
         }
+        // Relay membership is the same hard defect the build reports at
+        // `rebuild_from_raw`: a relay hop must dial and a rematch leaf
+        // never does — both a static `proxies:` member and an
+        // `include-all-proxies` expansion picking a declared leaf.
+        // A *group* member's dynamic rematch pick is the probe's
+        // business instead, exactly as in the build (issue #974).
+        for group in raw_config.proxy_groups.as_deref().unwrap_or(&[]) {
+            if group.group_type != "relay" {
+                continue;
+            }
+            for member in group.proxies.as_deref().unwrap_or(&[]) {
+                if rematch_names.contains(member.trim()) {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "config validation failed under force, and the candidate's \
+                             relay groups are structurally unsafe to commit verbatim: \
+                             relay group '{}' member '{member}' is a rematch \
+                             control outbound",
+                            group.name,
+                        ),
+                    );
+                }
+            }
+            if group.include_all_proxies.unwrap_or(false) {
+                if let Some(leaf) = rematch_names.iter().next() {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "config validation failed under force, and the candidate's \
+                             relay groups are structurally unsafe to commit verbatim: \
+                             relay group '{}' include-all-proxies supplies rematch \
+                             control outbound '{leaf}'",
+                            group.name,
+                        ),
+                    );
+                }
+            }
+        }
         for line in raw_config.rules.as_deref().unwrap_or(&[]) {
             if !meow_rules::line_mentions_rematch_name(line) {
                 continue;

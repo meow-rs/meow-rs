@@ -12386,6 +12386,37 @@ async fn put_configs_force_gates_malformed_rematch() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 
+    // A relay's static `proxies:` member naming a rematch leaf — the
+    // build's relay-membership hard error: a rematch can never carry a
+    // transport hop (issue #974).
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, inspect]}}\n\
+             proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: x}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The `include-all-proxies` expansion is a static membership too —
+    // it would absorb the declared leaf.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, include-all-proxies: true}}\n\
+             proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: x}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
     // The same predicate nested inside a `sub-rules:` block — the gate
     // reaches predicate leaves through the block map too.
     let resp = put_configs_payload(
@@ -12451,6 +12482,26 @@ async fn put_configs_force_gates_malformed_rematch() {
             .iter()
             .all(|r| r["type"] != "RematchName"),
         "live rules are still the retained generation's: {json}"
+    );
+
+    // A *group* member is a dynamic pick — not gated: the build leaves
+    // its rematch selection to the probe, so the verbatim gate does too.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, sel]}}\n\
+             \x20 - {{name: sel, type: select, proxies: [inspect]}}\n\
+             proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: x}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a group member's dynamic rematch pick is not a static-membership defect"
     );
 }
 
