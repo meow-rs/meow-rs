@@ -134,13 +134,17 @@ pub(crate) fn parse_sub_rule_reference(line: &str) -> Result<Option<SubRuleRef>,
 /// database-dependent leaf (GEOIP/IP-ASN) likewise only needs the
 /// caller's `ctx` — the API's empty-index context keeps those leaves
 /// structural rather than re-running the geo probe.
+///
+/// Returns the resolved blocks — a top-level `SUB-RULE,(cond),<name>`
+/// line's condition only parses against the built map, so the caller
+/// validating `rules:` needs it (issue #974).
 pub fn check_sub_rules_shape(
     raw_rules: &[String],
     sub_rules_map: &HashMap<String, Vec<String>>,
     providers: &HashMap<String, Arc<dyn RuleSet>>,
     ctx: &ParserContext,
-) -> Result<(), anyhow::Error> {
-    parse_sub_rules(sub_rules_map, providers, ctx, false)?;
+) -> Result<SubRuleBlocks, anyhow::Error> {
+    let resolved = parse_sub_rules(sub_rules_map, providers, ctx, false)?;
     // The top-level `rules:` → `sub-rules:` undefined-block gate the
     // rebuild applies — a verbatim commit must not persist a reference
     // the next boot hard-fails on.
@@ -154,7 +158,7 @@ pub fn check_sub_rules_shape(
             }
         }
     }
-    Ok(())
+    Ok(resolved)
 }
 
 /// DFS-based topological sort with cycle detection.  Returns the order in

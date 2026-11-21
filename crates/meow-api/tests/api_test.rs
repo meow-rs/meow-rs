@@ -2177,6 +2177,31 @@ async fn put_configs_force_fallback_gates_sub_rules_shape() {
         .sub_rules
         .as_ref()
         .is_some_and(|m| m.contains_key("blk")));
+
+    // A conditional reference gated on REMATCH-NAME is sound too — the
+    // verbatim gate parses it through the build's block-aware path
+    // (issue #974), not the plain rule parser that knows no `SUB-RULE`.
+    let resp = put(&format!(
+        "mode: rule\n{UNBUILDABLE}\
+         sub-rules:\n  blk:\n    - DOMAIN,x.test,DIRECT\n\
+         rules:\n  - SUB-RULE,(REMATCH-NAME,stage),blk\n  - MATCH,DIRECT\n"
+    ))
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a sound REMATCH-NAME conditional must commit verbatim"
+    );
+
+    // A malformed REMATCH-NAME inside the same conditional — an empty
+    // alternative the build would hard-fail on — still hits the gate.
+    let resp = put(&format!(
+        "mode: rule\n{UNBUILDABLE}\
+         sub-rules:\n  blk:\n    - DOMAIN,x.test,DIRECT\n\
+         rules:\n  - SUB-RULE,(REMATCH-NAME,),blk\n"
+    ))
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
 /// Issue #974: `/rules/append` dry-parses a candidate line against the

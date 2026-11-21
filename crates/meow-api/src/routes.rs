@@ -5434,13 +5434,21 @@ async fn put_configs(
             asn: Some(Arc::new(meow_rules::asn_index::AsnIndex::default())),
             geosite: None,
         };
-        if let Some(sub_map) = raw_config.sub_rules.as_ref().filter(|m| !m.is_empty()) {
-            if let Err(e) = meow_config::sub_rules_parser::check_sub_rules_shape(
-                raw_config.rules.as_deref().unwrap_or(&[]),
-                sub_map,
-                &stand_ins,
-                &shape_ctx,
-            ) {
+        // Run unconditionally — the rebuild's undefined-block gate does
+        // too (a `SUB-RULE` reference with no `sub-rules:` section fails
+        // the next boot the same way). The resolved blocks also feed the
+        // REMATCH-NAME check below, whose conditional
+        // `SUB-RULE,(cond),<name>` lines only parse block-aware
+        // (issue #974).
+        let empty_sub_map = HashMap::new();
+        let shape_blocks = match meow_config::sub_rules_parser::check_sub_rules_shape(
+            raw_config.rules.as_deref().unwrap_or(&[]),
+            raw_config.sub_rules.as_ref().unwrap_or(&empty_sub_map),
+            &stand_ins,
+            &shape_ctx,
+        ) {
+            Ok(blocks) => blocks,
+            Err(e) => {
                 return reload_rejected(
                     StatusCode::BAD_REQUEST,
                     &format!(
@@ -5449,13 +5457,14 @@ async fn put_configs(
                     ),
                 );
             }
-        }
+        };
         // The rematch pair is strict in both modes the same way — a
         // malformed `type: rematch` action or `REMATCH-NAME` predicate
         // committed verbatim would hard-fail the next boot. Check them
         // with or without a `sub-rules:` section; rule lines go through
-        // the ordinary parser, so nested condition leaves and logic
-        // legs get the same verdict as the build did (issue #974).
+        // the build's block-aware parser, so a `(cond)` inside
+        // `SUB-RULE` and the legs inside logic groups get the same
+        // verdict as the build did (issue #974).
         for node in raw_config.proxies.as_deref().unwrap_or(&[]) {
             if node.get("type").and_then(|v| v.as_str()) == Some("rematch") {
                 if let Err(e) = meow_config::proxy_parser::check_rematch_node(node) {
@@ -5473,7 +5482,12 @@ async fn put_configs(
             if !meow_rules::line_mentions_rematch_name(line) {
                 continue;
             }
-            if let Err(e) = meow_rules::parse_rule_with_rule_sets(line, &shape_ctx, &stand_ins) {
+            if let Err(e) = meow_config::rule_parser::parse_one_rule_or_subrule(
+                line,
+                &stand_ins,
+                &shape_ctx,
+                &shape_blocks,
+            ) {
                 return reload_rejected(
                     StatusCode::BAD_REQUEST,
                     &format!(
