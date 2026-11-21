@@ -602,10 +602,7 @@ impl ProxyAdapter for RelayGroup {
             if cur.rematch_action().is_some() {
                 return Some(cur);
             }
-            if let Some(relay) = cur
-                .as_any()
-                .and_then(|a| a.downcast_ref::<RelayGroup>())
-            {
+            if let Some(relay) = cur.as_any().and_then(|a| a.downcast_ref::<RelayGroup>()) {
                 stack.extend(relay.proxies.iter().rev().cloned());
                 continue;
             }
