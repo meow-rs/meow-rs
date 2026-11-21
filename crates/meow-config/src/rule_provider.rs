@@ -319,9 +319,14 @@ impl RuleProvider {
         let format = self.format;
         let cache_path = self.cache_path.clone();
         let cache_write_lock = Arc::clone(&self.cache_write_lock);
+        // A file provider's refresh re-reads user-authored bytes, so the
+        // REMATCH-NAME gate that armed at load applies again; http bytes
+        // stay third-party content (issue #974).
+        let local = self.provider_type == ProviderType::File;
         let (boxed, parsed_as) = crate::spawn_blocking_with_current_dispatcher(move || {
-            let parsed =
-                parse_bytes_to_ruleset_with_format(&bytes, behavior, format, &ctx_clone, strict)?;
+            let parsed = parse_bytes_to_ruleset_with_format(
+                &bytes, behavior, format, &ctx_clone, strict, local,
+            )?;
             // Persist the payload only *after* the parse succeeds so the
             // cache always holds the last usable payload — a cache-first
             // restart then picks up the newest refresh rather than the
@@ -1278,6 +1283,29 @@ fn empty_rule_set(behavior: RuleSetBehavior, ctx: &ParserContext) -> Box<dyn Rul
     build_rule_set(behavior, &[], ctx)
 }
 
+/// A line naming `REMATCH-NAME` that fails entry validation is a
+/// structural error on a *local* payload, mirroring the `rules:` gate in
+/// `rule_parser` — warn-skipping it silently routes the flow's first
+/// decision by a different rule than written (issue #974). Remote
+/// payloads keep the lenient skip: feed noise must not veto the build.
+fn reject_malformed_rematch_entries(
+    behavior: RuleSetBehavior,
+    entries: &[String],
+    ctx: &ParserContext,
+) -> Result<(), anyhow::Error> {
+    let suspect: Vec<String> = entries
+        .iter()
+        .filter(|e| meow_rules::line_mentions_rematch_name(e))
+        .cloned()
+        .collect();
+    if suspect.is_empty() {
+        return Ok(());
+    }
+    build_rule_set_checked(behavior, &suspect, ctx)
+        .map(|_| ())
+        .map_err(|e| anyhow!("malformed REMATCH-NAME predicate in rule-set payload: {e}"))
+}
+
 /// Parse payload bytes into a rule set, honoring `strict` per-entry: strict
 /// uses [`build_rule_set_checked`] so one malformed line fails the payload
 /// instead of installing a partial set (issue #533).
@@ -1291,6 +1319,8 @@ fn entries_to_rule_set(
         build_rule_set_checked(behavior, entries, ctx)
             .map_err(|e| LoadError::Payload(anyhow!("{e}")))
     } else {
+        // Inline `payload:` is authored in the config itself — local.
+        reject_malformed_rematch_entries(behavior, entries, ctx).map_err(LoadError::Payload)?;
         Ok(build_rule_set(behavior, entries, ctx))
     }
 }
@@ -1399,8 +1429,11 @@ fn load_file(
             }
         },
     };
-    let parsed = parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
-        .map_err(LoadError::Payload)?;
+    // A file provider's payload is user-authored bytes — local for the
+    // REMATCH-NAME structural gate (issue #974).
+    let parsed =
+        parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict, true)
+            .map_err(LoadError::Payload)?;
     provider.fill_fresh(parsed);
     Ok(provider)
 }
@@ -1492,7 +1525,7 @@ fn load_http(
         }
     };
     let parse = |bytes: &[u8]| {
-        parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict)
+        parse_bytes_to_ruleset_with_format(bytes, behavior, explicit_format, ctx, strict, false)
     };
     match entry {
         // Caller-supplied bytes for an http provider are still remote
@@ -1698,13 +1731,16 @@ fn parse_explicit_format(cfg: &RawRuleProvider) -> Result<Option<RuleSetFormat>>
 
 /// Parse payload bytes into a rule set, returned with the format they
 /// parsed as: MRS when declared or when the bytes carry the MRS magic,
-/// otherwise the declared format (YAML when undeclared).
+/// otherwise the declared format (YAML when undeclared). `local` marks
+/// user-authored payload (file providers) — it arms the REMATCH-NAME
+/// structural gate remote feeds are exempt from (issue #974).
 fn parse_bytes_to_ruleset_with_format(
     bytes: &[u8],
     behavior: RuleSetBehavior,
     explicit_format: Option<RuleSetFormat>,
     ctx: &ParserContext,
     strict: bool,
+    local: bool,
 ) -> Result<(Box<dyn RuleSet>, RuleSetFormat)> {
     let use_mrs = explicit_format == Some(RuleSetFormat::Mrs) || is_mrs_bytes(bytes);
     if use_mrs {
@@ -1723,6 +1759,9 @@ fn parse_bytes_to_ruleset_with_format(
         return build_rule_set_checked(behavior, &entries, ctx)
             .map(|rules| (rules, format))
             .map_err(|e| anyhow!("rule-set entry error: {e}"));
+    }
+    if local {
+        reject_malformed_rematch_entries(behavior, &entries, ctx)?;
     }
     Ok((build_rule_set(behavior, &entries, ctx), format))
 }
@@ -3661,5 +3700,97 @@ header:
             providers["fast-bad"].rule_count() == 2
         })
         .await;
+    }
+
+    /// A local payload line naming `REMATCH-NAME` that fails to parse is a
+    /// structural defect, like the `rules:` gate — lenient warn-and-skip
+    /// would silently route the flow's first decision by a different rule
+    /// than written. Remote bytes keep the lenient skip (issue #974).
+    #[test]
+    fn local_payloads_gate_malformed_rematch_predicates() {
+        let ctx = ParserContext::empty();
+        let bytes = b"payload:\n  - DOMAIN,x.com\n  - REMATCH-NAME,a//b\n";
+
+        assert!(
+            parse_bytes_to_ruleset_with_format(
+                bytes,
+                RuleSetBehavior::Classical,
+                None,
+                &ctx,
+                false,
+                true,
+            )
+            .is_err(),
+            "a malformed REMATCH-NAME line in a local payload must fail"
+        );
+
+        let (set, _) = parse_bytes_to_ruleset_with_format(
+            bytes,
+            RuleSetBehavior::Classical,
+            None,
+            &ctx,
+            false,
+            false,
+        )
+        .expect("remote feeds keep the lenient skip");
+        assert_eq!(set.len(), 1, "only the DOMAIN entry installs");
+
+        let ok = b"payload:\n  - REMATCH-NAME,stage1/alt\n";
+        let (set, _) = parse_bytes_to_ruleset_with_format(
+            ok,
+            RuleSetBehavior::Classical,
+            None,
+            &ctx,
+            false,
+            true,
+        )
+        .expect("a well-formed REMATCH-NAME entry is not gated");
+        assert_eq!(set.len(), 1);
+    }
+
+    /// The provider-level shape of the same verdict: a file or inline
+    /// payload with a malformed REMATCH-NAME entry does not register — the
+    /// defect is recorded instead of installing a partial set, and strict
+    /// fails the build.
+    #[test]
+    fn local_providers_drop_on_malformed_rematch_entry() {
+        let classical =
+            |provider_type: &str, path: Option<String>, payload: Option<Vec<String>>| {
+                RawRuleProvider {
+                    provider_type: provider_type.to_string(),
+                    behavior: "classical".to_string(),
+                    format: None,
+                    url: None,
+                    path,
+                    interval: None,
+                    proxy: None,
+                    header: None,
+                    payload,
+                    extra: Default::default(),
+                }
+            };
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("rules.yaml");
+        std::fs::write(&file, "payload:\n  - REMATCH-NAME,a//b\n  - DOMAIN,x.com\n").unwrap();
+        let entries = vec!["REMATCH-NAME,/a".to_string(), "DOMAIN,y.com".to_string()];
+        let providers = HashMap::from([
+            (
+                "file".to_string(),
+                classical("file", Some(file.to_string_lossy().to_string()), None),
+            ),
+            (
+                "inline".to_string(),
+                classical("inline", None, Some(entries)),
+            ),
+        ]);
+        let out = load_providers(&providers, Some(dir.path()), &ctx(), None, false)
+            .expect("lenient records the defect instead of failing");
+        assert!(
+            out.is_empty(),
+            "neither provider registers with a malformed REMATCH-NAME entry"
+        );
+        let err = load_providers(&providers, Some(dir.path()), &ctx(), None, true)
+            .expect_err("strict fails the build");
+        assert!(err.to_string().contains("REMATCH-NAME"), "{err}");
     }
 }
