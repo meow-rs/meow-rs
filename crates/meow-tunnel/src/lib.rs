@@ -16,6 +16,40 @@ pub mod tcp;
 pub mod tunnel;
 pub mod udp;
 
+/// Scoped WARN capture — `with_default` is thread-local, so parallel tests
+/// in this binary don't see each other's lines; see
+/// [`install_capture_fallback`] for the process-wide part.
+#[cfg(test)]
+pub(crate) fn capture_warns<R>(f: impl FnOnce() -> R) -> (R, String) {
+    install_capture_fallback();
+    #[derive(Clone)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+    let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let out = tracing::subscriber::with_default(subscriber, f);
+    let captured = sink.0.lock().unwrap();
+    (out, String::from_utf8_lossy(&captured).into_owned())
+}
+
 /// Called by every test that captures log lines with a scoped subscriber.
 ///
 /// `with_default` scopes the subscriber to one thread, but callsite interest

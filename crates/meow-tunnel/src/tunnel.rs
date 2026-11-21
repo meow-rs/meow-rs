@@ -1717,7 +1717,10 @@ impl RouteTargetProbe<'_> {
             return true;
         }
         if cur.unwrap_proxy(self.metadata, false).is_some() {
-            debug!(
+            // `false` here is the cap's answer, not the chain's — the
+            // dial may still reach a `want` hop the probe never saw;
+            // the failure lands loudly there instead (issue #974 review).
+            warn!(
                 "{}: unwrap chain exceeded {MAX_UNWRAP_HOPS} hops probing for {want}",
                 cur.name()
             );
@@ -1753,7 +1756,7 @@ impl RouteTargetProbe<'_> {
             return Some(found);
         }
         if cur.unwrap_proxy(self.metadata, false).is_some() {
-            debug!(
+            warn!(
                 "{}: unwrap chain exceeded {MAX_UNWRAP_HOPS} hops probing for rematch",
                 cur.name()
             );
@@ -4988,6 +4991,81 @@ sub-rules:
             let tunnel = rematch_tunnel(&yaml);
             let (adapter, _) = routed(&tunnel, "any.test").await;
             assert_eq!(adapter, "DIRECT", "the depth-16 PASS must skip the rule");
+        }
+
+        /// One hop past the cap the probe cannot know whether a rematch
+        /// leaf sits at g18 — `None` is the horizon's answer, not the
+        /// chain's, so the walk says so loudly rather than let the dial
+        /// meet a leaf it pretended was absent (issue #974 review).
+        #[test]
+        fn seventeen_hop_pick_chain_warns_on_truncated_rematch_probe() {
+            use std::fmt::Write as _;
+            let mut groups =
+                String::from("proxy-groups:\n  - {name: g17, type: select, proxies: [inspect]}\n");
+            for i in (1..17).rev() {
+                let _ = writeln!(
+                    groups,
+                    "  - {{name: g{i}, type: select, proxies: [g{}]}}",
+                    i + 1
+                );
+            }
+            let yaml = format!(
+                "proxies:\n  - {{name: inspect, type: rematch, target-rematch-name: stage1}}\n\
+                 {groups}rules:\n  - MATCH,g1\n",
+            );
+            let tunnel = rematch_tunnel(&yaml);
+            let route = tunnel.inner().route();
+            let md = Metadata {
+                host: "any.test".into(),
+                dst_port: 443,
+                network: Network::Tcp,
+                ..Default::default()
+            };
+            let rematch = std::cell::Cell::new(None);
+            let probe = TunnelInner::target_probe(&route, &md, None, false, &rematch);
+            let g1 = Arc::clone(route.proxies.get("g1").unwrap());
+            let (leaf, warns) = crate::capture_warns(|| probe.rematch_leaf(g1));
+            assert!(leaf.is_none(), "the leaf sits past the probe horizon");
+            assert!(
+                warns.contains("exceeded 16 hops"),
+                "truncation must say so loudly: {warns}"
+            );
+        }
+
+        /// The same horizon on the `PASS` walk: p1 → … → p17 → PASS
+        /// answers `false` from the budget, not from the chain — and says
+        /// so, so a swallowed PASS leaf never reads as an ordinary miss.
+        #[test]
+        fn seventeen_hop_pick_chain_warns_on_truncated_pass_probe() {
+            use std::fmt::Write as _;
+            let mut groups =
+                String::from("proxy-groups:\n  - {name: p17, type: select, proxies: [PASS]}\n");
+            for i in (1..17).rev() {
+                let _ = writeln!(
+                    groups,
+                    "  - {{name: p{i}, type: select, proxies: [p{}]}}",
+                    i + 1
+                );
+            }
+            let yaml = format!("{groups}rules:\n  - MATCH,p1\n  - MATCH,DIRECT\n");
+            let tunnel = rematch_tunnel(&yaml);
+            let route = tunnel.inner().route();
+            let md = Metadata {
+                host: "any.test".into(),
+                dst_port: 443,
+                network: Network::Tcp,
+                ..Default::default()
+            };
+            let rematch = std::cell::Cell::new(None);
+            let probe = TunnelInner::target_probe(&route, &md, None, false, &rematch);
+            let p1 = Arc::clone(route.proxies.get("p1").unwrap());
+            let (is_pass, warns) =
+                crate::capture_warns(|| probe.unwraps_to(p1, AdapterType::PassRule));
+            assert!(!is_pass, "the PASS leaf sits past the probe horizon");
+            assert!(
+                warns.contains("exceeded 16 hops"),
+                "truncation must say so loudly: {warns}"
+            );
         }
 
         /// Two distinct nodes restamping the *same* marker chain freely —

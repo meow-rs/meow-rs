@@ -3799,37 +3799,8 @@ mod tests {
         }
     }
 
-    /// Scoped WARN capture — `with_default` is thread-local, so parallel tests
-    /// in this binary don't see each other's lines; see
-    /// [`crate::install_capture_fallback`] for the process-wide part.
     fn capture_warns<R>(f: impl FnOnce() -> R) -> (R, String) {
-        crate::install_capture_fallback();
-        #[derive(Clone)]
-        struct Sink(Arc<std::sync::Mutex<Vec<u8>>>);
-        impl std::io::Write for Sink {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-        impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
-            type Writer = Sink;
-            fn make_writer(&'a self) -> Sink {
-                self.clone()
-            }
-        }
-        let sink = Sink(Arc::new(std::sync::Mutex::new(Vec::new())));
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(sink.clone())
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .finish();
-        let out = tracing::subscriber::with_default(subscriber, f);
-        let captured = sink.0.lock().unwrap();
-        (out, String::from_utf8_lossy(&captured).into_owned())
+        crate::capture_warns(f)
     }
 
     // Issue #533 item 4: the lazy two-phase resolve used to warn about a
