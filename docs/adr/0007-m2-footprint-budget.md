@@ -563,26 +563,31 @@ strip=true, codegen-units=1, panic=abort, opt-level="z"`):
   (10,054,968 → 9,884,656; .eh_frame −126.6 KB, .eh_frame_hdr
   −25.7 KB, .gcc_except_table −11.5 KB).
 
-Dropping `legacy` is a deliberate rejection boundary, not unreachable
-code removal: the `.mrs` loaders (`rule_set.rs`, `geosite.rs`) verify
-the outer `MRS!` magic or the upstream whole-file zstd magic and feed
-the compressed bytes to a `zstd::stream::Decoder`, so a payload whose
-zstd stream is a v0.1–v0.7 (2016-era) frame decoded before and now
-fails the load. The blast radius is private/archived rulesets — no
-public mrs/geosite feed ships pre-0.8 frames — and the failure names
-the cause: `mrs_parser::legacy_zstd_version` sniffs the frame magic
-ahead of every decoder entry point (`FD 2F B5 1E` for v0.1, which wrote
-the word big-endian; `NN B5 2F FD` for v0.2–v0.7), so the load error
-reads "unsupported legacy zstd frame (v0.N, pre-1.0 format); regenerate
-the file with a current zstd version" rather than the decoder's bare
-"unknown frame descriptor". The failure still takes the normal
-load-error path — a rule-provider warns and registers empty (recorded
-in the logbook), a geosite DB logs an error and loads as absent;
-startup continues, nothing crashes and nothing degrades silently. Note
-that a green `meow -t` is no counter-evidence for an HTTP provider:
-remote payload defects register the provider empty rather than fail
-validation, and offline `-t` parses the on-disk payload cache when one
-exists without fetching at all.
+Dropping `legacy` is a deliberate rejection boundary whose blast radius
+is narrower than the version list suggests. A legacy frame could only
+ever decompress on the streaming paths — an `MRS!`-wrapped payload, or
+a whole-file upstream `.mrs` opened by `UpstreamRuleSetReader`
+(convert-ruleset) — and `ZSTD_decompressLegacyStream` accepts just
+v0.4–v0.7, answering v0.1–v0.3 with `version_unsupported`; every other
+entry point (rule_set's `ZSTD_MAGIC` dispatch, geosite's `MRS!`/`.dat`
+split) refused the bytes before any decode. What the follow-up changes
+is the diagnosis: `mrs_parser::legacy_zstd_version` sniffs the first
+frame's magic ahead of the decoder at every entry point (`FD 2F B5 1E`
+for v0.1, which wrote the word big-endian; `NN B5 2F FD` for
+v0.2–v0.7), so all seven versions report "unsupported legacy zstd
+frame (v0.N, pre-1.0 format); regenerate the file with a current zstd
+version" instead of a bare "unknown frame descriptor" or a
+format-mismatch — a legacy frame later in a concatenated stream still
+takes the generic error. No public mrs/geosite feed ships pre-0.8
+frames, so the reachable surface stays private/archived rulesets.
+Failure handling is unchanged per surface: an HTTP provider's payload
+defect — including the on-disk cache offline `-t` parses without
+fetching, so a green `-t` proves nothing about the remote body —
+registers the provider empty in both modes (recorded in the logbook);
+a local `file:`/`inline:` payload defect is a config defect, rejected
+under `strict` and dropping the provider under lenient; a geosite DB
+logs an error and loads as absent. Nothing crashes and nothing
+degrades silently.
 
 The combined head-of-branch result is 8,002,048 B — the aarch64
 `minimal` cap is unchanged and now has ~377 KiB of headroom.
@@ -601,10 +606,10 @@ side already emits nothing.
 
 One debugging trade-off is accepted with the flag trim: musl C objects
 ship no unwind tables, so a crash inside boringssl/zstd/ring/blake3
-cannot be walked back through the C frames from a core dump or debugger
-— diagnosing one needs a rebuild that keeps the unwind tables (and
-debug symbols), e.g. via the packager opt-out in
-`docs/benchmarks/binary-size.md`.
+cannot be walked by DWARF unwind — a debugger may still reconstruct a
+partial backtrace via frame-pointer/prologue heuristics, but a complete
+trace needs a rebuild that keeps the unwind tables and debug symbols
+(e.g. via the packager opt-out in `docs/benchmarks/binary-size.md`).
 
 ## References
 

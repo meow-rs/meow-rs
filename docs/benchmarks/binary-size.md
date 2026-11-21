@@ -372,13 +372,14 @@ Two changes landed:
    Packager opt-out: exporting the same `CFLAGS_<triple>`/
    `CXXFLAGS_<triple>` names — to the desired flags, or empty to
    suppress them — replaces the repo defaults, because `[env]` never
-   clobbers a variable already set. A generic `CFLAGS`/`CXXFLAGS` does
-   *not* win: cc appends flag vars in the order bare →
+   clobbers a variable already set. A generic `CFLAGS`/`CXXFLAGS`
+   cannot remove them: cc accumulates flag vars in the order bare →
    `HOST_`/`TARGET_`-prefixed → underscore-qualified →
-   hyphenated-qualified so the qualified value lands last, and
-   cmake-rs takes the first hit of the same qualified-first sequence.
-   Rebuild in a fresh `CARGO_TARGET_DIR`: the boring-sys and blake3
-   warm object caches do not sense flag changes.
+   hyphenated-qualified so the qualified value lands last, and cmake-rs
+   merges `cc::Build::get_compiler()`'s arg list — the same accumulated
+   flags — into `CMAKE_*_FLAGS`. Rebuild in a fresh
+   `CARGO_TARGET_DIR`: the boring-sys and blake3 warm object caches do
+   not sense flag changes.
 
 Per-dep consumption evidence (exp-u1, `zig ar` member scans):
 `libzstd.a` 36 members, `libblake3_neon.a`, `libmimalloc` object,
