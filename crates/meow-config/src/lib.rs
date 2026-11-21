@@ -2210,7 +2210,7 @@ fn collect_dialer_edges(
     Ok(DialerEdges { declared, by_index })
 }
 
-/// The `dialer-proxy` edges [`collect_dialer_edges`] will actually bind
+/// The `dialer-proxy` edges `collect_dialer_edges` will actually bind
 /// at build — the verbatim/validation view of the same graph, so a
 /// shadowed duplicate's, a built-in-shadowing entry's or a rematch
 /// node's raw `dialer-proxy` key is not judged as an edge it never
