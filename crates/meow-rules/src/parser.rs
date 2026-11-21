@@ -422,16 +422,29 @@ fn split_once_trimmed(s: &str, sep: char) -> Option<(&str, &str)> {
 /// typo'd rematch predicate that silently disappears takes the flow's
 /// first routing decision with it. Payload text never reports — a token
 /// after a comma (`IP-CIDR,REMATCH-NAME,…`, `DOMAIN-KEYWORD,REMATCH-NAME`)
-/// is data, not a declaration.
+/// is data, not a declaration, and so is a `(` that opens inside a token
+/// (`^(REMATCH-NAME)x` in a regex).
 pub fn line_mentions_rematch_name(line: &str) -> bool {
     let bytes = line.as_bytes();
     let mut i = 0;
-    // `(` opens a predicate whose first token is again a type field.
+    // `(` opens a predicate whose first token is again a type field —
+    // but only at a token boundary (line start, after `,`, after another
+    // `(`). Mid-token it is payload text: regex groups like
+    // `^(REMATCH-NAME)x` must not flag the line (issue #974 review).
     let mut type_position = true;
+    let mut prev: Option<u8> = None;
     while i < bytes.len() {
         match bytes[i] {
-            b'(' => type_position = true,
-            b',' | b')' => type_position = false,
+            b'(' => {
+                if matches!(prev, None | Some(b',') | Some(b'(')) {
+                    type_position = true;
+                }
+                prev = Some(b'(');
+            }
+            b',' | b')' => {
+                type_position = false;
+                prev = Some(bytes[i]);
+            }
             b' ' | b'\t' => {}
             _ => {
                 let start = i;
@@ -449,6 +462,7 @@ pub fn line_mentions_rematch_name(line: &str) -> bool {
                     return true;
                 }
                 type_position = false;
+                prev = Some(bytes[i - 1]);
                 continue;
             }
         }
@@ -1456,6 +1470,10 @@ mod rematch_name_tests {
             "IP-CIDR,REMATCH-NAME,x,REJECT",
             "DOMAIN-KEYWORD,REMATCH-NAME,REJECT",
             "AND,((DOMAIN-KEYWORD,REMATCH-NAME),(DOMAIN,x)),REJECT",
+            // A `(` inside a token is payload text — regex groups do not
+            // open a type position (issue #974 review).
+            "DOMAIN-REGEX,^(REMATCH-NAME)x,REJECT",
+            "AND,((DOMAIN-REGEX,^(REMATCH-NAME)x),(DOMAIN,y)),REJECT",
         ] {
             assert!(!line_mentions_rematch_name(line), "'{line}'");
         }

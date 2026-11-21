@@ -325,6 +325,30 @@ mod tests {
         }
     }
 
+    /// A `(` inside a payload token is data, not a predicate opener:
+    /// `x(REMATCH-NAME` in a regex payload must not reach the strict
+    /// rematch gate — lenient warn-skips the unparseable line like any
+    /// other dead rule, and strict fails it with the generic parse
+    /// error, never "malformed REMATCH-NAME" (issue #974 review).
+    #[test]
+    fn regex_payload_paren_does_not_trip_the_rematch_gate() {
+        let ctx = ParserContext::default();
+        let raw = vec![
+            "DOMAIN-REGEX,x(REMATCH-NAME".to_string(),
+            "MATCH,DIRECT".to_string(),
+        ];
+
+        let rules =
+            parse_rules(&raw, &ctx, false).expect("lenient mode warn-skips the unparseable line");
+        assert_eq!(rules.len(), 1, "only MATCH survives the skipped line");
+
+        let err = parse_rules(&raw, &ctx, true).err().unwrap();
+        assert!(
+            !err.to_string().contains("malformed REMATCH-NAME predicate"),
+            "strict must report the generic parse failure, got: {err}"
+        );
+    }
+
     /// A dead domain payload inside a conditional predicate draws the
     /// same defect verdict as a logic-group leg (issue #974).
     #[test]
