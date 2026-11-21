@@ -4855,11 +4855,14 @@ fn load_mmdb_mmap(
 /// per-country ranges for codes no rule cares about.
 fn geoip_scan_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
-    // `\bGEOIP` matches both `GEOIP,CN` and `SRC-GEOIP,CN` because the `-`
-    // before `GEOIP` is a non-word boundary.
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\bGEOIP\s*,\s*([A-Za-z0-9]+)").expect("compile GEOIP scan regex")
+        // `SRC-GEOIP` keys the same country index; the `^` anchor keeps
+        // `GEOIP` in the type field — scan texts are type-first strings,
+        // so a payload mention (`DOMAIN-KEYWORD,GEOIP,x`) is data, not a
+        // declaration (issue #974).
+        regex::Regex::new(r"(?i)^\s*(?:SRC-)?GEOIP\s*,\s*([A-Za-z0-9]+)")
+            .expect("compile GEOIP scan regex")
     })
 }
 
@@ -4989,7 +4992,7 @@ fn geosite_scan_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\bGEOSITE\s*,\s*([A-Za-z0-9_!\-]+)(?:@[A-Za-z0-9_!\-]+)*")
+        regex::Regex::new(r"(?i)^\s*GEOSITE\s*,\s*([A-Za-z0-9_!\-]+)(?:@[A-Za-z0-9_!\-]+)*")
             .expect("compile GEOSITE scan regex")
     })
 }
@@ -5060,7 +5063,8 @@ fn asn_scan_regex() -> &'static regex::Regex {
     use std::sync::OnceLock;
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        regex::Regex::new(r"(?i)\b(?:SRC-)?IP-ASN\s*,\s*(\d+)").expect("compile IP-ASN scan regex")
+        regex::Regex::new(r"(?i)^\s*(?:SRC-)?IP-ASN\s*,\s*(\d+)")
+            .expect("compile IP-ASN scan regex")
     })
 }
 
@@ -9645,6 +9649,46 @@ mod geoip_context_tests {
             got, want,
             "duplicate country rules must collapse to one entry per code"
         );
+    }
+
+    /// Issue #974 review — the scan must read type fields only: a
+    /// `GEOIP,…` in a payload slot is data, not a declaration, and must
+    /// not trigger an MMDB load or an allowlist entry.
+    #[test]
+    fn geo_scan_ignores_payload_position_mentions() {
+        let lines: Vec<String> = [
+            "DOMAIN-KEYWORD,GEOIP,CN,REJECT",
+            "IP-CIDR,GEOIP,x,DIRECT",
+            "AND,((DOMAIN-KEYWORD,GEOIP,CN),(DST-PORT,443)),Proxy",
+            "DOMAIN-SUFFIX,GEOSITE,x,DIRECT",
+            "DOMAIN-KEYWORD,IP-ASN,13335,DIRECT",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert!(
+            collect_geoip_countries(&lines).is_empty(),
+            "payload-position GEOIP must not bin a country"
+        );
+        assert!(
+            collect_geosite_categories(&lines).is_empty(),
+            "payload-position GEOSITE must not bin a category"
+        );
+        assert!(
+            collect_asn_numbers(&lines).is_empty(),
+            "payload-position IP-ASN must not bin an ASN"
+        );
+        for line in &lines {
+            assert!(
+                !line_references_geoip(line),
+                "'{line}' must not trigger GeoIP"
+            );
+            assert!(
+                !line_references_geosite(line),
+                "'{line}' must not trigger geosite"
+            );
+            assert!(!line_references_asn(line), "'{line}' must not trigger ASN");
+        }
     }
 
     /// Issue #974 review — the scan descends logic nesting *before* the

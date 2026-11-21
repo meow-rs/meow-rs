@@ -414,23 +414,47 @@ fn split_once_trimmed(s: &str, sep: char) -> Option<(&str, &str)> {
     s.split_once(sep).map(|(l, r)| (l.trim(), r.trim_start()))
 }
 
-/// Whether a rule line references `REMATCH-NAME` anywhere — as the head
-/// type (any spelling, config or API) or as a `(REMATCH-NAME,…)`
-/// predicate inside a logic group or `SUB-RULE` condition. meow-config
-/// uses it to fail malformed rematch grammar *structurally* instead of
-/// warn-skipping the line (issue #974): a typo'd rematch predicate that
-/// silently disappears takes the flow's first routing decision with it.
-/// Payload bytes mentioning the name (`DOMAIN-KEYWORD,REMATCH-NAME,…`)
-/// report true as well — the caller only consults this on a line that
-/// already failed to parse, where being conservative is the safe side.
+/// Whether a rule line names `REMATCH-NAME` in a *type* position — the
+/// head type (any spelling, config or API) or the type field of a
+/// `(REMATCH-NAME,…)` predicate inside a logic group or `SUB-RULE`
+/// condition. meow-config uses it to fail malformed rematch grammar
+/// *structurally* instead of warn-skipping the line (issue #974): a
+/// typo'd rematch predicate that silently disappears takes the flow's
+/// first routing decision with it. Payload text never reports — a token
+/// after a comma (`IP-CIDR,REMATCH-NAME,…`, `DOMAIN-KEYWORD,REMATCH-NAME`)
+/// is data, not a declaration.
 pub fn line_mentions_rematch_name(line: &str) -> bool {
-    line.split([',', '(', ')']).map(str::trim).any(|tok| {
-        tok.eq_ignore_ascii_case("REMATCH-NAME")
-            || matches!(
-                meow_common::RuleType::from_mihomo_name(tok),
-                Some(meow_common::RuleType::RematchName)
-            )
-    })
+    let bytes = line.as_bytes();
+    let mut i = 0;
+    // `(` opens a predicate whose first token is again a type field.
+    let mut type_position = true;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'(' => type_position = true,
+            b',' | b')' => type_position = false,
+            b' ' | b'\t' => {}
+            _ => {
+                let start = i;
+                while i < bytes.len() && !matches!(bytes[i], b',' | b'(' | b')') {
+                    i += 1;
+                }
+                let tok = line[start..i].trim();
+                if type_position
+                    && (tok.eq_ignore_ascii_case("REMATCH-NAME")
+                        || matches!(
+                            meow_common::RuleType::from_mihomo_name(tok),
+                            Some(meow_common::RuleType::RematchName)
+                        ))
+                {
+                    return true;
+                }
+                type_position = false;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    false
 }
 
 /// Parse `AND,((r1),(r2),...),ADAPTER` / `OR,(...)`, / `NOT,((r1)),ADAPTER`.
@@ -1406,11 +1430,11 @@ mod rematch_name_tests {
         assert_eq!(leaf.rule_type(), RuleType::RematchName);
     }
 
-    /// `line_mentions_rematch_name` is the conservative gate meow-config
+    /// `line_mentions_rematch_name` is the type-position gate meow-config
     /// applies to lines that already failed to parse (issue #974): true
     /// on head spellings and nested predicates, false on unrelated lines
-    /// — a `DOMAIN-KEYWORD,REMATCH-NAME` payload byte-match reporting
-    /// true is the safe side on a line that failed anyway.
+    /// *and on payload text* — `IP-CIDR,REMATCH-NAME,x` is a bad CIDR
+    /// line, not a rematch predicate.
     #[test]
     fn mentions_gate_flags_rematch_lines() {
         for line in [
@@ -1419,11 +1443,20 @@ mod rematch_name_tests {
             "RematchName,stage1,REJECT",
             "AND,((REMATCH-NAME,a),(DOMAIN,x)),REJECT",
             "SUB-RULE,(REMATCH-NAME,a),blk",
+            "SUB-RULE,(AND,(REMATCH-NAME,a),(DOMAIN,x)),blk",
             "REMATCH-NAME,a//b,REJECT",
         ] {
             assert!(line_mentions_rematch_name(line), "'{line}'");
         }
-        for line in ["DOMAIN,x,REJECT", "MATCH,DIRECT", "REMATCHNAMES,x,D"] {
+        for line in [
+            "DOMAIN,x,REJECT",
+            "MATCH,DIRECT",
+            "REMATCHNAMES,x,D",
+            // Payload position is data, never a type (issue #974 review).
+            "IP-CIDR,REMATCH-NAME,x,REJECT",
+            "DOMAIN-KEYWORD,REMATCH-NAME,REJECT",
+            "AND,((DOMAIN-KEYWORD,REMATCH-NAME),(DOMAIN,x)),REJECT",
+        ] {
             assert!(!line_mentions_rematch_name(line), "'{line}'");
         }
     }
