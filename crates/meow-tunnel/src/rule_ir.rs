@@ -144,6 +144,9 @@ enum RuleOp {
     Network(Network),
     Uid(u32),
     InName(Box<str>),
+    /// REMATCH-NAME — the transition marker's exact, case-sensitive
+    /// compare; reads no enrichable field, so it carries no demand.
+    RematchName(Box<str>),
     InType(InTypeMask),
     InUser(Box<str>),
     Match,
@@ -759,7 +762,9 @@ impl CompiledRuleSet {
         if let Some(slot) = hit_slot {
             let m = self.static_match(slot, rules);
             match check_target(probe, &m) {
-                TargetCheck::Usable => return Some(m),
+                // A rematch target is terminal for this pass like Usable —
+                // the probe stashed the transition for the caller.
+                TargetCheck::Usable | TargetCheck::Rematch => return Some(m),
                 TargetCheck::Unusable => {
                     warn_unusable_target(&m);
                     return Some(m);
@@ -885,7 +890,7 @@ impl CompiledRuleSet {
                 if let Some(slot) = hit_slot {
                     let m = self.static_match(slot, rules);
                     match check_target(probe, &m) {
-                        TargetCheck::Usable => {
+                        TargetCheck::Usable | TargetCheck::Rematch => {
                             break 'scan LazyMatchOutcome::Matched(m);
                         }
                         TargetCheck::Unusable => {
@@ -1136,7 +1141,12 @@ impl CompiledRuleSet {
             };
             if let Some(m) = matched {
                 match check_target(probe, &m) {
-                    TargetCheck::Usable => return ScanOutcome::Matched(m),
+                    // A rematch target is terminal for this pass like
+                    // Usable — the probe stashed the transition it
+                    // commits for the caller's re-entry loop (issue #974).
+                    TargetCheck::Usable | TargetCheck::Rematch => {
+                        return ScanOutcome::Matched(m);
+                    }
                     // An existing-but-unusable target terminates the scan
                     // *on* this match — the dial fails loudly where a
                     // `Missing` verdict would slide to a later rule
@@ -1299,6 +1309,7 @@ fn dedup_fingerprint(payload: &str, op: &RuleOp) -> Option<String> {
         RuleOp::DomainRegex(_)
         | RuleOp::ProcessPath(_)
         | RuleOp::InName(_)
+        | RuleOp::RematchName(_)
         | RuleOp::InUser(_)
         | RuleOp::Match => Some(payload.to_string()),
         // `compile_op` stores the truncated network, so textual host-bit
@@ -1680,6 +1691,7 @@ fn compile_op(rule_type: RuleType, payload: &str) -> Option<RuleOp> {
         RuleType::Network => compile_network(payload),
         RuleType::Uid => payload.trim().parse::<u32>().ok().map(RuleOp::Uid),
         RuleType::InName => Some(RuleOp::InName(payload.into())),
+        RuleType::RematchName => Some(RuleOp::RematchName(payload.into())),
         RuleType::InType => compile_in_type(payload).map(RuleOp::InType),
         RuleType::InUser => Some(RuleOp::InUser(payload.into())),
         RuleType::Match => Some(RuleOp::Match),
@@ -1861,6 +1873,15 @@ fn matches_op(op: &RuleOp, input: &MatchInput<'_>, helper: &RuleMatchHelper) -> 
         RuleOp::InName(name) => {
             !input.metadata.in_name.is_empty() && input.metadata.in_name.as_str() == &**name
         }
+        // The payload is a `/`-separated alternative list, each token
+        // trimmed and compared exactly (case-sensitive) — the same
+        // semantics `RematchNameRule::match_metadata` applies. An unset
+        // marker matches nothing, including an empty alternative.
+        RuleOp::RematchName(payload) => input
+            .metadata
+            .rematch_name
+            .as_deref()
+            .is_some_and(|marker| payload.split('/').map(str::trim).any(|alt| alt == marker)),
         RuleOp::InType(mask) => in_type_matches(*mask, input.metadata.conn_type),
         RuleOp::InUser(user) => input.metadata.in_user.as_deref() == Some(&**user),
         RuleOp::Match => true,

@@ -159,7 +159,9 @@ impl TunnelInner {
 
 /// The leaf a UDP flow through `adapter` ends at ([`crate::tcp::leaf_proxy`],
 /// `None` inside for `adapter` itself), or `None` when that leaf sends
-/// nothing.
+/// nothing — a rematch control outbound included (issue #974): the flow
+/// re-enters routing before any of these dials, and a leaf that still
+/// ends here fails closed without a counter.
 fn udp_leaf(
     adapter: &dyn ProxyAdapter,
     metadata: &Metadata,
@@ -173,7 +175,8 @@ fn udp_leaf(
         AdapterType::Reject
         | AdapterType::RejectDrop
         | AdapterType::Pass
-        | AdapterType::PassRule => None,
+        | AdapterType::PassRule
+        | AdapterType::Rematch => None,
         _ => Some(leaf),
     }
 }

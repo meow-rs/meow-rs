@@ -169,7 +169,8 @@ pub fn match_rules<'rules>(
     for rule in &rules[..scan_end] {
         if let Some(adapter_name) = rule.match_and_resolve(metadata, &helper, probe) {
             match probe.check(adapter_name) {
-                TargetCheck::Usable => {
+                // A rematch verdict is terminal for the pass like Usable.
+                TargetCheck::Usable | TargetCheck::Rematch => {
                     return Some(MatchResult {
                         adapter_name,
                         rule_type: rule.rule_type(),
@@ -197,7 +198,7 @@ pub fn match_rules<'rules>(
         let rule = &rules[trie_idx];
         let adapter_name = rule.adapter();
         match probe.check(adapter_name) {
-            TargetCheck::Usable => {
+            TargetCheck::Usable | TargetCheck::Rematch => {
                 return Some(MatchResult {
                     adapter_name,
                     rule_type: rule.rule_type(),
@@ -222,7 +223,7 @@ pub fn match_rules<'rules>(
     for rule in &rules[tail..] {
         if let Some(adapter_name) = rule.match_and_resolve(metadata, &helper, probe) {
             match probe.check(adapter_name) {
-                TargetCheck::Usable => {
+                TargetCheck::Usable | TargetCheck::Rematch => {
                     return Some(MatchResult {
                         adapter_name,
                         rule_type: rule.rule_type(),
