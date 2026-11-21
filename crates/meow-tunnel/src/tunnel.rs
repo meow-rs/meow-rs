@@ -1388,6 +1388,14 @@ impl TunnelInner {
             None => {
                 // No rule matched, use DIRECT
                 conn_note!(Rule, "No rule matched → DIRECT");
+                if record_hit {
+                    // The implicit terminal is still the committed
+                    // routing outcome — a rematch-selected block that
+                    // exhausts ends here too — so the aggregate counts it
+                    // under the tail's "Final" name. There is no rule
+                    // slot to charge: no `record_hit` index applies.
+                    self.stats.rule_match.increment("Final", "DIRECT");
+                }
                 ResolvedTarget {
                     adapter: Arc::clone(&self.direct) as Arc<dyn ProxyAdapter>,
                     rule_name: SmolStr::new_static("Final"),
@@ -5142,6 +5150,45 @@ sub-rules:
                 "the committed main-list slot counts one hit"
             );
             assert_eq!(route.rule_stats.view(1).hits, 0, "MATCH was never reached");
+        }
+
+        /// A rematch-selected block that exhausts still commits the
+        /// flow's one routing outcome: the aggregate `rule_match` sees
+        /// the implicit DIRECT once, the transition itself is not a
+        /// second outcome, and no rule slot invents a hit for the miss.
+        #[tokio::test]
+        async fn exhausted_block_counts_one_final_outcome() {
+            let tunnel = rematch_tunnel(
+                r#"
+proxies:
+  - {name: hop, type: rematch, target-sub-rule: blk}
+rules:
+  - DOMAIN-SUFFIX,example.test,hop
+  - MATCH,DIRECT
+sub-rules:
+  blk:
+    - DOMAIN-SUFFIX,never-matches.invalid,REJECT
+"#,
+            );
+            let (adapter, _) = routed(&tunnel, "example.test").await;
+            assert_eq!(adapter, "DIRECT", "block exhaustion ends implicit DIRECT");
+            let snapshot = tunnel.inner().stats.rule_match.snapshot();
+            assert_eq!(
+                snapshot,
+                vec![(("Final", "DIRECT"), 1)],
+                "one aggregate outcome only, got {snapshot:?}"
+            );
+            let route = tunnel.inner().route();
+            assert_eq!(
+                route.rule_stats.view(0).hits,
+                1,
+                "the transition's committed slot keeps its own hit"
+            );
+            assert_eq!(
+                route.rule_stats.view(1).hits,
+                0,
+                "main-list MATCH was never reached"
+            );
         }
 
         /// The `resolve_udp_dst` probe resolves the route including
