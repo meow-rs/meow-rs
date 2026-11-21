@@ -531,6 +531,52 @@ Consequences:
   `meow-transport/simple-obfs` activation — their obfs is a server/snell
   concern, not the SS plugin surface this prunes.
 
+## Addendum (2026-11-21): C-dep unwind tables + zstd default features — two mechanism-level trims
+
+Two independent size reductions measured and landed on the same
+`aarch64-musl minimal` leg this ADR gates (zigbuild, `lto=fat,
+strip=true, codegen-units=1, panic=abort, opt-level="z"`):
+
+- `zstd` workspace dep → `default-features = false`. zstd 0.14
+  default-enables `legacy` (the v0.1–v0.7 frame decoders), `arrays` and
+  `zdict_builder`; `ZSTD_decompress` keeps a dispatch slot for the
+  legacy decoders so they survive LTO even though meow only ever
+  produces/consumes current-version frames via `zstd::encode_all` and
+  `zstd::stream::Decoder`. **−125,632 B** in-tree (measured on top of
+  the unwind-flags build; earlier isolated A/B measured −130,752 B).
+  `Cargo.lock` unchanged — features are not recorded there.
+- `.cargo/config.toml` `[env]` sets target-qualified
+  `CFLAGS_<triple>`/`CXXFLAGS_<triple>` to
+  `-fno-unwind-tables -fno-asynchronous-unwind-tables` (+ `-fno-exceptions`
+  for CXX) for `aarch64_unknown_linux_musl` and
+  `x86_64_unknown_linux_musl`. panic=abort already keeps rustc from
+  emitting unwind tables for workspace crates, but every C dep compiles
+  with toolchain defaults. Both C-build frontends honour the env vars —
+  the cc crate reads them directly, and cmake-rs merges them into its
+  `-DCMAKE_C_FLAGS`/`-DCMAKE_CXX_FLAGS` args — so boring-sys, zstd-sys,
+  libmimalloc-sys, ring and blake3 all compile table-free with no
+  wrapper scripts or vendored patches (`flags.make` and per-object
+  section scans verified). Measured: **−163,272 B on aarch64-musl**
+  (8,290,952 → 8,127,680), **−170,312 B on x86_64-musl**
+  (10,054,968 → 9,884,656): .eh_frame −117.6 KB, .eh_frame_hdr
+  −25.2 KB, .gcc_except_table −12.4 KB, plus ~7.8 KB of dead
+  landing-pad `.text`.
+
+The combined head-of-branch result is 8,002,048 B — the aarch64
+`minimal` cap is unchanged and now has ~377 KiB of headroom.
+
+Residual unwind data (~1.1 MiB on aarch64: .eh_frame 893 KB +
+.eh_frame_hdr 276 KB + .gcc_except_table 9 KB) is **not** C-side and
+these flags cannot reach it: prebuilt std-family rlib objects ship
+.eh_frame (locally compiled workspace rlibs emit none — panic=abort is
+already effective there), and zig's bundled musl objects keep theirs.
+Removing that needs `-Zbuild-std` (nightly — the workspace pins stable)
+or upstream zig changes; post-link `objcopy --remove-section` is not a
+workaround because the payload lives inside `PT_LOAD` segments (the
+file shrank by only 232 B in a direct experiment). `RUSTFLAGS=
+-Cforce-unwind-tables=no` was also verified a no-op here — the Rust
+side already emits nothing.
+
 ## References
 
 - `docs/roadmap.md` §M2 items 3 + 5 — pinned by this ADR.
