@@ -12546,6 +12546,69 @@ async fn put_configs_force_gates_malformed_rematch() {
         StatusCode::NO_CONTENT,
         "a built-in-shadowed node's dialer-proxy is no edge the build binds"
     );
+
+    // The name side is last-wins too: a rematch declaration shadowed by
+    // a same-named transport never becomes the leaf a member binds —
+    // the build's map holds `x` as direct, so the candidate commits
+    // rather than tripping the relay-membership check (issue #974).
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, x]}}\n\
+             proxies:\n\
+             \x20 - {{name: x, type: rematch, target-rematch-name: s}}\n\
+             \x20 - {{name: x, type: direct}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a shadowed rematch declaration is not the leaf the relay member binds"
+    );
+
+    // Same shadow on the dialer edge: `dialer-proxy: x` binds the
+    // shadowing transport, not the dropped rematch declaration.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: x, type: rematch, target-rematch-name: s}}\n\
+             \x20 - {{name: x, type: direct}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: x}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a shadowed rematch declaration is not the edge's target either"
+    );
+
+    // And a built-in shadow: `name: DIRECT` never binds — the built-in
+    // stays, so relay member DIRECT is legal whatever the entry's type.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, REJECT]}}\n\
+             proxies:\n  - {{name: DIRECT, type: rematch, target-rematch-name: s}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a built-in-shadowed rematch declaration binds no member either"
+    );
 }
 
 /// A plain `PUT /configs` (no `force`) rebuilds rematch content live:

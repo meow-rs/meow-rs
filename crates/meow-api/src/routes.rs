@@ -5465,7 +5465,6 @@ async fn put_configs(
         // the build's block-aware parser, so a `(cond)` inside
         // `SUB-RULE` and the legs inside logic groups get the same
         // verdict as the build did (issue #974).
-        let mut rematch_names = std::collections::HashSet::new();
         for node in raw_config.proxies.as_deref().unwrap_or(&[]) {
             if node.get("type").and_then(|v| v.as_str()) == Some("rematch") {
                 if let Err(e) = meow_config::proxy_parser::check_rematch_node(node) {
@@ -5477,11 +5476,15 @@ async fn put_configs(
                         ),
                     );
                 }
-                if let Some(name) = node.get("name").and_then(|v| v.as_str()) {
-                    rematch_names.insert(name.to_string());
-                }
             }
         }
+        // The name set the edges are judged against is the map the build
+        // produces — last-wins and built-in shadows included — not every
+        // raw `type: rematch` declaration: a rematch shadowed by a later
+        // same-named transport never becomes the leaf a member or
+        // `dialer-proxy` binds (issue #974).
+        let rematch_names =
+            meow_config::declared_rematch_names(raw_config.proxies.as_deref().unwrap_or(&[]));
         // The reverse edge is the same hard defect the build's
         // `apply_dialer_proxies_validate` reports: a `dialer-proxy`
         // naming a statically known rematch leaf can never carry the
@@ -5525,7 +5528,10 @@ async fn put_configs(
                 continue;
             }
             for member in group.proxies.as_deref().unwrap_or(&[]) {
-                if rematch_names.contains(member.trim()) {
+                // Untrimmed like the build's `proxies.get(member)` — a
+                // padded member name the registry never binds must not
+                // collide with a leaf it never becomes.
+                if rematch_names.contains(member.as_str()) {
                     return reload_rejected(
                         StatusCode::BAD_REQUEST,
                         &format!(

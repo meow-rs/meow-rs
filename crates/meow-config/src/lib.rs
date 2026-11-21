@@ -2223,6 +2223,30 @@ pub fn declared_dialer_edges(
     collect_dialer_edges(raw_proxies, false).map(|edges| edges.declared)
 }
 
+/// The names whose final `proxies:` binding is a rematch leaf — the
+/// verbatim/validation view of the map `insert_parsed_leaves` produces:
+/// last-wins like its `proxies.insert` (a later same-name declaration
+/// replaces the earlier type), and an entry named after a built-in
+/// never binds at all (issue #974 review).
+pub fn declared_rematch_names(
+    raw_proxies: &[HashMap<String, serde_json::Value>],
+) -> std::collections::HashSet<SmolStr> {
+    let mut rematch = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    for node in raw_proxies.iter().rev() {
+        let Some(name) = node.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !seen.insert(name) || BUILTIN_ADAPTER_NAMES.contains(&name) {
+            continue;
+        }
+        if node.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+            rematch.insert(SmolStr::from(name));
+        }
+    }
+    rematch
+}
+
 /// Validate the `dialer-proxy` edges [`collect_dialer_edges`] declared, now
 /// that every leaf has been built — the check half of the old
 /// `apply_dialer_proxies` pass. The chains themselves are already applied:
