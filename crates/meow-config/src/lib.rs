@@ -2136,6 +2136,14 @@ fn collect_dialer_edges(
         if BUILTIN_ADAPTER_NAMES.contains(&name) {
             continue;
         }
+        // `type: rematch` owns no dialer — `check_rematch_node` already
+        // rejected a non-blank `dialer-proxy`, so a leftover blank value
+        // is unset, not malformed. Binding the sentinel here would wrap
+        // the control leaf in `DialerProxyAdapter` and hide its rematch
+        // action (issue #974).
+        if raw_proxy.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+            continue;
+        }
         let dialer: SmolStr = match raw_proxy.get("dialer-proxy") {
             None => continue,
             Some(v) => match v.as_str() {
@@ -11327,6 +11335,31 @@ rules:
             err.to_string().contains("rematch control outbound"),
             "unexpected: {err}"
         );
+    }
+
+    /// A blank `dialer-proxy` on a `type: rematch` node is unset, not a
+    /// malformed edge — `check_rematch_node` treats blank-or-null as
+    /// absent, and binding the fail-at-dial sentinel would wrap the leaf
+    /// in `DialerProxyAdapter` and hide its rematch action (issue #974).
+    #[test]
+    fn blank_dialer_proxy_on_rematch_node_is_unset() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: inspect, type: rematch, target-rematch-name: stage1, dialer-proxy: " " }}
+rules:
+  - "MATCH,DIRECT"
+"#,
+            );
+            let RebuildResult { proxies, .. } = rebuild_from_raw(&raw_config(&yaml))
+                .expect("a blank dialer-proxy on a rematch node is unset");
+            assert!(
+                proxies["inspect"].rematch_action().is_some(),
+                "strict={strict}: the rematch leaf must keep its action"
+            );
+        }
     }
 
     #[test]
