@@ -188,6 +188,14 @@ impl ProxyAdapter for WrappedProxy {
         self.hop.is_some()
     }
 
+    /// Transparent like every other leaf signal here — a wrapped
+    /// `type: rematch` leaf must still report its action to the
+    /// match-time probe or it reads as an ordinary dialable target
+    /// (issue #974).
+    fn rematch_action(&self) -> Option<meow_common::RematchAction<'_>> {
+        self.adapter.rematch_action()
+    }
+
     fn dialer_hop_network(&self, flow: meow_common::Network) -> meow_common::Network {
         self.adapter.dialer_hop_network(flow)
     }
@@ -301,6 +309,12 @@ impl ProxyAdapter for ChainedProxy {
     /// must not hide PASS/PASS-RULE members from the match-time probe.
     fn unwrap_proxy(&self, metadata: &Metadata, touch: bool) -> Option<Arc<dyn Proxy>> {
         self.inner.unwrap_proxy(metadata, touch)
+    }
+
+    /// Transparent — a chained rematch leaf keeps reporting its action
+    /// to the match-time probe (issue #974).
+    fn rematch_action(&self) -> Option<meow_common::RematchAction<'_>> {
+        self.inner.rematch_action()
     }
 
     /// The injected leaf answers the front hop itself; forward so the
@@ -947,6 +961,17 @@ pub fn parse_proxy_with_dialer_and_fp(
                 WrappedProxy::new(Box::new(adapter)).with_node_dialer_opts(node_opts),
             ))
         }
+        // `type: rematch` — a control outbound consumed by the rule
+        // scanner, not a transport (issue #974). No server/port, no node
+        // dialer opts, no chain wrapper: `collect_dialer_edges` already
+        // rejects a `dialer-proxy` on it structurally, and `parse_rematch`
+        // re-rejects the key for the provider paths this dispatch also
+        // serves.
+        "rematch" => {
+            reject_unthreaded_dialer(name, "rematch", dialer)?;
+            let adapter = parse_rematch(name, config)?;
+            Ok(Arc::new(WrappedProxy::new(Box::new(adapter))))
+        }
         #[cfg(feature = "anytls")]
         "anytls" => {
             let adapter = parse_anytls(name, config, global_client_fingerprint)?;
@@ -1112,6 +1137,93 @@ fn is_external_sip003_plugin(plugin: Option<&str>) -> bool {
         !meow_proxy::shadowsocks_adapter::is_builtin_sip003_plugin(p)
             && meow_proxy::shadowsocks_adapter::missing_plugin_feature(p).is_none()
     })
+}
+
+/// The structural verdict on one `type: rematch` node (issue #974):
+/// `name` present, at least one `target-*` field supplied, both fields
+/// strings-or-null, and no `dialer-proxy`. `build_proxy_layer` runs this
+/// ahead of the per-node parse so a malformed rematch action fails the
+/// whole load instead of warn-dropping the node, and `parse_rematch`
+/// re-checks it so provider payloads get the same verdict node-by-node.
+pub fn check_rematch_node(
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    let name = config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or("rematch node requires a `name`")?;
+    // A `dialer-proxy` on a rematch node has no hop to carry — reject the
+    // key itself so every parse surface agrees.
+    match config.get("dialer-proxy") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(v) if v.as_str().is_some_and(|s| s.trim().is_empty()) => {}
+        Some(_) => {
+            return Err(format!(
+                "rematch[{name}]: `dialer-proxy` is not supported — a rematch \
+                 node is a routing control, not a transport the chain can ride"
+            ));
+        }
+    }
+    let rematch_name = rematch_opt_str(config, "target-rematch-name", name)?;
+    let sub_rule = rematch_opt_str(config, "target-sub-rule", name)?;
+    if rematch_name.is_none() && sub_rule.is_none() {
+        return Err(format!(
+            "rematch[{name}]: set `target-rematch-name` and/or `target-sub-rule` — \
+             a rematch node with neither changes nothing"
+        ));
+    }
+    Ok(())
+}
+
+/// `type: rematch` — the two `target-*` fields are the whole node
+/// (issue #974). [`check_rematch_node`] already ran the structural gate;
+/// this parse adds the ignored-option warnings and builds the adapter.
+fn parse_rematch(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<meow_proxy::RematchAdapter, String> {
+    check_rematch_node(config)?;
+    // Recognized socket options would claim an effect a control node can
+    // never have — warn rather than silently honoring them (issue #974).
+    for key in [
+        "routing-mark",
+        "interface-name",
+        "ip-version",
+        "tfo",
+        "mptcp",
+    ] {
+        if config.get(key).is_some_and(|v| !v.is_null()) {
+            tracing::warn!(
+                "proxy '{name}': `{key}` is ignored on type: rematch — it opens no sockets"
+            );
+        }
+    }
+    let rematch_name = rematch_opt_str(config, "target-rematch-name", name)?;
+    let sub_rule = rematch_opt_str(config, "target-sub-rule", name)?;
+    Ok(meow_proxy::RematchAdapter::new(
+        name,
+        rematch_name,
+        sub_rule,
+    ))
+}
+
+/// One `target-*` field of a rematch node: absent/`null` → `None` (leave
+/// the flow's field untouched); a string keeps its exact bytes — `""` is
+/// the explicit clear form and nothing is trimmed, folded or split;
+/// anything else is a type error — quote numeric identifiers (issue #974).
+fn rematch_opt_str<'a>(
+    config: &'a HashMap<String, serde_json::Value>,
+    key: &str,
+    name: &str,
+) -> std::result::Result<Option<&'a str>, String> {
+    match config.get(key) {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(v) => v
+            .as_str()
+            .map(Some)
+            .ok_or_else(|| format!("rematch[{name}]: `{key}` must be a string")),
+    }
 }
 
 /// Reject a `ProxyDialer` for adapter types that do not thread it through.
@@ -8227,5 +8339,70 @@ tls: true
             seen.lock().as_ref().map(|o| o.ip_version),
             Some(meow_common::IpVersion::Ipv6)
         );
+    }
+
+    /// `type: rematch` structural gate (issue #974): `name` plus at least
+    /// one `target-*` field, both strings-or-null, and never a
+    /// `dialer-proxy` — a control outbound has no hop to carry.
+    #[test]
+    fn rematch_node_structural_gate() {
+        for (yaml, why) in [
+            ("type: rematch\ntarget-rematch-name: x", "missing name"),
+            ("name: r\ntype: rematch", "neither target field"),
+            (
+                "name: r\ntype: rematch\ntarget-rematch-name: 1",
+                "unquoted numeric target",
+            ),
+            (
+                "name: r\ntype: rematch\ntarget-sub-rule:\n  - a",
+                "non-scalar target",
+            ),
+            (
+                "name: r\ntype: rematch\ntarget-rematch-name: x\ndialer-proxy: front",
+                "dialer-proxy on a control leaf",
+            ),
+        ] {
+            let node = proxy_config(yaml);
+            assert!(
+                check_rematch_node(&node).is_err(),
+                "{why} must fail the gate"
+            );
+        }
+        for yaml in [
+            "name: r\ntype: rematch\ntarget-rematch-name: stage1",
+            "name: r\ntype: rematch\ntarget-sub-rule: blk",
+            "name: r\ntype: rematch\ntarget-rematch-name: \"\"\ntarget-sub-rule: \"\"",
+            // `null` means leave the field unchanged — same as omitted.
+            "name: r\ntype: rematch\ntarget-rematch-name:\ntarget-sub-rule: blk",
+        ] {
+            let node = proxy_config(yaml);
+            check_rematch_node(&node).unwrap_or_else(|e| panic!("'{yaml}' must pass: {e}"));
+        }
+    }
+
+    /// The dispatch path builds the control leaf verbatim: no server,
+    /// `udp: false` ignored, fields reach `rematch_action` untouched.
+    #[test]
+    fn rematch_dispatch_builds_control_leaf() {
+        let node = proxy_config(
+            "name: inspect\ntype: rematch\ntarget-rematch-name: ' stage1 '\n\
+             target-sub-rule: second-pass\nudp: false\n",
+        );
+        let proxy = parse_proxy(&node).expect("rematch node parses");
+        assert_eq!(proxy.adapter_type(), meow_common::AdapterType::Rematch);
+        let action = proxy.rematch_action().expect("action reported");
+        assert_eq!(action.rematch_name, Some(" stage1 "));
+        assert_eq!(action.sub_rule, Some("second-pass"));
+    }
+
+    /// `dialer-proxy` on rematch fails through the same dispatcher the
+    /// ordinary nodes use — the provider payload path included.
+    #[test]
+    fn rematch_dialer_proxy_rejected_at_dispatch() {
+        let node = proxy_config(
+            "name: inspect\ntype: rematch\ntarget-rematch-name: x\ndialer-proxy: front\n",
+        );
+        let err = parse_proxy(&node).err().expect("must reject");
+        assert!(err.contains("dialer-proxy"), "{err}");
     }
 }

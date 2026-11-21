@@ -67,12 +67,23 @@ pub fn parse_rules_full(
                 }
                 rules.push(rule);
             }
-            Err(e) if strict => {
-                return Err(anyhow::anyhow!(
-                    "rules: failed to parse '{line}' (strict mode): {e}"
-                ));
+            Err(e) => {
+                // A malformed REMATCH-NAME predicate fails the whole load
+                // in either mode (issue #974): it rewires the flow's
+                // first routing decision, so warn-and-skip would silently
+                // route by a different rule than written.
+                if meow_rules::line_mentions_rematch_name(line) {
+                    return Err(anyhow::anyhow!(
+                        "rules: malformed REMATCH-NAME predicate in '{line}': {e}"
+                    ));
+                }
+                if strict {
+                    return Err(anyhow::anyhow!(
+                        "rules: failed to parse '{line}' (strict mode): {e}"
+                    ));
+                }
+                warn!("Failed to parse rule '{}': {}", line, e);
             }
-            Err(e) => warn!("Failed to parse rule '{}': {}", line, e),
         }
     }
     Ok(rules)

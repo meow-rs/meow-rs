@@ -2236,6 +2236,19 @@ fn apply_dialer_proxies_validate(
         if !dialable.contains(dialer.as_str()) && !dialer.starts_with(MALFORMED_DIALER_PREFIX) {
             anyhow::bail!("proxy '{name}': dialer-proxy '{dialer}' not found");
         }
+        // A statically resolvable rematch leaf can never carry the hop —
+        // a rematch's only action is a routing re-entry, not a dial
+        // (issue #974). Group fronts resolve their pick at dial time,
+        // where the leaf's own dial fails closed instead.
+        if proxies
+            .get(dialer.as_str())
+            .is_some_and(|p| p.adapter_type() == meow_common::AdapterType::Rematch)
+        {
+            anyhow::bail!(
+                "proxy '{name}': dialer-proxy '{dialer}' is a rematch control \
+                 outbound — it cannot carry a dialer front"
+            );
+        }
     }
     Ok(())
 }
@@ -3113,6 +3126,17 @@ fn build_proxy_layer(
     // build-bare-then-re-parse pass, whose double construction could spawn an
     // `ss` node's external SIP003 subprocess twice.
     let raw_proxies = raw.proxies.as_deref().unwrap_or(&[]);
+    // A malformed `type: rematch` action fails the whole load in either
+    // mode — warn-dropping it would silently remove the flow's first
+    // routing decision (issue #974). Run the structural gate before the
+    // leaf pass so `-t`, boot, PUT and provider-less rebuilds agree.
+    for raw_proxy in raw_proxies {
+        if raw_proxy.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+            if let Err(e) = proxy_parser::check_rematch_node(raw_proxy) {
+                anyhow::bail!("proxies: {e}");
+            }
+        }
+    }
     let dialer_edges = collect_dialer_edges(raw_proxies, strict)?;
 
     // `global-client-fingerprint` (issue #974) is normalized once per
@@ -3827,6 +3851,29 @@ fn rebuild_from_raw_impl(
                         reference.name
                     ));
                 }
+            }
+        }
+    }
+
+    // A rematch node's `target-sub-rule` names a block by reference only —
+    // like `SUB-RULE` references, a miss falls back to the main rule list
+    // at match time, so warn once here rather than failing (issue #974).
+    if let Some(raw_proxies) = raw.proxies.as_deref() {
+        for node in raw_proxies {
+            if node.get("type").and_then(|v| v.as_str()) != Some("rematch") {
+                continue;
+            }
+            let Some(block) = node.get("target-sub-rule").and_then(|v| v.as_str()) else {
+                continue;
+            };
+            if !block.is_empty() && !sub_rules.contains_key(block) {
+                warn!(
+                    "rematch '{}': target-sub-rule '{block}' is not a declared \
+                     sub-rules block — flows selecting it fall back to the main rules",
+                    node.get("name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("<unnamed>")
+                );
             }
         }
     }
