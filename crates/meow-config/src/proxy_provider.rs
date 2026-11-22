@@ -1391,6 +1391,25 @@ impl ProxyProvider {
         // `dialer-proxy` in any shape, even malformed. Parse the leaf bare;
         // `parse_dns_node` emits the ignored-key warnings (issue #974).
         if raw_map.get("type").and_then(|v| v.as_str()) == Some("dns") {
+            // The node-level key's warning comes from `parse_dns_node`,
+            // but the two stronger dialer sources — provider-level
+            // `dialer-proxy:` and `override.dialer-proxy:` — are not node
+            // keys and would apply silently without one (issue #974
+            // review). `override.dialer-proxy: ""` is the "clear the
+            // chain" knob, not a declared front — nothing to warn on.
+            let enforced = self
+                .override_dialer
+                .as_deref()
+                .or(self.provider_dialer.as_deref())
+                .filter(|dialer| !dialer.is_empty());
+            if let Some(dialer) = enforced {
+                warn!(
+                    provider = %self.name,
+                    proxy = raw_name,
+                    "dns node ignores `dialer-proxy` '{dialer}' — \
+                     the leaf owns no transport to chain"
+                );
+            }
             return proxy_parser::parse_proxy_provider_node_with_fp(
                 raw_map,
                 self.ipv6,
@@ -3368,6 +3387,109 @@ header:
         .unwrap();
         assert!(n >= 12);
         assert_eq!(buf[3] & 0x0f, 2);
+    }
+
+    /// `dialer-proxy` reaching a `type: dns` member from either stronger
+    /// level — the provider's own `dialer-proxy:` or `override.dialer-proxy`
+    /// — must warn rather than apply silently: an enforcement knob the
+    /// operator believes chains the node is being dropped (issue #974
+    /// review). The node-level key already warns inside `parse_dns_node`.
+    #[tokio::test]
+    async fn provider_dns_node_dialer_levels_warn() {
+        crate::test_support::install_global_discard_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - {name: dns-out, type: dns, dialer-proxy: node-front}\n",
+        )
+        .unwrap();
+        let dns_cell = meow_dns::new_dns_outbound_cell();
+
+        // Provider-level only — the warning names the provider's front.
+        let mut raw = raw_file_provider("nodes.yaml");
+        raw.dialer_proxy = Some("front".to_string());
+        let p = ProxyProvider::new_with_client_fingerprint(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+            None,
+            Some(Arc::clone(&dns_cell)),
+        )
+        .unwrap();
+        let cap = crate::test_support::WarnCapture::start();
+        p.refresh().await.unwrap();
+        let warns = cap.take();
+        assert!(
+            warns.contains("ignores `dialer-proxy` 'front'"),
+            "the provider-level front must warn: {warns}"
+        );
+        assert!(
+            warns.contains("`dialer-proxy` is ignored on type: dns"),
+            "the node-level key must warn: {warns}"
+        );
+
+        // `override` beats the provider level — the warning names the
+        // enforcement that actually reaches the node, and 'front' never
+        // surfaces.
+        let mut raw = raw_file_provider("nodes.yaml");
+        raw.dialer_proxy = Some("front".to_string());
+        raw.override_ = Some(HashMap::from([(
+            "dialer-proxy".to_string(),
+            serde_json::Value::String("enforced".to_string()),
+        )]));
+        let p = ProxyProvider::new_with_client_fingerprint(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+            None,
+            Some(Arc::clone(&dns_cell)),
+        )
+        .unwrap();
+        let cap = crate::test_support::WarnCapture::start();
+        p.refresh().await.unwrap();
+        let warns = cap.take();
+        assert!(
+            warns.contains("ignores `dialer-proxy` 'enforced'"),
+            "the override front must warn: {warns}"
+        );
+        assert!(
+            !warns.contains("`dialer-proxy` 'front'"),
+            "the overridden provider front must not warn: {warns}"
+        );
+
+        // `override.dialer-proxy: ""` is the explicit clear — it overwrites
+        // the provider level too, so no front reaches the node and nothing
+        // warns.
+        let mut raw = raw_file_provider("nodes.yaml");
+        raw.dialer_proxy = Some("front".to_string());
+        raw.override_ = Some(HashMap::from([(
+            "dialer-proxy".to_string(),
+            serde_json::Value::String(String::new()),
+        )]));
+        let p = ProxyProvider::new_with_client_fingerprint(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+            None,
+            Some(Arc::clone(&dns_cell)),
+        )
+        .unwrap();
+        let cap = crate::test_support::WarnCapture::start();
+        p.refresh().await.unwrap();
+        let warns = cap.take();
+        assert!(
+            !warns.contains("ignores `dialer-proxy`"),
+            "an empty override must not warn as an enforced front: {warns}"
+        );
     }
 
     /// A refresh that *changes* the `dialer-proxy` name must retarget the
