@@ -477,14 +477,12 @@ impl DnsServer {
                 arcount > 0,
             )));
         }
-        if qtype != 1 && qtype != 28 {
-            // Generic queries escalate to the task path — the remaining
-            // gates there (record-count FORMERR, hickory-parse FORMERR,
-            // BADVERS) may not even reach upstream, and they are not
-            // evaluated on this probe path.
-            return LocalAnswer::Upstream;
-        }
-
+        // Response rules are checked BEFORE the A/AAAA gate: a REFUSED/
+        // NODATA/static-address verdict on a generic qtype (TXT, MX, …)
+        // is fully locally answerable, so it must never draw an upstream
+        // permit or queue behind a saturated in-flight pool — the same
+        // ordering `handle_generic_forward` keeps before forwarding
+        // (issue #974 review).
         if let Some(answer) = Self::try_response_rule(data, question_len, &domain, qtype, resolver)
         {
             return LocalAnswer::Answer(LocalResponse {
@@ -502,6 +500,14 @@ impl DnsServer {
                     )
                 }),
             });
+        }
+
+        if qtype != 1 && qtype != 28 {
+            // Generic queries escalate to the task path — the remaining
+            // gates there (record-count FORMERR, hickory-parse FORMERR,
+            // BADVERS) may not even reach upstream, and they are not
+            // evaluated on this probe path.
+            return LocalAnswer::Upstream;
         }
 
         let outcome = {
@@ -2803,11 +2809,16 @@ mod tests {
             (truncated, 1),
             (query, 5),
         ] {
-            assert!(matches!(
-                DnsServer::try_answer_local(&packet, &resolver),
-                LocalAnswer::Upstream
-            ));
+            // A matching rule makes even a generic-qtype packet locally
+            // answerable (issue #974): `try_response_rule` runs
+            // `parse_request` before the refusal, so FORMERR/BADVERS still
+            // win — without spending an upstream permit.
+            let LocalAnswer::Answer(inline) = DnsServer::try_answer_local(&packet, &resolver)
+            else {
+                panic!("a rule-matched generic query must answer locally");
+            };
             let reply = DnsServer::handle_query(&packet, &resolver).await.unwrap();
+            assert_eq!(inline.response, reply);
             let msg = Message::from_vec(&reply).unwrap();
             assert_eq!(u16::from(msg.metadata.response_code), expected);
         }
@@ -4624,6 +4635,110 @@ mod tests {
             "the first MAX_IN_FLIGHT queries all got permits"
         );
         serve.abort();
+    }
+
+    /// A response-rule verdict on a GENERIC qtype is locally decidable:
+    /// a TXT query matching a REFUSED rule must answer without an
+    /// upstream permit, even with the in-flight pool fully parked — the
+    /// rule check precedes the A/AAAA escalation gate (issue #974
+    /// review).
+    #[tokio::test]
+    async fn response_rule_answers_under_saturated_upstream_cap() {
+        let upstream = spawn_blackhole_upstream().await;
+        let mut resolver = crate::resolver::Resolver::new(
+            vec![upstream],
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        );
+        resolver
+            .set_response_rules(vec![crate::response_policy::ResponseRule {
+                matcher: Arc::new(|_| true),
+                query_types: vec![16],
+                action: crate::response_policy::ResponseAction::Refused,
+            }])
+            .unwrap();
+        let resolver = Arc::new(resolver);
+        let server = DnsServer::new(resolver, "127.0.0.1:0".parse().unwrap());
+        let bound = server.bind().await.unwrap();
+        let dropped = Arc::clone(&bound.dropped);
+        let addr = bound.local_addr().unwrap();
+        let serve = tokio::spawn(bound.run());
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Park every permit on the blackhole upstream.
+        for i in 0..MAX_IN_FLIGHT as u16 {
+            client.send_to(&sample_query(i, 1), addr).await.unwrap();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+        // The TXT REFUSED verdict answers inline despite zero permits.
+        client
+            .send_to(&sample_query(0xfe16, 16), addr)
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let (_, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.recv_from(&mut buf),
+        )
+        .await
+        .expect("a response-rule verdict must not wait for a permit")
+        .unwrap();
+        assert_eq!(&buf[0..2], &[0xfe, 0x16]);
+        assert_eq!(buf[3] & 15, 5, "REFUSED");
+        assert_eq!(
+            dropped.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "nothing should have been dropped"
+        );
+        serve.abort();
+    }
+
+    /// The outbound lane's own gate: with ZERO free permits a TXT query
+    /// matching a REFUSED response rule still answers on both the
+    /// datagram exchange and the stream's `answer_wire` — escalation
+    /// would hang on the semaphore instead (issue #974 review).
+    #[tokio::test]
+    async fn outbound_response_rule_bypasses_a_zero_permit_budget() {
+        let mut resolver = crate::resolver::Resolver::new(
+            vec!["127.0.0.1:9".parse().unwrap()],
+            Vec::new(),
+            DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            true,
+            true,
+        );
+        resolver
+            .set_response_rules(vec![crate::response_policy::ResponseRule {
+                matcher: Arc::new(|_| true),
+                query_types: vec![16],
+                action: crate::response_policy::ResponseAction::Refused,
+            }])
+            .unwrap();
+        let resolver = Arc::new(resolver);
+        let cell = new_dns_outbound_cell();
+        *cell.write() = Some(new_resolver_slot(Arc::clone(&resolver)));
+        let budget = Arc::new(tokio::sync::Semaphore::new(0));
+
+        let reply = answer_outbound_datagram(&sample_query(0xf0, 16), &cell, &budget)
+            .await
+            .expect("a response-rule verdict never draws a permit");
+        assert_eq!(
+            Message::from_vec(&reply).unwrap().metadata.response_code,
+            ResponseCode::Refused
+        );
+
+        let reply = answer_wire(&sample_query(0xf1, 16), &resolver, &budget)
+            .await
+            .unwrap()
+            .expect("the stream lane takes the same local verdict");
+        assert_eq!(
+            Message::from_vec(&reply).unwrap().metadata.response_code,
+            ResponseCode::Refused
+        );
     }
 
     // ---- `type: dns` outbound exchange (issue #974) ----
