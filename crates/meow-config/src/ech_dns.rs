@@ -222,8 +222,13 @@ pub async fn preresolve_ech(
         return Ok(());
     }
     for proxy in proxies {
-        // REALITY never uses ECH, so its lookup would be wasted.
-        if proxy.contains_key("reality-opts") {
+        // REALITY never uses ECH, so its lookup would be wasted. A
+        // `type: dns` node owns no transport at all — every option key on
+        // it is ignored — so an `ech-opts:` there must not cost an HTTPS
+        // lookup either (issue #974 review).
+        if proxy.contains_key("reality-opts")
+            || proxy.get("type").and_then(|v| v.as_str()) == Some("dns")
+        {
             continue;
         }
         let proxy_name = proxy
@@ -294,10 +299,14 @@ pub async fn preresolve_ech(
 /// up in DNS, and the shape [`check_ech_defects`] defects on when nothing
 /// names a query target. `has_query_source` is `true` when
 /// `query-server-name:` or `server:` supplies one. `None` for every other
-/// map (`ech-opts:` absent, not a mapping, disabled, already inline, or
-/// ignored because the proxy uses `reality-opts`).
+/// map (`ech-opts:` absent, not a mapping, disabled, already inline,
+/// ignored because the proxy uses `reality-opts`, or a `type: dns` node —
+/// a dns leaf owns no transport, so an `ech-opts:` key on it is ignored
+/// like every other option, not a defect — issue #974 review).
 fn ech_dns_status(proxy: &HashMap<String, Value>) -> Option<bool> {
-    if proxy.contains_key("reality-opts") {
+    if proxy.contains_key("reality-opts")
+        || proxy.get("type").and_then(|v| v.as_str()) == Some("dns")
+    {
         return None;
     }
     let ech_map = proxy.get("ech-opts")?.as_object()?;
@@ -362,6 +371,35 @@ pub fn check_ech_defects(proxies: &[HashMap<String, Value>], strict: bool) -> Re
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    /// Issue #974 review: a `type: dns` node owns no transport — every
+    /// option key on it is ignored — so `ech-opts` there is neither a
+    /// defect nor worth an HTTPS lookup, even with a `server:` to query.
+    #[tokio::test]
+    async fn preresolve_and_defects_skip_dns_nodes() {
+        let _serial = crate::test_support::ech_dns_serial().lock().await;
+        ECH_LOOKUPS.store(0, std::sync::atomic::Ordering::Relaxed);
+        let bare: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "name": "d",
+            "type": "dns",
+            "ech-opts": {"enable": true},
+        }))
+        .unwrap();
+        let with_server: HashMap<String, Value> = serde_json::from_value(serde_json::json!({
+            "name": "d2",
+            "type": "dns",
+            "server": "ignored.example",
+            "ech-opts": {"enable": true, "query-server-name": "also.ignored"},
+        }))
+        .unwrap();
+        let mut proxies = vec![bare.clone(), with_server.clone()];
+
+        check_ech_defects(&proxies, true).expect("a dns node's ech-opts is ignored, not a defect");
+        assert!(!needs_ech_dns(&proxies));
+        preresolve_ech(&mut proxies, true).await.unwrap();
+        assert_eq!(ECH_LOOKUPS.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(proxies, vec![bare, with_server]);
+    }
 
     #[tokio::test]
     async fn preresolve_skips_reality_proxies() {
