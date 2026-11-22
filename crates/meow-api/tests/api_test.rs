@@ -12933,6 +12933,35 @@ async fn put_configs_reloads_rematch_live() {
     );
 }
 
+/// Issue #974 review: a `type: dns` leaf surfaces on `/proxies/{name}`
+/// like any route-table entry — `type: "Dns"`, `udp: true` (the leaf
+/// serves framed UDP exchanges in-process), and no endpoint address:
+/// `addr()` is `""` and the JSON shape carries no server field a client
+/// could misread as dialable.
+#[tokio::test]
+async fn get_proxy_reports_dns_leaf_shape() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    let resp = put_configs_payload(
+        &state,
+        "mode: rule\n\
+         proxies:\n  - {name: dns-out, type: dns}\n\
+         rules:\n  - DST-PORT,53,dns-out\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let (status, json) = get_json(&state, "/proxies/dns-out").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["name"], "dns-out");
+    assert_eq!(json["type"], "Dns");
+    assert_eq!(json["udp"], true);
+    assert!(
+        json.get("server").is_none() && json.get("address").is_none(),
+        "a dns leaf advertises no endpoint: {json}"
+    );
+}
+
 /// A group delay round probes a rematch member like any other — it is
 /// scheduled, fails through the ordinary transport-error path, is left
 /// out of the result map, and records the failed probe. mihomo has no
