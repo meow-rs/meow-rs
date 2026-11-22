@@ -460,7 +460,10 @@ pub struct Statistics {
     pub connections: DashMap<Uuid, ConnectionInfo>,
     /// Headless flows still need cancellation on a cold config reload, but
     /// never need the metadata and serialization fields used by the API.
-    headless_connections: OnceLock<DashMap<usize, Arc<ConnCounters>>>,
+    /// The leaf name rides along so a filtered close (e.g. dns-leaf flows
+    /// surviving a config swap, issue #974) can classify them exactly like
+    /// API-tracked `chains[0]` entries.
+    headless_connections: OnceLock<DashMap<usize, HeadlessConn>>,
     /// Connections that recorded notes, kept after they close so a client
     /// can still read why a short-lived or failed flow went where it did.
     /// Newest last, at most [`RECENTLY_CLOSED_CAPACITY`]. Flows without
@@ -785,26 +788,42 @@ impl Statistics {
         route: impl FnOnce() -> Option<Route>,
     ) -> Option<Arc<ConnCounters>> {
         let connections = self.headless_connections.get()?;
-        let counters =
-            ConnCounters::filed(None, None, metadata, false, route, &self.process_policy());
+        let route = route();
+        // The leaf rides into the entry so a filtered close can classify a
+        // headless flow exactly like an API-tracked `chains[0]`.
+        let leaf = route.as_ref().map(|r| Arc::clone(&r.policy));
+        let counters = ConnCounters::filed(
+            None,
+            None,
+            metadata,
+            false,
+            || route,
+            &self.process_policy(),
+        );
         // The guard pins this allocation until after its Drop unregisters it.
         // Even after a reload drains the map, a stale guard keeps its address
         // from being reused by a new connection. The address is only a private
         // map key, never dereferenced, and has no cumulative ID limit on 32-bit.
-        connections.insert(Arc::as_ptr(&counters).addr(), Arc::clone(&counters));
+        connections.insert(
+            Arc::as_ptr(&counters).addr(),
+            HeadlessConn {
+                leaf,
+                counters: Arc::clone(&counters),
+            },
+        );
         Some(counters)
     }
 
     pub(crate) fn close_headless_connection(&self, counters: &Arc<ConnCounters>) {
         // Borrow the owning Arc so the key cannot outlive its allocation.
         let key = Arc::as_ptr(counters).addr();
-        if let Some((_, counters)) = self
+        if let Some((_, entry)) = self
             .headless_connections
             .get()
             .and_then(|connections| connections.remove(&key))
         {
-            counters.close();
-            counters.settle_ledger();
+            entry.counters.close();
+            entry.counters.settle_ledger();
         }
     }
 
@@ -914,11 +933,27 @@ impl Statistics {
     /// Request closure of all tracked TCP connections and remove their entries.
     /// Returns the number of closure requests, not completed socket teardowns.
     pub fn close_all_connections_counted(&self) -> usize {
+        self.close_connections_counted_where(|_| true)
+    }
+
+    /// [`Self::close_all_connections_counted`] with a leaf filter: `should_close`
+    /// receives the connection's committed leaf name (`chains[0]`; `None` for
+    /// entries that never resolved one) and returns whether it is closed.
+    /// Surviving entries keep tracking untouched — used so `type: dns` leaf
+    /// flows, in-process pipes that re-read the shared resolver cell per
+    /// query, outlive the route-table swap itself (issue #974 review).
+    pub fn close_connections_counted_where(
+        &self,
+        should_close: impl Fn(Option<&str>) -> bool,
+    ) -> usize {
         let mut closed = 0;
         // Signal and remove under the same shard lock. A separate iteration
         // followed by clear could erase newly inserted, unsignalled entries.
         let mut noted = Vec::new();
         self.connections.retain(|_, info| {
+            if !should_close(info.chains.first().map(std::convert::AsRef::as_ref)) {
+                return true;
+            }
             info.counters.close();
             info.counters.settle_ledger();
             closed += 1;
@@ -931,15 +966,26 @@ impl Statistics {
             self.remember_closed(info);
         }
         if let Some(connections) = self.headless_connections.get() {
-            connections.retain(|_, counters| {
-                counters.close();
-                counters.settle_ledger();
+            connections.retain(|_, entry| {
+                if !should_close(entry.leaf.as_deref()) {
+                    return true;
+                }
+                entry.counters.close();
+                entry.counters.settle_ledger();
                 closed += 1;
                 false
             });
         }
         closed
     }
+}
+
+/// A headless (no-API) tracked flow: cancellation counters plus the leaf
+/// name it committed to, so filtered closes see it exactly like a
+/// `ConnectionInfo`'s `chains[0]`.
+struct HeadlessConn {
+    leaf: Option<Arc<str>>,
+    counters: Arc<ConnCounters>,
 }
 
 impl Default for Statistics {
@@ -966,7 +1012,7 @@ impl traffic_ledger::Source for Statistics {
         }
         if let Some(connections) = self.headless_connections.get() {
             for entry in connections {
-                entry.value().settle_ledger();
+                entry.value().counters.settle_ledger();
             }
         }
         for entry in &self.udp_flows {

@@ -2284,6 +2284,17 @@ impl Tunnel {
         mode: Option<TunnelMode>,
         dialer_registry: meow_proxy::dialer::ProxyRegistry,
     ) -> usize {
+        // A `type: dns` leaf's conn is an in-process pipe to the shared
+        // resolver cell — the swap itself cannot strand it; its next query
+        // reads the new generation. Cancelling it would only force a
+        // reconnect the leaf never needed, breaking open DNS streams on a
+        // cold PUT (issue #974 review). The set is read off the NEW map:
+        // a leaf retyped or removed by this swap still closes.
+        let dns_leaves: std::collections::HashSet<SmolStr> = proxies
+            .iter()
+            .filter(|(_, adapter)| adapter.adapter_type() == meow_common::AdapterType::Dns)
+            .map(|(name, _)| name.clone())
+            .collect();
         let route = Arc::new(RouteTable::new(
             proxies,
             rules,
@@ -2293,7 +2304,13 @@ impl Tunnel {
         ));
         let mut generation = self.inner.tcp_generation.write();
         *generation = generation.checked_add(1).expect("TCP generation exhausted");
-        let closed = self.inner.stats.close_all_connections_counted();
+        let closed = self
+            .inner
+            .stats
+            .close_connections_counted_where(|leaf| match leaf {
+                Some(leaf) => !dns_leaves.contains(leaf),
+                None => true,
+            });
         let old = self.install_routing(route);
         if let Some(mode) = mode {
             self.set_mode(mode);
@@ -2355,11 +2372,26 @@ impl Tunnel {
         let adapters = meow_common::reset_sessions_reachable(
             route.proxies.values().cloned().chain(extra_roots),
         );
+        // A `type: dns` leaf's conn owns no socket — an outbound-interface
+        // rebinding cannot strand it (issue #974 review); keep such flows.
+        let dns_leaves: std::collections::HashSet<SmolStr> = route
+            .proxies
+            .iter()
+            .filter(|(_, adapter)| adapter.adapter_type() == meow_common::AdapterType::Dns)
+            .map(|(name, _)| name.clone())
+            .collect();
         drop(route);
         let dns = self.resolver().reset_connections();
         meow_dns::reset_pooled_connections();
         let tcp = match tcp {
-            TrackedTcp::Cancel => self.inner.stats.close_all_connections_counted(),
+            TrackedTcp::Cancel => {
+                self.inner
+                    .stats
+                    .close_connections_counted_where(|leaf| match leaf {
+                        Some(leaf) => !dns_leaves.contains(leaf),
+                        None => true,
+                    })
+            }
             TrackedTcp::AlreadyCancelled => 0,
         };
         let udp = self.close_all_udp_sessions();
