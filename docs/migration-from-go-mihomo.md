@@ -150,6 +150,7 @@ These fields parse without error but behave differently from Go mihomo:
 | `profile.store-fake-ip` | Persists fake-IP mappings when `true` | Resolution is `profile.store-fake-ip` > `dns.store-fake-ip` > `false`; a disagreement between the two spellings warns once per admission | B |
 | `ntp:` | Polls SNTP and (optionally) writes the OS clock | Bounded poll feeding protocol timestamps only — never the OS clock; see "NTP scope" below | A |
 | `smux.statistic` | Tracks mux carrier statistics | Parsed and warn-ignored: physical carrier tracking is unavailable; use `/connections`/`/traffic` for per-flow accounting | B |
+| `smux.brutal-opts` | TCP Brutal rate cap negotiated per mux carrier (sing-mux `_BrutalBwExchange`) | Implemented: parse leniency mirrored (`up`/`down` weak-decode numbers to text, unparseable → 0, eager shape errors), the exchange runs on every platform and pins the pool to one carrier, `protocol: muxcool` is rejected. The carrier-socket rate cap itself applies only on Linux (tcp-brutal module); non-Linux still negotiates and warns | B |
 
 ### Fields that are silently ignored in Go mihomo but error in meow-rs
 

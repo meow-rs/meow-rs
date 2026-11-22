@@ -95,13 +95,13 @@ pub use sniffer::SnifferConfig;
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
 pub use socket_protect::set_listener_socket_mark;
 pub use socket_protect::{
-    apply_ip_version_filter, bind_udp, bind_udp_for_peer, canonical_socket_addr, connect_tcp,
-    connect_tcp_candidates, connect_tcp_host, dialer_opts, dialer_opts_scope, effective_user_agent,
-    enlarge_udp_recv_buffer, global_dialer_opts, global_interface_name, global_ua,
-    is_valid_http_header_value, pin_routing_mark, resolve_host, resolve_host_all,
-    resolve_host_all_via, routing_mark, routing_mark_pinned, set_global_interface_name,
-    set_global_ua, set_routing_mark, DialerOpts, GlobalDialerOpts, IpVersion, RoutingMarkPin,
-    DEFAULT_USER_AGENT,
+    apply_ip_version_filter, bind_udp, bind_udp_for_peer, brutal_carrier_scope,
+    canonical_socket_addr, connect_tcp, connect_tcp_candidates, connect_tcp_host, dialer_opts,
+    dialer_opts_scope, effective_user_agent, enlarge_udp_recv_buffer, global_dialer_opts,
+    global_interface_name, global_ua, is_valid_http_header_value, pin_routing_mark, resolve_host,
+    resolve_host_all, resolve_host_all_via, routing_mark, routing_mark_pinned,
+    set_global_interface_name, set_global_ua, set_routing_mark, BrutalCarrier, DialerOpts,
+    GlobalDialerOpts, IpVersion, RoutingMarkPin, DEFAULT_USER_AGENT,
 };
 pub use tcp_opts::{
     outbound_tcp_keepalive, set_outbound_tcp_keepalive, OutboundTcpKeepalive, TcpKeepaliveConfig,

@@ -376,6 +376,192 @@ pub async fn dialer_opts_scope<F: std::future::Future>(opts: DialerOpts, fut: F)
     DIALER_OPTS.scope(opts, fut).await
 }
 
+// ─── TCP Brutal carrier sockets (smux.brutal-opts, issue #974) ─────────────
+//
+// mihomo's `smux.brutal-opts` negotiates a TCP Brutal rate cap on the mux
+// carrier (sing-mux's `_BrutalBwExchange` control stream) and applies it to
+// the carrier's *physical* socket: `SetBrutalOptions` unwraps every
+// TLS/proxy wrapper down to the bottom `syscall.Conn` — under
+// `dialer-proxy` that is the *front hop's* socket. meow's socket helpers
+// already sit at that bottom: a mux session dial wrapped in
+// [`brutal_carrier_scope`] collects the `TcpStream` clone every
+// [`connect_tcp`] hands upward, and `apply_rate` sets the negotiated rate
+// on each stash. This deliberately is a *separate* task-local from
+// `DIALER_OPTS`: a `dialer-proxy` front hop REPLACES the dialer-opts scope
+// for its own physical dial, while the carrier cell must survive that
+// replacement so the front's socket is still the one captured.
+//
+// Resolver-internal sockets are excluded: `resolve_via_hook` and
+// `resolve_host_all_via` clear the cell for the lookup, so sockets a
+// DNS-via-proxy dial opens never land in a carrier's set.
+
+/// The kernel TCP sockets one brutal-enabled mux session dial opened,
+/// stashed by [`connect_tcp`] (Linux only — elsewhere the cell stays empty
+/// and [`apply_rate`](BrutalCarrier::apply_rate) is the upstream stub's
+/// behavior). The stash holds `dup`'d fd handles of the same kernel
+/// sockets — so the set stays referencable after the dial wraps each
+/// original in TLS/proxy layers, and closing a dropped clone can never
+/// disturb the live socket.
+#[derive(Debug, Default)]
+pub struct BrutalCarrier {
+    /// Stashed socket clones — Linux only; the field stays compiled out
+    /// elsewhere so the cell is provably empty on those builds.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    sockets: parking_lot::Mutex<Vec<std::net::TcpStream>>,
+}
+
+impl BrutalCarrier {
+    /// An empty carrier — one per new mux session dial (`create_session`).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record one dialled socket. The `dup`'d fd shares the kernel
+    /// socket, so `apply_rate`'s setsockopts land on the socket the dial
+    /// is using, not a copy of it.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    fn stash(&self, stream: std::net::TcpStream) {
+        self.sockets.lock().push(stream);
+    }
+
+    /// How many sockets the dial stashed (test observability).
+    #[cfg(all(test, target_os = "linux", not(target_env = "ohos")))]
+    fn stashed(&self) -> usize {
+        self.sockets.lock().len()
+    }
+
+    /// Apply the negotiated rate cap (bytes/s) to every stashed socket —
+    /// `TCP_CONGESTION "brutal"` then `TCP_BRUTAL_PARAMS{rate, cwnd_gain
+    /// 20}`, mirroring sing-mux `brutal_linux.go` (requires the apernet
+    /// tcp-brutal kernel module). Failures are `debug!`-only, never
+    /// fatal — upstream logs the same error at Debug and keeps the
+    /// carrier. Returns the count of sockets that took both setsockopts.
+    ///
+    /// Parallel `connect_tcp_candidates` may stash losing candidates; an
+    /// applied-then-closed loser wastes one setsockopt pair, which is
+    /// bounded and harmless.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    pub fn apply_rate(&self, rate_bps: u64) -> usize {
+        let sockets = self.sockets.lock();
+        if sockets.is_empty() {
+            // e.g. mux-over-mux: the carrier's bottom conn is another
+            // mux's stream, not a kernel socket — the same "cannot
+            // convert to syscall.Conn" outcome upstream debug-logs.
+            tracing::debug!("brutal: no kernel socket to apply TCP Brutal to");
+            return 0;
+        }
+        let mut applied = 0;
+        for stream in sockets.iter() {
+            match apply_brutal_rate(stream, rate_bps) {
+                Ok(()) => applied += 1,
+                Err(error) => tracing::debug!(
+                    %error,
+                    "brutal: failed to enable TCP Brutal at client \
+                     (the tcp-brutal kernel module may be missing)"
+                ),
+            }
+        }
+        applied
+    }
+
+    /// Non-Linux stub. The `_BrutalBwExchange` negotiation still ran — the
+    /// server applied its half of the rate — so this mirrors upstream's
+    /// `SetBrutalOptions` build-stub error, which sing-mux logs at Debug
+    /// and treats as non-fatal.
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    pub fn apply_rate(&self, _rate_bps: u64) -> usize {
+        tracing::debug!("brutal: TCP Brutal is only supported on Linux");
+        0
+    }
+}
+
+tokio::task_local! {
+    /// The [`BrutalCarrier`] collecting kernel sockets for the mux session
+    /// dial it wraps. `None` inside resolver internals (`resolve_via_hook`
+    /// / `resolve_host_all_via`): DNS plumbing sockets are meow's own, not
+    /// the dialing node's carrier egress.
+    static BRUTAL_CARRIER: Option<Arc<BrutalCarrier>>;
+}
+
+/// Run `fut` with the carrier cell set to `carrier`: `Some` collects every
+/// [`connect_tcp`] socket the dial opens (the scope a brutal-enabled mux
+/// client installs around its session dial); `None` shadows an outer cell
+/// so a *non-brutal* mux session's dial cannot feed a rear node's carrier
+/// under `dialer-proxy` mux-over-mux — Go's "nested multiplexing is not
+/// supported" verdict by construction (the rear's `apply_rate` then finds
+/// no kernel socket and debug-logs, matching upstream's cannot-convert).
+pub async fn brutal_carrier_scope<F: std::future::Future>(
+    carrier: Option<Arc<BrutalCarrier>>,
+    fut: F,
+) -> F::Output {
+    BRUTAL_CARRIER.scope(carrier, fut).await
+}
+
+/// The carrier whose dial scope the current task is inside, if any.
+/// Compiled for Linux (the stash path) and unix tests (scope assertions —
+/// `mod tests` is `cfg(unix)`, so `test` alone would be dead on Windows).
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), all(test, unix)))]
+fn brutal_carrier() -> Option<Arc<BrutalCarrier>> {
+    BRUTAL_CARRIER.try_with(Clone::clone).ok().flatten()
+}
+
+/// `TCP_BRUTAL_PARAMS` (23301) payload — apernet tcp-brutal's
+/// `TCPBrutalParams` as sing-mux writes it: rate in bytes/s plus the
+/// hysteria2-default cwnd_gain. 16 bytes; the tail padding is an explicit
+/// field so the option buffer is fully initialized.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+#[repr(C)]
+struct TcpBrutalParams {
+    rate: u64,
+    cwnd_gain: u32,
+    _pad: u32,
+}
+
+/// One socket's pair of setsockopts, sing-mux `brutal_linux.go` verbatim:
+/// pick the `brutal` congestion-control algorithm, then feed it the rate.
+#[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+fn apply_brutal_rate(stream: &std::net::TcpStream, rate_bps: u64) -> io::Result<()> {
+    use std::os::fd::AsRawFd;
+    const TCP_BRUTAL_PARAMS: libc::c_int = 23301;
+    const CWND_GAIN: u32 = 20;
+    let fd = stream.as_raw_fd();
+    let congestion = b"brutal\0";
+    // SAFETY: `stream` owns the fd for the call; `congestion` is a valid
+    // NUL-terminated name buffer of the length passed.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            libc::TCP_CONGESTION,
+            congestion.as_ptr().cast(),
+            congestion.len() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let params = TcpBrutalParams {
+        rate: rate_bps,
+        cwnd_gain: CWND_GAIN,
+        _pad: 0,
+    };
+    // SAFETY: `params` outlives the call and is the exact layout the
+    // tcp-brutal module reads at `size_of::<TcpBrutalParams>()` = 16.
+    if unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            TCP_BRUTAL_PARAMS,
+            std::ptr::addr_of!(params).cast(),
+            std::mem::size_of::<TcpBrutalParams>() as libc::socklen_t,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 // ─── System-resolver result cache (Android / iOS only) ─────────────────────
 //
 // Backstop for the path that still hits libc `getaddrinfo` (no `HostResolver`
@@ -732,6 +918,24 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     let keepalive = crate::tcp_opts::outbound_tcp_keepalive();
     let stream = connect_tcp_dial(addr).await?;
     keepalive.apply(&stream);
+    // Inside a brutal mux session dial the physical socket is collected
+    // for the post-exchange rate cap — the `dup`'d fd (tokio's TcpStream
+    // has no `try_clone`; `try_clone_to_owned` is `F_DUPFD_CLOEXEC`)
+    // shares the same kernel socket so `apply_rate`'s setsockopts hit the
+    // fd the dial actually uses (and the front hop's socket under
+    // `dialer-proxy`, which is what the task-local outliving the front's
+    // `dialer_opts_scope` buys). A dup failure is debug-only, matching
+    // every other apply-side failure.
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    if let Some(carrier) = brutal_carrier() {
+        use std::os::fd::AsFd;
+        match stream.as_fd().try_clone_to_owned() {
+            Ok(owned) => carrier.stash(std::net::TcpStream::from(owned)),
+            Err(error) => {
+                tracing::debug!(%error, "brutal: failed to dup carrier socket");
+            }
+        }
+    }
     Ok(stream)
 }
 
@@ -1122,6 +1326,8 @@ pub async fn resolve_host_all_via(
             }
         }
     } else {
+        // `resolve_via_hook` clears the carrier cell for the lookup —
+        // the exclusion covers this caller-supplied-resolver path too.
         resolve_via_hook(r, host, port).await?
     };
     // The injected-resolver path resolves the same node-level names
@@ -1150,9 +1356,14 @@ async fn resolve_via_hook(
     host: &str,
     port: u16,
 ) -> io::Result<Vec<SocketAddr>> {
+    // `BRUTAL_CARRIER.scope(None, …)` excludes the hook's upstream sockets
+    // from a carrier cell: a `#PROXY` DNS exchange dialing through a
+    // brutal-mux node opens *its own* session (and carrier cell), while a
+    // non-mux upstream's sockets are DNS plumbing — never the dialing
+    // node's egress, exactly like the `global_only` dialer opts.
     let ips = dialer_opts_scope(
         DialerOpts::global_only(),
-        IN_HOST_RESOLVER.scope((), r.resolve_all(host)),
+        BRUTAL_CARRIER.scope(None, IN_HOST_RESOLVER.scope((), r.resolve_all(host))),
     )
     .await?;
     if ips.is_empty() {
@@ -2878,6 +3089,178 @@ mod tests {
             .expect("tfo/mptcp warn-and-skip must not fail the dial");
         let _ = accept.await.unwrap();
         drop(stream);
+    }
+
+    // ─── TCP Brutal carrier scope (smux.brutal-opts, issue #974) ────────
+
+    /// The cell is visible to `connect_tcp` inside
+    /// `brutal_carrier_scope` — across a nested `dialer_opts_scope`
+    /// replacement, which is what a `dialer-proxy` front hop installs —
+    /// and gone again on unwind. On Linux the loopback socket must land
+    /// in the stash.
+    #[tokio::test]
+    async fn carrier_scope_collects_sockets_across_opts_replacement() {
+        let _g = LOCK.lock().await;
+        clear_socket_protector();
+        let carrier = Arc::new(BrutalCarrier::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+
+        assert!(brutal_carrier().is_none(), "no cell outside a scope");
+        let stream = brutal_carrier_scope(Some(Arc::clone(&carrier)), async {
+            assert!(brutal_carrier().is_some());
+            let stream = connect_tcp(addr).await.expect("connect");
+            dialer_opts_scope(DialerOpts::default(), async {
+                assert!(
+                    brutal_carrier().is_some(),
+                    "a front hop's dialer-opts replacement must not hide the cell"
+                );
+            })
+            .await;
+            stream
+        })
+        .await;
+        let _ = accept.await.unwrap();
+        drop(stream);
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        assert_eq!(
+            carrier.stashed(),
+            1,
+            "the loopback dial must stash its socket"
+        );
+        assert!(brutal_carrier().is_none(), "the scope must unwind");
+    }
+
+    /// The resolver hook must see `None` — sockets a DNS-via-proxy
+    /// upstream dials inside the lookup are plumbing, not carrier egress.
+    struct CarrierCapturingResolver {
+        seen: parking_lot::Mutex<Option<bool>>,
+    }
+    #[async_trait]
+    impl HostResolver for CarrierCapturingResolver {
+        async fn resolve(&self, host: &str) -> io::Result<IpAddr> {
+            self.resolve_all(host).await.map(|ips| ips[0])
+        }
+        async fn resolve_all(&self, _host: &str) -> io::Result<Vec<IpAddr>> {
+            *self.seen.lock() = Some(brutal_carrier().is_some());
+            Ok(vec![IpAddr::from([203, 0, 113, 9])])
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_via_hook_and_host_all_via_clear_the_carrier_cell() {
+        let _g = LOCK.lock().await;
+        clear_host_resolver();
+        let carrier = Arc::new(BrutalCarrier::new());
+
+        // The installed-hook path (`resolve_addrs` → `resolve_via_hook`).
+        let hooked = Arc::new(CarrierCapturingResolver {
+            seen: parking_lot::Mutex::new(None),
+        });
+        set_host_resolver(Arc::clone(&hooked) as Arc<dyn HostResolver>);
+        let got = brutal_carrier_scope(
+            Some(Arc::clone(&carrier)),
+            resolve_addrs("node.example", 443),
+        )
+        .await
+        .expect("hook answers");
+        assert_eq!(got, vec![SocketAddr::from(([203, 0, 113, 9], 443))]);
+        assert_eq!(
+            *hooked.seen.lock(),
+            Some(false),
+            "the hook must observe the cleared cell"
+        );
+        clear_host_resolver();
+
+        // The caller-supplied-resolver path (`resolve_host_all_via`,
+        // WireGuard's endpoint lookup) — its hook call goes through the
+        // same `resolve_via_hook`, so it must see the same `None`.
+        let injected = Arc::new(CarrierCapturingResolver {
+            seen: parking_lot::Mutex::new(None),
+        });
+        let got = brutal_carrier_scope(
+            Some(carrier),
+            resolve_host_all_via(injected.as_ref(), "ep.example", 51820),
+        )
+        .await
+        .expect("injected resolver answers");
+        assert_eq!(got, vec![SocketAddr::from(([203, 0, 113, 9], 51820))]);
+        assert_eq!(
+            *injected.seen.lock(),
+            Some(false),
+            "the injected-resolver call must observe the cleared cell"
+        );
+    }
+
+    /// `apply_rate` on a real stashed socket: on Linux the pair either
+    /// lands (tcp-brutal module loaded) or debug-logs ENOPROTOOPT, and
+    /// off-Linux the upstream stub arm returns 0 — never fatal.
+    #[tokio::test]
+    async fn apply_rate_on_a_stashed_socket_is_never_fatal() {
+        let _g = LOCK.lock().await;
+        clear_socket_protector();
+        let carrier = Arc::new(BrutalCarrier::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move { listener.accept().await.unwrap() });
+        let stream = brutal_carrier_scope(Some(Arc::clone(&carrier)), connect_tcp(addr))
+            .await
+            .expect("connect");
+        let _ = accept.await.unwrap();
+
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            let applied = carrier.apply_rate(1_000_000);
+            assert!(
+                applied <= carrier.stashed(),
+                "apply count {applied} cannot exceed the stash"
+            );
+        }
+        #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+        assert_eq!(
+            carrier.apply_rate(1_000_000),
+            0,
+            "the non-Linux stub applies nothing"
+        );
+        drop(stream);
+    }
+
+    /// `scope(None)` shadows an outer cell — the mechanism a non-brutal
+    /// mux session's `create_session` uses so its kernel sockets can never
+    /// feed a rear node's carrier under mux-over-mux `dialer-proxy`.
+    #[tokio::test]
+    async fn none_scope_shadows_an_outer_carrier() {
+        let _g = LOCK.lock().await;
+        clear_socket_protector();
+        let outer = Arc::new(BrutalCarrier::new());
+        let inner = Arc::new(BrutalCarrier::new());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accept = tokio::spawn(async move {
+            let _ = listener.accept().await.unwrap();
+            let _ = listener.accept().await.unwrap();
+        });
+
+        brutal_carrier_scope(Some(Arc::clone(&outer)), async {
+            // The shadowed dial — a non-brutal front's session dial under
+            // a rear node's carrier scope.
+            let _shadowed = brutal_carrier_scope(None, connect_tcp(addr))
+                .await
+                .expect("shadowed connect");
+            // A nested brutal cell still collects its own sockets.
+            let _nested = brutal_carrier_scope(Some(Arc::clone(&inner)), connect_tcp(addr))
+                .await
+                .expect("nested connect");
+        })
+        .await;
+        accept.await.unwrap();
+
+        #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+        {
+            assert_eq!(outer.stashed(), 0, "the shadowed dial fed no socket");
+            assert_eq!(inner.stashed(), 1, "the nested cell kept its own");
+        }
     }
 }
 

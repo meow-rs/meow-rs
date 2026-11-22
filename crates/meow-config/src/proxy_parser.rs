@@ -3595,6 +3595,11 @@ fn parse_mux_options_impl(
         return Ok(None);
     };
     let enabled = mux_bool_field(name, mux_cfg, "enabled", false)?;
+    // `brutal-opts` shape-decodes eagerly — upstream mapstructure walks
+    // the whole `smux` map even when `smux.enabled` is false, so a
+    // malformed block is a node defect either way (verified upstream:
+    // garbage under `enabled: false` still errors).
+    let brutal = parse_brutal_opts(name, mux_cfg)?;
     if !enabled {
         return Ok(None);
     }
@@ -3648,13 +3653,6 @@ fn parse_mux_options_impl(
              per-flow counters"
         );
     }
-    // `brutal-opts` (TCP Brutal, Linux-only upstream) stays warn-ignore.
-    if !quiet && mux_cfg.get("brutal-opts").is_some() {
-        tracing::warn!(
-            proxy = %name,
-            "mux option 'brutal-opts' is not supported in meow-rs and will be ignored"
-        );
-    }
     // Padding is a sing-mux session layer; Mux.Cool has none, so honouring
     // the flag is impossible and ignoring it would send the unpadded traffic
     // shape the operator opted out of (Class A per ADR-0002).
@@ -3666,6 +3664,29 @@ fn parse_mux_options_impl(
              or pick a sing-mux protocol"
         ));
     }
+    // The bandwidth exchange lives on a sing-mux control stream
+    // (`_BrutalBwExchange`); Mux.Cool's frame layer has no such stream,
+    // so the combination can never negotiate — a node defect, same class
+    // as padding+above rather than a silent no-op.
+    if brutal.is_some() && protocol == meow_proxy::mux::Protocol::MuxCool {
+        return Err(format!(
+            "{name}: mux option 'brutal-opts' is sing-mux only (smux/yamux/h2mux); \
+             Mux.Cool (`protocol: muxcool`) has no bandwidth exchange"
+        ));
+    }
+    // The exchange itself runs on every platform (the server caps its own
+    // send side) — only the client socket's rate cap needs Linux's
+    // tcp-brutal module. Say so once per enabled node rather than
+    // silently applying half the feature.
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
+    if !quiet && brutal.is_some() {
+        tracing::warn!(
+            proxy = %name,
+            "mux option 'brutal-opts': the TCP Brutal rate cap applies only on Linux — \
+             the _BrutalBwExchange negotiation still runs, but this platform skips the \
+             carrier socket's rate cap"
+        );
+    }
     Ok(Some(meow_proxy::mux::MuxOptions {
         protocol,
         padding,
@@ -3673,6 +3694,7 @@ fn parse_mux_options_impl(
         min_streams,
         max_streams,
         only_tcp: mux_bool_field(name, mux_cfg, "only-tcp", false)?,
+        brutal,
     }))
 }
 
@@ -3811,6 +3833,111 @@ fn mux_usize_field(
             .map_err(|_| format!("{name}: mux option '{key}' is too large")),
         Some(other) => Err(format!(
             "{name}: mux option '{key}' must be a non-negative integer, got {other:?}"
+        )),
+    }
+}
+
+/// mihomo `smux.brutal-opts` — `SingMuxOption.BrutalOpts BrutalOption`
+/// (`{enabled, up, down}`), decoded with upstream's eager-shape contract:
+/// a scalar/list `brutal-opts` and a non-stringable `up`/`down` are hard
+/// errors **even under `smux.enabled: false`** — the caller runs this
+/// before its `!enabled` early return for exactly that reason. `null`
+/// and absent decode to defaults; unknown sub-keys (`debug:`) are
+/// tolerated.
+///
+/// Returns `Some(MuxBrutal)` whenever `enabled` is set — including
+/// `enabled: true` with zero/unparseable rates, where the negotiation
+/// still runs (the kernel just gets rate 0, upstream parity).
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn parse_brutal_opts(
+    name: &str,
+    mux_cfg: &serde_json::Value,
+) -> std::result::Result<Option<meow_proxy::mux::MuxBrutal>, String> {
+    let Some(raw) = mux_cfg.get("brutal-opts") else {
+        return Ok(None);
+    };
+    if raw.is_null() {
+        return Ok(None);
+    }
+    let Some(map) = raw.as_object() else {
+        return Err(format!(
+            "{name}: mux option 'brutal-opts' expected a map, got {raw:?}"
+        ));
+    };
+    // `enabled` weak-decodes a bool or a number — upstream's
+    // WeaklyTypedInput treats any nonzero as true; a string `enabled`
+    // is a hard error there, so it is one here.
+    let enabled = match map.get("enabled") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::Number(n)) => n.as_f64().is_some_and(|v| v != 0.0),
+        Some(other) => {
+            return Err(format!(
+                "{name}: mux option 'brutal-opts.enabled' must be a boolean or number, got {other:?}"
+            ));
+        }
+    };
+    let up = brutal_weak_string(name, map.get("up"), "brutal-opts.up")?;
+    let down = brutal_weak_string(name, map.get("down"), "brutal-opts.down")?;
+    if !enabled {
+        return Ok(None);
+    }
+    Ok(Some(meow_proxy::mux::MuxBrutal {
+        send_bps: meow_proxy::mux::brutal::string_to_bps(&up),
+        receive_bps: meow_proxy::mux::brutal::string_to_bps(&down),
+    }))
+}
+
+/// One `brutal-opts` rate field under mihomo's weak string decoder
+/// (`up`/`down` are Go `string` fields): string verbatim, `null`/absent
+/// → `""`, number → its rendered value (`50`→`"50"`, `50.5`→`"50.5"`,
+/// integral `50.0`→`"50"`); bool/list/map hard-error like upstream's
+/// "expected type 'string'" failure. What the rendered text means —
+/// Mbps, Bps, garbage — is `string_to_bps`'s call, not this layer's.
+#[cfg(all(
+    feature = "mux",
+    any(
+        feature = "trojan",
+        feature = "vless",
+        feature = "ss",
+        feature = "vmess"
+    )
+))]
+fn brutal_weak_string(
+    name: &str,
+    value: Option<&serde_json::Value>,
+    key: &str,
+) -> std::result::Result<String, String> {
+    let Some(value) = value else {
+        return Ok(String::new());
+    };
+    match value {
+        serde_json::Value::Null => Ok(String::new()),
+        serde_json::Value::String(s) => Ok(s.clone()),
+        serde_json::Value::Number(n) => {
+            let rendered = match n.as_f64() {
+                // Go renders the weak-decoded float without a fraction —
+                // `50.0` decodes to "50". Only normalize inside the
+                // exactly-representable integer range (|f| ≤ 2^53): a
+                // larger float's raw repr stands, and the rate parser's
+                // verdict on it is identical either way.
+                Some(f) if n.is_f64() && f.fract() == 0.0 && f.abs() <= 9_007_199_254_740_992.0 => {
+                    format!("{}", f as i64)
+                }
+                _ => n.to_string(),
+            };
+            Ok(rendered)
+        }
+        other => Err(format!(
+            "{name}: mux option '{key}' must be a string or number, got {other:?}"
         )),
     }
 }
@@ -5066,6 +5193,232 @@ mod tests {
         );
         let opts = parse_mux_options("n", &node).unwrap().unwrap();
         assert_eq!(opts.max_streams, 2);
+    }
+
+    // ─── smux.brutal-opts (issue #974) ──────────────────────────────────
+
+    /// String rates parse through `string_to_bps` at parse time; the
+    /// weak decoder also accepts numbers and integral floats.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_brutal_opts_parses_rates_and_weak_shapes() {
+        let brutal_of = |block: &str| -> Option<meow_proxy::mux::MuxBrutal> {
+            let node = proxy_config(&format!(
+                "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n  {block}\n"
+            ));
+            parse_mux_options("n", &node).unwrap().unwrap().brutal
+        };
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true\n    up: 100 Mbps\n    down: 1 Gbps"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 12_500_000,
+                receive_bps: 125_000_000,
+            })
+        );
+        // Numbers coerce through the weak string decoder — `100` is the
+        // bare-int Mbps form, not bytes.
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true\n    up: 100\n    down: 200"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 12_500_000,
+                receive_bps: 25_000_000,
+            })
+        );
+        // Integral floats normalize to the integer repr.
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true\n    up: 50.0"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 6_250_000,
+                receive_bps: 0,
+            })
+        );
+        // `enabled` accepts the upstream 0/1 numeric forms.
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: 1\n    up: 10 Mbps"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 1_250_000,
+                receive_bps: 0,
+            })
+        );
+        assert_eq!(brutal_of("brutal-opts:\n    enabled: 0"), None);
+    }
+
+    /// `enabled: true` yields `Some` even when both rates are zero or
+    /// unparseable — the exchange still runs upstream.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_brutal_opts_enabled_with_zero_or_garbage_rates_is_some() {
+        let brutal_of = |block: &str| -> Option<meow_proxy::mux::MuxBrutal> {
+            let node = proxy_config(&format!(
+                "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n  {block}\n"
+            ));
+            parse_mux_options("n", &node).unwrap().unwrap().brutal
+        };
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 0,
+                receive_bps: 0,
+            })
+        );
+        // Unparseable rates silently fall to 0 — never a parse error.
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true\n    up: abc\n    down: -5"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 0,
+                receive_bps: 0,
+            })
+        );
+        // Unknown sub-keys are tolerated.
+        assert_eq!(
+            brutal_of("brutal-opts:\n    enabled: true\n    debug: true"),
+            Some(meow_proxy::mux::MuxBrutal {
+                send_bps: 0,
+                receive_bps: 0,
+            })
+        );
+    }
+
+    /// The eager shape contract: a scalar/list `brutal-opts`, a bool or
+    /// structured `up`/`down`, and a string `enabled` are hard errors —
+    /// including under `smux.enabled: false`.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_brutal_opts_malformed_shapes_hard_error() {
+        let err_of = |mux: &str, smux_enabled: bool| -> String {
+            let node = proxy_config(&format!(
+                "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: {smux_enabled}\n  {mux}\n"
+            ));
+            parse_mux_options("n", &node).unwrap_err()
+        };
+        for smux_enabled in [true, false] {
+            for bad in ["brutal-opts: true", "brutal-opts: [1]", "brutal-opts: 5"] {
+                assert!(
+                    err_of(bad, smux_enabled).contains("'brutal-opts' expected a map"),
+                    "enabled={smux_enabled}, {bad}"
+                );
+            }
+            for bad in [
+                "brutal-opts:\n    up: true",
+                "brutal-opts:\n    up: [1]",
+                "brutal-opts:\n    down:\n      a: 1",
+            ] {
+                assert!(
+                    err_of(bad, smux_enabled).contains("must be a string or number"),
+                    "enabled={smux_enabled}, {bad}"
+                );
+            }
+            assert!(
+                err_of("brutal-opts:\n    enabled: \"yes\"", smux_enabled)
+                    .contains("'brutal-opts.enabled'"),
+                "enabled={smux_enabled} string enabled"
+            );
+        }
+        // `smux.enabled: false` with a *well-formed* block still parses
+        // clean — the eager shape check is the only part that runs.
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: false\n  brutal-opts:\n    enabled: true\n    up: 10\n",
+        );
+        assert!(parse_mux_options("n", &node).unwrap().is_none());
+    }
+
+    /// `brutal-opts` + `protocol: muxcool` is a node defect — the frame
+    /// mux has no `_BrutalBwExchange` stream to negotiate over.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn smux_brutal_opts_rejects_muxcool() {
+        let node = proxy_config(
+            "name: n\ntype: trojan\nserver: s\nport: 443\npassword: p\nsmux:\n  enabled: true\n  protocol: muxcool\n  brutal-opts:\n    enabled: true\n    up: 10 Mbps\n",
+        );
+        let err = parse_mux_options("n", &node).unwrap_err();
+        assert!(err.contains("sing-mux only"), "{err}");
+    }
+
+    /// The quiet early gate (`check_mux_shape`) runs the same eager
+    /// shape decode — a malformed `brutal-opts` under `smux.enabled:
+    /// false` must reject the document there too, before ECH I/O, not
+    /// only in the real parse below it.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn check_mux_shape_propagates_brutal_opts_errors() {
+        // `check_mux_shape` filters nodes on their compiled `type` — pick
+        // whichever mux-capable protocol this build carries (the gate
+        // never inspects credentials, so a stub `password` satisfies all).
+        let kind = if cfg!(feature = "trojan") {
+            "trojan"
+        } else if cfg!(feature = "vless") {
+            "vless"
+        } else if cfg!(feature = "ss") {
+            "ss"
+        } else {
+            "vmess"
+        };
+        let raw_of = |smux: &str| -> crate::raw::RawConfig {
+            serde_saphyr::from_str(&format!(
+                "proxies:\n  - name: n\n    type: {kind}\n    server: s\n    port: 443\n    password: p\n    smux:\n      {smux}\n"
+            ))
+            .unwrap()
+        };
+        for bad in [
+            "enabled: false\n      brutal-opts: [1]",
+            "enabled: false\n      brutal-opts:\n        up: true",
+            "enabled: true\n      brutal-opts: 5",
+        ] {
+            let err = check_mux_shape(&raw_of(bad), true).unwrap_err();
+            assert!(
+                err.contains("brutal-opts"),
+                "the quiet gate must surface the shape error: {bad} -> {err}"
+            );
+        }
+        // A well-formed block under a disabled smux still passes.
+        check_mux_shape(
+            &raw_of("enabled: false\n      brutal-opts:\n        enabled: true\n        up: 10"),
+            true,
+        )
+        .unwrap();
+        // Lenient mode skips the gate entirely — malformed nodes are
+        // warn-dropped by the real parse instead.
+        check_mux_shape(&raw_of("enabled: false\n      brutal-opts: [1]"), false).unwrap();
     }
 
     #[cfg(feature = "vless")]

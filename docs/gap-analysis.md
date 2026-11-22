@@ -83,7 +83,7 @@ feature — `simple-obfs` behind `ss-obfs`, `v2ray-plugin` behind
 | kcptun           | Yes      | Yes (SS plugin, smux v1 only) | OK |
 | Reality          | Yes      | Yes  | OK |
 | simple-obfs      | Yes      | Yes  | OK |
-| SMUX / mux       | Yes      | Yes (`mux` feature: smux/yamux/h2mux/muxcool; `smux:`/`mux:` node option + gost-plugin single-stream; smux v1 also underlays kcptun) | OK |
+| SMUX / mux       | Yes      | Yes (`mux` feature: smux/yamux/h2mux/muxcool; `smux:`/`mux:` node option incl. `brutal-opts` TCP Brutal negotiation; gost-plugin single-stream; smux v1 also underlays kcptun) | OK |
 
 ### Proxy groups
 
