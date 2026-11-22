@@ -3260,11 +3260,23 @@ fn build_proxy_layer(
     // mode — warn-dropping it would silently remove the flow's first
     // routing decision (issue #974). Run the structural gate before the
     // leaf pass so `-t`, boot, PUT and provider-less rebuilds agree.
+    // `type: dns` gets the same treatment: a nameless node parses away to
+    // nothing under leniency, so a `PUT /configs?force=true` retry could
+    // otherwise commit a document the verbatim gate — and the next
+    // boot — would reject (issue #974 review).
     for raw_proxy in raw_proxies {
-        if raw_proxy.get("type").and_then(|v| v.as_str()) == Some("rematch") {
-            if let Err(e) = proxy_parser::check_rematch_node(raw_proxy) {
-                anyhow::bail!("proxies: {e}");
+        match raw_proxy.get("type").and_then(|v| v.as_str()) {
+            Some("rematch") => {
+                if let Err(e) = proxy_parser::check_rematch_node(raw_proxy) {
+                    anyhow::bail!("proxies: {e}");
+                }
             }
+            Some("dns") => {
+                if let Err(e) = proxy_parser::check_dns_node(raw_proxy) {
+                    anyhow::bail!("proxies: {e}");
+                }
+            }
+            _ => {}
         }
     }
     let dialer_edges = collect_dialer_edges(raw_proxies, strict)?;

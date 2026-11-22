@@ -12759,6 +12759,148 @@ async fn put_configs_force_gates_malformed_rematch() {
     );
 }
 
+/// The same verbatim-commit obligation for `type: dns` (issue #974
+/// review): the force path never ran the build's structural gate, so
+/// shape defects the next boot would hard-fail — a nameless dns node, a
+/// transport chaining a dialer hop through a dns leaf, a relay member
+/// or `include-all-proxies` naming one — are refused rather than
+/// committed. The name set is the CONSERVATIVE `declared_dns_names`
+/// view: any raw dns declaration marks the name, since a later shadow
+/// may warn-drop and leave the dns binding standing.
+#[tokio::test]
+async fn put_configs_force_gates_malformed_dns_nodes() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    // Duplicate group names fail strict AND lenient — the verbatim
+    // fallback is the only path the candidates below can reach.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+
+    // A dns node without a `name` is the one structural defect the type
+    // has — everything else it tolerates by contract.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The reverse edge is the build's hard error: a transport node
+    // chaining through a dns leaf — the leaf answers in-process, it
+    // never dials a hop.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: dns-out, type: dns}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: dns-out}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The conservative half of the name set: the same edge is still
+    // refused when a LATER same-named transport shadows the dns decl —
+    // lenient parse can warn-drop the shadow and leave the dns binding
+    // effective, so the verbatim lane cannot trust last-wins.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: x, type: dns}}\n\
+             \x20 - {{name: x, type: direct}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: x}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A relay's static `proxies:` member naming a dns leaf — the leaf
+    // can never carry a transport hop.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, dns-out]}}\n\
+             proxies:\n  - {{name: dns-out, type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // `include-all-proxies` would absorb the declared leaf — a static
+    // membership too.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, include-all-proxies: true}}\n\
+             proxies:\n  - {{name: dns-out, type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A built-in shadow never binds the leaf: `name: DIRECT` typed dns
+    // stays the built-in, so relay member DIRECT is legal.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, REJECT]}}\n\
+             proxies:\n  - {{name: DIRECT, type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Sound dns content still commits verbatim — including the leaf's
+    // own `dialer-proxy`, which binds no edge and is ignored by contract
+    // (the committed document keeps the node).
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{name: dns-out, type: dns, dialer-proxy: front}}\n\
+             rules:\n  - DST-PORT,53,dns-out\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a well-formed dns node commits even when the live build cannot"
+    );
+    {
+        let raw = state.raw_config.read();
+        assert!(
+            raw.proxies.as_deref().is_some_and(|p| p
+                .iter()
+                .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("dns"))),
+            "the committed document keeps the dns node"
+        );
+    }
+}
+
 /// A plain `PUT /configs` (no `force`) rebuilds rematch content live:
 /// the node is dialed by the route engine and the rule is listed in
 /// the new generation.
