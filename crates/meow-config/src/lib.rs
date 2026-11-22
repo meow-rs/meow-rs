@@ -3971,14 +3971,34 @@ fn rebuild_from_raw_impl(
     // payload is remote content and the dialer name may point at a group
     // built above — so warn about references that will never resolve and let
     // the by-name lookup surface a loud dial error at runtime.
+    // A name that DOES resolve but lands on a `type: rematch`/`type: dns`
+    // leaf is the opposite verdict — the same statically resolvable
+    // control/resolver leaf `apply_dialer_proxies_validate` rejects on a
+    // static edge; provider fronts bind late, so judge them here, against
+    // the finished map, before they can commit (issue #974 review).
     for provider in candidate_providers.values() {
         for dialer in provider.declared_dialer_names() {
-            if !proxies.contains_key(dialer.as_str()) {
-                warn!(
-                    provider = %provider.name,
-                    "provider node declares dialer-proxy '{dialer}', which is \
-                     not a built proxy or group — chained dials will fail"
-                );
+            match proxies.get(dialer.as_str()) {
+                Some(target)
+                    if matches!(
+                        target.adapter_type(),
+                        AdapterType::Rematch | AdapterType::Dns
+                    ) =>
+                {
+                    anyhow::bail!(
+                        "proxy-provider '{}': dialer-proxy '{dialer}' is a \
+                         control/resolver leaf — it cannot carry a dialer front",
+                        provider.name
+                    );
+                }
+                None => {
+                    warn!(
+                        provider = %provider.name,
+                        "provider node declares dialer-proxy '{dialer}', which is \
+                         not a built proxy or group — chained dials will fail"
+                    );
+                }
+                _ => {}
             }
         }
     }
@@ -11938,6 +11958,44 @@ rules:
                 "strict={strict}: unexpected: {err}"
             );
         }
+    }
+
+    /// A provider node's `dialer-proxy` binds late — against the finished
+    /// registry — so it cannot be shape-checked at edge-collection time.
+    /// When that name resolves to a static `type: dns` leaf the verdict is
+    /// the same hard failure a static edge gets (issue #974 review).
+    #[test]
+    fn rejects_provider_dialer_front_on_dns_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - {name: hop, type: socks5, server: 127.0.0.1, port: 1080, dialer-proxy: dns-out}\n",
+        )
+        .unwrap();
+        let yaml = r#"
+proxies:
+  - { name: dns-out, type: dns }
+proxy-providers:
+  airport:
+    type: file
+    path: nodes.yaml
+rules:
+  - "MATCH,DIRECT"
+"#;
+        let Err(err) = rebuild_from_raw_with_resolver(
+            &raw_config(yaml),
+            None,
+            Some(dir.path()),
+            &HashMap::new(),
+            None,
+            &meow_proxy::SelectionBacking::unpersisted(),
+        ) else {
+            panic!("a provider dialer front landing on a dns leaf must fail the build");
+        };
+        assert!(
+            err.to_string().contains("cannot carry a dialer front"),
+            "unexpected: {err}"
+        );
     }
 
     /// A `type: dns` leaf can never be a relay transport hop — a declared
