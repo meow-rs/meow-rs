@@ -50,7 +50,7 @@ Several protocols are gated behind Cargo features (`ss`, `trojan`, `vless`, `vme
 | `password` | string | ✓ | — | |
 | `cipher` | string | ✓ | — | e.g. `aes-256-gcm`, `chacha20-ietf-poly1305` |
 | `udp` | bool | | `false` | Enable UDP relay |
-| `plugin` | string | | — | `obfs`/`simple-obfs`, `v2ray-plugin` (bundled with `ss`); `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` (built-in, no external binary — each behind its same-named Cargo feature: all ship in `full`/default builds, none in `minimal`; enable with `--features <name>`, see the [feature-flags table](https://github.com/madeye/meow-rs/blob/main/docs/specs/cargo-feature-flags.md). A name the build lacks still loads, but the node stays unavailable and every dial through it fails with "not compiled into this build") |
+| `plugin` | string | | — | `obfs`/`simple-obfs` (behind `ss-obfs`), `v2ray-plugin` (behind `ss-v2ray-plugin`); `gost-plugin`, `shadow-tls`, `restls`, `jls`, `kcptun`, `ech-tls-tunnel` (built-in, no external binary — each behind its same-named Cargo feature: all ship in `full`/default builds, `minimal` ships `ss-obfs` only; enable with `--features <name>`, see the [feature-flags table](https://github.com/madeye/meow-rs/blob/main/docs/specs/cargo-feature-flags.md). A name the build lacks still loads, but the node stays unavailable and every dial through it fails with "not compiled into this build") |
 | `plugin-opts` | string \| map | | — | Plugin options |
 
 ```yaml

@@ -46,8 +46,8 @@ The `ss` built-in-plugin contract is fully per-plugin: `ss-obfs` and
 `ss-v2ray-plugin` joined the four heavier SIP003 transports as opt-in
 features re-bundled into `default`/`full` (ADR-0007 2026-11-21 addendum —
 the pair's ~19 KB of symbols tipped `minimal` past its 8 MiB aarch64-musl
-cap; `ss-obfs` was later restored to `minimal`, leaving `ss-v2ray-plugin`
-the only `plugin:` transport excluded). All built-in plugin names
+cap; `ss-obfs` was later restored to `minimal`, while `ss-v2ray-plugin`
+stays out alongside the heavier plugins). All built-in plugin names
 (including `kcptun` and `ech-tls-tunnel`) stay *reserved* even when
 compiled out — a `plugin:` line naming one keeps the node bound as an
 unavailable placeholder (`meow -t`, boot and provider refresh all read it
