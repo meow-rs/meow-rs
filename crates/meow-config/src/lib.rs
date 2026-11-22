@@ -2279,21 +2279,29 @@ pub fn declared_rematch_names(
     rematch
 }
 
-/// The names whose final `proxies:` binding is a `type: dns` leaf — the
-/// same last-wins/built-in-shadow view [`declared_rematch_names`] gives
-/// the verbatim lanes. A dns leaf answers queries in-process and never
-/// dials, so a `dialer-proxy` front or relay hop that names one must be
-/// refused exactly like a rematch target (issue #974).
+/// The names a `proxies:` document could leave bound to a `type: dns`
+/// leaf — the CONSERVATIVE view the verbatim lanes need (issue #974
+/// review). A dns leaf answers queries in-process and never dials, so a
+/// `dialer-proxy` front or relay hop that names one must be refused
+/// exactly like a rematch target.
+///
+/// Unlike [`declared_rematch_names`]'s straight last-wins view this
+/// cannot trust the last raw declaration: `insert_parsed_leaves` only
+/// replaces a binding on a *successful* bind — a later same-named node
+/// that lenient parsing warn-drops leaves an earlier dns binding
+/// standing, and a verbatim lane (whose build failed by definition)
+/// cannot prove a later decl binds. So ANY named dns declaration marks
+/// the name unless it is built-in-shadowed — the built-in always wins,
+/// the entry never binds.
 pub fn declared_dns_names(
     raw_proxies: &[HashMap<String, serde_json::Value>],
 ) -> std::collections::HashSet<SmolStr> {
     let mut dns = std::collections::HashSet::new();
-    let mut seen = std::collections::HashSet::new();
-    for node in raw_proxies.iter().rev() {
+    for node in raw_proxies {
         let Some(name) = node.get("name").and_then(|v| v.as_str()) else {
             continue;
         };
-        if !seen.insert(name) || BUILTIN_ADAPTER_NAMES.contains(&name) {
+        if BUILTIN_ADAPTER_NAMES.contains(&name) {
             continue;
         }
         if node.get("type").and_then(|v| v.as_str()) == Some("dns") {
@@ -9914,6 +9922,85 @@ rules:
             leaf.is_dialer_proxy_non_transparent(),
             "the ChainedProxy marker must pin the #969 fail-closed verdict"
         );
+    }
+}
+
+#[cfg(test)]
+mod declared_dns_names_tests {
+    use super::*;
+
+    fn node(name: Option<&str>, ty: &str) -> HashMap<String, serde_json::Value> {
+        let mut m = HashMap::new();
+        if let Some(name) = name {
+            m.insert(
+                "name".to_string(),
+                serde_json::Value::String(name.to_string()),
+            );
+        }
+        m.insert(
+            "type".to_string(),
+            serde_json::Value::String(ty.to_string()),
+        );
+        m
+    }
+
+    /// A plain dns declaration marks its name; non-dns leaves and an
+    /// empty document do not (issue #974 review).
+    #[test]
+    fn marks_dns_decls_and_skips_others() {
+        let names = declared_dns_names(&[node(Some("dns-out"), "dns"), node(Some("web"), "ss")]);
+        assert!(names.contains("dns-out"));
+        assert!(!names.contains("web"));
+        assert!(declared_dns_names(&[]).is_empty());
+    }
+
+    /// Last-wins still applies when the LAST declaration is the dns one —
+    /// a later dns decl over an earlier transport marks the name.
+    #[test]
+    fn later_dns_decl_marks_the_name() {
+        let names = declared_dns_names(&[node(Some("x"), "ss"), node(Some("x"), "dns")]);
+        assert!(names.contains("x"));
+    }
+
+    /// The conservative half of the contract (issue #974 review): an
+    /// earlier dns decl is NOT unmarked by a later same-named transport
+    /// decl — that later decl may warn-drop at lenient parse and leave
+    /// the dns binding effective, so the name stays suspect on lanes
+    /// that cannot prove the later decl binds.
+    #[test]
+    fn earlier_dns_decl_survives_a_later_shadow() {
+        let names = declared_dns_names(&[node(Some("x"), "dns"), node(Some("x"), "ss")]);
+        assert!(
+            names.contains("x"),
+            "a later decl that may not bind must not unmark the dns leaf"
+        );
+    }
+
+    /// A decl named after a built-in never binds a leaf — the built-in
+    /// wins regardless of the declared type — so it is never a dns name.
+    /// The shadow check is exact-case like `insert_parsed_leaves`: a
+    /// lowercase "direct" is an ordinary leaf name.
+    #[test]
+    fn builtin_names_never_bind_a_dns_leaf() {
+        for builtin in BUILTIN_ADAPTER_NAMES {
+            let names = declared_dns_names(&[node(Some(builtin), "dns")]);
+            assert!(
+                !names.contains(builtin),
+                "'{builtin}' is built-in-shadowed and cannot be a dns leaf"
+            );
+        }
+        let names = declared_dns_names(&[node(Some("direct"), "dns")]);
+        assert!(names.contains("direct"));
+    }
+
+    /// Decls without a usable `name` are unreferenceable — a nameless
+    /// `type: dns` map and a null-named one mark nothing, while a sibling
+    /// decl under another name still marks its own.
+    #[test]
+    fn nameless_and_unrelated_decls() {
+        let names = declared_dns_names(&[node(None, "dns"), node(Some("d"), "dns")]);
+        assert_eq!(names.len(), 1);
+        assert!(names.contains("d"));
     }
 }
 
