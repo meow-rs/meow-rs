@@ -498,8 +498,9 @@ pub async fn brutal_carrier_scope<F: std::future::Future>(
 }
 
 /// The carrier whose dial scope the current task is inside, if any.
-/// Compiled for Linux (the stash path) and tests (scope assertions).
-#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), test))]
+/// Compiled for Linux (the stash path) and unix tests (scope assertions —
+/// `mod tests` is `cfg(unix)`, so `test` alone would be dead on Windows).
+#[cfg(any(all(target_os = "linux", not(target_env = "ohos")), all(test, unix)))]
 fn brutal_carrier() -> Option<Arc<BrutalCarrier>> {
     BRUTAL_CARRIER.try_with(Clone::clone).ok().flatten()
 }
