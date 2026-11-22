@@ -62,6 +62,18 @@ impl DnsAdapter {
         }
     }
 
+    /// Test seam: a shared, saturatable `budget` so conn-drop vs.
+    /// permit-wait ordering is observable.
+    #[cfg(test)]
+    fn with_budget(name: &str, cell: DnsOutboundCell, budget: Arc<Semaphore>) -> Self {
+        Self {
+            name: SmolStr::from(name),
+            cell,
+            budget,
+            health: ProxyHealth::new(),
+        }
+    }
+
     /// A `ConnType::Inner` metadata is the dialer layer asking this leaf
     /// to forward for a chained node — a dns leaf never forwards. The
     /// parser keeps dns nodes out of `dialer-proxy` edges, but a forced
@@ -105,12 +117,19 @@ impl ProxyAdapter for DnsAdapter {
         let cell = Arc::clone(&self.cell);
         let budget = Arc::clone(&self.budget);
         let name = self.name.clone();
-        tokio::spawn(async move {
+        // The serve task is owned by the conn: dropping the client half
+        // aborts it even while it parks on an upstream-budget permit —
+        // otherwise a dead conn could still spend a freed permit on an
+        // upstream query nobody reads (issue #974 review).
+        let serve = tokio::spawn(async move {
             if let Err(error) = serve_dns_outbound_stream(server, cell, budget).await {
                 debug!("dns outbound '{name}' tcp serve ended: {error}");
             }
         });
-        Ok(Box::new(DnsStreamConn(client)))
+        Ok(Box::new(DnsStreamConn {
+            stream: client,
+            serve,
+        }))
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
@@ -148,8 +167,19 @@ impl ProxyAdapter for DnsAdapter {
 }
 
 /// The caller half of a `type: dns` outbound's in-process TCP pipe —
-/// framed DNS wire bytes; no socket sits underneath.
-struct DnsStreamConn(DuplexStream);
+/// framed DNS wire bytes; no socket sits underneath. Owns the serve
+/// task's handle: dropping the conn aborts the far end so a parked
+/// permit wait or in-flight upstream query cannot outlive its client.
+struct DnsStreamConn {
+    stream: DuplexStream,
+    serve: JoinHandle<()>,
+}
+
+impl Drop for DnsStreamConn {
+    fn drop(&mut self) {
+        self.serve.abort();
+    }
+}
 
 impl ProxyConn for DnsStreamConn {}
 
@@ -159,7 +189,7 @@ impl AsyncRead for DnsStreamConn {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_read(cx, buf)
+        Pin::new(&mut self.stream).poll_read(cx, buf)
     }
 }
 
@@ -169,15 +199,15 @@ impl AsyncWrite for DnsStreamConn {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.0).poll_write(cx, buf)
+        Pin::new(&mut self.stream).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_flush(cx)
+        Pin::new(&mut self.stream).poll_flush(cx)
     }
 
     fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Pin::new(&mut self.0).poll_shutdown(cx)
+        Pin::new(&mut self.stream).poll_shutdown(cx)
     }
 }
 
@@ -296,6 +326,24 @@ mod tests {
         q.extend_from_slice(b"example");
         q.push(3);
         q.extend_from_slice(b"com");
+        q.push(0);
+        q.extend_from_slice(&1u16.to_be_bytes()); // A
+        q.extend_from_slice(&1u16.to_be_bytes()); // IN
+        q
+    }
+
+    /// A minimal A query for `name` — `sample_query`'s shape with a
+    /// caller-chosen QNAME (names outside hosts take the upstream path).
+    fn query_named(id: u16, name: &str) -> Vec<u8> {
+        let mut q = Vec::with_capacity(64);
+        q.extend_from_slice(&id.to_be_bytes());
+        q.extend_from_slice(&[0x01, 0x00]);
+        q.extend_from_slice(&[0x00, 0x01]);
+        q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+        for label in name.split('.') {
+            q.push(u8::try_from(label.len()).unwrap());
+            q.extend_from_slice(label.as_bytes());
+        }
         q.push(0);
         q.extend_from_slice(&1u16.to_be_bytes()); // A
         q.extend_from_slice(&1u16.to_be_bytes()); // IN
@@ -486,6 +534,46 @@ mod tests {
         assert!(
             parked.expect("close wakes the reader").is_err(),
             "close ends a parked read instead of hanging"
+        );
+    }
+
+    /// Issue #974 review: dropping the client half aborts the serve task
+    /// even while it parks on the shared upstream permit — a dead conn
+    /// must not still consume the permit it was waiting for once the
+    /// holder releases it. The upstream is a blackhole, so a leaked task
+    /// would hold the freed permit for the full query timeout.
+    #[tokio::test]
+    async fn dropping_tcp_conn_aborts_a_permit_parked_serve() {
+        let budget = Arc::new(Semaphore::new(1));
+        let held = Arc::clone(&budget).acquire_owned().await.unwrap();
+        // Upstream-only resolver: no hosts, a dead upstream — the query
+        // below must wait on `budget` before it could ever forward.
+        let resolver = meow_dns::resolver::Resolver::new(
+            vec!["127.0.0.1:9".parse().unwrap()],
+            Vec::new(),
+            meow_common::DnsMode::Normal,
+            DomainTrie::new(),
+            true,
+            true,
+        );
+        let cell = meow_dns::new_dns_outbound_cell();
+        *cell.write() = Some(meow_dns::new_resolver_slot(Arc::new(resolver)));
+        let adapter = DnsAdapter::with_budget("dns-out", cell, Arc::clone(&budget));
+
+        let mut conn = adapter.dial_tcp(&metadata()).await.unwrap();
+        write_frame(&mut conn, &query_named(1, "nowhere.test")).await;
+        // Let the serve task read the frame and reach its permit wait.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(budget.available_permits(), 0);
+        drop(conn);
+        drop(held);
+        // If the dropped conn's task were still parked it would now grab
+        // the freed permit and pin it against the blackhole upstream.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        assert_eq!(
+            budget.available_permits(),
+            1,
+            "the aborted serve must not consume the freed permit"
         );
     }
 }
