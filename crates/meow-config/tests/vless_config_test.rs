@@ -1367,11 +1367,12 @@ proxies:
     assert_eq!(mux_warns, 0, "no warn expected; captured lines: {lines:?}");
 }
 
-/// D16g: `statistic` / `brutal-opts` → accepted with a warn each
-/// (upstream fields meow-rs does not implement).
+/// D16g: `statistic` still warns as unimplemented; `brutal-opts` is now
+/// implemented — parsed into the mux options, so the old ignore warn is
+/// gone. Off Linux the enabled form earns the platform advisory instead.
 #[cfg(feature = "mux")]
 #[tokio::test]
-async fn parse_vless_mux_unsupported_fields_warn_and_ignore() {
+async fn parse_vless_mux_statistic_warns_and_brutal_opts_is_supported() {
     let yaml = r#"
 proxies:
   - name: v
@@ -1395,13 +1396,26 @@ proxies:
         .iter()
         .filter(|l| l.contains("mux option 'statistic'"))
         .count();
-    let brutal = lines
+    assert!(statistic >= 1, "expected the statistic warn; {lines:?}");
+    let ignored = lines
         .iter()
-        .filter(|l| l.contains("mux option 'brutal-opts'"))
+        .filter(|l| l.contains("brutal-opts") && l.contains("not supported"))
         .count();
+    assert_eq!(
+        ignored, 0,
+        "brutal-opts is implemented — the ignore warn must be gone; {lines:?}"
+    );
+    #[cfg(not(all(target_os = "linux", not(target_env = "ohos"))))]
     assert!(
-        statistic >= 1 && brutal >= 1,
-        "expected one warn per unsupported field; {lines:?}"
+        lines
+            .iter()
+            .any(|l| l.contains("brutal-opts") && l.contains("Linux")),
+        "non-Linux must advise that the socket rate cap is skipped; {lines:?}"
+    );
+    #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
+    assert!(
+        !lines.iter().any(|l| l.contains("brutal-opts")),
+        "Linux is fully supported — no brutal-opts advisory; {lines:?}"
     );
 }
 
