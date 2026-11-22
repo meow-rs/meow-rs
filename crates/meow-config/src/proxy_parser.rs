@@ -5366,6 +5366,61 @@ mod tests {
         assert!(err.contains("sing-mux only"), "{err}");
     }
 
+    /// The quiet early gate (`check_mux_shape`) runs the same eager
+    /// shape decode — a malformed `brutal-opts` under `smux.enabled:
+    /// false` must reject the document there too, before ECH I/O, not
+    /// only in the real parse below it.
+    #[cfg(all(
+        feature = "mux",
+        any(
+            feature = "trojan",
+            feature = "vless",
+            feature = "ss",
+            feature = "vmess"
+        )
+    ))]
+    #[test]
+    fn check_mux_shape_propagates_brutal_opts_errors() {
+        // `check_mux_shape` filters nodes on their compiled `type` — pick
+        // whichever mux-capable protocol this build carries (the gate
+        // never inspects credentials, so a stub `password` satisfies all).
+        let kind = if cfg!(feature = "trojan") {
+            "trojan"
+        } else if cfg!(feature = "vless") {
+            "vless"
+        } else if cfg!(feature = "ss") {
+            "ss"
+        } else {
+            "vmess"
+        };
+        let raw_of = |smux: &str| -> crate::raw::RawConfig {
+            serde_saphyr::from_str(&format!(
+                "proxies:\n  - name: n\n    type: {kind}\n    server: s\n    port: 443\n    password: p\n    smux:\n      {smux}\n"
+            ))
+            .unwrap()
+        };
+        for bad in [
+            "enabled: false\n      brutal-opts: [1]",
+            "enabled: false\n      brutal-opts:\n        up: true",
+            "enabled: true\n      brutal-opts: 5",
+        ] {
+            let err = check_mux_shape(&raw_of(bad), true).unwrap_err();
+            assert!(
+                err.contains("brutal-opts"),
+                "the quiet gate must surface the shape error: {bad} -> {err}"
+            );
+        }
+        // A well-formed block under a disabled smux still passes.
+        check_mux_shape(
+            &raw_of("enabled: false\n      brutal-opts:\n        enabled: true\n        up: 10"),
+            true,
+        )
+        .unwrap();
+        // Lenient mode skips the gate entirely — malformed nodes are
+        // warn-dropped by the real parse instead.
+        check_mux_shape(&raw_of("enabled: false\n      brutal-opts: [1]"), false).unwrap();
+    }
+
     #[cfg(feature = "vless")]
     #[test]
     fn lenient_base64_accepts_noncanonical_trailing_bits() {

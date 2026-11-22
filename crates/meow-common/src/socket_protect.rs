@@ -398,7 +398,7 @@ pub async fn dialer_opts_scope<F: std::future::Future>(opts: DialerOpts, fut: F)
 /// The kernel TCP sockets one brutal-enabled mux session dial opened,
 /// stashed by [`connect_tcp`] (Linux only — elsewhere the cell stays empty
 /// and [`apply_rate`](BrutalCarrier::apply_rate) is the upstream stub's
-/// behavior). The stash holds `try_clone`s — dup'd fds of the same kernel
+/// behavior). The stash holds `dup`'d fd handles of the same kernel
 /// sockets — so the set stays referencable after the dial wraps each
 /// original in TLS/proxy layers, and closing a dropped clone can never
 /// disturb the live socket.
@@ -407,7 +407,7 @@ pub struct BrutalCarrier {
     /// Stashed socket clones — Linux only; the field stays compiled out
     /// elsewhere so the cell is provably empty on those builds.
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    sockets: parking_lot::Mutex<Vec<TcpStream>>,
+    sockets: parking_lot::Mutex<Vec<std::net::TcpStream>>,
 }
 
 impl BrutalCarrier {
@@ -416,11 +416,11 @@ impl BrutalCarrier {
         Self::default()
     }
 
-    /// Record one dialled socket. `clone` shares the kernel socket via
-    /// `dup`, so `apply_rate`'s setsockopts land on the socket the dial
+    /// Record one dialled socket. The `dup`'d fd shares the kernel
+    /// socket, so `apply_rate`'s setsockopts land on the socket the dial
     /// is using, not a copy of it.
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-    fn stash(&self, stream: TcpStream) {
+    fn stash(&self, stream: std::net::TcpStream) {
         self.sockets.lock().push(stream);
     }
 
@@ -519,7 +519,7 @@ struct TcpBrutalParams {
 /// One socket's pair of setsockopts, sing-mux `brutal_linux.go` verbatim:
 /// pick the `brutal` congestion-control algorithm, then feed it the rate.
 #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
-fn apply_brutal_rate(stream: &TcpStream, rate_bps: u64) -> io::Result<()> {
+fn apply_brutal_rate(stream: &std::net::TcpStream, rate_bps: u64) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     const TCP_BRUTAL_PARAMS: libc::c_int = 23301;
     const CWND_GAIN: u32 = 20;
@@ -918,17 +918,20 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
     let stream = connect_tcp_dial(addr).await?;
     keepalive.apply(&stream);
     // Inside a brutal mux session dial the physical socket is collected
-    // for the post-exchange rate cap — the `try_clone` shares the socket
-    // via dup so `apply_rate` hits the fd the dial actually uses (and the
-    // front hop's socket under `dialer-proxy`, which is what the task-local
-    // outliving the front's `dialer_opts_scope` buys). A clone failure is
-    // debug-only, matching every other apply-side failure.
+    // for the post-exchange rate cap — the `dup`'d fd (tokio's TcpStream
+    // has no `try_clone`; `try_clone_to_owned` is `F_DUPFD_CLOEXEC`)
+    // shares the same kernel socket so `apply_rate`'s setsockopts hit the
+    // fd the dial actually uses (and the front hop's socket under
+    // `dialer-proxy`, which is what the task-local outliving the front's
+    // `dialer_opts_scope` buys). A dup failure is debug-only, matching
+    // every other apply-side failure.
     #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
     if let Some(carrier) = brutal_carrier() {
-        match stream.try_clone() {
-            Ok(clone) => carrier.stash(clone),
+        use std::os::fd::AsFd;
+        match stream.as_fd().try_clone_to_owned() {
+            Ok(owned) => carrier.stash(std::net::TcpStream::from(owned)),
             Err(error) => {
-                tracing::debug!(%error, "brutal: failed to clone carrier socket")
+                tracing::debug!(%error, "brutal: failed to dup carrier socket")
             }
         }
     }
