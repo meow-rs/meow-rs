@@ -10951,6 +10951,11 @@ async fn state_with_providers(
         .iter()
         .map(|(name, yaml)| ((*name).to_string(), serde_saphyr::from_str(yaml).unwrap()))
         .collect();
+    let state = test_state_default();
+    // Share the tunnel's dns-outbound cell like production provider
+    // loading — `type: dns` leaves in these providers bind the same
+    // live-resolver slot the tunnel republishes (issue #974).
+    let dns_cell = state.tunnel.dns_outbound_cell();
     let loaded = meow_config::proxy_provider::load_proxy_providers_within(
         &raw,
         Some(dir),
@@ -10959,11 +10964,11 @@ async fn state_with_providers(
         &Default::default(),
         None,
         None,
+        Some(&dns_cell),
         &mut meow_config::DroppedProviders::default(),
     )
     .await
     .unwrap();
-    let state = test_state_default();
     for (name, provider) in loaded {
         state.proxy_providers.insert(name, provider);
     }
@@ -12045,7 +12050,9 @@ async fn put_configs_fake_ip_move_while_named_tun_runs_rejected() {
         )
         .await
         .expect("dns builds");
-        state.tunnel.set_resolver(Arc::clone(&dns.resolver));
+        state
+            .tunnel
+            .set_resolver(Arc::clone(&dns.resolver), dns.enabled);
     }
     let pool_before = state.tunnel.resolver().fake_ip_v4_net();
     assert!(pool_before.is_some(), "the pin needs a live pool");

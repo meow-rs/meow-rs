@@ -104,6 +104,16 @@ pub struct Config {
     /// update, so provider nodes — which persist across rebuilds — always
     /// resolve the *current* name map.
     pub provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    /// Live-resolver indirection every `type: dns` leaf this build
+    /// produced binds (issue #974): static `proxies:` entries parse
+    /// against it directly, and `ProxyProvider`s carry it so nodes their
+    /// payloads declare — parsed before DNS exists, refreshed long after
+    /// — resolve the same slot. Install it on the tunnel
+    /// (`Tunnel::set_dns_outbound_cell`) so `install_resolver_everywhere`
+    /// republishes the tunnel's `ResolverSlot` into it; until then it
+    /// stays empty and bound leaves SERVFAIL rather than guess an
+    /// upstream.
+    pub provider_dns_cell: meow_dns::DnsOutboundCell,
     pub rules: Vec<Box<dyn Rule>>,
     /// The `sub-rules:` blocks `listeners[].rule` selects by name —
     /// published into the route table in the same snapshot as `rules` so
@@ -1812,6 +1822,7 @@ pub fn rebuild_from_raw(raw: &raw::RawConfig) -> Result<RebuildResult, anyhow::E
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
         &meow_proxy::dialer::ProxyRegistry::default(),
+        &meow_dns::new_dns_outbound_cell(),
         None,
         false,
     )
@@ -1876,6 +1887,12 @@ pub fn rebuild_from_raw_with_resolver(
     let store_selected = resolve_profile(raw).store_selected;
     selection.prepare_sync(store_selected);
     let writer = selection.attach(store_selected);
+    // This lane hands in a live resolver slot but no long-lived dns
+    // outbound cell — bind the slot so `type: dns` leaves built here
+    // answer the same generation instead of sitting unbound (issue
+    // #974; the geodata lane's proxies are never committed anyway).
+    let dns_cell = meow_dns::new_dns_outbound_cell();
+    *dns_cell.write() = resolver.cloned();
     rebuild_from_raw_impl(
         raw,
         cache_dir,
@@ -1886,6 +1903,7 @@ pub fn rebuild_from_raw_with_resolver(
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
         &meow_proxy::dialer::ProxyRegistry::default(),
+        &dns_cell,
         shared_rule_providers,
         false,
     )
@@ -1917,6 +1935,10 @@ pub fn rebuild_from_raw_runtime(
     // writers correctly (issue #974). Pass
     // SelectionBacking::unpersisted() for embedders without a backing file.
     selection: &meow_proxy::SelectionBacking,
+    // The live-resolver indirection `type: dns` leaves bind (issue #974) —
+    // pass `Tunnel::dns_outbound_cell()` so leaves the candidate builds
+    // resolve the same slot the running generation's leaves do.
+    provider_dns_cell: &meow_dns::DnsOutboundCell,
 ) -> Result<RebuildResult, anyhow::Error> {
     // This lane always runs on a blocking thread (spawn_blocking in the
     // API/subscription callers), so the lazy store open is safe inline.
@@ -1933,6 +1955,7 @@ pub fn rebuild_from_raw_runtime(
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
         provider_dialer_registry,
+        provider_dns_cell,
         None,
         true,
     )
@@ -1950,6 +1973,8 @@ pub fn rebuild_from_raw_with_cache_dir(
     cache_dir: Option<&Path>,
     resolver: Option<&meow_dns::ResolverSlot>,
 ) -> Result<RebuildResult, anyhow::Error> {
+    let dns_cell = meow_dns::new_dns_outbound_cell();
+    *dns_cell.write() = resolver.cloned();
     rebuild_from_raw_impl(
         raw,
         cache_dir,
@@ -1960,6 +1985,7 @@ pub fn rebuild_from_raw_with_cache_dir(
         None,
         &meow_proxy::dialer::ProxyRegistry::default(),
         &meow_proxy::dialer::ProxyRegistry::default(),
+        &dns_cell,
         None,
         false,
     )
@@ -2140,8 +2166,14 @@ fn collect_dialer_edges(
         // rejected a non-blank `dialer-proxy`, so a leftover blank value
         // is unset, not malformed. Binding the sentinel here would wrap
         // the control leaf in `DialerProxyAdapter` and hide its rematch
-        // action (issue #974).
-        if raw_proxy.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+        // action (issue #974). `type: dns` is the same shape: an
+        // in-process resolver leaf owns no transport to chain, and
+        // mihomo reads no `dialer-proxy` off it — skip the edge entirely
+        // (`parse_dns_node` emits the ignored-key warning instead).
+        if matches!(
+            raw_proxy.get("type").and_then(|v| v.as_str()),
+            Some("rematch") | Some("dns")
+        ) {
             continue;
         }
         let dialer: SmolStr = match raw_proxy.get("dialer-proxy") {
@@ -2247,6 +2279,30 @@ pub fn declared_rematch_names(
     rematch
 }
 
+/// The names whose final `proxies:` binding is a `type: dns` leaf — the
+/// same last-wins/built-in-shadow view [`declared_rematch_names`] gives
+/// the verbatim lanes. A dns leaf answers queries in-process and never
+/// dials, so a `dialer-proxy` front or relay hop that names one must be
+/// refused exactly like a rematch target (issue #974).
+pub fn declared_dns_names(
+    raw_proxies: &[HashMap<String, serde_json::Value>],
+) -> std::collections::HashSet<SmolStr> {
+    let mut dns = std::collections::HashSet::new();
+    let mut seen = std::collections::HashSet::new();
+    for node in raw_proxies.iter().rev() {
+        let Some(name) = node.get("name").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !seen.insert(name) || BUILTIN_ADAPTER_NAMES.contains(&name) {
+            continue;
+        }
+        if node.get("type").and_then(|v| v.as_str()) == Some("dns") {
+            dns.insert(SmolStr::from(name));
+        }
+    }
+    dns
+}
+
 /// Validate the `dialer-proxy` edges [`collect_dialer_edges`] declared, now
 /// that every leaf has been built — the check half of the old
 /// `apply_dialer_proxies` pass. The chains themselves are already applied:
@@ -2281,17 +2337,20 @@ fn apply_dialer_proxies_validate(
         if !dialable.contains(dialer.as_str()) && !dialer.starts_with(MALFORMED_DIALER_PREFIX) {
             anyhow::bail!("proxy '{name}': dialer-proxy '{dialer}' not found");
         }
-        // A statically resolvable rematch leaf can never carry the hop —
-        // a rematch's only action is a routing re-entry, not a dial
-        // (issue #974). Group fronts resolve their pick at dial time,
-        // where the leaf's own dial fails closed instead.
-        if proxies
-            .get(dialer.as_str())
-            .is_some_and(|p| p.adapter_type() == meow_common::AdapterType::Rematch)
-        {
+        // A statically resolvable rematch or dns leaf can never carry
+        // the hop — a rematch's only action is a routing re-entry, and a
+        // dns leaf answers in-process; neither dials (issue #974). Group
+        // fronts resolve their pick at dial time, where the leaf's own
+        // dial fails closed instead.
+        if proxies.get(dialer.as_str()).is_some_and(|p| {
+            matches!(
+                p.adapter_type(),
+                meow_common::AdapterType::Rematch | meow_common::AdapterType::Dns
+            )
+        }) {
             anyhow::bail!(
-                "proxy '{name}': dialer-proxy '{dialer}' is a rematch control \
-                 outbound — it cannot carry a dialer front"
+                "proxy '{name}': dialer-proxy '{dialer}' is a control/resolver \
+                 leaf — it cannot carry a dialer front"
             );
         }
     }
@@ -2695,6 +2754,7 @@ fn parse_dialered_leaf(
     strict: bool,
     registry: &meow_proxy::dialer::ProxyRegistry,
     global_client_fingerprint: Option<&str>,
+    dns_cell: &meow_dns::DnsOutboundCell,
 ) -> Result<ParsedLeaf, anyhow::Error> {
     // Edged blocks always carry `name:` — `collect_dialer_edges` only emits
     // an edge for a block whose name parses.
@@ -2711,6 +2771,7 @@ fn parse_dialered_leaf(
         &proxy_dialer,
         ipv6,
         global_client_fingerprint,
+        Some(dns_cell),
     ) {
         // The `ChainedProxy` marker pins the #969 fail-closed verdict on
         // injected entries: unlike the relay-based wrapper below, an
@@ -2735,6 +2796,7 @@ fn parse_dialered_leaf(
             ipv6,
             resolver,
             global_client_fingerprint,
+            Some(dns_cell),
         ) {
             Ok(inner) => {
                 warn!(
@@ -2820,6 +2882,7 @@ fn insert_parsed_leaves(
     registry: &meow_proxy::dialer::ProxyRegistry,
     dialer_edges: &HashMap<usize, SmolStr>,
     global_client_fingerprint: Option<&str>,
+    dns_cell: &meow_dns::DnsOutboundCell,
 ) -> Result<std::collections::HashSet<SmolStr>, anyhow::Error> {
     let mut placeholder_names = std::collections::HashSet::new();
     for (index, raw_proxy) in raw_proxies.iter().enumerate() {
@@ -2834,6 +2897,7 @@ fn insert_parsed_leaves(
                 strict,
                 registry,
                 global_client_fingerprint,
+                dns_cell,
             )? {
                 Some(bound) => bound,
                 None => continue,
@@ -2844,6 +2908,7 @@ fn insert_parsed_leaves(
                 ipv6,
                 resolver,
                 global_client_fingerprint,
+                Some(dns_cell),
             ) {
                 Ok(proxy) => (proxy, false),
                 Err(e) if strict => {
@@ -2988,6 +3053,11 @@ fn materialize_proxy_providers(
     // newly declared providers must share it, or their `dialer-proxy`
     // nodes can never resolve (issue #489).
     provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    // The live-resolver indirection `type: dns` leaves bind (issue #974):
+    // shared into every provider this call constructs so a node parsed
+    // from a payload — before DNS exists, or on a refresh long after —
+    // resolves the same slot the commit populates.
+    provider_dns_cell: &meow_dns::DnsOutboundCell,
     dropped: &mut DroppedProviders,
 ) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
     let Some(raw_map) = raw.proxy_providers.as_ref() else {
@@ -3023,6 +3093,7 @@ fn materialize_proxy_providers(
             strict,
             provider_dialer_registry.clone(),
             global_fp,
+            Some(Arc::clone(provider_dns_cell)),
         ) {
             Ok(provider) => {
                 // A new `file:` provider's payload is local content —
@@ -3095,6 +3166,10 @@ fn build_proxy_layer(
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selection: Option<&meow_proxy::SelectorWriter>,
     registry: &meow_proxy::dialer::ProxyRegistry,
+    // The live-resolver indirection static `type: dns` leaves bind
+    // (issue #974) — the same handle the provider set carries, so both
+    // node origins resolve one slot.
+    dns_cell: &meow_dns::DnsOutboundCell,
     strict: bool,
 ) -> Result<BuiltProxyLayer, anyhow::Error> {
     let ipv6 = effective_ipv6(raw.ipv6);
@@ -3204,6 +3279,7 @@ fn build_proxy_layer(
         registry,
         &dialer_edges.by_index,
         global_fp.as_deref(),
+        dns_cell,
     )?;
 
     let raw_groups = raw.proxy_groups.as_deref().unwrap_or(&[]);
@@ -3273,8 +3349,9 @@ fn build_proxy_layer(
         .map(|(_, proxy)| proxy)
         .collect();
 
-    // A statically known `type: rematch` hop can never carry a relay
-    // chain — the leaf's only action is a routing re-entry, not a dial
+    // A statically known `type: rematch` or `type: dns` hop can never
+    // carry a relay chain — rematch's only action is a routing re-entry
+    // and a dns leaf answers in-process; neither dials a transport hop
     // (issue #974: "Rematch is not a meow relay transport hop; reject
     // statically known uses"). Both static memberships a relay can have
     // — a declared `proxies:` name resolving to the leaf, and the
@@ -3285,6 +3362,8 @@ fn build_proxy_layer(
     // rematch pick is the probe's business instead:
     // `RelayGroup::unwrap_proxy` surfaces it and the cycle guard closes
     // the loop.
+    let is_non_transport_leaf =
+        |p: &Arc<dyn Proxy>| p.rematch_action().is_some() || p.adapter_type() == AdapterType::Dns;
     for group in raw_groups {
         if group.group_type != "relay" {
             continue;
@@ -3292,11 +3371,11 @@ fn build_proxy_layer(
         for member in group.proxies.as_deref().unwrap_or(&[]) {
             if proxies
                 .get(member.as_str())
-                .is_some_and(|p| p.rematch_action().is_some())
+                .is_some_and(&is_non_transport_leaf)
             {
                 anyhow::bail!(
-                    "relay group '{}': member '{member}' is a rematch control \
-                     outbound — it cannot be a relay transport hop",
+                    "relay group '{}': member '{member}' is a control/resolver \
+                     leaf — it cannot be a relay transport hop",
                     group.name
                 );
             }
@@ -3304,11 +3383,11 @@ fn build_proxy_layer(
         if group.include_all_proxies.unwrap_or(false) {
             if let Some(hop) = include_all_proxies
                 .iter()
-                .find(|p| p.rematch_action().is_some())
+                .find(|p| is_non_transport_leaf(p))
             {
                 anyhow::bail!(
-                    "relay group '{}': include-all-proxies supplies rematch control \
-                     outbound '{}' — it cannot be a relay transport hop",
+                    "relay group '{}': include-all-proxies supplies control/resolver \
+                     leaf '{}' — it cannot be a relay transport hop",
                     group.name,
                     hop.name()
                 );
@@ -3526,15 +3605,15 @@ fn build_proxy_layer(
         all_proxy_names.sort();
         let primary = primary_global_target(raw, &proxies).map(str::to_string);
         // The member at index 0 is the selector's default pick: the
-        // primary when it resolves, else the first non-rematch member —
-        // a sorted-first rematch leaf is a control outbound and can
-        // never be a dialable default (issue #974 review).
+        // primary when it resolves, else the first non-control member —
+        // a sorted-first rematch or dns leaf answers no ordinary flow
+        // and can never be a dialable default (issue #974 review).
         let default_position = match primary.as_deref() {
             Some(primary) => all_proxy_names.iter().position(|name| name == primary),
             None => all_proxy_names.iter().position(|name| {
-                proxies
-                    .get(name.as_str())
-                    .is_some_and(|p| p.adapter_type() != AdapterType::Rematch)
+                proxies.get(name.as_str()).is_some_and(|p| {
+                    !matches!(p.adapter_type(), AdapterType::Rematch | AdapterType::Dns)
+                })
             }),
         };
         if let Some(position) = default_position {
@@ -3650,6 +3729,9 @@ fn prefetch_proxy_map(
     // without publishing here a provider node's front hop resolves to
     // nothing during the prefetch window (issue #974 review).
     provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    // The same dns-outbound cell the real build binds — prefetch dns
+    // leaves behave identically to the runtime map's (issue #974).
+    provider_dns_cell: &meow_dns::DnsOutboundCell,
 ) -> Result<Option<PrefetchProxies>, anyhow::Error> {
     // No `proxies:` and no `proxy-groups:` means nothing to tunnel
     // through — named `proxy:` lookups and the default proxy all come
@@ -3675,6 +3757,7 @@ fn prefetch_proxy_map(
         providers,
         selection,
         &registry,
+        provider_dns_cell,
         raw.strict.unwrap_or(false),
     )?;
     registry.publish(Arc::new(map.clone()));
@@ -3699,17 +3782,20 @@ async fn prefetch_proxy_layer_async(
     providers: &HashMap<String, Arc<ProxyProvider>>,
     selection: Option<&meow_proxy::SelectorWriter>,
     provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    provider_dns_cell: &meow_dns::DnsOutboundCell,
 ) -> Result<Option<Arc<PrefetchProxies>>, anyhow::Error> {
     let raw = raw.clone();
     let providers = providers.clone();
     let selection = selection.cloned();
     let provider_dialer_registry = provider_dialer_registry.clone();
+    let provider_dns_cell = Arc::clone(provider_dns_cell);
     spawn_blocking_with_current_dispatcher(move || {
         prefetch_proxy_map(
             &raw,
             &providers,
             selection.as_ref(),
             &provider_dialer_registry,
+            &provider_dns_cell,
         )
     })
     .await
@@ -3742,6 +3828,12 @@ fn rebuild_from_raw_impl(
     // validation, tests) may pass a throwaway: providers built on it never
     // dial in those contexts (issue #489).
     provider_dialer_registry: &meow_proxy::dialer::ProxyRegistry,
+    // The live-resolver indirection `type: dns` leaves bind (issue #974) —
+    // same lifetime contract as `provider_dialer_registry`: committing
+    // lanes pass `Tunnel::dns_outbound_cell()` so leaves parsed here and
+    // by providers resolve the running slot; a throwaway leaves them
+    // unbound (SERVFAIL, never a guessed upstream).
+    provider_dns_cell: &meow_dns::DnsOutboundCell,
     // An already-loaded provider set to bind into this build (startup's
     // two-pass build shares the set it loaded for DNS so rules, DNS
     // `rule-set:` matchers, and `Config.rule_providers` all reference one
@@ -3821,6 +3913,7 @@ fn rebuild_from_raw_impl(
         cache_dir,
         strict,
         provider_dialer_registry,
+        provider_dns_cell,
         &mut dropped,
     )?;
     let (proxies, placeholder_names) = build_proxy_layer(
@@ -3829,6 +3922,7 @@ fn rebuild_from_raw_impl(
         &candidate_providers,
         selection,
         registry,
+        provider_dns_cell,
         strict,
     )?;
     // An enabled `ntp.dialer-proxy` must name a BUILT target — checked
@@ -4104,6 +4198,9 @@ async fn rebuild_from_raw_impl_async(
     // The live provider-dialer cell newly declared providers share
     // (issue #489) — see `rebuild_from_raw_impl`.
     provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
+    // The live-resolver indirection `type: dns` leaves bind (issue #974) —
+    // see `rebuild_from_raw_impl`.
+    provider_dns_cell: meow_dns::DnsOutboundCell,
     // Startup's pass-2 shares the provider set already loaded for DNS so
     // rules, `rule-set:` matchers, and `Config.rule_providers` reference one
     // object per provider (issue #533 review). `None` = load fresh.
@@ -4120,6 +4217,7 @@ async fn rebuild_from_raw_impl_async(
             Some(provider_payloads),
             &registry,
             &provider_dialer_registry,
+            &provider_dns_cell,
             shared_providers,
             false,
         )
@@ -6276,6 +6374,10 @@ fn declared_leaf_binding(name: &str, raw: &raw::RawConfig) -> Option<bool> {
     let ipv6 = effective_ipv6(raw.ipv6);
     let fp = raw.global_client_fingerprint.as_deref();
     let registry = meow_proxy::dialer::ProxyRegistry::default();
+    // Dry-run verdicts only need a throwaway cell — a `type: dns` leaf
+    // lands either way; which resolver slot it would serve is runtime
+    // state this mirror never consults (issue #974).
+    let dns_cell = meow_dns::new_dns_outbound_cell();
     let key = SmolStr::from(name);
     // (binding, is_placeholder) — `parse_dialered_leaf` consults both.
     let mut bound: Option<(Arc<dyn Proxy>, bool)> = None;
@@ -6302,6 +6404,7 @@ fn declared_leaf_binding(name: &str, raw: &raw::RawConfig) -> Option<bool> {
                 strict,
                 &registry,
                 fp,
+                &dns_cell,
             ) {
                 Ok(Some(b)) => bound = Some(b),
                 // Skipped — the earlier same-name binding stands.
@@ -6310,7 +6413,7 @@ fn declared_leaf_binding(name: &str, raw: &raw::RawConfig) -> Option<bool> {
             }
             continue;
         }
-        match proxy_parser::parse_static_proxy(block, ipv6, None, fp) {
+        match proxy_parser::parse_static_proxy(block, ipv6, None, fp, Some(&dns_cell)) {
             Ok(proxy) => bound = Some((proxy, false)),
             Err(e) => {
                 if strict {
@@ -6459,6 +6562,9 @@ fn declared_provider_buildable(
         raw.strict.unwrap_or(false),
         meow_proxy::dialer::ProxyRegistry::default(),
         raw.global_client_fingerprint.as_deref(),
+        // Dry-run verdict only: the candidate never serves, so dns leaves
+        // stay unbound here (issue #974).
+        None,
     )
     .is_ok()
 }
@@ -7374,6 +7480,13 @@ async fn build_config_inner(
     // nodes parsed during the initial refresh already hold the handle; the
     // tunnel publishes the live route map into it on every routing install.
     let provider_dialer_registry = meow_proxy::dialer::ProxyRegistry::default();
+    // The cell `type: dns` leaves bind (issue #974) — shared into every
+    // provider before it loads and every static leaf the passes below
+    // build, then handed to the tunnel (`Tunnel::set_dns_outbound_cell`)
+    // so `install_resolver_everywhere` republishes the live resolver
+    // slot into it. `Config::provider_dns_cell` retains it like
+    // `provider_dialer_registry`.
+    let provider_dns_cell = meow_dns::new_dns_outbound_cell();
 
     // Load proxy providers (async: may HTTP-fetch provider files). The build
     // passes below leave out the same ones again; this load's are kept.
@@ -7390,6 +7503,7 @@ async fn build_config_inner(
                 &provider_dialer_registry,
                 raw.global_client_fingerprint.as_deref(),
                 provider_fetch_deadline(),
+                Some(&provider_dns_cell),
                 &mut dropped_providers,
             )
             .await?
@@ -7447,6 +7561,7 @@ async fn build_config_inner(
             &proxy_providers,
             selector_writer.as_ref(),
             &provider_dialer_registry,
+            &provider_dns_cell,
         )
         .await?
     } else {
@@ -7504,6 +7619,7 @@ async fn build_config_inner(
             Arc::clone(&provider_payloads),
             dialer_registry.clone(),
             provider_dialer_registry.clone(),
+            Arc::clone(&provider_dns_cell),
             None,
         )
         .await?;
@@ -7550,6 +7666,14 @@ async fn build_config_inner(
         None,
     )
     .await?;
+    // Bind the dns-outbound cell to the slot the embedder hands the
+    // tunnel (`Tunnel::new_with_slot(config.dns.resolver_slot)`): `type:
+    // dns` leaves parsed in pass 1 — and provider nodes parsed before
+    // this line — now resolve the live generation from their first
+    // query. A disabled `dns:` still binds: `ResolverGen.enabled` is the
+    // SERVFAIL verdict, not an unbound cell. `install_resolver_everywhere`
+    // re-asserts the same object on every later install (issue #974).
+    *provider_dns_cell.write() = Some(Arc::clone(&dns_config.resolver_slot));
 
     let (proxies, rules, sub_rules, _) = {
         let res = rebuild_from_raw_impl_async(
@@ -7562,6 +7686,7 @@ async fn build_config_inner(
             Arc::clone(&provider_payloads),
             dialer_registry.clone(),
             provider_dialer_registry.clone(),
+            Arc::clone(&provider_dns_cell),
             // Share the provider set already loaded for DNS so rules,
             // `rule-set:` matchers, and `Config.rule_providers` reference
             // one object per provider (issue #533 review).
@@ -7637,6 +7762,7 @@ async fn build_config_inner(
         proxies,
         proxy_providers,
         provider_dialer_registry,
+        provider_dns_cell,
         rules,
         sub_rules,
         rule_providers,
@@ -7737,6 +7863,7 @@ mod missing_plugin_placeholder_tests {
             &meow_proxy::dialer::ProxyRegistry::default(),
             &HashMap::new(),
             None,
+            &meow_dns::new_dns_outbound_cell(),
         )
         .unwrap();
         let bound = proxies
@@ -7762,6 +7889,7 @@ mod missing_plugin_placeholder_tests {
             &meow_proxy::dialer::ProxyRegistry::default(),
             &HashMap::new(),
             None,
+            &meow_dns::new_dns_outbound_cell(),
         )
         .unwrap_err();
         assert!(
@@ -7944,6 +8072,7 @@ mod missing_plugin_placeholder_tests {
             &meow_proxy::dialer::ProxyRegistry::default(),
             &HashMap::new(),
             None,
+            &meow_dns::new_dns_outbound_cell(),
         )
         .unwrap();
         assert_eq!(
@@ -7970,6 +8099,7 @@ mod missing_plugin_placeholder_tests {
             &meow_proxy::dialer::ProxyRegistry::default(),
             &HashMap::new(),
             None,
+            &meow_dns::new_dns_outbound_cell(),
         )
         .unwrap();
         assert_eq!(
@@ -8079,6 +8209,7 @@ mod dialer_proxy_tests {
         let registry = meow_proxy::dialer::ProxyRegistry::default();
         let edges = collect_dialer_edges(raw_proxies, false)?;
         let mut static_proxy_names = std::collections::HashSet::new();
+        let dns_cell = meow_dns::new_dns_outbound_cell();
         insert_parsed_leaves(
             proxies,
             &mut static_proxy_names,
@@ -8089,6 +8220,7 @@ mod dialer_proxy_tests {
             &registry,
             &edges.by_index,
             None,
+            &dns_cell,
         )?;
         apply_dialer_proxies_validate(proxies, &edges.declared, raw_groups)?;
         for group in raw_groups {
@@ -8198,9 +8330,15 @@ mod dialer_proxy_tests {
         .unwrap();
 
         let providers = HashMap::new();
-        let mini = prefetch_proxy_map(&raw, &providers, None, &Default::default())
-            .expect("layer builds")
-            .expect("proxies configured");
+        let mini = prefetch_proxy_map(
+            &raw,
+            &providers,
+            None,
+            &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
+        )
+        .expect("layer builds")
+        .expect("proxies configured");
         let metadata = meow_common::Metadata {
             network: meow_common::Network::Tcp,
             host: "example.invalid".into(),
@@ -8258,9 +8396,15 @@ mod dialer_proxy_tests {
         let store = meow_proxy::SelectorStore::open(dir.path().join("sel.json"));
         store.set("G", "B2");
         let writer = meow_proxy::SelectorWriter::standalone(store);
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&writer), &Default::default())
-            .expect("layer builds")
-            .expect("proxies configured");
+        let layer = prefetch_proxy_map(
+            &raw,
+            &providers,
+            Some(&writer),
+            &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
+        )
+        .expect("layer builds")
+        .expect("proxies configured");
         let geo = geodata::parse_geodata(&raw).unwrap();
         let GeodataEgress::Proxy {
             proxy: resolved, ..
@@ -8285,9 +8429,15 @@ mod dialer_proxy_tests {
         let empty_dir = tempfile::tempdir().unwrap();
         let empty_store = meow_proxy::SelectorStore::open(empty_dir.path().join("sel.json"));
         let empty_writer = meow_proxy::SelectorWriter::standalone(empty_store);
-        let layer = prefetch_proxy_map(&raw, &providers, Some(&empty_writer), &Default::default())
-            .expect("layer builds")
-            .expect("proxies configured");
+        let layer = prefetch_proxy_map(
+            &raw,
+            &providers,
+            Some(&empty_writer),
+            &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
+        )
+        .expect("layer builds")
+        .expect("proxies configured");
         let geo = geodata::parse_geodata(&raw).unwrap();
         let GeodataEgress::Proxy {
             proxy: resolved, ..
@@ -8419,9 +8569,15 @@ mod dialer_proxy_tests {
             "groups alone must not short-circuit the layer"
         );
 
-        let layer = prefetch_proxy_map(&raw, &providers, None, &Default::default())
-            .expect("layer builds")
-            .expect("provider-fed groups produce a layer");
+        let layer = prefetch_proxy_map(
+            &raw,
+            &providers,
+            None,
+            &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
+        )
+        .expect("layer builds")
+        .expect("provider-fed groups produce a layer");
         let GeodataEgress::Proxy {
             proxy,
             direct_fallback,
@@ -8513,9 +8669,15 @@ mod dialer_proxy_tests {
         ))
         .unwrap();
 
-        let layer = prefetch_proxy_map(&raw, &providers, None, &provider_registry)
-            .expect("layer builds")
-            .expect("proxies configured");
+        let layer = prefetch_proxy_map(
+            &raw,
+            &providers,
+            None,
+            &provider_registry,
+            &meow_dns::new_dns_outbound_cell(),
+        )
+        .expect("layer builds")
+        .expect("proxies configured");
         let payloads =
             prefetch_rule_provider_payloads_async(&raw, None, Some(Arc::new(layer))).await;
         assert_eq!(
@@ -8560,9 +8722,15 @@ mod dialer_proxy_tests {
 
         let providers = HashMap::new();
         let layer = Arc::new(
-            prefetch_proxy_map(&raw, &providers, None, &Default::default())
-                .expect("layer builds")
-                .expect("proxies configured"),
+            prefetch_proxy_map(
+                &raw,
+                &providers,
+                None,
+                &Default::default(),
+                &meow_dns::new_dns_outbound_cell(),
+            )
+            .expect("layer builds")
+            .expect("proxies configured"),
         );
         // The fetch itself fails — the counting listener accepts then drops
         // — but the TCP connect to B proves `proxy: A` dialled its front hop.
@@ -9004,6 +9172,7 @@ mod dialer_proxy_tests {
                 &meow_proxy::dialer::ProxyRegistry::default(),
                 &HashMap::new(),
                 None,
+                &meow_dns::new_dns_outbound_cell(),
             )
             .unwrap();
         });
@@ -10510,6 +10679,7 @@ mod geoip_context_tests {
                 None,
                 &meow_proxy::dialer::ProxyRegistry::default(),
                 &meow_proxy::SelectionBacking::unpersisted(),
+                &meow_dns::new_dns_outbound_cell(),
             )
         })
         .await
@@ -11273,6 +11443,7 @@ rules:
             Some(dir.path()),
             &Default::default(),
             &meow_proxy::SelectionBacking::unpersisted(),
+            &meow_dns::new_dns_outbound_cell(),
         )
         .expect(
             "trusted runtime rebuild with the real cache dir must not hard-fail on a file provider",
@@ -11559,7 +11730,7 @@ rules:
                 panic!("strict={strict}: a static rematch relay hop must fail the build");
             };
             assert!(
-                err.to_string().contains("rematch control outbound"),
+                err.to_string().contains("cannot be a relay transport hop"),
                 "strict={strict}: unexpected: {err}"
             );
         }
@@ -11583,7 +11754,135 @@ rules:
             panic!("an include-all rematch relay hop must fail the build");
         };
         assert!(
-            err.to_string().contains("rematch control outbound"),
+            err.to_string().contains("cannot be a relay transport hop"),
+            "unexpected: {err}"
+        );
+    }
+
+    /// A `type: dns` leaf beside a transport builds like any other node —
+    /// and lands as `AdapterType::Dns`, never wrapped or degraded
+    /// (issue #974).
+    #[test]
+    fn dns_leaf_builds_alongside_transports() {
+        let yaml = r#"
+proxies:
+  - { name: dns-out, type: dns }
+  - { name: node, type: direct }
+rules:
+  - "DST-PORT,53,dns-out"
+  - "MATCH,node"
+"#;
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw_config(yaml)).expect("a dns leaf beside a transport builds");
+        assert_eq!(
+            proxies["dns-out"].adapter_type(),
+            meow_common::AdapterType::Dns
+        );
+    }
+
+    /// `dialer-proxy` on a dns node collects no edge and no wrapper —
+    /// mihomo reads no chain options off the leaf (issue #974).
+    #[test]
+    fn dns_leaf_dialer_proxy_collects_no_edge() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: dns-out, type: dns, dialer-proxy: front }}
+  - {{ name: front, type: direct }}
+rules:
+  - "MATCH,dns-out"
+"#,
+            );
+            let RebuildResult { proxies, .. } = rebuild_from_raw(&raw_config(&yaml))
+                .unwrap_or_else(|e| {
+                    panic!("strict={strict}: a dns leaf's dialer-proxy is ignored: {e}")
+                });
+            let leaf = &proxies["dns-out"];
+            assert_eq!(leaf.adapter_type(), meow_common::AdapterType::Dns);
+            assert!(
+                !leaf
+                    .as_any()
+                    .is_some_and(<dyn std::any::Any>::is::<meow_proxy::DialerProxyAdapter>),
+                "strict={strict}: the dns leaf must not be chain-wrapped"
+            );
+        }
+    }
+
+    /// A `type: dns` leaf is an in-process resolver endpoint — naming it
+    /// as a `dialer-proxy` front is a structural error in *both* modes,
+    /// exactly like a rematch front (issue #974).
+    #[test]
+    fn rejects_dns_leaf_as_dialer_front() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: node, type: socks5, server: 127.0.0.1, port: 1080, dialer-proxy: dns-out }}
+  - {{ name: dns-out, type: dns }}
+rules:
+  - "MATCH,node"
+"#,
+            );
+            let Err(err) = rebuild_from_raw(&raw_config(&yaml)) else {
+                panic!("strict={strict}: a dns leaf cannot carry a dialer front");
+            };
+            assert!(
+                err.to_string().contains("cannot carry a dialer front"),
+                "strict={strict}: unexpected: {err}"
+            );
+        }
+    }
+
+    /// A `type: dns` leaf can never be a relay transport hop — a declared
+    /// member naming one is a structural error in *both* modes (issue
+    /// #974).
+    #[test]
+    fn rejects_static_dns_relay_member() {
+        for strict in ["true", "false"] {
+            let yaml = format!(
+                r#"
+strict: {strict}
+proxies:
+  - {{ name: dns-out, type: dns }}
+  - {{ name: node, type: direct }}
+proxy-groups:
+  - {{ name: chain, type: relay, proxies: [node, dns-out] }}
+rules:
+  - "MATCH,chain"
+"#,
+            );
+            let Err(err) = rebuild_from_raw(&raw_config(&yaml)) else {
+                panic!("strict={strict}: a static dns relay hop must fail the build");
+            };
+            assert!(
+                err.to_string().contains("cannot be a relay transport hop"),
+                "strict={strict}: unexpected: {err}"
+            );
+        }
+    }
+
+    /// The same membership arriving through `include-all-proxies` keeps
+    /// the gate — the expansion feeds the member vec `parse_relay_group`
+    /// checks (issue #974).
+    #[test]
+    fn rejects_include_all_dns_relay_member() {
+        let yaml = r#"
+proxies:
+  - { name: dns-out, type: dns }
+  - { name: node, type: direct }
+proxy-groups:
+  - { name: chain, type: relay, include-all-proxies: true }
+rules:
+  - "MATCH,chain"
+"#;
+        let Err(err) = rebuild_from_raw(&raw_config(yaml)) else {
+            panic!("an include-all dns relay hop must fail the build");
+        };
+        assert!(
+            err.to_string().contains("cannot be a relay transport hop"),
             "unexpected: {err}"
         );
     }
@@ -12571,6 +12870,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("provider materializes");
@@ -12583,6 +12883,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("reuse");
@@ -12597,6 +12898,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("changed def materializes fresh");
@@ -12634,6 +12936,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("provider materializes");
@@ -12646,6 +12949,7 @@ rules:
             Some(cache_dir),
             false,
             &Default::default(),
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("interval-only change must reuse the provider");
@@ -12685,6 +12989,7 @@ rules:
             None,
             false,
             &registry,
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("provider materializes");
@@ -12704,6 +13009,7 @@ rules:
             None,
             false,
             &registry,
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("fingerprint-only rebuild materializes");
@@ -12736,6 +13042,7 @@ rules:
             None,
             false,
             &registry,
+            &meow_dns::new_dns_outbound_cell(),
             &mut DroppedProviders::default(),
         )
         .expect("def change materializes fresh");

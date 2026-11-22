@@ -246,6 +246,15 @@ pub struct TunnelInner {
     /// install republishes the live proxies map into it so provider nodes —
     /// which persist across config rebuilds — always resolve current names.
     dialer_registry: std::sync::OnceLock<meow_proxy::dialer::ProxyRegistry>,
+    /// Live-resolver indirection `type: dns` leaves bind (issue #974).
+    /// Installed once at startup from `Config::provider_dns_cell` — the
+    /// same handle static leaves parsed during `build_config` and every
+    /// `ProxyProvider` share — then republished with this tunnel's
+    /// [`ResolverSlot`](meow_dns::ResolverSlot) by
+    /// `install_resolver_everywhere`. Provider nodes parsed before DNS
+    /// existed, and providers reused across rebuilds, resolve the
+    /// *current* generation through it.
+    dns_outbound_cell: std::sync::OnceLock<meow_dns::DnsOutboundCell>,
     /// UDP flush signal (issue #695): bumped by
     /// [`Tunnel::close_all_udp_sessions`]; every listener-owned UDP flow
     /// holds a receiver ([`udp::UdpFlushWatch`]).
@@ -343,7 +352,7 @@ impl TunnelInner {
     /// Snapshot the current resolver generation: one short read lock +
     /// `Arc` clone. Always reflects the latest `Tunnel::set_resolver`.
     pub fn resolver(&self) -> Arc<Resolver> {
-        Arc::clone(&self.resolver.read())
+        Arc::clone(&self.resolver.read().resolver)
     }
 
     /// Subscribe a UDP flow to [`Tunnel::close_all_udp_sessions`] (issue
@@ -1870,6 +1879,7 @@ impl Tunnel {
                 process_lookup_hook: Mutex::new(None),
                 tun_handle: RwLock::new(None),
                 dialer_registry: std::sync::OnceLock::new(),
+                dns_outbound_cell: std::sync::OnceLock::new(),
                 selection_backing: std::sync::OnceLock::new(),
                 udp_flush: tokio::sync::watch::Sender::new(0),
                 connection_notes: AtomicBool::new(false),
@@ -1961,6 +1971,35 @@ impl Tunnel {
                  it will fail every dial"
             );
         }
+    }
+
+    /// Install the cell `type: dns` leaves resolve their live resolver
+    /// through (issue #974) — called once at startup with
+    /// `Config::provider_dns_cell`, the same handle the build bound into
+    /// static dns leaves and every `ProxyProvider`; subsequent calls are
+    /// ignored — the cell is a process-lifetime singleton by contract,
+    /// like the provider dialer registry above.
+    pub fn set_dns_outbound_cell(&self, cell: meow_dns::DnsOutboundCell) {
+        if self.inner.dns_outbound_cell.set(cell).is_err() {
+            warn!(
+                "dns outbound cell already installed — the new handle stays \
+                 unbound; `type: dns` leaves built on it will SERVFAIL"
+            );
+        }
+    }
+
+    /// The cell `type: dns` leaves bind — hand clones to
+    /// `rebuild_from_raw_runtime` so dns leaves the candidate build
+    /// constructs resolve the same live slot the running generation's
+    /// leaves do. Before the startup install (tests, embedders that
+    /// never set one) this lazily pins an empty cell: unbound leaves
+    /// SERVFAIL rather than guess an upstream (issue #974).
+    pub fn dns_outbound_cell(&self) -> meow_dns::DnsOutboundCell {
+        Arc::clone(
+            self.inner
+                .dns_outbound_cell
+                .get_or_init(meow_dns::new_dns_outbound_cell),
+        )
     }
 
     /// Install the config's selection-persistence owner (issue #974) —
@@ -2391,11 +2430,14 @@ impl Tunnel {
     /// `resolver()` snapshots all pick up the new generation. Previously
     /// the resolver was fixed at `Tunnel::new`, so `PUT /configs`
     /// persisted a new `dns:` section while the process kept resolving
-    /// through the old one.
-    pub fn set_resolver(&self, resolver: Arc<Resolver>) {
+    /// through the old one. `enabled` is the rebuilt `dns:` section's
+    /// enable verdict, published in the same write so a `type: dns`
+    /// leaf's SERVFAIL-on-disabled verdict flips atomically with the
+    /// resolver it would have used (issue #974).
+    pub fn set_resolver(&self, resolver: Arc<Resolver>, enabled: bool) {
         // One write updates the routing snapshot, `inner.direct`, and every
         // rebuilt `DIRECT` — they all share this slot.
-        *self.inner.resolver.write() = resolver;
+        *self.inner.resolver.write() = meow_dns::ResolverGen { resolver, enabled };
     }
 
     /// Snapshot of the current route table (rules + domain index + proxies).

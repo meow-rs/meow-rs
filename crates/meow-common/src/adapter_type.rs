@@ -38,6 +38,10 @@ pub enum AdapterType {
     /// scan with `Metadata.rematch_name`/`special_rules` updated. Carries
     /// no address and can never open a socket (upstream `C.Rematch`).
     Rematch,
+    /// `type: dns` outbound (issue #974, upstream `C.Dns`) — answers the
+    /// flow's DNS payload from the kernel's own resolver; the nominal
+    /// destination is never contacted.
+    Dns,
 }
 
 impl fmt::Display for AdapterType {
@@ -66,6 +70,7 @@ impl fmt::Display for AdapterType {
             AdapterType::PassRule => write!(f, "PassRule"),
             AdapterType::Compatible => write!(f, "Compatible"),
             AdapterType::Rematch => write!(f, "Rematch"),
+            AdapterType::Dns => write!(f, "Dns"),
         }
     }
 }

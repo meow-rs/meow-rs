@@ -59,7 +59,10 @@ pub async fn parse_dns(
             );
             let resolver = Arc::new(resolver);
             return Ok(DnsConfig {
-                resolver_slot: meow_dns::new_resolver_slot(Arc::clone(&resolver)),
+                // Disabled is published on the generation itself: a
+                // `type: dns` leaf serves SERVFAIL on it rather than
+                // dialling this stub's fallback upstream (issue #974).
+                resolver_slot: meow_dns::new_resolver_slot_state(Arc::clone(&resolver), false),
                 resolver,
                 listen_addr: None,
                 enabled: false,

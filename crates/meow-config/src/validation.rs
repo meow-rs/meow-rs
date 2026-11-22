@@ -287,6 +287,11 @@ const DIRECT_NODE_KEYS: &[&str] = &["connect-timeout", "dns"];
 /// reads as an ignored unknown key), just the two re-entry targets.
 const REMATCH_NODE_KEYS: &[&str] = &["target-rematch-name", "target-sub-rule"];
 
+/// `type: dns` (issue #974) — an in-process resolver leaf with no
+/// endpoint keys of its own: `server`/`port`/`udp` and the transport
+/// family all read as ignored unknown keys.
+const DNS_NODE_KEYS: &[&str] = &[];
+
 const TRUSTTUNNEL_NODE_KEYS: &[&str] = &[
     "server",
     "port",
@@ -443,6 +448,7 @@ fn known_node_keys(proxy_type: &str) -> Option<&'static [&'static str]> {
         "socks5" => SOCKS5_NODE_KEYS,
         "direct" => DIRECT_NODE_KEYS,
         "rematch" => REMATCH_NODE_KEYS,
+        "dns" => DNS_NODE_KEYS,
         "trusttunnel" => TRUSTTUNNEL_NODE_KEYS,
         "anytls" => ANYTLS_NODE_KEYS,
         "hysteria2" => HYSTERIA2_NODE_KEYS,

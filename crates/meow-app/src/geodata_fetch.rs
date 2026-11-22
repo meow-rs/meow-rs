@@ -630,11 +630,11 @@ mod tests {
         .await;
 
         assert!(
-            !Arc::ptr_eq(&stale, &slot.read()),
+            !Arc::ptr_eq(&stale, &slot.read().resolver),
             "the running server's slot must leave the stale generation"
         );
         assert!(
-            Arc::ptr_eq(&slot.read(), &tunnel.resolver()),
+            Arc::ptr_eq(&slot.read().resolver, &tunnel.resolver()),
             "server slot and tunnel must hold the same rebuilt resolver"
         );
         meow_common::clear_host_resolver();

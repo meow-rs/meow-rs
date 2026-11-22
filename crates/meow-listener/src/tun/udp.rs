@@ -1616,7 +1616,7 @@ mod cleanup_tests {
         let resolver = dns.resolver;
         let fake = resolver.lookup_ipv4("pending.example").await.unwrap();
         let (tunnel, mut spec, _tx, probe) = fixture();
-        tunnel.set_resolver(resolver);
+        tunnel.set_resolver(resolver, true);
         spec.key.1.set_ip(fake);
         let worker_tunnel = tunnel.clone();
         let mut task = tokio::spawn(async move { relay_flow(&worker_tunnel, spec).await });

@@ -22,9 +22,9 @@ const DEFAULT_ANSWER_TTL_SECS: u32 = 60;
 /// client retries. Tests use a small cap so saturation is exercised
 /// deterministically.
 #[cfg(not(test))]
-const MAX_IN_FLIGHT: usize = 512;
+pub const MAX_IN_FLIGHT: usize = 512;
 #[cfg(test)]
-const MAX_IN_FLIGHT: usize = 8;
+pub const MAX_IN_FLIGHT: usize = 8;
 
 /// Bound idle/partial-frame connections separately from active DNS work.
 #[cfg(not(test))]
@@ -48,17 +48,51 @@ const OPT_RECORD: &[u8] = &[
     0x00, 0x00, // RDLENGTH: 0
 ];
 
-/// Shared resolver slot behind `RwLock<Arc<..>>` so a config reload can
-/// swap the generation every live server reads per query — no socket
-/// rebind, no in-flight query disruption (issue #514).
-pub type ResolverSlot = Arc<parking_lot::RwLock<Arc<Resolver>>>;
+/// One published resolver generation: the resolver itself plus whether
+/// the `dns:` section that produced it is enabled (issue #974). A
+/// `type: dns` outbound reads `enabled` to answer SERVFAIL on a disabled
+/// generation — `parse_dns` still builds a stub resolver there, and
+/// serving it would leak a real upstream dial. Availability rides in the
+/// same write as the resolver so a commit swaps both atomically.
+pub struct ResolverGen {
+    pub resolver: Arc<Resolver>,
+    pub enabled: bool,
+}
 
-/// Build a fresh slot holding `resolver`. Every component that should
-/// observe resolver hot-swaps (DNS servers, the built-in DIRECT adapter,
-/// the TUN loopback DNS) must share the *same* slot — pass clones of the
-/// returned `Arc`, not freshly wrapped copies of the resolver.
+/// Shared resolver slot behind `RwLock<ResolverGen>` so a config reload
+/// can swap the generation every live server reads per query — no socket
+/// rebind, no in-flight query disruption (issue #514).
+pub type ResolverSlot = Arc<parking_lot::RwLock<ResolverGen>>;
+
+/// Build a fresh slot holding `resolver` as an enabled generation. Every
+/// component that should observe resolver hot-swaps (DNS servers, the
+/// built-in DIRECT adapter, the TUN loopback DNS) must share the *same*
+/// slot — pass clones of the returned `Arc`, not freshly wrapped copies
+/// of the resolver.
 pub fn new_resolver_slot(resolver: Arc<Resolver>) -> ResolverSlot {
-    Arc::new(parking_lot::RwLock::new(resolver))
+    new_resolver_slot_state(resolver, true)
+}
+
+/// [`new_resolver_slot`] with an explicit `enabled` verdict — `parse_dns`
+/// uses it to mark the stub generation it still builds when `dns:` is
+/// absent or disabled, so a `type: dns` leaf answers SERVFAIL instead of
+/// dialling the stub's fallback upstream (issue #974).
+pub fn new_resolver_slot_state(resolver: Arc<Resolver>, enabled: bool) -> ResolverSlot {
+    Arc::new(parking_lot::RwLock::new(ResolverGen { resolver, enabled }))
+}
+
+/// The indirection a `type: dns` leaf resolves its live [`ResolverSlot`]
+/// through (issue #974): provider-sourced nodes are parsed before the
+/// DNS build installs a slot, and the objects persist across config
+/// rebuilds, so the adapter binds the cell the build populates rather
+/// than a slot alive at parse time. `None` inside — no resolver
+/// installed yet — means the leaf serves SERVFAIL, never a real upstream.
+pub type DnsOutboundCell = Arc<parking_lot::RwLock<Option<ResolverSlot>>>;
+
+/// A fresh, empty [`DnsOutboundCell`] — the config layer populates it
+/// with the tunnel's slot once a DNS build exists.
+pub fn new_dns_outbound_cell() -> DnsOutboundCell {
+    Arc::new(parking_lot::RwLock::new(None))
 }
 
 /// Outcome of [`DnsServer::try_answer_local`] — the synchronous probe the
@@ -117,7 +151,7 @@ pub struct DnsServer {
 impl DnsServer {
     pub fn new(resolver: Arc<Resolver>, listen_addr: SocketAddr) -> Self {
         Self {
-            resolver: Arc::new(parking_lot::RwLock::new(resolver)),
+            resolver: new_resolver_slot(resolver),
             listen_addr,
         }
     }
@@ -1192,7 +1226,7 @@ impl BoundDnsServer {
     /// (issue #514).
     pub fn from_socket(socket: UdpSocket, resolver: Arc<Resolver>) -> Self {
         Self {
-            resolver: Arc::new(parking_lot::RwLock::new(resolver)),
+            resolver: new_resolver_slot(resolver),
             socket: Arc::new(socket),
             tcp: None,
             dropped: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1314,7 +1348,7 @@ impl BoundDnsServer {
             // guard is scoped to the probe so no lock is held across .await.
             let local = {
                 let resolver_guard = resolver.read();
-                DnsServer::try_answer_local(&buf[..len], &resolver_guard)
+                DnsServer::try_answer_local(&buf[..len], &resolver_guard.resolver)
             };
             match local {
                 LocalAnswer::Answer(LocalResponse { response, hook }) => {
@@ -1370,7 +1404,7 @@ impl BoundDnsServer {
                 // Snapshot the current resolver generation per query —
                 // a `PUT /configs` DNS reload swaps the slot (issue #514).
                 // The read guard must drop before `.await`: it is !Send.
-                let resolver = Arc::clone(&resolver_slot.read());
+                let resolver = Arc::clone(&resolver_slot.read().resolver);
                 // Panic guard: a panicked task would drop the query, so keep
                 // the panic scoped to this one request and log it loudly.
                 let outcome = AssertUnwindSafe(DnsServer::handle_query_charged(
@@ -1462,67 +1496,17 @@ pub async fn serve_tcp_stream<S: AsyncRead + AsyncWrite + Unpin>(
     loop {
         let exchange = async {
             // Distinguish orderly EOF between queries from truncated frames.
-            let mut prefix = [0; 2];
-            if stream.read(&mut prefix[..1]).await? == 0 {
+            let Some(query) = read_dns_frame(&mut stream, usize::from(u16::MAX)).await? else {
                 // Queue FIN after the response; dropping lwIP without shutdown
                 // aborts unsent and unacknowledged data. This shares the deadline.
                 stream.shutdown().await?;
                 return Ok(false);
-            }
-            stream.read_exact(&mut prefix[1..]).await?;
-            let length = usize::from(u16::from_be_bytes(prefix));
-            if length < 12 {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "DNS TCP query length",
-                ));
-            }
-            // The wire prefix bounds each query to 65535 bytes. A client owns
-            // at most one frame, even when it pipelines requests.
-            let mut query = vec![0; length];
-            stream.read_exact(&mut query).await?;
-            let current = Arc::clone(&resolver.read());
-            let response = match DnsServer::try_answer_local(&query, &current) {
-                LocalAnswer::Answer(LocalResponse { response, hook }) => {
-                    if let Some(work) = hook {
-                        // Mirror the UDP path: locally answerable queries
-                        // bypass the upstream budget entirely — a saturated
-                        // in-flight pool must not delay an answer that needs
-                        // no upstream, so the hook runs uncharged.
-                        tokio::task::spawn_blocking(move || work.run())
-                            .await
-                            .map_err(std::io::Error::other)?;
-                    }
-                    response
-                }
-                // Non-query traffic (QR=1, garbage) is a protocol event,
-                // not data corruption: close the connection cleanly rather
-                // than answering a frame that needs no response.
-                LocalAnswer::Drop => return Ok(false),
-                LocalAnswer::Upstream => {
-                    let charge = Arc::new(
-                        Arc::clone(&budget)
-                            .acquire_owned()
-                            .await
-                            .map_err(std::io::Error::other)?,
-                    );
-                    DnsServer::handle_query_charged(&query, &current, Some(charge))
-                        .await
-                        .map_err(|_| {
-                            std::io::Error::new(std::io::ErrorKind::InvalidData, "DNS TCP query")
-                        })?
-                }
             };
-            let length = u16::try_from(response.len()).map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "DNS TCP response length")
-            })?;
-            // One contiguous write avoids a tiny prefix segment waiting on
-            // delayed ACKs before Nagle allows the response body through.
-            let mut framed = Vec::with_capacity(response.len() + 2);
-            framed.extend_from_slice(&length.to_be_bytes());
-            framed.extend_from_slice(&response);
-            stream.write_all(&framed).await?;
-            stream.flush().await?;
+            let current = Arc::clone(&resolver.read().resolver);
+            let Some(response) = answer_wire(&query, &current, &budget).await? else {
+                return Ok(false);
+            };
+            write_dns_frame(&mut stream, &response).await?;
             Ok(true)
         };
         match tokio::time::timeout(TCP_EXCHANGE_TIMEOUT, exchange).await {
@@ -1537,6 +1521,280 @@ pub async fn serve_tcp_stream<S: AsyncRead + AsyncWrite + Unpin>(
             }
         }
     }
+}
+
+/// The request-size ceiling a `type: dns` outbound enforces per frame
+/// (issue #974): 16 KiB — well above the 512-byte classic UDP message and
+/// every EDNS payload, while a larger frame cannot be a legitimate stub
+/// query. The standalone listener keeps the wire-imposed 65535 bound.
+const OUTBOUND_TCP_FRAME_MAX: usize = 16 * 1024;
+
+/// What a `type: dns` leaf's per-query resolver snapshot resolves to
+/// (issue #974).
+enum OutboundView {
+    /// Serve through the current generation's resolver.
+    Resolver(Arc<Resolver>),
+    /// No slot installed yet, or the published generation's `dns:` section
+    /// is disabled — answer SERVFAIL, never an OS/public fallback.
+    Disabled,
+}
+
+/// Snapshot the [`DnsOutboundCell`]'s view for one query. Both locks are
+/// released before the returned `Arc` is awaited on: the cell guard drops
+/// once the slot is cloned, and the slot guard ends with the read.
+fn outbound_resolver_view(cell: &DnsOutboundCell) -> OutboundView {
+    let slot = cell.read().clone();
+    slot.and_then(|slot| {
+        let gen = slot.read();
+        gen.enabled
+            .then(|| OutboundView::Resolver(Arc::clone(&gen.resolver)))
+    })
+    .unwrap_or(OutboundView::Disabled)
+}
+
+/// Serve DNS-over-TCP on a `type: dns` outbound's caller-owned in-process
+/// stream (issue #974). Same wire contract as [`serve_tcp_stream`] —
+/// 2-byte big-endian length prefix, exactly one message per frame,
+/// requests and replies both framed — with the outbound's own limits:
+///
+/// - frames cap at 16 KiB (`OUTBOUND_TCP_FRAME_MAX`); a short prefix,
+///   short body, undecodable message or oversize frame closes the stream
+///   without a fabricated answer;
+/// - no per-exchange deadline — the caller (the tunnel) owns connection
+///   lifetime;
+/// - the resolver comes from the shared [`DnsOutboundCell`], so a config
+///   reload reaches live conns; a disabled or unbound generation answers
+///   SERVFAIL rather than any upstream fallback.
+///
+/// `budget` is shared across every conn the adapter hands out, bounding
+/// in-flight upstream queries without per-query task spawning.
+pub async fn serve_dns_outbound_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    cell: DnsOutboundCell,
+    budget: Arc<tokio::sync::Semaphore>,
+) -> std::io::Result<()> {
+    loop {
+        let Some(query) = read_dns_frame(&mut stream, OUTBOUND_TCP_FRAME_MAX).await? else {
+            // Orderly EOF between frames: shut down the in-process half so
+            // the client side sees FIN instead of a dropped writer.
+            stream.shutdown().await?;
+            return Ok(());
+        };
+        let response = match outbound_resolver_view(&cell) {
+            OutboundView::Resolver(current) => {
+                match answer_wire(&query, &current, &budget).await? {
+                    Some(response) => response,
+                    None => return Ok(()),
+                }
+            }
+            OutboundView::Disabled => match disabled_answer(&query) {
+                Some(response) => response,
+                None => return Ok(()),
+            },
+        };
+        write_dns_frame(&mut stream, &response).await?;
+    }
+}
+
+/// Read one length-prefixed DNS frame from `stream`. `Ok(None)` is an
+/// orderly EOF before the first prefix byte — the caller closes cleanly;
+/// anything shorter than a header or longer than `max_len` is a protocol
+/// error that ends the stream without an answer.
+async fn read_dns_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    max_len: usize,
+) -> std::io::Result<Option<Vec<u8>>> {
+    let mut prefix = [0; 2];
+    if stream.read(&mut prefix[..1]).await? == 0 {
+        return Ok(None);
+    }
+    stream.read_exact(&mut prefix[1..]).await?;
+    let length = usize::from(u16::from_be_bytes(prefix));
+    if length < 12 || length > max_len {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "DNS TCP query length",
+        ));
+    }
+    let mut query = vec![0; length];
+    stream.read_exact(&mut query).await?;
+    Ok(Some(query))
+}
+
+/// Write `response` as one length-prefixed DNS frame.
+async fn write_dns_frame<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    response: &[u8],
+) -> std::io::Result<()> {
+    let length = u16::try_from(response.len()).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, "DNS TCP response length")
+    })?;
+    // One contiguous write avoids a tiny prefix segment waiting on
+    // delayed ACKs before Nagle allows the response body through.
+    let mut framed = Vec::with_capacity(response.len() + 2);
+    framed.extend_from_slice(&length.to_be_bytes());
+    framed.extend_from_slice(response);
+    stream.write_all(&framed).await?;
+    stream.flush().await
+}
+
+/// Resolve one already-framed DNS query against `resolver`: the local
+/// fast path first (hosts, fake-IP, fresh cache — uncharged, hook work
+/// included), then the bounded upstream pipeline. `Ok(None)` means no
+/// answer is owed — non-query traffic is a protocol event the caller
+/// ends the exchange on, exactly like the listener.
+async fn answer_wire(
+    query: &[u8],
+    resolver: &Resolver,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> std::io::Result<Option<Vec<u8>>> {
+    match DnsServer::try_answer_local(query, resolver) {
+        LocalAnswer::Answer(LocalResponse { response, hook }) => {
+            if let Some(work) = hook {
+                // Mirror the UDP path: locally answerable queries bypass
+                // the upstream budget entirely — a saturated in-flight
+                // pool must not delay an answer that needs no upstream,
+                // so the hook runs uncharged.
+                tokio::task::spawn_blocking(move || work.run())
+                    .await
+                    .map_err(std::io::Error::other)?;
+            }
+            Ok(Some(response))
+        }
+        LocalAnswer::Drop => Ok(None),
+        LocalAnswer::Upstream => {
+            let charge = Arc::new(
+                Arc::clone(budget)
+                    .acquire_owned()
+                    .await
+                    .map_err(std::io::Error::other)?,
+            );
+            DnsServer::handle_query_charged(query, resolver, Some(charge))
+                .await
+                .map(Some)
+                .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, "DNS TCP query"))
+        }
+    }
+}
+
+/// A SERVFAIL answer for a `type: dns` leaf whose resolver view is
+/// disabled or unbound (issue #974): the kernel answers failure in-band
+/// and never falls back to an OS/public resolver. Mirrors the error
+/// taxonomy `handle_query` produces for header-level defects — a
+/// response packet (QR=1) or truncated frame earns silence, a
+/// non-QUERY opcode NOTIMP, multi-question FORMERR — so `None` means
+/// "no answer owed", the same verdict the serve loop gives a drop.
+fn disabled_answer(data: &[u8]) -> Option<Vec<u8>> {
+    if data.len() < 12 {
+        return None;
+    }
+    let id = u16::from_be_bytes([data[0], data[1]]);
+    let flags = u16::from_be_bytes([data[2], data[3]]);
+    let qdcount = u16::from_be_bytes([data[4], data[5]]);
+    let arcount = u16::from_be_bytes([data[10], data[11]]);
+    if flags & 0x8000 != 0 {
+        return None;
+    }
+    if flags & 0x7800 != 0 {
+        return Some(DnsServer::build_notimp(id, flags, arcount > 0));
+    }
+    if qdcount == 0 {
+        return None;
+    }
+    if qdcount != 1 {
+        return Some(DnsServer::build_formerr(id, flags, arcount > 0));
+    }
+    let (_, _, question_len) = DnsServer::parse_question(&data[12..]).ok()?;
+    Some(DnsServer::build_servfail(id, data, flags, question_len))
+}
+
+/// Reply ceiling a `type: dns` leaf honours per datagram (issue #974):
+/// RFC 6891's advertised-payload cap. A query without OPT gets the
+/// classic 512-byte bound, exactly like a real UDP resolver.
+const MAX_OUTBOUND_UDP_REPLY: usize = 2048;
+
+/// Answer one raw DNS datagram for a `type: dns` leaf (issue #974) — the
+/// UDP counterpart of [`serve_dns_outbound_stream`]'s exchange. The
+/// reply is fit to the client's EDNS-advertised payload (512 without
+/// OPT, capped at `MAX_OUTBOUND_UDP_REPLY`) by dropping whole records
+/// back-to-front and setting TC — what a stub resolver expects a real
+/// UDP server to do. `None` is a silent drop (undecodable wire,
+/// saturated budget), matching `handle_query`'s error verdicts and the
+/// listener's UDP semantics: the client retries.
+///
+/// `budget` is *try*-acquired — a saturated pool drops rather than
+/// queues a datagram. Resolver state comes from the shared
+/// [`DnsOutboundCell`] per datagram, so a config reload's new generation
+/// reaches live conns and a disabled generation answers SERVFAIL.
+pub async fn answer_outbound_datagram(
+    wire: &[u8],
+    cell: &DnsOutboundCell,
+    budget: &Arc<tokio::sync::Semaphore>,
+) -> Option<Vec<u8>> {
+    // Decoded for the EDNS payload bound; decode failure does not pre-empt
+    // the verdict — `handle_query`'s own parser is the authority.
+    let query = Message::from_vec(wire).ok();
+    let response = match outbound_resolver_view(cell) {
+        OutboundView::Disabled => disabled_answer(wire)?,
+        OutboundView::Resolver(resolver) => match DnsServer::try_answer_local(wire, &resolver) {
+            LocalAnswer::Answer(LocalResponse { response, hook }) => {
+                if let Some(work) = hook {
+                    // Same ordering the listener keeps: a deferred hook
+                    // (nftset adds, fake-IP bookkeeping) runs on the
+                    // blocking pool and completes before the reply goes
+                    // out — locally answerable queries never draw a
+                    // permit.
+                    tokio::task::spawn_blocking(move || work.run()).await.ok()?;
+                }
+                response
+            }
+            LocalAnswer::Drop => return None,
+            LocalAnswer::Upstream => {
+                let charge = Arc::new(Arc::clone(budget).try_acquire_owned().ok()?);
+                DnsServer::handle_query_charged(wire, &resolver, Some(charge))
+                    .await
+                    .ok()?
+            }
+        },
+    };
+    Some(fit_udp_response(query.as_ref(), &response))
+}
+
+/// Bound `response` to the payload the query's OPT record advertised
+/// (`None`/undecodable query → 512), at most [`MAX_OUTBOUND_UDP_REPLY`].
+/// Oversize answers drop whole additional, then authority, then answer
+/// records and set TC — the truncation a stub retries over TCP on. A
+/// response that cannot be re-decoded passes through unfit rather than
+/// being silently mauled.
+fn fit_udp_response(query: Option<&Message>, response: &[u8]) -> Vec<u8> {
+    // `Message::max_payload` reads the OPT's advertised size, defaulting
+    // to (and flooring at) the classic 512 without one.
+    let bound = query
+        .map_or(512, |q| usize::from(q.max_payload()))
+        .min(MAX_OUTBOUND_UDP_REPLY);
+    if response.len() <= bound {
+        return response.to_vec();
+    }
+    let Ok(mut msg) = Message::from_vec(response) else {
+        return response.to_vec();
+    };
+    loop {
+        let removed = msg
+            .additionals
+            .pop()
+            .or_else(|| msg.authorities.pop())
+            .or_else(|| msg.answers.pop());
+        if removed.is_none() {
+            break;
+        }
+        msg.metadata.truncation = true;
+        match msg.to_vec() {
+            Ok(bytes) if bytes.len() <= bound => return bytes,
+            Ok(_) => {}
+            Err(_) => return response.to_vec(),
+        }
+    }
+    msg.to_vec().unwrap_or_else(|_| response.to_vec())
 }
 
 /// `try_send_to`, not `send_to().await`: a transient full send buffer
@@ -2151,7 +2409,10 @@ mod tests {
             assert_eq!(reply.metadata.response_code, ResponseCode::Refused);
         }
         peer.await.unwrap();
-        *slot.write() = Arc::new(resolver_with_upstream_rcode(ResponseCode::NXDomain).await);
+        *slot.write() = ResolverGen {
+            resolver: Arc::new(resolver_with_upstream_rcode(ResponseCode::NXDomain).await),
+            enabled: true,
+        };
         tcp_frame(&mut stream, &sample_query(12, 16)).await;
         assert_eq!(
             tcp_reply(&mut stream).await.metadata.response_code,
@@ -2202,14 +2463,17 @@ mod tests {
         );
         let held = budget.acquire().await.unwrap();
         // IPv6-disabled answers are local even when all upstream slots are busy.
-        *slot.write() = Arc::new(crate::resolver::Resolver::new(
-            Vec::new(),
-            Vec::new(),
-            DnsMode::Normal,
-            meow_trie::DomainTrie::new(),
-            false,
-            false,
-        ));
+        *slot.write() = ResolverGen {
+            resolver: Arc::new(crate::resolver::Resolver::new(
+                Vec::new(),
+                Vec::new(),
+                DnsMode::Normal,
+                meow_trie::DomainTrie::new(),
+                false,
+                false,
+            )),
+            enabled: true,
+        };
         tcp_frame(&mut client, &sample_query(31, 28)).await;
         let reply =
             tokio::time::timeout(std::time::Duration::from_secs(1), tcp_reply(&mut client)).await;
@@ -2237,7 +2501,7 @@ mod tests {
                 true,
             ))
         };
-        let slot = Arc::new(parking_lot::RwLock::new(make("10.0.0.1".parse().unwrap())));
+        let slot = new_resolver_slot(make("10.0.0.1".parse().unwrap()));
         let (mut client, server) = tokio::io::duplex(8192);
         let task = tokio::spawn(serve_tcp_stream(
             server,
@@ -2245,7 +2509,10 @@ mod tests {
             Arc::new(tokio::sync::Semaphore::new(1)),
         ));
         for octet in [1, 2] {
-            *slot.write() = make(format!("10.0.0.{octet}").parse().unwrap());
+            *slot.write() = ResolverGen {
+                resolver: make(format!("10.0.0.{octet}").parse().unwrap()),
+                enabled: true,
+            };
             let query = sample_query(octet as u16, 1);
             client.write_u16(query.len() as u16).await.unwrap();
             // Split input framing like a TCP fallback after a truncated UDP answer.
@@ -2349,7 +2616,7 @@ mod tests {
                 true,
             ))
         };
-        let slot = Arc::new(parking_lot::RwLock::new(make("10.0.0.1".parse().unwrap())));
+        let slot = new_resolver_slot(make("10.0.0.1".parse().unwrap()));
         let (mut client, server) = tokio::io::duplex(8192);
         let task = tokio::spawn(serve_tcp_stream(
             tokio::io::BufStream::new(server),
@@ -2357,7 +2624,10 @@ mod tests {
             Arc::new(tokio::sync::Semaphore::new(1)),
         ));
         for octet in [1, 2] {
-            *slot.write() = make(format!("10.0.0.{octet}").parse().unwrap());
+            *slot.write() = ResolverGen {
+                resolver: make(format!("10.0.0.{octet}").parse().unwrap()),
+                enabled: true,
+            };
             let query = sample_query(octet as u16, 1);
             client.write_u16(query.len() as u16).await.unwrap();
             // Split input framing like a TCP fallback after a truncated UDP answer.
@@ -4340,6 +4610,289 @@ mod tests {
             "the first MAX_IN_FLIGHT queries all got permits"
         );
         serve.abort();
+    }
+
+    // ---- `type: dns` outbound exchange (issue #974) ----
+
+    fn make(ip: IpAddr) -> Arc<Resolver> {
+        let mut hosts = meow_trie::DomainTrie::new();
+        hosts.insert(
+            "example.com",
+            crate::resolver::HostEntry::Addresses(vec![ip]),
+        );
+        Arc::new(crate::resolver::Resolver::new(
+            Vec::new(),
+            Vec::new(),
+            DnsMode::Normal,
+            hosts,
+            true,
+            true,
+        ))
+    }
+
+    async fn outbound_exchange(
+        client: &mut tokio::io::DuplexStream,
+        query: &[u8],
+    ) -> Option<Vec<u8>> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let len = (query.len() as u16).to_be_bytes();
+        client.write_all(&len).await.unwrap();
+        client.write_all(query).await.unwrap();
+        client.flush().await.unwrap();
+        let mut prefix = [0u8; 2];
+        client.read_exact(&mut prefix).await.ok()?;
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+        client.read_exact(&mut body).await.ok()?;
+        Some(body)
+    }
+
+    /// A `type: dns` leaf serves length-prefixed DNS on the caller's
+    /// in-process stream through the cell's current generation.
+    #[tokio::test]
+    async fn outbound_stream_answers_and_follows_generation_swaps() {
+        let cell = new_dns_outbound_cell();
+        *cell.write() = Some(new_resolver_slot(make("10.0.0.1".parse().unwrap())));
+        let (mut client, server) = tokio::io::duplex(4096);
+        let budget = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+        let serve = tokio::spawn(serve_dns_outbound_stream(server, Arc::clone(&cell), budget));
+
+        let reply = outbound_exchange(&mut client, &sample_query(1, 1))
+            .await
+            .unwrap();
+        let msg = Message::from_vec(&reply).unwrap();
+        assert_eq!(msg.metadata.id, 1);
+        assert_eq!(msg.answers[0].data, RData::A("10.0.0.1".parse().unwrap()));
+
+        // A reload's new slot reaches the already-open stream.
+        *cell.write() = Some(new_resolver_slot(make("10.0.0.2".parse().unwrap())));
+        let reply = outbound_exchange(&mut client, &sample_query(2, 1))
+            .await
+            .unwrap();
+        let msg = Message::from_vec(&reply).unwrap();
+        assert_eq!(msg.metadata.id, 2);
+        assert_eq!(msg.answers[0].data, RData::A("10.0.0.2".parse().unwrap()));
+
+        drop(client);
+        serve.await.unwrap().unwrap();
+    }
+
+    /// Disabled and unbound views both answer SERVFAIL in-band — the leaf
+    /// never substitutes an OS or public resolver.
+    #[tokio::test]
+    async fn outbound_stream_disabled_and_unbound_answer_servfail() {
+        for cell in [
+            {
+                let cell = new_dns_outbound_cell();
+                *cell.write() = Some(new_resolver_slot_state(
+                    make("10.0.0.1".parse().unwrap()),
+                    false,
+                ));
+                cell
+            },
+            new_dns_outbound_cell(),
+        ] {
+            let (mut client, server) = tokio::io::duplex(4096);
+            let budget = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+            let serve = tokio::spawn(serve_dns_outbound_stream(server, cell, budget));
+            let reply = outbound_exchange(&mut client, &sample_query(0x55, 1))
+                .await
+                .expect("SERVFAIL is still an answer");
+            let msg = Message::from_vec(&reply).unwrap();
+            assert_eq!(msg.metadata.id, 0x55);
+            assert_eq!(msg.metadata.response_code, ResponseCode::ServFail);
+            drop(client);
+            serve.await.unwrap().unwrap();
+        }
+    }
+
+    /// The enabled→disabled verdict travels with the generation: an open
+    /// stream serves SERVFAIL as soon as a disabled slot lands, then
+    /// recovers when a re-enabled one follows — the cell keeps them
+    /// atomic (issue #974).
+    #[tokio::test]
+    async fn outbound_stream_enabled_bit_swaps_atomically() {
+        let cell = new_dns_outbound_cell();
+        let slot = new_resolver_slot(make("10.0.0.1".parse().unwrap()));
+        *cell.write() = Some(Arc::clone(&slot));
+        let (mut client, server) = tokio::io::duplex(4096);
+        let budget = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+        let serve = tokio::spawn(serve_dns_outbound_stream(server, cell, budget));
+
+        let reply = outbound_exchange(&mut client, &sample_query(1, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            Message::from_vec(&reply).unwrap().metadata.response_code,
+            ResponseCode::NoError
+        );
+        *slot.write() = ResolverGen {
+            resolver: make("10.0.0.1".parse().unwrap()),
+            enabled: false,
+        };
+        let reply = outbound_exchange(&mut client, &sample_query(2, 1))
+            .await
+            .unwrap();
+        assert_eq!(
+            Message::from_vec(&reply).unwrap().metadata.response_code,
+            ResponseCode::ServFail
+        );
+        *slot.write() = ResolverGen {
+            resolver: make("10.0.0.3".parse().unwrap()),
+            enabled: true,
+        };
+        let reply = outbound_exchange(&mut client, &sample_query(3, 1))
+            .await
+            .unwrap();
+        let msg = Message::from_vec(&reply).unwrap();
+        assert_eq!(msg.answers[0].data, RData::A("10.0.0.3".parse().unwrap()));
+        drop(client);
+        serve.await.unwrap().unwrap();
+    }
+
+    /// Datagram path: a query through `answer_outbound_datagram` resolves
+    /// through the cell's current generation, and a disabled one SERVFAILs.
+    #[tokio::test]
+    async fn outbound_datagram_answers_and_follows_swaps() {
+        let cell = new_dns_outbound_cell();
+        *cell.write() = Some(new_resolver_slot(make("10.0.0.5".parse().unwrap())));
+        let budget = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+
+        let reply = answer_outbound_datagram(&sample_query(9, 1), &cell, &budget)
+            .await
+            .unwrap();
+        let msg = Message::from_vec(&reply).unwrap();
+        assert_eq!(msg.metadata.id, 9);
+        assert_eq!(msg.answers[0].data, RData::A("10.0.0.5".parse().unwrap()));
+
+        *cell.write() = Some(new_resolver_slot_state(
+            make("10.0.0.6".parse().unwrap()),
+            false,
+        ));
+        let reply = answer_outbound_datagram(&sample_query(10, 1), &cell, &budget)
+            .await
+            .unwrap();
+        assert_eq!(
+            Message::from_vec(&reply).unwrap().metadata.response_code,
+            ResponseCode::ServFail
+        );
+    }
+
+    /// The datagram path never waits on a saturated upstream budget — a
+    /// full semaphore drops the exchange like a lost packet.
+    #[tokio::test]
+    async fn outbound_datagram_saturated_budget_drops() {
+        let cell = new_dns_outbound_cell();
+        // The resolver has no upstream it could reach anyway; the permit
+        // check must fire before the query ever looks at it.
+        *cell.write() = Some(new_resolver_slot(make("10.0.0.1".parse().unwrap())));
+        let budget = Arc::new(tokio::sync::Semaphore::new(1));
+        let _held = Arc::clone(&budget).acquire_owned().await.unwrap();
+        // A locally answerable query bypasses the budget entirely.
+        assert!(
+            answer_outbound_datagram(&sample_query(1, 1), &cell, &budget)
+                .await
+                .is_some(),
+            "local answers never draw a permit"
+        );
+        // An upstream-bound query — `uncached.example` is not in hosts —
+        // drops when no permit is free.
+        let upstream_query = {
+            let mut q = Vec::new();
+            q.extend_from_slice(&3u16.to_be_bytes());
+            q.extend_from_slice(&[0x01, 0x00]);
+            q.extend_from_slice(&[0x00, 0x01]);
+            q.extend_from_slice(&[0x00, 0x00, 0x00, 0x00, 0x00, 0x00]);
+            q.push(8);
+            q.extend_from_slice(b"uncached");
+            q.push(7);
+            q.extend_from_slice(b"example");
+            q.push(0);
+            q.extend_from_slice(&1u16.to_be_bytes());
+            q.extend_from_slice(&1u16.to_be_bytes());
+            q
+        };
+        assert!(
+            answer_outbound_datagram(&upstream_query, &cell, &budget)
+                .await
+                .is_none(),
+            "a saturated budget drops upstream-bound datagrams"
+        );
+    }
+
+    /// `disabled_answer` mirrors `handle_query`'s taxonomy: silence for a
+    /// response packet or a truncated frame, NOTIMP for a non-QUERY
+    /// opcode, FORMERR for a multi-question, SERVFAIL for a good query.
+    #[test]
+    fn disabled_answer_matches_handle_query_taxonomy() {
+        // Response packets and truncated frames earn silence.
+        let mut as_response = sample_query(1, 1);
+        as_response[2] |= 0x80;
+        assert!(disabled_answer(&as_response).is_none());
+        assert!(disabled_answer(&[0u8; 5]).is_none());
+        // Non-QUERY opcode → NOTIMP.
+        let mut iquery = sample_query(2, 1);
+        iquery[2] |= 0x08; // opcode 1 (IQUERY)
+        let reply = disabled_answer(&iquery).unwrap();
+        assert_eq!(
+            Message::from_vec(&reply).unwrap().metadata.response_code,
+            ResponseCode::NotImp
+        );
+        // QDCOUNT 0 is a no-answer; multi-question is FORMERR.
+        let mut no_question = sample_query(3, 1);
+        no_question[5] = 0;
+        assert!(disabled_answer(&no_question).is_none());
+        let mut two_questions = sample_query(4, 1);
+        two_questions[5] = 2;
+        assert_eq!(
+            Message::from_vec(&disabled_answer(&two_questions).unwrap())
+                .unwrap()
+                .metadata
+                .response_code,
+            ResponseCode::FormErr
+        );
+        // A normal query answers SERVFAIL with the id echoed.
+        let reply = disabled_answer(&sample_query(0x77, 1)).unwrap();
+        let msg = Message::from_vec(&reply).unwrap();
+        assert_eq!(msg.metadata.id, 0x77);
+        assert_eq!(msg.metadata.response_code, ResponseCode::ServFail);
+    }
+
+    /// `fit_udp_response` honours the advertised EDNS bound — an oversize
+    /// answer drops records back-to-front and sets TC like a real UDP
+    /// server, and a query without OPT keeps the classic 512 ceiling.
+    #[test]
+    fn fit_udp_response_truncates_to_the_advertised_bound() {
+        use hickory_proto::rr::rdata::TXT;
+        use std::str::FromStr;
+        // ~700 bytes: one TXT answer carrying three near-max
+        // character-strings (255 is the per-string cap).
+        let build = |id: u16| {
+            let mut msg = Message::new(id, MessageType::Response, OpCode::Query);
+            let chunk = "x".repeat(250);
+            msg.add_answer(Record::from_rdata(
+                hickory_proto::rr::Name::from_str("example.com.").unwrap(),
+                300,
+                RData::TXT(TXT::new(vec![chunk.clone(), chunk.clone(), chunk])),
+            ));
+            msg.to_vec().unwrap()
+        };
+        let response = build(1);
+        assert!(response.len() > 512);
+        // No OPT on the query → 512 bound, TC set, still decodable.
+        let fitted = fit_udp_response(
+            Message::from_vec(&sample_query(1, 1)).ok().as_ref(),
+            &response,
+        );
+        assert!(fitted.len() <= 512);
+        let msg = Message::from_vec(&fitted).unwrap();
+        assert!(msg.metadata.truncation);
+        // An EDNS 2048 payload passes unmodified.
+        let mut edns_query = Message::from_vec(&sample_query(1, 1)).unwrap();
+        let mut edns = hickory_proto::op::Edns::new();
+        edns.set_max_payload(2048);
+        edns_query.set_edns(edns);
+        let fitted = fit_udp_response(Some(&edns_query), &response);
+        assert_eq!(fitted, response);
     }
 }
 

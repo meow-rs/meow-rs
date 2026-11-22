@@ -240,6 +240,7 @@ pub async fn run_loop(
                             .map(|e| (e.key().clone(), Arc::clone(e.value())))
                             .collect();
                         let selection = tunnel.selection_backing();
+                        let dns_cell = tunnel.dns_outbound_cell();
                         move || {
                             // The runtime variant attaches the tunnel's
                             // selection backing so a `select` group in the
@@ -257,6 +258,7 @@ pub async fn run_loop(
                                 cache_dir.as_deref(),
                                 &provider_dialer_registry,
                                 &selection,
+                                &dns_cell,
                             )
                         }
                     })

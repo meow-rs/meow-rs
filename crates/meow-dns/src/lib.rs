@@ -25,5 +25,8 @@ pub use host_resolver_hook::ResolverHostHook;
 pub use resolver::{
     BootstrapError, FallbackFilter, HostEntry, NameserverPolicy, PolicyEntry, Resolver,
 };
-pub use server::{new_resolver_slot, BoundDnsServer, DnsServer, LocalAnswer, ResolverSlot};
+pub use server::{
+    new_dns_outbound_cell, new_resolver_slot, new_resolver_slot_state, BoundDnsServer,
+    DnsOutboundCell, DnsServer, LocalAnswer, ResolverGen, ResolverSlot,
+};
 pub use upstream::{H3Policy, HostOrIp, NameServerEntry, NameServerParseError, NameServerUrl};
