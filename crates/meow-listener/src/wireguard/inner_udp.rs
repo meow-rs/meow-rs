@@ -127,13 +127,6 @@ pub(super) async fn run_flow(args: FlowArgs, mut rx: mpsc::Receiver<Bytes>) -> R
     }
     inner.pre_resolve(&mut metadata).await;
     let probed = inner.resolve_udp_dst(&mut metadata).await;
-    let Some(dst_ip) = metadata.dst_ip else {
-        return Err(format!(
-            "dst_ip not resolved for {}",
-            metadata.remote_address()
-        ));
-    };
-    let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
 
     // A `resolve_udp_dst` probe already produced the committed decision —
     // use it so the direct-nameserver verdict and the route agree
@@ -153,6 +146,22 @@ pub(super) async fn run_flow(args: FlowArgs, mut rx: mpsc::Receiver<Bytes>) -> R
             "no matching rule for {}",
             metadata.remote_address()
         ));
+    };
+    // A `type: dns` leaf never contacts the destination — its conn only
+    // echoes this addr back as the reply source, so mandatory
+    // pre-resolution must not gate it and the ORIGINAL inner destination
+    // is what gets stamped (issue #974 review). Transports keep requiring
+    // `dst_ip` — they actually dial it.
+    let dst_addr = if proxy.adapter_type() == meow_common::AdapterType::Dns {
+        metadata.dns_udp_dst(Some(orig_dst))
+    } else {
+        let Some(dst_ip) = metadata.dst_ip else {
+            return Err(format!(
+                "dst_ip not resolved for {}",
+                metadata.remote_address()
+            ));
+        };
+        SocketAddr::new(dst_ip, metadata.dst_port)
     };
     info!(
         "UDP {client} --> {orig_dst} match {} using {}",

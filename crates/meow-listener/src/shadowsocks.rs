@@ -1034,6 +1034,14 @@ where
         Address::SocketAddress(sa) => (SmolStr::default(), Some(sa.ip()), sa.port()),
     };
 
+    // The destination the client claimed, captured before
+    // `pre_handle_metadata` can clear `dst_ip` on a fake-IP rewrite: a
+    // flow committed to a `type: dns` leaf echoes this address as the
+    // reply source, never a resolved replacement (issue #974).
+    let claimed = dst_ip
+        .or_else(|| metadata_ip_literal(&host))
+        .map(|ip| SocketAddr::new(ip.to_canonical(), dst_port));
+
     // Provisional flow key — identical to the post-pipeline key for
     // every input that survives `pre_handle_metadata` unchanged: a
     // socket-address target canonicalizes, a domain-typed IP literal
@@ -1159,6 +1167,7 @@ where
         Arc::clone(sock),
         rx,
         metadata,
+        claimed,
         peer,
         reply_control,
         server_session,
@@ -1198,6 +1207,7 @@ async fn run_ss_udp_flow<S>(
     sock: Arc<shadowsocks::ProxySocket<S>>,
     mut rx: mpsc::Receiver<SmallVec<[u8; 1500]>>,
     mut metadata: Metadata,
+    claimed: Option<SocketAddr>,
     peer: SocketAddr,
     reply_control: UdpSocketControlData,
     server_session: Option<Arc<ServerSession>>,
@@ -1225,18 +1235,10 @@ async fn run_ss_udp_flow<S>(
     ) {
         return;
     }
-    // UDP keeps the eager pre_resolve (no lazy enrichment): the writer
-    // needs a resolved dst_ip regardless of what the rules demand.
+    // UDP keeps the eager pre_resolve (no lazy enrichment): transports
+    // dial `dst_ip` regardless of what the rules demand.
     inner.pre_resolve(&mut metadata).await;
     let probed = inner.resolve_udp_dst(&mut metadata).await;
-    let Some(dst_ip) = metadata.dst_ip else {
-        debug!(
-            "ss udp flow: dst_ip not resolved for {}",
-            metadata.remote_address()
-        );
-        return;
-    };
-    let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
 
     // Taken before the dial so a flush landing mid-dial still ends the flow
     // (issue #695): its socket may predate the new outbound binding.
@@ -1246,7 +1248,7 @@ async fn run_ss_udp_flow<S>(
     // (issue #533 review) — block-scoped so a long-lived flow doesn't
     // retain a stale route table (or adapter/rule Arcs) for its whole
     // idle window.
-    let conn: Arc<dyn ProxyPacketConn> = {
+    let (conn, dst_addr): (Arc<dyn ProxyPacketConn>, SocketAddr) = {
         // A `resolve_udp_dst` probe already produced the committed
         // decision — use it so the direct-nameserver verdict and the
         // route agree (issue #974).
@@ -1267,6 +1269,23 @@ async fn run_ss_udp_flow<S>(
             );
             return;
         };
+        // A `type: dns` leaf never contacts the destination — its conn
+        // only echoes this addr back as the reply source, so mandatory
+        // pre-resolution must not gate it and the CLAIMED destination is
+        // what gets stamped (issue #974 review). Transports keep
+        // requiring `dst_ip` — they actually dial it.
+        let dst_addr = if proxy.adapter_type() == meow_common::AdapterType::Dns {
+            metadata.dns_udp_dst(claimed)
+        } else {
+            let Some(dst_ip) = metadata.dst_ip else {
+                debug!(
+                    "ss udp flow: dst_ip not resolved for {}",
+                    metadata.remote_address()
+                );
+                return;
+            };
+            SocketAddr::new(dst_ip, metadata.dst_port)
+        };
         info!(
             "UDP {peer} --> {} match {} using {}",
             metadata.remote_address(),
@@ -1274,7 +1293,7 @@ async fn run_ss_udp_flow<S>(
             UsingProxy::new(proxy.as_ref(), &metadata)
         );
         match inner.dial_udp(proxy.as_ref(), &metadata).await {
-            Ok(conn) => Arc::from(conn),
+            Ok(conn) => (Arc::from(conn), dst_addr),
             Err(e) => {
                 debug!(
                     "ss udp flow to {dst_addr}: dial_udp via {}: {e}",

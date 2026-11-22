@@ -398,6 +398,26 @@ impl Metadata {
         }
     }
 
+    /// The `SocketAddr` a `type: dns`-committed UDP flow hands to its
+    /// conn's `write_packet` (issue #974): the leaf never dials the
+    /// destination — the addr is echoed back as the reply's source, like
+    /// a bound datagram socket, so it must be the destination the client
+    /// *claimed*, not a resolved replacement (a fake-IP flow whose
+    /// `dst_ip` `pre_handle_metadata` cleared still owes the client
+    /// replies from the fake address). `claimed` is the listener-captured
+    /// pre-resolution socket form of the request — `Some` for IP-typed
+    /// claims, `None` for domain-typed ones. A domain claim has no IP
+    /// form; a resolved `dst_ip` stands in when it exists, else the
+    /// unspecified wildcard carries the port.
+    pub fn dns_udp_dst(&self, claimed: Option<SocketAddr>) -> SocketAddr {
+        claimed
+            .or_else(|| self.dst_ip.map(|ip| SocketAddr::new(ip, self.dst_port)))
+            .unwrap_or(SocketAddr::new(
+                IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                self.dst_port,
+            ))
+    }
+
     pub fn source_address(&self) -> AddrDisplay<'_> {
         AddrDisplay {
             host: "",
@@ -632,6 +652,38 @@ mod tests {
         assert_eq!(m.dst_ip, before.dst_ip);
         assert_eq!(m.src_port, before.src_port);
         assert_eq!(m.dst_port, before.dst_port);
+    }
+
+    /// `dns_udp_dst` ordering (issue #974): the listener-captured claim
+    /// wins over any resolved `dst_ip` — a fake-IP flow must echo replies
+    /// from the fake address the client believes in. A domain claim has
+    /// no IP form, so resolution stands in; with neither, the unspecified
+    /// wildcard still carries the port the reply pretends to come from.
+    #[test]
+    fn dns_udp_dst_prefers_claimed_then_resolved() {
+        let claimed: SocketAddr = "198.51.100.53:53".parse().unwrap();
+        let resolved: IpAddr = "203.0.113.9".parse().unwrap();
+        let m = Metadata {
+            host: "example.com".into(),
+            dst_ip: Some(resolved),
+            dst_port: 53,
+            ..Default::default()
+        };
+        assert_eq!(m.dns_udp_dst(Some(claimed)), claimed);
+
+        // Domain claim: the resolved address stands in for it.
+        assert_eq!(m.dns_udp_dst(None), SocketAddr::new(resolved, 53));
+
+        // Nothing resolved and nothing claimed: wildcard + the port.
+        let m = Metadata {
+            host: "example.com".into(),
+            dst_port: 5353,
+            ..Default::default()
+        };
+        assert_eq!(
+            m.dns_udp_dst(None),
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 5353)
+        );
     }
 
     #[test]
