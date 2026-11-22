@@ -1989,6 +1989,147 @@ async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
     );
 }
 
+/// Issue #974 review: the forced verbatim-commit fallback keeps the
+/// previous route table, but the committed document's `dns:` verdict must
+/// still publish — a verbatim `dns.enable: false` installs the disabled
+/// generation, so a `type: dns` leaf's answers flip to SERVFAIL even
+/// though the route table (and the leaf adapter itself) was kept. Before
+/// the fix the lane committed with `PendingPublish::default()`, so the
+/// old enabled generation kept answering and a later same-inputs PUT
+/// short-circuited on `dns_inputs_equal` without reconciling.
+#[tokio::test]
+async fn put_configs_force_verbatim_publishes_dns_disable() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name, RData, RecordType};
+    use meow_common::Metadata;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Committed: DNS enabled with a hosts answer and a `type: dns` leaf
+    // reached by DST-PORT,53. Rebuild through the runtime lane so the
+    // leaf binds the tunnel's outbound cell — the production publish —
+    // then install the enabled generation the way
+    // `install_resolver_everywhere` does.
+    let raw = meow_config::parse_raw_yaml(
+        "mode: rule\n\
+         dns:\n\
+         \x20 enable: true\n\
+         \x20 nameserver: [127.0.0.1:9]\n\
+         proxies:\n\
+         \x20 - {name: dns-out, type: dns}\n\
+         rules:\n\
+         \x20 - DST-PORT,53,dns-out\n",
+    )
+    .unwrap();
+    let state = test_state(raw);
+    let mut hosts = DomainTrie::new();
+    hosts.insert(
+        "example.com",
+        HostEntry::Addresses(vec!["10.0.0.1".parse().unwrap()]),
+    );
+    state.tunnel.set_resolver(
+        Arc::new(Resolver::new(
+            vec!["127.0.0.1:9".parse().unwrap()],
+            vec![],
+            DnsMode::Normal,
+            hosts,
+            true,
+            true,
+        )),
+        true,
+    );
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw_runtime(
+        &state.raw_config.read().clone(),
+        Some(&state.tunnel.resolver_slot()),
+        &HashMap::new(),
+        None,
+        &state.provider_dialer_registry,
+        &state.tunnel.selection_backing(),
+        &state.tunnel.dns_outbound_cell(),
+    )
+    .unwrap();
+    state.tunnel.update_proxies(proxies, Default::default());
+    state.tunnel.update_rules_with_sub_rules(rules, sub_rules);
+    *state.tunnel.dns_outbound_cell().write() = Some(state.tunnel.resolver_slot());
+
+    async fn leaf_exchange(state: &Arc<AppState>, id: u16) -> Message {
+        let metadata = Metadata {
+            host: "example.com".into(),
+            dst_port: 53,
+            ..Default::default()
+        };
+        let ResolvedTarget { adapter, .. } =
+            state.tunnel.inner().resolve_proxy(&metadata).await.unwrap();
+        assert_eq!(adapter.name(), "dns-out");
+        let mut conn = adapter.dial_tcp(&metadata).await.unwrap();
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let wire = query.to_vec().unwrap();
+        conn.write_all(&(wire.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        conn.write_all(&wire).await.unwrap();
+        conn.flush().await.unwrap();
+        let mut prefix = [0u8; 2];
+        conn.read_exact(&mut prefix).await.unwrap();
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+        conn.read_exact(&mut body).await.unwrap();
+        Message::from_vec(&body).unwrap()
+    }
+
+    let before = leaf_exchange(&state, 1).await;
+    assert_eq!(before.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        before.answers[0].data,
+        RData::A("10.0.0.1".parse().unwrap()),
+        "the enabled generation must answer the hosts hit"
+    );
+
+    // Duplicate group names fail strict AND lenient — the verbatim lane
+    // commits the document as written. Its `dns.enable: false` must still
+    // install into the resolver slot the kept leaf reads.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(format!(
+        "mode: rule\n\
+         dns:\n\
+         \x20 enable: false\n\
+         {UNBUILDABLE}"
+    ));
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "payload": payload }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let after = leaf_exchange(&state, 2).await;
+    assert_eq!(
+        after.metadata.response_code,
+        ResponseCode::ServFail,
+        "a verbatim `dns.enable: false` commit must publish the disabled \
+         generation to the dns-outbound cell"
+    );
+}
+
 /// Issue #974 review: the forced verbatim-commit fallback compares
 /// effective `ntp:` values only — a candidate that keeps the committed
 /// `ntp:` block verbatim but deletes the named `dialer-proxy` target
