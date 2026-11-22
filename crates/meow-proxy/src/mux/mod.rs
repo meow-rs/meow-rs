@@ -15,6 +15,7 @@
 //! See docs/specs/proxy-mux.md for the full wire specification.
 
 pub mod address;
+pub mod brutal;
 pub mod client;
 pub mod h2mux;
 pub mod muxcool;
@@ -25,6 +26,7 @@ pub mod smux;
 pub mod stream;
 pub mod yamux;
 
+pub use brutal::MuxBrutal;
 pub use client::{DialFn, MuxClient, MuxOptions};
 pub use packet::MuxPacketConn;
 pub use stream::MuxStreamConn;

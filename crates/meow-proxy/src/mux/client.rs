@@ -5,6 +5,7 @@
 //! on the session with the fewest streams, new sessions are dialed only when
 //! the configured connection/stream bounds are reached.
 
+use super::brutal::{self, MuxBrutal};
 use super::h2mux;
 use super::muxcool;
 use super::packet::MuxPacketConn;
@@ -25,7 +26,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::sync::Mutex;
 
 /// Idle sessions (zero streams) are closed after this long.
@@ -52,6 +53,14 @@ pub struct MuxOptions {
     /// Route UDP through the plain proxy path instead of mux streams
     /// (mihomo SingMuxOption.OnlyTcp).
     pub only_tcp: bool,
+    /// TCP Brutal rate negotiation (mihomo `smux.brutal-opts`, sing-mux
+    /// `BrutalOptions`; `Some` == `enabled: true`): pins every stream to
+    /// `sessions[0]` — the carrier pool collapses to one physical
+    /// connection — and runs the `_BrutalBwExchange` handshake on each
+    /// new carrier before it is pooled. Sing-mux only; the parser
+    /// rejects it under `protocol: muxcool` and programmatic
+    /// construction gets the same verdict at session setup.
+    pub brutal: Option<MuxBrutal>,
 }
 
 impl Default for MuxOptions {
@@ -64,6 +73,7 @@ impl Default for MuxOptions {
             min_streams: 4,
             max_streams: 4,
             only_tcp: false,
+            brutal: None,
         }
     }
 }
@@ -587,6 +597,19 @@ impl MuxClient {
             let idle = now.wrapping_sub(s.last_used_ms.load(Ordering::SeqCst));
             s.streams.load(Ordering::SeqCst) > 0 || idle < IDLE_TIMEOUT.as_millis() as Uint
         });
+        // `brutal.Enabled` pins every stream to the first carrier
+        // (sing-mux `Client.offer`'s `sessions[0]` — unconditional, no
+        // capacity check): the pool collapses to one physical connection
+        // and max/min-streams are dead weight under it. `fetch_add` *is*
+        // the reservation — a bounded CAS like the normal path would be
+        // wrong precisely because there is no bound here.
+        if self.options.brutal.is_some() {
+            if let Some(session) = sessions.front() {
+                session.streams.fetch_add(1, Ordering::SeqCst);
+                return Ok(Arc::clone(session));
+            }
+            return self.offer_new_locked(&mut sessions).await;
+        }
         let options = &self.options;
         let best = sessions
             .iter()
@@ -682,7 +705,33 @@ impl MuxClient {
     }
 
     async fn create_session(&self) -> Result<SessionKind> {
-        let mut conn = (self.dial)().await?;
+        if self.options.brutal.is_some() && self.options.protocol == Protocol::MuxCool {
+            // The parser rejects `brutal-opts` + `protocol: muxcool`; a
+            // programmatic construction gets the same verdict at session
+            // setup rather than a silently dead option (Mux.Cool is Xray
+            // frame mux — the `_BrutalBwExchange` control stream would
+            // only reach a server that does not speak it).
+            return Err(MeowError::Proxy(
+                "mux: brutal-opts is sing-mux only (smux/yamux/h2mux); \
+                 `protocol: muxcool` has no bandwidth exchange"
+                    .into(),
+            ));
+        }
+        // One cell per carrier dial, scoped unconditionally: `Some(cell)`
+        // collects the physical socket(s) `connect_tcp` opens so
+        // `apply_rate` below lands on them — Go's `Cast[syscall.Conn]`
+        // bottom-unwrap by other means, hitting the front hop's socket
+        // under `dialer-proxy` since the cell outlives the front's
+        // `dialer_opts_scope` replacement. `None` shadows an outer cell —
+        // mux-over-mux keeps this session's kernel sockets out of a rear
+        // node's stash (upstream's "nested multiplexing is not
+        // supported"), so the rear's `apply_rate` debug-logs an empty set.
+        let carrier = self
+            .options
+            .brutal
+            .map(|_| Arc::new(meow_common::BrutalCarrier::new()));
+        let dial = (self.dial)();
+        let mut conn = meow_common::brutal_carrier_scope(carrier.clone(), dial).await?;
         match self.options.protocol {
             Protocol::Smux | Protocol::Yamux | Protocol::H2Mux => {
                 let header = Request::new(
@@ -701,7 +750,7 @@ impl MuxClient {
                 } else {
                     conn
                 };
-                Ok(match self.options.protocol {
+                let kind = match self.options.protocol {
                     Protocol::Smux => SessionKind::Smux(Arc::new(
                         smux::Session::client(conn).map_err(MeowError::Io)?,
                     )),
@@ -712,7 +761,14 @@ impl MuxClient {
                         h2mux::Session::client(conn).await.map_err(MeowError::Io)?,
                     )),
                     Protocol::MuxCool => unreachable!("handled above"),
-                })
+                };
+                if let (Some(brutal), Some(cell)) = (self.options.brutal, &carrier) {
+                    // Still inside SESSION_SETUP_TIMEOUT, as upstream's
+                    // offerNew TCPTimeout bounds it; an exchange error
+                    // propagates and kills this carrier dial.
+                    self.brutal_exchange(&kind, brutal, cell).await?;
+                }
+                Ok(kind)
             }
             Protocol::MuxCool => Ok(SessionKind::MuxCool(
                 muxcool::MuxCoolSession::client(conn)
@@ -720,6 +776,56 @@ impl MuxClient {
                     .map_err(MeowError::Io)?,
             )),
         }
+    }
+
+    /// sing-mux `(*Client).brutalExchange` on a freshly built session:
+    /// open a stream to `_BrutalBwExchange:0`, write `receive_bps` u64
+    /// BE, read `[ok u8]` → `u64 BE serverReceiveBPS` or `!ok` → a
+    /// vstring message. Then `min(send_bps, serverReceiveBPS)` is applied
+    /// to the carrier's stashed physical socket(s). Any error propagates
+    /// — upstream kills the carrier dial the same way (`conn.Close()` +
+    /// `session.Close()`); only the socket-apply half is non-fatal
+    /// (inside `apply_rate`, matching upstream's Debug log). Returns the
+    /// negotiated rate for test assertions.
+    async fn brutal_exchange(
+        &self,
+        kind: &SessionKind,
+        brutal: MuxBrutal,
+        carrier: &meow_common::BrutalCarrier,
+    ) -> Result<u64> {
+        let mut stream = kind
+            .open_stream(brutal::BRUTAL_EXCHANGE_DOMAIN, 0, false)
+            .await
+            .map_err(MeowError::Io)?;
+        // The stream's drop below is its close — upstream `conn.Close()`.
+        let server_recv = async {
+            stream
+                .write_all(&brutal.receive_bps.to_be_bytes())
+                .await
+                .map_err(MeowError::Io)?;
+            stream.flush().await.map_err(MeowError::Io)?;
+            let mut ok = [0u8; 1];
+            // The first read consumes the sing-mux status byte via
+            // `poll_response`; `ok` here is the brutal-level bool
+            // (`binary.Write(bool)` — nonzero means success).
+            stream.read_exact(&mut ok).await.map_err(MeowError::Io)?;
+            if ok[0] == 0 {
+                let message = brutal::read_vstring(&mut stream)
+                    .await
+                    .map_err(MeowError::Io)?;
+                return Err(MeowError::Proxy(format!("remote error: {message}")));
+            }
+            let mut bps = [0u8; 8];
+            stream.read_exact(&mut bps).await.map_err(MeowError::Io)?;
+            Ok(u64::from_be_bytes(bps))
+        }
+        .await;
+        drop(stream);
+        let server_recv =
+            server_recv.map_err(|e| MeowError::Proxy(format!("mux: brutal exchange: {e}")))?;
+        let rate = brutal.send_bps.min(server_recv);
+        carrier.apply_rate(rate);
+        Ok(rate)
     }
 }
 
@@ -1342,5 +1448,311 @@ mod tests {
         assert_eq!(sessions[0].generation, client.generation());
         drop(sessions);
         drop(stream);
+    }
+
+    // ─── TCP Brutal exchange (smux.brutal-opts, issue #974) ────────────
+
+    const WIRE_CMD_SYN: u8 = 0;
+    const WIRE_CMD_PSH: u8 = 2;
+    const WIRE_CMD_NOP: u8 = 3;
+
+    /// What the scripted far end answers on the `_BrutalBwExchange`
+    /// control stream.
+    enum BrutalReply {
+        /// `[ok=1][u64 BE serverReceiveBPS]`.
+        Ok(u64),
+        /// `[ok=0][vstring message]` — the server's refusal.
+        Err(&'static str),
+    }
+
+    #[derive(Default)]
+    struct WireCapture {
+        /// Concatenated PSH payloads of the exchange stream.
+        exchange_payload: Vec<u8>,
+        /// Stream ids of every post-exchange SYN the server saw.
+        opened_sids: Vec<u32>,
+    }
+
+    fn smux_wire_frame(cmd: u8, sid: u32, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + data.len());
+        out.push(1); // smux v1
+        out.push(cmd);
+        out.extend_from_slice(&(data.len() as u16).to_le_bytes());
+        out.extend_from_slice(&sid.to_le_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    async fn read_wire_frame(io: &mut tokio::io::DuplexStream) -> (u8, u32, Vec<u8>) {
+        let mut hdr = [0u8; 8];
+        io.read_exact(&mut hdr).await.unwrap();
+        assert_eq!(hdr[0], 1, "smux frame version");
+        let len = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+        let sid = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+        let mut data = vec![0u8; len];
+        io.read_exact(&mut data).await.unwrap();
+        (hdr[1], sid, data)
+    }
+
+    /// The scripted far end of one brutal carrier dial: v1 request
+    /// header, the exchange stream's SYN on sid 1, its request prefix +
+    /// u64 receive_bps across PSH payloads, the scripted reply, then SYN
+    /// sid collection while draining everything else (FINs, user
+    /// streams' PSH) so the client's writer never backpressures.
+    fn spawn_brutal_wire_server(
+        mut io: tokio::io::DuplexStream,
+        reply: BrutalReply,
+        capture: Arc<std::sync::Mutex<WireCapture>>,
+    ) {
+        tokio::spawn(async move {
+            // sing-mux request header: unpadded sessions are version 0 —
+            // two bytes, [version][protocol], no padding flag.
+            let mut hdr = [0u8; 2];
+            io.read_exact(&mut hdr).await.unwrap();
+            assert_eq!(&hdr, &[0, Protocol::Smux as u8]);
+
+            // The first stream on a brutal session must be the exchange.
+            let (cmd, sid, _) = read_wire_frame(&mut io).await;
+            assert_eq!(
+                (cmd, sid),
+                (WIRE_CMD_SYN, 1),
+                "the first smux stream must be _BrutalBwExchange"
+            );
+
+            // request prefix = [flags u16 BE][0x03][u8 len][domain][port u16
+            // BE]; the client's receive_bps follows as u64 BE. Both may span
+            // several PSH frames — accumulate until the whole thing lands.
+            let want = 2 + 2 + brutal::BRUTAL_EXCHANGE_DOMAIN.len() + 2 + 8;
+            let mut payload = Vec::new();
+            while payload.len() < want {
+                let (cmd, sid, data) = read_wire_frame(&mut io).await;
+                match cmd {
+                    WIRE_CMD_PSH => {
+                        assert_eq!(sid, 1, "exchange payload must stay on sid 1");
+                        payload.extend_from_slice(&data);
+                    }
+                    WIRE_CMD_NOP => {}
+                    other => panic!("unexpected cmd {other} while the exchange runs"),
+                }
+            }
+            capture.lock().unwrap().exchange_payload = payload;
+
+            // ReadBrutalResponse's wire shape: the stream status byte, the
+            // brutal ok bool, then u64 BE serverReceiveBPS or a vstring.
+            let mut resp = vec![0u8];
+            match reply {
+                BrutalReply::Ok(bps) => {
+                    resp.push(1);
+                    resp.extend_from_slice(&bps.to_be_bytes());
+                }
+                BrutalReply::Err(msg) => {
+                    resp.push(0);
+                    // uvarint length — every scripted message is < 128 bytes.
+                    resp.push(msg.len() as u8);
+                    resp.extend_from_slice(msg.as_bytes());
+                }
+            }
+            io.write_all(&smux_wire_frame(WIRE_CMD_PSH, 1, &resp))
+                .await
+                .unwrap();
+
+            // The exchange stream's drop-FIN and the user streams' SYN/PSH
+            // frames arrive in either order from here — record SYNs, drain
+            // the rest, and exit when the session is torn down.
+            loop {
+                let mut hdr = [0u8; 8];
+                if io.read_exact(&mut hdr).await.is_err() {
+                    return;
+                }
+                let len = u16::from_le_bytes([hdr[2], hdr[3]]) as usize;
+                let sid = u32::from_le_bytes([hdr[4], hdr[5], hdr[6], hdr[7]]);
+                if hdr[1] == WIRE_CMD_SYN {
+                    capture.lock().unwrap().opened_sids.push(sid);
+                }
+                let mut scratch = vec![0u8; len];
+                if io.read_exact(&mut scratch).await.is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    /// A brutal-enabled client whose dials each spawn the scripted
+    /// exchange server; `decide` picks that dial's reply.
+    fn mock_brutal_client(
+        dials: Arc<AtomicUsize>,
+        captures: Arc<std::sync::Mutex<Vec<Arc<std::sync::Mutex<WireCapture>>>>>,
+        decide: impl Fn(usize) -> BrutalReply + Send + Sync + 'static,
+    ) -> Arc<MuxClient> {
+        let decide = Arc::new(decide);
+        let dial: DialFn = Arc::new(move || {
+            let dials = Arc::clone(&dials);
+            let captures = Arc::clone(&captures);
+            let decide = Arc::clone(&decide);
+            Box::pin(async move {
+                let index = dials.fetch_add(1, Ordering::SeqCst);
+                let capture = Arc::new(std::sync::Mutex::new(WireCapture::default()));
+                captures.lock().unwrap().push(Arc::clone(&capture));
+                let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+                spawn_brutal_wire_server(server_io, decide(index), capture);
+                Ok(Box::new(TestConn(client_io)) as Box<dyn ProxyConn>)
+            })
+        });
+        MuxClient::new(
+            dial,
+            MuxOptions {
+                protocol: Protocol::Smux,
+                brutal: Some(MuxBrutal {
+                    send_bps: 10_000_000,
+                    receive_bps: 20_000_000,
+                }),
+                ..MuxOptions::default()
+            },
+        )
+    }
+
+    /// Assert the captured exchange payload is exactly the stream request
+    /// to `_BrutalBwExchange:0` followed by the configured receive_bps.
+    fn assert_exchange_payload(capture: &std::sync::Mutex<WireCapture>, receive_bps: u64) {
+        let p = capture.lock().unwrap().exchange_payload.clone();
+        let domain = brutal::BRUTAL_EXCHANGE_DOMAIN;
+        assert_eq!(&p[..2], &[0, 0], "stream request flags");
+        assert_eq!(p[2], 0x03, "FQDN socksaddr type");
+        assert_eq!(p[3] as usize, domain.len());
+        let name_end = 4 + domain.len();
+        assert_eq!(&p[4..name_end], domain.as_bytes());
+        assert_eq!(&p[name_end..name_end + 2], &[0, 0], "exchange port is 0");
+        let sent = u64::from_be_bytes(p[name_end + 2..name_end + 10].try_into().unwrap());
+        assert_eq!(sent, receive_bps, "client receive_bps on the wire");
+    }
+
+    #[tokio::test]
+    async fn brutal_exchange_runs_then_streams_pin_to_one_carrier() {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let captures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        // Server receives at 5 MB/s; our configured up is 10 MB/s, so the
+        // negotiated rate is the min — the exchange is what accepts the
+        // session, not the reply's value.
+        let client = mock_brutal_client(Arc::clone(&dials), Arc::clone(&captures), |_| {
+            BrutalReply::Ok(5_000_000)
+        });
+
+        let mut streams = Vec::new();
+        for _ in 0..8 {
+            streams.push(client.open_stream("a.example", 80).await.unwrap());
+        }
+        assert_eq!(
+            dials.load(Ordering::SeqCst),
+            1,
+            "brutal pins every stream to the first carrier"
+        );
+        {
+            let sessions = client.sessions.lock().await;
+            assert_eq!(sessions.len(), 1);
+            assert_eq!(sessions[0].streams.load(Ordering::SeqCst), 8);
+        }
+        let captures = captures.lock().unwrap();
+        assert_eq!(captures.len(), 1, "one dial = one exchange");
+        assert_exchange_payload(&captures[0], 20_000_000);
+    }
+
+    /// Concurrent offers must all land on the single brutal carrier.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn brutal_concurrent_offers_share_one_carrier() {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let captures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = mock_brutal_client(Arc::clone(&dials), Arc::clone(&captures), |_| {
+            BrutalReply::Ok(50_000_000)
+        });
+        let handles: Vec<_> = (0..16)
+            .map(|i| {
+                let client = Arc::clone(&client);
+                tokio::spawn(async move {
+                    client
+                        .open_stream(format!("h{i}.example").as_str(), 443)
+                        .await
+                        .unwrap()
+                })
+            })
+            .collect();
+        let mut streams = Vec::new();
+        for handle in handles {
+            streams.push(handle.await.unwrap());
+        }
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        let sessions = client.sessions.lock().await;
+        assert_eq!(sessions.len(), 1, "the pool collapses to one carrier");
+        assert_eq!(sessions[0].streams.load(Ordering::SeqCst), 16);
+        drop(sessions);
+        drop(streams);
+    }
+
+    /// A `!ok` reply carries the server's vstring message; the exchange
+    /// failure kills the carrier dial (upstream `conn.Close()` +
+    /// `session.Close()` parity) so the open errors and the next open
+    /// redials — where a success reply lets the second session through.
+    #[tokio::test]
+    async fn brutal_remote_error_kills_the_carrier_dial() {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let captures = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let client = mock_brutal_client(Arc::clone(&dials), Arc::clone(&captures), |index| {
+            if index == 0 {
+                BrutalReply::Err("bandwidth limit exceeded")
+            } else {
+                BrutalReply::Ok(50_000_000)
+            }
+        });
+
+        let err = client
+            .open_stream("a.example", 80)
+            .await
+            .err()
+            .expect("a !ok exchange must fail the open");
+        assert!(
+            err.to_string()
+                .contains("remote error: bandwidth limit exceeded"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        {
+            let sessions = client.sessions.lock().await;
+            assert!(sessions.is_empty(), "a failed carrier is never pooled");
+        }
+
+        let _stream = client.open_stream("a.example", 80).await.unwrap();
+        assert_eq!(dials.load(Ordering::SeqCst), 2, "the next open redials");
+    }
+
+    /// Programmatic `brutal` + `muxcool` hits the same verdict the parser
+    /// gives — before any dial.
+    #[tokio::test]
+    async fn brutal_muxcool_is_rejected_without_dialing() {
+        let dials = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&dials);
+        let dial: DialFn = Arc::new(move || {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Box::pin(std::future::pending::<Result<Box<dyn ProxyConn>>>())
+        });
+        let client = MuxClient::new(
+            dial,
+            MuxOptions {
+                protocol: Protocol::MuxCool,
+                brutal: Some(MuxBrutal {
+                    send_bps: 1_000_000,
+                    receive_bps: 1_000_000,
+                }),
+                ..MuxOptions::default()
+            },
+        );
+        let err = client
+            .open_stream("a.example", 80)
+            .await
+            .err()
+            .expect("brutal + muxcool must be rejected");
+        assert!(
+            err.to_string().contains("sing-mux only"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(dials.load(Ordering::SeqCst), 0);
     }
 }
