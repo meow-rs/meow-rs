@@ -2187,6 +2187,7 @@ async fn apply_raw_to_tunnel(
         cache_dir,
         state.provider_dialer_registry.clone(),
         state.tunnel.selection_backing(),
+        state.tunnel.dns_outbound_cell(),
     )
     .await
     .map_err(|e| (StatusCode::BAD_REQUEST, e))?;
@@ -2994,7 +2995,16 @@ pub fn install_resolver_everywhere(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
-    tunnel.set_resolver(Arc::clone(&dns.resolver));
+    tunnel.set_resolver(Arc::clone(&dns.resolver), dns.enabled);
+
+    // Bind the dns-outbound indirection to the tunnel's live slot
+    // (issue #974): `type: dns` leaves parsed under this or any earlier
+    // config — including provider nodes — read the *generation* inside
+    // the slot, so one write serves every past and future swap. The
+    // `enabled` verdict travels inside `ResolverGen`, so a disabled
+    // `dns:` section still binds: the leaves SERVFAIL on `enabled`, not
+    // on an unbound cell.
+    *tunnel.dns_outbound_cell().write() = Some(tunnel.resolver_slot());
 
     // Same host-resolver policy as `main.rs` startup: installed whenever
     // DNS is enabled, unconditionally on VPN platforms where it is the
@@ -3012,7 +3022,10 @@ pub fn install_resolver_everywhere(
     }
 
     if let Some(h) = dns_server.read().as_ref() {
-        *h.resolver_slot.write() = Arc::clone(&dns.resolver);
+        *h.resolver_slot.write() = meow_dns::ResolverGen {
+            resolver: Arc::clone(&dns.resolver),
+            enabled: dns.enabled,
+        };
     }
 }
 
@@ -3173,6 +3186,9 @@ async fn rebuild_from_raw_runtime_async(
     // persisted picks and the commit's epoch bump fences correctly
     // (issue #974).
     selection: Arc<meow_proxy::SelectionBacking>,
+    // The tunnel's dns-outbound indirection — `type: dns` leaves the
+    // candidate builds resolve the live slot through it (issue #974).
+    provider_dns_cell: meow_dns::DnsOutboundCell,
 ) -> Result<meow_config::RebuildResult, String> {
     // Carry the caller's tracing dispatcher into the rebuild thread — the
     // same propagation `spawn_blocking_with_current_dispatcher` applies
@@ -3188,6 +3204,7 @@ async fn rebuild_from_raw_runtime_async(
                 cache_dir.as_deref(),
                 &provider_dialer_registry,
                 &selection,
+                &provider_dns_cell,
             )
         })
     })
@@ -4735,12 +4752,18 @@ async fn swap_config_and_reconcile_tun(
                 .tunnel
                 .selection_backing()
                 .commit(routing.store_selected);
-            // The resolver swap precedes the route publish: the swap drops
-            // the old `RouteTable` and its dialer-registry cell, so every
-            // consumer — the tunnel slot, the host hook, a live
-            // `dns.listen` server — must already serve the new generation
-            // or chained `#name` upstreams fail closed in between
-            // (issue #533 review).
+            // The resolver swap precedes the route publish: the swap
+            // drops the old `RouteTable` and its dialer-registry cell, so
+            // every consumer — the tunnel slot, the host hook, a live
+            // `dns.listen` server, every `type: dns` outbound reading the
+            // shared cell — must already serve the new generation or
+            // chained `#name` upstreams fail closed in between
+            // (issue #533 review). The `else` arm covers the lanes that
+            // keep the previous route table — PATCH and the forced
+            // verbatim fallback — where the committed document's `dns:`
+            // verdict (enabled bit included) must still land or a
+            // verbatim `dns.enable: false` commit leaves the old enabled
+            // generation answering (issue #974 review).
             if let Some((dns, plan)) = dns {
                 install_dns_publish(&state.tunnel, &state.dns_server, &dns, plan);
             }
@@ -5302,6 +5325,7 @@ async fn put_configs(
         cache_dir.clone(),
         state.provider_dialer_registry.clone(),
         state.tunnel.selection_backing(),
+        state.tunnel.dns_outbound_cell(),
     )
     .await
     {
@@ -5327,6 +5351,7 @@ async fn put_configs(
                     cache_dir.clone(),
                     state.provider_dialer_registry.clone(),
                     state.tunnel.selection_backing(),
+                    state.tunnel.dns_outbound_cell(),
                 )
                 .await
                 {
@@ -5478,6 +5503,23 @@ async fn put_configs(
                 }
             }
         }
+        // `type: dns` carries the same verbatim-commit obligation: the
+        // force path never ran the build's structural gate, so a dns node
+        // missing `name` must be refused here — everything else the type
+        // tolerates by contract (issue #974).
+        for node in raw_config.proxies.as_deref().unwrap_or(&[]) {
+            if node.get("type").and_then(|v| v.as_str()) == Some("dns") {
+                if let Err(e) = meow_config::proxy_parser::check_dns_node(node) {
+                    return reload_rejected(
+                        StatusCode::BAD_REQUEST,
+                        &format!(
+                            "config validation failed under force, and the candidate's \
+                             dns nodes are structurally unsafe to commit verbatim: {e}"
+                        ),
+                    );
+                }
+            }
+        }
         // The name set the edges are judged against is the map the build
         // produces — last-wins and built-in shadows included — not every
         // raw `type: rematch` declaration: a rematch shadowed by a later
@@ -5485,6 +5527,13 @@ async fn put_configs(
         // `dialer-proxy` binds (issue #974).
         let rematch_names =
             meow_config::declared_rematch_names(raw_config.proxies.as_deref().unwrap_or(&[]));
+        // `type: dns` leaves fail the same two contracts a rematch does —
+        // neither can front a `dialer-proxy` hop nor carry a relay leg
+        // (issue #974) — so the edge/membership sweeps judge the union.
+        let dns_names =
+            meow_config::declared_dns_names(raw_config.proxies.as_deref().unwrap_or(&[]));
+        let non_transport_names =
+            |name: &str| rematch_names.contains(name) || dns_names.contains(name);
         // The reverse edge is the same hard defect the build's
         // `apply_dialer_proxies_validate` reports: a `dialer-proxy`
         // naming a statically known rematch leaf can never carry the
@@ -5495,13 +5544,13 @@ async fn put_configs(
         match meow_config::declared_dialer_edges(raw_config.proxies.as_deref().unwrap_or(&[])) {
             Ok(edges) => {
                 for (_, dialer) in edges {
-                    if rematch_names.contains(dialer.as_str()) {
+                    if non_transport_names(dialer.as_str()) {
                         return reload_rejected(
                             StatusCode::BAD_REQUEST,
                             &format!(
                                 "config validation failed under force, and the candidate's \
                                  dialer-proxy edges are structurally unsafe to commit verbatim: \
-                                 dialer-proxy '{dialer}' is a rematch control outbound",
+                                 dialer-proxy '{dialer}' is a control/resolver leaf",
                             ),
                         );
                     }
@@ -5531,28 +5580,29 @@ async fn put_configs(
                 // Untrimmed like the build's `proxies.get(member)` — a
                 // padded member name the registry never binds must not
                 // collide with a leaf it never becomes.
-                if rematch_names.contains(member.as_str()) {
+                if non_transport_names(member.as_str()) {
                     return reload_rejected(
                         StatusCode::BAD_REQUEST,
                         &format!(
                             "config validation failed under force, and the candidate's \
                              relay groups are structurally unsafe to commit verbatim: \
-                             relay group '{}' member '{member}' is a rematch \
-                             control outbound",
+                             relay group '{}' member '{member}' is a control/resolver \
+                             leaf",
                             group.name,
                         ),
                     );
                 }
             }
             if group.include_all_proxies.unwrap_or(false) {
-                if let Some(leaf) = rematch_names.iter().next() {
+                let leaf = rematch_names.iter().chain(dns_names.iter()).next();
+                if let Some(leaf) = leaf {
                     return reload_rejected(
                         StatusCode::BAD_REQUEST,
                         &format!(
                             "config validation failed under force, and the candidate's \
                              relay groups are structurally unsafe to commit verbatim: \
-                             relay group '{}' include-all-proxies supplies rematch \
-                             control outbound '{leaf}'",
+                             relay group '{}' include-all-proxies supplies \
+                             control/resolver leaf '{leaf}'",
                             group.name,
                         ),
                     );
@@ -5608,6 +5658,36 @@ async fn put_configs(
             }
         }
         let prior_resolver = state.tunnel.resolver();
+        // The committed document's `dns:` verdict must still land on the
+        // verbatim lane: it keeps the previous route table but a skipped
+        // publish leaves the old resolver generation — `dns.enable: false`
+        // in particular — answering forever, and a later same-inputs PUT
+        // short-circuits on `dns_inputs_equal` so it can never reconcile
+        // (issue #974 review). Rebuild against the KEPT proxies, provider
+        // map and the live route table's own dialer-registry cell; a
+        // rebuild failure rejects rather than committing a `dns:` section
+        // nothing can serve.
+        let verbatim_dns = {
+            let live_route = state.tunnel.route_snapshot();
+            // Cloned rather than holding the read guard across the await —
+            // the commit's `commit_registry` write would deadlock on it.
+            let rule_providers = state.rule_providers.read().clone();
+            match reconcile_dns_config(
+                &state.raw_config,
+                &raw_config,
+                state.config_path.as_deref(),
+                live_route.proxies.as_ref(),
+                Some(&rule_providers),
+                None,
+                Some(Arc::clone(&prior_resolver)),
+                Some(&live_route.dialer_registry),
+            )
+            .await
+            {
+                Ok(dns) => dns,
+                Err((code, msg)) => return reload_rejected(code, &msg),
+            }
+        };
         // No `reload_routing` ran, so tracked TCP predating the binding
         // is still live. A TUN that fails to come up is rolled back and
         // recorded there; the document is committed, so the PUT succeeds.
@@ -5615,7 +5695,10 @@ async fn put_configs(
             let _ = swap_config_and_reconcile_tun(
                 &state,
                 raw_config,
-                PendingPublish::default(),
+                PendingPublish {
+                    routing: None,
+                    dns: verbatim_dns,
+                },
                 prior_resolver,
                 preinstalled,
                 TrackedTcp::Cancel,

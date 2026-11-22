@@ -31,6 +31,7 @@ Upstream lives in `adapter/outbound/`. Current Rust adapters live in `crates/meo
 | Protocol        | Upstream | Rust port | Status  | Notes |
 |-----------------|:--------:|:---------:|---------|-------|
 | Direct          | Yes      | Yes       | OK      | `direct.rs` |
+| Dns             | Yes      | Yes       | OK      | `dns_adapter.rs` (#974): `type: dns` leaf answers the flow's DNS payload through the in-process resolver, never contacting the nominal destination — see [specs/dns-outbound.md](specs/dns-outbound.md) |
 | Reject          | Yes      | Yes       | OK      | `reject.rs` (single behaviour; upstream also has `RejectDrop`) |
 | RejectDrop      | Yes      | No        | **Gap** | `AdapterType::RejectDrop` exists in the enum but no adapter |
 | Pass            | Yes      | No        | **Gap** | Enum variant only |
@@ -356,7 +357,7 @@ These surfaced during the audit and warrant engineer follow-up even before new f
 6. **Hosts trie**: allocated in `Resolver::new` but never populated from config.
 7. **In-flight dedup**: allocated but unused (`#[allow(dead_code)]`).
 8. **Logic rules reachability**: `meow-rules/src/logic.rs` exists but `parser.rs` never dispatches `AND/OR/NOT` — verify whether logic rules can be loaded from YAML at all.
-9. **`AdapterType` enum has variants without implementations**: `RejectDrop`, `Compatible`, `Pass`, `Dns`, `Relay`, `LoadBalance`, plus many protocol variants. Either implement or remove to avoid false signals.
+9. **`AdapterType` enum has variants without implementations**: `RejectDrop`, `Compatible`, `Pass`, `Relay`, `LoadBalance`, plus many protocol variants. Either implement or remove to avoid false signals.
 
 ---
 

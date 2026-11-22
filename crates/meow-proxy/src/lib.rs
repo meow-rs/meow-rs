@@ -16,6 +16,7 @@ mod aead;
 mod certificate_pin;
 pub mod dialer;
 pub mod direct;
+pub mod dns_adapter;
 #[cfg(feature = "ss-obfs")]
 mod first_flight;
 pub mod group;
@@ -107,6 +108,7 @@ pub mod vless_adapter;
 pub mod vmess;
 
 pub use direct::DirectAdapter;
+pub use dns_adapter::DnsAdapter;
 pub use group::dialer_proxy::DialerProxyAdapter;
 pub use group::fallback::FallbackGroup;
 pub use group::load_balance::{LbStrategy, LoadBalanceGroup};

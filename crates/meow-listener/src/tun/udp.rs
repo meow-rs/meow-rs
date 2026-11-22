@@ -684,15 +684,6 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
             probe_target = inner.resolve_udp_dst(&mut metadata).await;
         } => {}
     }
-    let Some(dst_ip) = metadata.dst_ip else {
-        drop_held(&held);
-        return Err(format!(
-            "dst_ip not resolved for {}",
-            metadata.remote_address()
-        ));
-    };
-    let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
-
     // Non-hijacked client traffic follows the same policy on every port.
     // A `resolve_udp_dst` probe already produced the committed decision —
     // use it so the direct-nameserver verdict and the route agree
@@ -723,6 +714,24 @@ async fn relay_flow(tunnel: &Tunnel, spec: FlowSpec) -> Result<(), String> {
             "no matching rule for {}",
             metadata.remote_address()
         ));
+    };
+    // A `type: dns` leaf never contacts the destination — its conn only
+    // echoes this addr back as the reply source, so mandatory
+    // pre-resolution must not gate it (a fake-IP dst rewritten to an
+    // unresolvable host would die before routing) and the flow's ORIGINAL
+    // dst is what gets stamped (issue #974 review). Transports keep
+    // requiring `dst_ip` — they actually dial it.
+    let dst_addr = if proxy.adapter_type() == meow_common::AdapterType::Dns {
+        metadata.dns_udp_dst(Some(dst))
+    } else {
+        let Some(dst_ip) = metadata.dst_ip else {
+            drop_held(&held);
+            return Err(format!(
+                "dst_ip not resolved for {}",
+                metadata.remote_address()
+            ));
+        };
+        SocketAddr::new(dst_ip, metadata.dst_port)
     };
     info!(
         "UDP {} --> {} match {} using {}",
@@ -1616,7 +1625,7 @@ mod cleanup_tests {
         let resolver = dns.resolver;
         let fake = resolver.lookup_ipv4("pending.example").await.unwrap();
         let (tunnel, mut spec, _tx, probe) = fixture();
-        tunnel.set_resolver(resolver);
+        tunnel.set_resolver(resolver, true);
         spec.key.1.set_ip(fake);
         let worker_tunnel = tunnel.clone();
         let mut task = tokio::spawn(async move { relay_flow(&worker_tunnel, spec).await });

@@ -137,7 +137,7 @@ impl DirectAdapter {
         //    standalone usage).
         if !metadata.host.is_empty() {
             if let Some(resolver) = &self.resolver {
-                let resolver = Arc::clone(&resolver.read());
+                let resolver = Arc::clone(&resolver.read().resolver);
                 return Self::resolve_host_with(&resolver, metadata).await;
             }
 
@@ -172,7 +172,7 @@ impl DirectAdapter {
         self.resolver
             .as_ref()
             .or(self.direct_slot.as_ref())
-            .and_then(|slot| slot.read().direct_resolver().map(Arc::clone))
+            .and_then(|slot| slot.read().resolver.direct_resolver().map(Arc::clone))
     }
 
     /// `true` when `metadata` names a host (not an IP literal) that the
@@ -1029,7 +1029,10 @@ mod tests {
         // A config swap installs a generation carrying `direct-nameserver`.
         let mut main = hosts_only_resolver("node.test", main_ip);
         main.set_direct_resolver(Arc::new(hosts_only_resolver("node.test", direct_ip)));
-        *slot.write() = Arc::new(main);
+        *slot.write() = meow_dns::ResolverGen {
+            resolver: Arc::new(main),
+            enabled: true,
+        };
         assert_eq!(
             adapter.resolve_targets(&metadata).await.unwrap(),
             vec![SocketAddr::new(direct_ip, 443)]

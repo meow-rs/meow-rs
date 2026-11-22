@@ -1552,6 +1552,11 @@ async fn run(
     // registry; install before the first `update_routing` so it publishes
     // the initial route map (issue #489).
     tunnel.set_dialer_registry(config.provider_dialer_registry.clone());
+    // `type: dns` leaves — static and provider-sourced alike — resolve the
+    // live resolver through this cell; `install_resolver_everywhere`
+    // republishes the tunnel's slot into it on every DNS install
+    // (issue #974).
+    tunnel.set_dns_outbound_cell(Arc::clone(&config.provider_dns_cell));
     tunnel.set_mode(config.general.mode);
     tunnel.set_connection_notes(config.general.connection_notes);
     tunnel.set_tcp_idle_timeout(config.general.tcp_idle_timeout);

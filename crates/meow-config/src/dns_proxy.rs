@@ -174,6 +174,43 @@ mod tests {
             .is_err());
     }
 
+    /// Issue #974 review: a `type: dns` leaf fails `ConnType::Inner`
+    /// closed — a dialer-hop metadata must never reach its answer path.
+    /// The guard has to hold end-to-end, not just on a direct adapter
+    /// call: here through the DnsProxy nameserver wrapper (`#dns-out`)
+    /// and again through a selector group (`#sel` → dns-out), whose
+    /// picked member is only known at dial time.
+    #[tokio::test]
+    async fn dns_leaf_rejects_inner_dials_through_wrappers() {
+        use meow_common::ConnType;
+        let config = crate::load_config_from_str(
+            "\
+            proxies:\n  - {name: dns-out, type: dns}\n\
+            proxy-groups:\n  - {name: sel, type: select, proxies: [dns-out]}\n\
+            dns:\n  enable: true\n  use-system-hosts: false\n\
+              \x20 nameserver: ['udp://192.0.2.53:53#dns-out', 'udp://192.0.2.54:53#sel']\n\
+            rules: [MATCH,dns-out]\n",
+        )
+        .await
+        .unwrap();
+        let inner = Metadata {
+            conn_type: ConnType::Inner,
+            ..Default::default()
+        };
+        let leaf = config.dns.resolver.main_nameservers()[0].proxy().unwrap();
+        let group = config.dns.resolver.main_nameservers()[1].proxy().unwrap();
+        for (tag, proxy) in [("direct tag", leaf), ("selector pick", group)] {
+            assert!(
+                proxy.dial_tcp(&inner).await.is_err(),
+                "{tag}: a dns leaf must refuse the inner dial"
+            );
+            assert!(
+                proxy.dial_udp(&inner).await.is_err(),
+                "{tag}: a dns leaf must refuse the inner dial"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn dns_proxy_reload_uses_the_candidate_generation() {
         let config = crate::load_config_from_str(

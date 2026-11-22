@@ -145,14 +145,17 @@ async fn tcp_cancelled_and_failed_upstream_queries_release_work_permit() {
     assert_eq!(budget.available_permits(), 1);
     // No usable upstream: resolution fails to SERVFAIL, without retaining
     // the permit in an idle, still-open client connection.
-    *slot.write() = Arc::new(Resolver::new(
-        Vec::new(),
-        Vec::new(),
-        meow_common::DnsMode::Normal,
-        meow_trie::DomainTrie::new(),
-        false,
-        true,
-    ));
+    *slot.write() = crate::server::ResolverGen {
+        resolver: Arc::new(Resolver::new(
+            Vec::new(),
+            Vec::new(),
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        )),
+        enabled: true,
+    };
     let (mut client, server) = tokio::io::duplex(4096);
     let task = tokio::spawn(serve_tcp_stream(server, slot, Arc::clone(&budget)));
     send(&mut client, "failed.test").await;

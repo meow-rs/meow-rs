@@ -110,7 +110,10 @@ async fn emfile_child() {
         panic!("DNS listener exited under EMFILE: {:?}", task.await);
     }
     // No upstream sockets are needed: both generations are fresh cache hits.
-    *slot.write() = cached_resolver(2);
+    *slot.write() = crate::server::ResolverGen {
+        resolver: cached_resolver(2),
+        enabled: true,
+    };
     ask(&mut existing, 2).await;
     udp.send_to(&query(), addr).await.unwrap();
     let mut answer = [0; 512];

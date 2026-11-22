@@ -567,7 +567,7 @@ pub fn parse_proxy(
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let dialer: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
         std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
-    parse_proxy_with_dialer_and_fp(config, &dialer, ipv6, None)
+    parse_proxy_with_dialer_and_fp(config, &dialer, ipv6, None, None)
 }
 
 /// [`parse_proxy`] for a static `proxies:` entry. A `type: direct` entry
@@ -581,6 +581,7 @@ pub(crate) fn parse_static_proxy(
     ipv6: bool,
     resolver: Option<&meow_dns::ResolverSlot>,
     global_client_fingerprint: Option<&str>,
+    dns_cell: Option<&meow_dns::DnsOutboundCell>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     match (config.get("type").and_then(|v| v.as_str()), resolver) {
         (Some("direct"), Some(slot)) => {
@@ -597,7 +598,13 @@ pub(crate) fn parse_static_proxy(
         _ => {
             let dialer: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
                 std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
-            parse_proxy_with_dialer_and_fp(config, &dialer, ipv6, global_client_fingerprint)
+            parse_proxy_with_dialer_and_fp(
+                config,
+                &dialer,
+                ipv6,
+                global_client_fingerprint,
+                dns_cell,
+            )
         }
     }
 }
@@ -705,19 +712,23 @@ pub fn parse_proxy_provider_node(
     allow_external_plugin: bool,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
-    parse_proxy_provider_node_with_fp(config, ipv6, allow_external_plugin, dialer, None)
+    parse_proxy_provider_node_with_fp(config, ipv6, allow_external_plugin, dialer, None, None)
 }
 
 /// [`parse_proxy_provider_node`] honoring the config's top-level
 /// `global-client-fingerprint` (issue #974): the provider snapshot is
 /// parsed under the fingerprint committed for that config load, so a
 /// fingerprint change forces the provider adapters to rebuild.
+/// `dns_cell` is the provider's live-resolver indirection — provider
+/// `type: dns` leaves bind it so the commit's populated slot reaches
+/// conns parsed before DNS existed (issue #974).
 pub fn parse_proxy_provider_node_with_fp(
     config: &HashMap<String, serde_json::Value>,
     ipv6: bool,
     allow_external_plugin: bool,
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
     global_client_fingerprint: Option<&str>,
+    dns_cell: Option<&meow_dns::DnsOutboundCell>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     if !allow_external_plugin && node_selects_external_plugin(config) {
         let name = config.get("name").and_then(|v| v.as_str()).unwrap_or("?");
@@ -730,7 +741,7 @@ pub fn parse_proxy_provider_node_with_fp(
         ));
     }
     let _ = allow_external_plugin;
-    parse_proxy_with_dialer_and_fp(config, dialer, ipv6, global_client_fingerprint)
+    parse_proxy_with_dialer_and_fp(config, dialer, ipv6, global_client_fingerprint, dns_cell)
 }
 
 /// Like [parse_proxy] but injects a custom [meow_proxy::dialer::TcpDialer]
@@ -743,7 +754,7 @@ pub fn parse_proxy_with_dialer(
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
     ipv6: bool,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
-    parse_proxy_with_dialer_and_fp(config, dialer, ipv6, None)
+    parse_proxy_with_dialer_and_fp(config, dialer, ipv6, None, None)
 }
 
 /// [`parse_proxy_with_dialer`] honoring the config's top-level
@@ -754,6 +765,7 @@ pub fn parse_proxy_with_dialer_and_fp(
     dialer: &std::sync::Arc<dyn meow_proxy::dialer::TcpDialer>,
     ipv6: bool,
     global_client_fingerprint: Option<&str>,
+    dns_cell: Option<&meow_dns::DnsOutboundCell>,
 ) -> std::result::Result<Arc<dyn Proxy>, String> {
     let name = config
         .get("name")
@@ -776,6 +788,19 @@ pub fn parse_proxy_with_dialer_and_fp(
     if proxy_type == "rematch" {
         reject_unthreaded_dialer(name, "rematch", dialer)?;
         let adapter = parse_rematch(name, config)?;
+        return Ok(Arc::new(WrappedProxy::new(Box::new(adapter))));
+    }
+    // `type: dns` — an in-process resolver leaf, not a transport (issue
+    // #974). Same dispatch position as rematch: a dns node owns no
+    // `server`/`port`/socket semantics, so its endpoint and dialer
+    // fields must not reach the transport-only option parse — the
+    // warn-ignored verdict lives in `parse_dns_node` instead. No chain
+    // wrapper: `collect_dialer_edges` skips `type: dns` like rematch,
+    // and a provider-level `dialer-proxy` is peeled off before this
+    // parse runs.
+    if proxy_type == "dns" {
+        reject_unthreaded_dialer(name, "dns", dialer)?;
+        let adapter = parse_dns_node(name, config, dns_cell)?;
         return Ok(Arc::new(WrappedProxy::new(Box::new(adapter))));
     }
     // The shared per-node dialer fields (issue #974) — protocol-agnostic,
@@ -1180,6 +1205,63 @@ pub fn check_rematch_node(
         ));
     }
     Ok(())
+}
+
+/// The structural verdict on one `type: dns` node (issue #974): `name`
+/// present. Everything else is tolerated — a dns leaf carries no
+/// endpoint/protocol parameters, so `server`/`port`/`udp` and the
+/// transport family are ignored with warnings rather than rejected,
+/// even ill-typed (mihomo `C.Dns` reads no node options at all).
+/// `parse_dns_node` re-runs this so provider payloads get the same
+/// verdict node-by-node.
+pub fn check_dns_node(
+    config: &HashMap<String, serde_json::Value>,
+) -> std::result::Result<(), String> {
+    config
+        .get("name")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(|_| ())
+        .ok_or_else(|| "dns node requires a `name`".to_string())
+}
+
+/// `type: dns` — `name` is the whole node (issue #974). The leaf binds
+/// `dns_cell`, the config-scoped live-resolver indirection the commit
+/// populates with the tunnel's shared slot: provider-sourced nodes are
+/// parsed before DNS exists and persist across rebuilds, so they cannot
+/// capture a slot directly. `None` — a standalone parse with no build
+/// context — leaves the leaf unbound, i.e. SERVFAIL, never a fallback
+/// upstream.
+fn parse_dns_node(
+    name: &str,
+    config: &HashMap<String, serde_json::Value>,
+    dns_cell: Option<&meow_dns::DnsOutboundCell>,
+) -> std::result::Result<meow_proxy::DnsAdapter, String> {
+    check_dns_node(config)?;
+    // Keys that would claim an effect the leaf never has — warn rather
+    // than silently honor them. `server`/`port`/`udp` and the
+    // TLS/mux/plugin family already warn through the unknown-key
+    // inventory (`DNS_NODE_KEYS` is empty); these are the common keys
+    // that inventory accepts for real transports.
+    for key in [
+        "dialer-proxy",
+        "routing-mark",
+        "interface-name",
+        "ip-version",
+        "tfo",
+        "mptcp",
+    ] {
+        if config.get(key).is_some_and(|v| !v.is_null()) {
+            tracing::warn!(
+                "proxy '{name}': `{key}` is ignored on type: dns — the leaf \
+                 answers locally and owns no transport"
+            );
+        }
+    }
+    let cell = dns_cell
+        .cloned()
+        .unwrap_or_else(meow_dns::new_dns_outbound_cell);
+    Ok(meow_proxy::DnsAdapter::new(name, cell))
 }
 
 /// `type: rematch` — the two `target-*` fields are the whole node
@@ -5093,24 +5175,24 @@ mod tests {
             std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
 
         let bare = proxy_config(NODE);
-        let err = parse_proxy_with_dialer_and_fp(&bare, &direct, false, None)
+        let err = parse_proxy_with_dialer_and_fp(&bare, &direct, false, None, None)
             .err()
             .expect("REALITY without any fingerprint must stay refused");
         assert!(
             err.contains("REALITY is based on uTLS, please set a client-fingerprint"),
             "{err}"
         );
-        parse_proxy_with_dialer_and_fp(&bare, &direct, false, Some("chrome"))
+        parse_proxy_with_dialer_and_fp(&bare, &direct, false, Some("chrome"), None)
             .expect("the global fingerprint must satisfy REALITY");
 
         // An explicit node fingerprint wins over the global; an explicit
         // `none` stays the REALITY literal (warn + Chrome fallback), which
         // counts as set for the uTLS gate.
         let own = proxy_config(&format!("{NODE}client-fingerprint: firefox\n"));
-        parse_proxy_with_dialer_and_fp(&own, &direct, false, Some("chrome"))
+        parse_proxy_with_dialer_and_fp(&own, &direct, false, Some("chrome"), None)
             .expect("the node fingerprint must apply");
         let none = proxy_config(&format!("{NODE}client-fingerprint: none\n"));
-        parse_proxy_with_dialer_and_fp(&none, &direct, false, Some("chrome"))
+        parse_proxy_with_dialer_and_fp(&none, &direct, false, Some("chrome"), None)
             .expect("explicit none stays the REALITY literal, not a parse error");
     }
 
@@ -5125,7 +5207,7 @@ mod tests {
         let quic = proxy_config(
             "name: t\ntype: trusttunnel\nserver: t.test\nport: 443\nusername: u\npassword: p\nquic: true\n",
         );
-        let adapter = parse_proxy_with_dialer_and_fp(&quic, &direct, false, Some("chrome"))
+        let adapter = parse_proxy_with_dialer_and_fp(&quic, &direct, false, Some("chrome"), None)
             .expect("the global fingerprint is TCP-only — H3 must not inherit it");
         assert_eq!(
             adapter.client_fingerprint(),
@@ -5135,7 +5217,7 @@ mod tests {
         let with_node = proxy_config(
             "name: t\ntype: trusttunnel\nserver: t.test\nport: 443\nusername: u\npassword: p\nquic: true\nclient-fingerprint: chrome\n",
         );
-        let err = parse_proxy_with_dialer_and_fp(&with_node, &direct, false, Some("chrome"))
+        let err = parse_proxy_with_dialer_and_fp(&with_node, &direct, false, Some("chrome"), None)
             .err()
             .expect("a per-node fingerprint under H3 stays refused");
         assert!(err.contains("cannot honor client-fingerprint"), "{err}");
@@ -5150,7 +5232,7 @@ mod tests {
             std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
         let cfg =
             proxy_config("name: h\ntype: hysteria2\nserver: h.test\nport: 443\npassword: p\n");
-        parse_proxy_with_dialer_and_fp(&cfg, &direct, false, Some("chrome"))
+        parse_proxy_with_dialer_and_fp(&cfg, &direct, false, Some("chrome"), None)
             .expect("hysteria2 must ignore the uTLS global entirely");
     }
 
@@ -5170,7 +5252,7 @@ mod tests {
         let direct: std::sync::Arc<dyn meow_proxy::dialer::TcpDialer> =
             std::sync::Arc::new(meow_proxy::dialer::DirectDialer);
         let baked = |yaml: &str, global: Option<&str>| {
-            parse_proxy_with_dialer_and_fp(&proxy_config(yaml), &direct, false, global)
+            parse_proxy_with_dialer_and_fp(&proxy_config(yaml), &direct, false, global, None)
                 .map(|proxy| proxy.client_fingerprint().map(str::to_string))
         };
 
@@ -5875,7 +5957,7 @@ tls: true
         let slot = meow_dns::new_resolver_slot(Arc::new(main));
 
         let cfg = direct_config("name: 直连\ntype: direct\n");
-        let proxy = parse_static_proxy(&cfg, true, Some(&slot), None).unwrap();
+        let proxy = parse_static_proxy(&cfg, true, Some(&slot), None, None).unwrap();
         let meta = Metadata {
             network: meow_common::Network::Udp,
             host: "node.test".into(),
@@ -8441,5 +8523,117 @@ tls: true
         );
         let err = parse_proxy(&node).err().expect("must reject");
         assert!(err.contains("dialer-proxy"), "{err}");
+    }
+
+    /// `type: dns` structural gate (issue #974): `name` is the whole
+    /// contract — everything else is tolerated, even ill-typed.
+    #[test]
+    fn dns_node_structural_gate() {
+        for yaml in [
+            "type: dns",
+            "name: ''\ntype: dns",
+            "name: 7\ntype: dns",
+            "name: [x]\ntype: dns",
+        ] {
+            let node = proxy_config(yaml);
+            assert!(
+                check_dns_node(&node).is_err(),
+                "'{yaml}' must fail the gate"
+            );
+        }
+        for yaml in [
+            "name: dns-out\ntype: dns",
+            // Endpoint and transport keys are tolerated — warn-ignored,
+            // never part of the structural verdict.
+            "name: dns-out\ntype: dns\nserver: 8.8.8.8\nport: 53\nudp: false",
+            "name: dns-out\ntype: dns\nserver: [bogus]\nport: not-a-port\nudp: nope",
+            "name: dns-out\ntype: dns\ntls: true\nws-opts:\n  path: /\nsmux:\n  enabled: true",
+        ] {
+            let node = proxy_config(yaml);
+            check_dns_node(&node).unwrap_or_else(|e| panic!("'{yaml}' must pass: {e}"));
+        }
+    }
+
+    /// The dispatch builds an in-process resolver leaf: `AdapterType::Dns`,
+    /// no address, no transport wrapper — even with endpoint keys present
+    /// (mihomo's `C.Dns` reads no node options at all).
+    #[test]
+    fn dns_dispatch_builds_resolver_leaf() {
+        let node =
+            proxy_config("name: dns-out\ntype: dns\nserver: 8.8.8.8\nport: 53\nudp: false\n");
+        let proxy = parse_proxy(&node).expect("dns node parses");
+        assert_eq!(proxy.adapter_type(), meow_common::AdapterType::Dns);
+        assert_eq!(proxy.addr(), "", "a dns leaf owns no endpoint address");
+        assert!(
+            proxy.support_udp(),
+            "UDP is the leaf's own datagram path, not a transport flag"
+        );
+    }
+
+    /// `dialer-proxy` on a dns node is warn-ignored — mihomo never reads
+    /// it, and `collect_dialer_edges` never emits an edge for the type —
+    /// so the dispatch itself must accept the key rather than error.
+    /// Malformed values are equally inert.
+    #[test]
+    fn dns_dialer_proxy_key_is_ignored() {
+        for yaml in [
+            "name: dns-out\ntype: dns\ndialer-proxy: front",
+            "name: dns-out\ntype: dns\ndialer-proxy: 7",
+            "name: dns-out\ntype: dns\ndialer-proxy: [a, b]",
+            "name: dns-out\ntype: dns\ndialer-proxy: '   '",
+        ] {
+            let node = proxy_config(yaml);
+            let proxy = parse_proxy(&node).unwrap_or_else(|e| panic!("'{yaml}' must parse: {e}"));
+            assert_eq!(proxy.adapter_type(), meow_common::AdapterType::Dns);
+        }
+    }
+
+    /// A dns node parsed without a build context binds no resolver slot —
+    /// the leaf must fail closed (SERVFAIL) rather than pick an upstream.
+    #[tokio::test]
+    async fn dns_leaf_unbound_cell_fails_closed() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let node = proxy_config("name: dns-out\ntype: dns");
+        let proxy = parse_proxy(&node).expect("dns node parses");
+        let metadata = meow_common::Metadata {
+            network: meow_common::Network::Tcp,
+            host: "example.com".into(),
+            dst_port: 53,
+            ..Default::default()
+        };
+        let mut stream = proxy.dial_tcp(&metadata).await.expect("dial succeeds");
+        // RFC 1035 framing: 2-byte length + a minimal A query for
+        // example.com (id 0x1234).
+        let query: &[u8] = &[
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
+            b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let len = (query.len() as u16).to_be_bytes();
+        stream.write_all(&len).await.unwrap();
+        stream.write_all(query).await.unwrap();
+        stream.flush().await.unwrap();
+        let mut prefix = [0u8; 2];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+        stream.read_exact(&mut body).await.unwrap();
+        // RCODE is the low nibble of the second flags byte.
+        assert_eq!(body[3] & 0x0f, 2, "unbound leaf answers SERVFAIL");
+        assert_eq!(&body[..2], &query[..2], "SERVFAIL echoes the query id");
+    }
+
+    /// `connect_over` must fail — a dns leaf owns no transport to chain a
+    /// front hop's exchange through.
+    #[tokio::test]
+    async fn dns_leaf_connect_over_fails() {
+        let node = proxy_config("name: dns-out\ntype: dns");
+        let proxy = parse_proxy(&node).expect("dns node parses");
+        let metadata = meow_common::Metadata::default();
+        let conn = proxy.dial_tcp(&metadata).await.expect("dial succeeds");
+        let err = proxy
+            .connect_over(conn, &metadata)
+            .await
+            .err()
+            .expect("connect_over on a dns leaf must fail");
+        assert!(err.to_string().contains("dns"), "{err}");
     }
 }

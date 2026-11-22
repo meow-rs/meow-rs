@@ -854,6 +854,149 @@ mod tests {
         assert_eq!(stats.close_all_connections_counted(), 0);
     }
 
+    /// Leaf stub for the route map: a name plus the `AdapterType` a
+    /// built leaf would report — enough for `track_named`'s chain and the
+    /// reload's dns-leaf filter.
+    struct TypedLeaf {
+        name: &'static str,
+        ty: meow_common::AdapterType,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyAdapter for TypedLeaf {
+        fn name(&self) -> &str {
+            self.name
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            self.ty
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> meow_common::Result<Box<dyn ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("stub".to_string()))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            Err(meow_common::MeowError::NotSupported("stub".to_string()))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            static H: std::sync::OnceLock<meow_common::ProxyHealth> = std::sync::OnceLock::new();
+            H.get_or_init(meow_common::ProxyHealth::new)
+        }
+    }
+
+    impl Proxy for TypedLeaf {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// A flow committed to a `type: dns` leaf survives a cold reload on
+    /// BOTH tracking paths: its conn is an in-process pipe that re-reads
+    /// the shared resolver cell per query — the swap itself cannot
+    /// strand it. An ordinary leaf's flow is still cancelled, and the
+    /// dns-committed flow closes once the leaf is retyped or dropped from
+    /// the new map (issue #974 review).
+    #[tokio::test]
+    async fn cold_reload_spares_dns_leaf_flows() {
+        for headless in [false, true] {
+            let tunnel = test_tunnel();
+            if headless {
+                tunnel.statistics().set_headless();
+            }
+            let inner = tunnel.inner();
+            let dns_leaf = TypedLeaf {
+                name: "dns-out",
+                ty: meow_common::AdapterType::Dns,
+            };
+            let node = TypedLeaf {
+                name: "node",
+                ty: meow_common::AdapterType::Socks5,
+            };
+            let dns_flow = inner
+                .tcp_admission()
+                .track_named(&metadata(), "MATCH".into(), "".into(), &dns_leaf)
+                .unwrap();
+            let node_flow = inner
+                .tcp_admission()
+                .track_named(&metadata(), "MATCH".into(), "".into(), &node)
+                .unwrap();
+
+            let map: std::collections::HashMap<SmolStr, Arc<dyn Proxy>> =
+                std::collections::HashMap::from([
+                    (
+                        "dns-out".into(),
+                        Arc::new(TypedLeaf {
+                            name: "dns-out",
+                            ty: meow_common::AdapterType::Dns,
+                        }) as Arc<dyn Proxy>,
+                    ),
+                    (
+                        "node".into(),
+                        Arc::new(TypedLeaf {
+                            name: "node",
+                            ty: meow_common::AdapterType::Socks5,
+                        }) as Arc<dyn Proxy>,
+                    ),
+                ]);
+            assert_eq!(
+                tunnel.reload_routing(map, vec![], Default::default(), None, Default::default()),
+                1,
+                "headless={headless}: only the ordinary flow cancels"
+            );
+            assert!(node_flow.run_until_closed(async { "dial" }).await.is_none());
+            assert_eq!(
+                dns_flow.run_until_closed(async { "dial" }).await,
+                Some("dial"),
+                "headless={headless}: the dns-committed flow rides through"
+            );
+
+            // Same name retyped — it is no longer a dns leaf, so the
+            // exemption ends and the flow closes like any other.
+            let retyped: std::collections::HashMap<SmolStr, Arc<dyn Proxy>> =
+                std::collections::HashMap::from([(
+                    "dns-out".into(),
+                    Arc::new(TypedLeaf {
+                        name: "dns-out",
+                        ty: meow_common::AdapterType::Socks5,
+                    }) as Arc<dyn Proxy>,
+                )]);
+            assert_eq!(
+                tunnel.reload_routing(
+                    retyped,
+                    vec![],
+                    Default::default(),
+                    None,
+                    Default::default()
+                ),
+                1,
+                "headless={headless}: a retyped leaf loses the exemption"
+            );
+            assert!(dns_flow
+                .run_until_closed(async { panic!("closed flow must not dial") })
+                .await
+                .is_none());
+        }
+    }
+
     #[tokio::test]
     async fn concurrent_registration_cannot_escape_cold_reload() {
         for headless in [false, true] {

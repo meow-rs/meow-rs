@@ -1989,6 +1989,147 @@ async fn put_configs_force_fallback_rejects_effective_knob_diffs() {
     );
 }
 
+/// Issue #974 review: the forced verbatim-commit fallback keeps the
+/// previous route table, but the committed document's `dns:` verdict must
+/// still publish — a verbatim `dns.enable: false` installs the disabled
+/// generation, so a `type: dns` leaf's answers flip to SERVFAIL even
+/// though the route table (and the leaf adapter itself) was kept. Before
+/// the fix the lane committed with `PendingPublish::default()`, so the
+/// old enabled generation kept answering and a later same-inputs PUT
+/// short-circuited on `dns_inputs_equal` without reconciling.
+#[tokio::test]
+async fn put_configs_force_verbatim_publishes_dns_disable() {
+    let _globals_lane = process_globals_lane().await;
+    use base64::Engine as _;
+    use hickory_proto::op::{Message, MessageType, OpCode, Query, ResponseCode};
+    use hickory_proto::rr::{Name, RData, RecordType};
+    use meow_common::Metadata;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Committed: DNS enabled with a hosts answer and a `type: dns` leaf
+    // reached by DST-PORT,53. Rebuild through the runtime lane so the
+    // leaf binds the tunnel's outbound cell — the production publish —
+    // then install the enabled generation the way
+    // `install_resolver_everywhere` does.
+    let raw = meow_config::parse_raw_yaml(
+        "mode: rule\n\
+         dns:\n\
+         \x20 enable: true\n\
+         \x20 nameserver: [127.0.0.1:9]\n\
+         proxies:\n\
+         \x20 - {name: dns-out, type: dns}\n\
+         rules:\n\
+         \x20 - DST-PORT,53,dns-out\n",
+    )
+    .unwrap();
+    let state = test_state(raw);
+    let mut hosts = DomainTrie::new();
+    hosts.insert(
+        "example.com",
+        HostEntry::Addresses(vec!["10.0.0.1".parse().unwrap()]),
+    );
+    state.tunnel.set_resolver(
+        Arc::new(Resolver::new(
+            vec!["127.0.0.1:9".parse().unwrap()],
+            vec![],
+            DnsMode::Normal,
+            hosts,
+            true,
+            true,
+        )),
+        true,
+    );
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw_runtime(
+        &state.raw_config.read().clone(),
+        Some(&state.tunnel.resolver_slot()),
+        &HashMap::new(),
+        None,
+        &state.provider_dialer_registry,
+        &state.tunnel.selection_backing(),
+        &state.tunnel.dns_outbound_cell(),
+    )
+    .unwrap();
+    state.tunnel.update_proxies(proxies, Default::default());
+    state.tunnel.update_rules_with_sub_rules(rules, sub_rules);
+    *state.tunnel.dns_outbound_cell().write() = Some(state.tunnel.resolver_slot());
+
+    async fn leaf_exchange(state: &Arc<AppState>, id: u16) -> Message {
+        let metadata = Metadata {
+            host: "example.com".into(),
+            dst_port: 53,
+            ..Default::default()
+        };
+        let ResolvedTarget { adapter, .. } =
+            state.tunnel.inner().resolve_proxy(&metadata).await.unwrap();
+        assert_eq!(adapter.name(), "dns-out");
+        let mut conn = adapter.dial_tcp(&metadata).await.unwrap();
+        let mut query = Message::new(id, MessageType::Query, OpCode::Query);
+        query.add_query(Query::query(
+            Name::from_ascii("example.com.").unwrap(),
+            RecordType::A,
+        ));
+        let wire = query.to_vec().unwrap();
+        conn.write_all(&(wire.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        conn.write_all(&wire).await.unwrap();
+        conn.flush().await.unwrap();
+        let mut prefix = [0u8; 2];
+        conn.read_exact(&mut prefix).await.unwrap();
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+        conn.read_exact(&mut body).await.unwrap();
+        Message::from_vec(&body).unwrap()
+    }
+
+    let before = leaf_exchange(&state, 1).await;
+    assert_eq!(before.metadata.response_code, ResponseCode::NoError);
+    assert_eq!(
+        before.answers[0].data,
+        RData::A("10.0.0.1".parse().unwrap()),
+        "the enabled generation must answer the hosts hit"
+    );
+
+    // Duplicate group names fail strict AND lenient — the verbatim lane
+    // commits the document as written. Its `dns.enable: false` must still
+    // install into the resolver slot the kept leaf reads.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+    let payload = base64::engine::general_purpose::STANDARD.encode(format!(
+        "mode: rule\n\
+         dns:\n\
+         \x20 enable: false\n\
+         {UNBUILDABLE}"
+    ));
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "payload": payload }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    let after = leaf_exchange(&state, 2).await;
+    assert_eq!(
+        after.metadata.response_code,
+        ResponseCode::ServFail,
+        "a verbatim `dns.enable: false` commit must publish the disabled \
+         generation to the dns-outbound cell"
+    );
+}
+
 /// Issue #974 review: the forced verbatim-commit fallback compares
 /// effective `ntp:` values only — a candidate that keeps the committed
 /// `ntp:` block verbatim but deletes the named `dialer-proxy` target
@@ -10951,6 +11092,11 @@ async fn state_with_providers(
         .iter()
         .map(|(name, yaml)| ((*name).to_string(), serde_saphyr::from_str(yaml).unwrap()))
         .collect();
+    let state = test_state_default();
+    // Share the tunnel's dns-outbound cell like production provider
+    // loading — `type: dns` leaves in these providers bind the same
+    // live-resolver slot the tunnel republishes (issue #974).
+    let dns_cell = state.tunnel.dns_outbound_cell();
     let loaded = meow_config::proxy_provider::load_proxy_providers_within(
         &raw,
         Some(dir),
@@ -10959,11 +11105,11 @@ async fn state_with_providers(
         &Default::default(),
         None,
         None,
+        Some(&dns_cell),
         &mut meow_config::DroppedProviders::default(),
     )
     .await
     .unwrap();
-    let state = test_state_default();
     for (name, provider) in loaded {
         state.proxy_providers.insert(name, provider);
     }
@@ -12045,7 +12191,9 @@ async fn put_configs_fake_ip_move_while_named_tun_runs_rejected() {
         )
         .await
         .expect("dns builds");
-        state.tunnel.set_resolver(Arc::clone(&dns.resolver));
+        state
+            .tunnel
+            .set_resolver(Arc::clone(&dns.resolver), dns.enabled);
     }
     let pool_before = state.tunnel.resolver().fake_ip_v4_net();
     assert!(pool_before.is_some(), "the pin needs a live pool");
@@ -12611,6 +12759,148 @@ async fn put_configs_force_gates_malformed_rematch() {
     );
 }
 
+/// The same verbatim-commit obligation for `type: dns` (issue #974
+/// review): the force path never ran the build's structural gate, so
+/// shape defects the next boot would hard-fail — a nameless dns node, a
+/// transport chaining a dialer hop through a dns leaf, a relay member
+/// or `include-all-proxies` naming one — are refused rather than
+/// committed. The name set is the CONSERVATIVE `declared_dns_names`
+/// view: any raw dns declaration marks the name, since a later shadow
+/// may warn-drop and leave the dns binding standing.
+#[tokio::test]
+async fn put_configs_force_gates_malformed_dns_nodes() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    // Duplicate group names fail strict AND lenient — the verbatim
+    // fallback is the only path the candidates below can reach.
+    const UNBUILDABLE: &str = "proxy-groups:\n\
+         \x20 - {name: dup, type: select, proxies: [DIRECT]}\n\
+         \x20 - {name: dup, type: select, proxies: [REJECT]}\n";
+
+    // A dns node without a `name` is the one structural defect the type
+    // has — everything else it tolerates by contract.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The reverse edge is the build's hard error: a transport node
+    // chaining through a dns leaf — the leaf answers in-process, it
+    // never dials a hop.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: dns-out, type: dns}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: dns-out}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // The conservative half of the name set: the same edge is still
+    // refused when a LATER same-named transport shadows the dns decl —
+    // lenient parse can warn-drop the shadow and leave the dns binding
+    // effective, so the verbatim lane cannot trust last-wins.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n\
+             \x20 - {{name: x, type: dns}}\n\
+             \x20 - {{name: x, type: direct}}\n\
+             \x20 - {{name: node, type: direct, dialer-proxy: x}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A relay's static `proxies:` member naming a dns leaf — the leaf
+    // can never carry a transport hop.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, dns-out]}}\n\
+             proxies:\n  - {{name: dns-out, type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // `include-all-proxies` would absorb the declared leaf — a static
+    // membership too.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, include-all-proxies: true}}\n\
+             proxies:\n  - {{name: dns-out, type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // A built-in shadow never binds the leaf: `name: DIRECT` typed dns
+    // stays the built-in, so relay member DIRECT is legal.
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             \x20 - {{name: chain, type: relay, proxies: [DIRECT, REJECT]}}\n\
+             proxies:\n  - {{name: DIRECT, type: dns}}\n\
+             rules:\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+    // Sound dns content still commits verbatim — including the leaf's
+    // own `dialer-proxy`, which binds no edge and is ignored by contract
+    // (the committed document keeps the node).
+    let resp = put_configs_payload(
+        &state,
+        &format!(
+            "mode: rule\n{UNBUILDABLE}\
+             proxies:\n  - {{name: dns-out, type: dns, dialer-proxy: front}}\n\
+             rules:\n  - DST-PORT,53,dns-out\n  - MATCH,DIRECT\n"
+        ),
+        "?force=true",
+    )
+    .await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "a well-formed dns node commits even when the live build cannot"
+    );
+    {
+        let raw = state.raw_config.read();
+        assert!(
+            raw.proxies.as_deref().is_some_and(|p| p
+                .iter()
+                .any(|n| n.get("type").and_then(|t| t.as_str()) == Some("dns"))),
+            "the committed document keeps the dns node"
+        );
+    }
+}
+
 /// A plain `PUT /configs` (no `force`) rebuilds rematch content live:
 /// the node is dialed by the route engine and the rule is listed in
 /// the new generation.
@@ -12640,6 +12930,35 @@ async fn put_configs_reloads_rematch_live() {
             .iter()
             .any(|r| r["type"] == "RematchName" && r["payload"] == "stage1"),
         "the rebuilt generation installs the predicate: {json}"
+    );
+}
+
+/// Issue #974 review: a `type: dns` leaf surfaces on `/proxies/{name}`
+/// like any route-table entry — `type: "Dns"`, `udp: true` (the leaf
+/// serves framed UDP exchanges in-process), and no endpoint address:
+/// `addr()` is `""` and the JSON shape carries no server field a client
+/// could misread as dialable.
+#[tokio::test]
+async fn get_proxy_reports_dns_leaf_shape() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state(test_raw_config());
+    let resp = put_configs_payload(
+        &state,
+        "mode: rule\n\
+         proxies:\n  - {name: dns-out, type: dns}\n\
+         rules:\n  - DST-PORT,53,dns-out\n  - MATCH,DIRECT\n",
+        "",
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let (status, json) = get_json(&state, "/proxies/dns-out").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(json["name"], "dns-out");
+    assert_eq!(json["type"], "Dns");
+    assert_eq!(json["udp"], true);
+    assert!(
+        json.get("server").is_none() && json.get("address").is_none(),
+        "a dns leaf advertises no endpoint: {json}"
     );
 }
 

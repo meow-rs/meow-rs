@@ -123,18 +123,11 @@ pub(super) mod flow {
         ) {
             return Err("unmapped fake-ip destination".into());
         }
-        // UDP keeps the eager pre_resolve (no lazy enrichment): the outbound
-        // packet API needs a resolved dst_ip regardless of what the rules
-        // demand — including after a fake-IP was rewritten back to a hostname.
+        // UDP keeps the eager pre_resolve (no lazy enrichment): transports
+        // dial `dst_ip` regardless of what the rules demand — including
+        // after a fake-IP was rewritten back to a hostname.
         inner.pre_resolve(&mut metadata).await;
         let probed = inner.resolve_udp_dst(&mut metadata).await;
-        let Some(dst_ip) = metadata.dst_ip else {
-            return Err(format!(
-                "dst_ip not resolved for {}",
-                metadata.remote_address()
-            ));
-        };
-        let dst_addr = SocketAddr::new(dst_ip, metadata.dst_port);
 
         // Port 53 follows ordinary routing — no implicit DNS hijack here
         // (external rules feed queries to the standalone DNS server if
@@ -161,6 +154,22 @@ pub(super) mod flow {
                 "no matching rule for {}",
                 metadata.remote_address()
             ));
+        };
+        // A `type: dns` leaf never contacts the destination — its conn only
+        // echoes this addr back as the reply source, so mandatory
+        // pre-resolution must not gate it and the ORIGINAL destination is
+        // what gets stamped (issue #974 review). Transports keep requiring
+        // `dst_ip` — they actually dial it.
+        let dst_addr = if proxy.adapter_type() == meow_common::AdapterType::Dns {
+            metadata.dns_udp_dst(Some(orig_dst))
+        } else {
+            let Some(dst_ip) = metadata.dst_ip else {
+                return Err(format!(
+                    "dst_ip not resolved for {}",
+                    metadata.remote_address()
+                ));
+            };
+            SocketAddr::new(dst_ip, metadata.dst_port)
         };
         info!(
             "UDP {client} --> {orig_dst} match {} using {}",

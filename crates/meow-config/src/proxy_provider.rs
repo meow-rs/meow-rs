@@ -101,6 +101,12 @@ pub struct ProxyProvider {
     /// proxy per request). `None` = direct (`proxy:` absent, empty, or
     /// `DIRECT`) (issue #625).
     download_proxy: Option<smol_str::SmolStr>,
+    /// The config's live-resolver indirection `type: dns` nodes bind
+    /// (issue #974). Like `dialer_registry`, this provider outlives the
+    /// config generation that built it — the cell is republished by the
+    /// tunnel on every DNS install, so a node parsed on any later refresh
+    /// resolves the current slot rather than a captured snapshot.
+    dns_cell: meow_dns::DnsOutboundCell,
     /// Set when a fetch found `download_proxy` unresolvable — the startup
     /// build loads providers *before* the first route map is published, so
     /// the post-publish kick ([`spawn_deferred_initial_fetches`]) fetches
@@ -279,12 +285,28 @@ impl ProxyProvider {
         strict: bool,
         dialer_registry: meow_proxy::dialer::ProxyRegistry,
     ) -> Result<Self, String> {
-        Self::new_with_client_fingerprint(name, raw, cache_dir, ipv6, strict, dialer_registry, None)
+        Self::new_with_client_fingerprint(
+            name,
+            raw,
+            cache_dir,
+            ipv6,
+            strict,
+            dialer_registry,
+            None,
+            None,
+        )
     }
 
     /// [`ProxyProvider::new`] under the config's top-level
     /// `global-client-fingerprint` (issue #974): provider nodes that omit
-    /// `client-fingerprint` inherit it at parse time.
+    /// `client-fingerprint` inherit it at parse time. `dns_cell` is the
+    /// config's live-resolver indirection `type: dns` nodes bind —
+    /// `None` leaves them unbound (SERVFAIL) for callers that have none.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each argument is an independent provider-build input; bundling \
+                  them would only rename the same list"
+    )]
     pub fn new_with_client_fingerprint(
         name: &str,
         raw: &RawProxyProvider,
@@ -293,6 +315,7 @@ impl ProxyProvider {
         strict: bool,
         dialer_registry: meow_proxy::dialer::ProxyRegistry,
         global_client_fingerprint: Option<&str>,
+        dns_cell: Option<meow_dns::DnsOutboundCell>,
     ) -> Result<Self, String> {
         // Any on-disk location (read or write) must stay inside `cache_dir`
         // (issue #429): `path:` — and the provider *name* feeding the implicit
@@ -477,6 +500,7 @@ impl ProxyProvider {
             ),
             dialer_registry,
             download_proxy,
+            dns_cell: dns_cell.unwrap_or_else(meow_dns::new_dns_outbound_cell),
             deferred_initial: AtomicBool::new(false),
             background_pending: AtomicBool::new(false),
             fetched_remote: AtomicBool::new(false),
@@ -1363,6 +1387,38 @@ impl ProxyProvider {
         crate::validation::warn_unknown_node_keys(raw_map, Some(&self.name));
         let direct: Arc<dyn meow_proxy::dialer::TcpDialer> =
             Arc::new(meow_proxy::dialer::DirectDialer);
+        // A `type: dns` node reads no transport fields at all — including
+        // `dialer-proxy` in any shape, even malformed. Parse the leaf bare;
+        // `parse_dns_node` emits the ignored-key warnings (issue #974).
+        if raw_map.get("type").and_then(|v| v.as_str()) == Some("dns") {
+            // The node-level key's warning comes from `parse_dns_node`,
+            // but the two stronger dialer sources — provider-level
+            // `dialer-proxy:` and `override.dialer-proxy:` — are not node
+            // keys and would apply silently without one (issue #974
+            // review). `override.dialer-proxy: ""` is the "clear the
+            // chain" knob, not a declared front — nothing to warn on.
+            let enforced = self
+                .override_dialer
+                .as_deref()
+                .or(self.provider_dialer.as_deref())
+                .filter(|dialer| !dialer.is_empty());
+            if let Some(dialer) = enforced {
+                warn!(
+                    provider = %self.name,
+                    proxy = raw_name,
+                    "dns node ignores `dialer-proxy` '{dialer}' — \
+                     the leaf owns no transport to chain"
+                );
+            }
+            return proxy_parser::parse_proxy_provider_node_with_fp(
+                raw_map,
+                self.ipv6,
+                self.allow_external_plugin,
+                &direct,
+                self.global_client_fingerprint.as_deref(),
+                Some(&self.dns_cell),
+            );
+        }
         let node_dialer = match raw_map.get("dialer-proxy") {
             Some(value) => match value.as_str() {
                 Some(s) if !s.trim().is_empty() => Some(s.trim()),
@@ -1371,14 +1427,18 @@ impl ProxyProvider {
                 // (mihomo's `len > 0` check treats `""` as unset). A
                 // whitespace-only value is remote-controlled garbage, not a
                 // usable name — reject the node rather than dial direct.
-                // `type: rematch` is the exception: `check_rematch_node`
-                // treats blank-or-null as absent, and the node owns no
-                // transport to chain (issue #974).
+                // `type: rematch`/`type: dns` are the exceptions:
+                // `check_rematch_node` treats blank-or-null as absent, and
+                // mihomo reads no `dialer-proxy` off a dns leaf — neither
+                // owns a transport to chain (issue #974).
                 Some("") => None,
                 None if value.is_null() => None,
                 Some(s)
                     if s.trim().is_empty()
-                        && raw_map.get("type").and_then(|v| v.as_str()) == Some("rematch") =>
+                        && matches!(
+                            raw_map.get("type").and_then(|v| v.as_str()),
+                            Some("rematch") | Some("dns")
+                        ) =>
                 {
                     None
                 }
@@ -1406,6 +1466,7 @@ impl ProxyProvider {
                 self.allow_external_plugin,
                 &direct,
                 self.global_client_fingerprint.as_deref(),
+                Some(&self.dns_cell),
             );
         };
         // `override.dialer-proxy: ""` is the upstream "clear the chain"
@@ -1418,19 +1479,23 @@ impl ProxyProvider {
                 self.allow_external_plugin,
                 &direct,
                 self.global_client_fingerprint.as_deref(),
+                Some(&self.dns_cell),
             );
         }
-        // A `dialer-proxy` chain is a transport knob a `type: rematch`
-        // node cannot carry — parse the control leaf bare rather than
-        // wrap it in `DialerProxyAdapter`, which does not report the
-        // rematch action (issue #974). A non-blank `dialer-proxy` on the
-        // node itself still fails in `check_rematch_node` below.
-        if raw_map.get("type").and_then(|v| v.as_str()) == Some("rematch") {
+        // A `dialer-proxy` chain is a transport knob a `type: rematch` or
+        // `type: dns` node cannot carry — parse the control/resolver leaf
+        // bare rather than wrap it in `DialerProxyAdapter`, which neither
+        // reports the rematch action nor would ever dial anyway (issue
+        // #974). A non-blank `dialer-proxy` on a rematch node itself
+        // still fails in `check_rematch_node` below.
+        let node_type = raw_map.get("type").and_then(|v| v.as_str());
+        if matches!(node_type, Some("rematch") | Some("dns")) {
             warn!(
                 provider = %self.name,
                 proxy = raw_name,
-                "rematch node ignores `dialer-proxy` '{dialer_name}' — \
-                 a rematch is a routing control, not a transport"
+                "{node_type} node ignores `dialer-proxy` '{dialer_name}' — \
+                 the leaf owns no transport to chain",
+                node_type = node_type.unwrap_or("?")
             );
             return proxy_parser::parse_proxy_provider_node_with_fp(
                 raw_map,
@@ -1438,6 +1503,7 @@ impl ProxyProvider {
                 self.allow_external_plugin,
                 &direct,
                 self.global_client_fingerprint.as_deref(),
+                Some(&self.dns_cell),
             );
         }
         if dialer_name == raw_name {
@@ -1453,6 +1519,7 @@ impl ProxyProvider {
             self.allow_external_plugin,
             &chained,
             self.global_client_fingerprint.as_deref(),
+            Some(&self.dns_cell),
         ) {
             // The `ChainedProxy` marker pins the #969 fail-closed verdict
             // on injected entries, identical to the static `proxies:`
@@ -1471,6 +1538,7 @@ impl ProxyProvider {
                     self.allow_external_plugin,
                     &direct,
                     self.global_client_fingerprint.as_deref(),
+                    Some(&self.dns_cell),
                 )?;
                 warn!(
                     provider = %self.name,
@@ -1663,6 +1731,7 @@ pub async fn load_proxy_providers(
         dialer_registry,
         None,
         crate::provider_fetch_deadline(),
+        None,
         &mut DroppedProviders::default(),
     )
     .await
@@ -1673,6 +1742,9 @@ pub async fn load_proxy_providers(
 /// leniently go into `dropped`, for the commit to record.
 /// `global_client_fingerprint` is the committed top-level
 /// `global-client-fingerprint` (issue #974) the providers' nodes inherit.
+/// `dns_cell` is the config's live-resolver indirection provider `type: dns`
+/// leaves bind — `None` leaves them unbound (SERVFAIL) for callers that
+/// have none (issue #974).
 #[allow(
     clippy::too_many_arguments,
     reason = "each argument is an independent config-build input; bundling \
@@ -1686,6 +1758,7 @@ pub async fn load_proxy_providers_within(
     dialer_registry: &meow_proxy::dialer::ProxyRegistry,
     global_client_fingerprint: Option<&str>,
     deadline: Option<Duration>,
+    dns_cell: Option<&meow_dns::DnsOutboundCell>,
     dropped: &mut DroppedProviders,
 ) -> Result<HashMap<String, Arc<ProxyProvider>>, anyhow::Error> {
     let mut result = HashMap::new();
@@ -1699,6 +1772,7 @@ pub async fn load_proxy_providers_within(
             strict,
             dialer_registry.clone(),
             global_client_fingerprint,
+            dns_cell.cloned(),
         ) {
             Ok(provider) => Arc::new(provider),
             Err(e) if strict => {
@@ -3158,6 +3232,266 @@ header:
         }
     }
 
+    /// A hosts-only resolver answering `host` → `ip` locally — the dns
+    /// leaf's local fast path needs no upstream.
+    fn hosts_resolver(host: &str, ip: std::net::IpAddr) -> meow_dns::resolver::Resolver {
+        let mut hosts = meow_trie::DomainTrie::new();
+        hosts.insert(host, meow_dns::HostEntry::Addresses(vec![ip]));
+        meow_dns::resolver::Resolver::new(
+            Vec::new(),
+            Vec::new(),
+            meow_common::DnsMode::Normal,
+            hosts,
+            true,
+            true,
+        )
+    }
+
+    /// A `type: dns` provider node reads no transport fields at all:
+    /// node-level `dialer-proxy` — of any shape, even ill-typed — the
+    /// provider's own `dialer-proxy:` and `override.dialer-proxy` are all
+    /// peeled before the leaf parses, so the members land as bare
+    /// `AdapterType::Dns` leaves bound to the provider's dns cell
+    /// (issue #974).
+    #[tokio::test]
+    async fn provider_dns_nodes_parse_bare_and_bind_the_provider_cell() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n\
+             \x20 - {name: plain, type: dns}\n\
+             \x20 - {name: chained, type: dns, dialer-proxy: front}\n\
+             \x20 - {name: malformed, type: dns, dialer-proxy: [a, b]}\n\
+             \x20 - {name: endpointish, type: dns, server: 8.8.8.8, port: 53, udp: false}\n",
+        )
+        .unwrap();
+        let mut raw = raw_file_provider("nodes.yaml");
+        raw.dialer_proxy = Some("front".to_string());
+        raw.override_ = Some(HashMap::from([(
+            "dialer-proxy".to_string(),
+            serde_json::Value::String("enforced".to_string()),
+        )]));
+        let dns_cell = meow_dns::new_dns_outbound_cell();
+        let p = ProxyProvider::new_with_client_fingerprint(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+            None,
+            Some(Arc::clone(&dns_cell)),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        let members = p.proxies();
+        let mut names: Vec<String> = members.iter().map(|n| n.name().to_string()).collect();
+        names.sort();
+        // Every node survives — unlike rematch, dns tolerates even a
+        // malformed `dialer-proxy`, which mihomo never reads.
+        assert_eq!(names, ["chained", "endpointish", "malformed", "plain"]);
+        for member in &members {
+            assert_eq!(member.adapter_type(), meow_common::AdapterType::Dns);
+            assert!(
+                !member
+                    .as_any()
+                    .is_some_and(<dyn std::any::Any>::is::<meow_proxy::DialerProxyAdapter>),
+                "{} must not be chain-wrapped",
+                member.name()
+            );
+        }
+
+        // The provider's cell is the live indirection: populating it
+        // after the parse reaches the already-built leaf — a provider
+        // node parsed before DNS exists still serves the generation the
+        // commit installs (issue #974).
+        let leaf = members
+            .iter()
+            .find(|m| m.name() == "plain")
+            .expect("the dns leaf lands");
+        let metadata = meow_common::Metadata {
+            network: meow_common::Network::Tcp,
+            host: "example.com".into(),
+            dst_port: 53,
+            ..Default::default()
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = leaf.dial_tcp(&metadata).await.expect("dial succeeds");
+        let query: &[u8] = &[
+            0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
+            b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0x00, 0x01, 0x00, 0x01,
+        ];
+        let len = (query.len() as u16).to_be_bytes();
+        stream.write_all(&len).await.unwrap();
+        stream.write_all(query).await.unwrap();
+        let mut prefix = [0u8; 2];
+        stream.read_exact(&mut prefix).await.unwrap();
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(body[3] & 0x0f, 2, "unbound cell → SERVFAIL, not a drop");
+
+        *dns_cell.write() = Some(meow_dns::new_resolver_slot(Arc::new(hosts_resolver(
+            "example.com",
+            "10.9.9.9".parse().unwrap(),
+        ))));
+        let mut stream = leaf.dial_tcp(&metadata).await.expect("dial succeeds");
+        stream.write_all(&len).await.unwrap();
+        stream.write_all(query).await.unwrap();
+        stream.read_exact(&mut prefix).await.unwrap();
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+        stream.read_exact(&mut body).await.unwrap();
+        assert_eq!(body[3] & 0x0f, 0, "the installed generation answers");
+        assert!(body.windows(4).any(|w| w == [10, 9, 9, 9]));
+    }
+
+    /// The same shape through `parse_node` directly — the leaf the
+    /// provider slot materializes. This is the parity the static
+    /// `proxies:` lane's `dns_leaf_unbound_cell_fails_closed` pins.
+    #[tokio::test]
+    async fn provider_dns_node_unbound_cell_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - {name: dns-out, type: dns}\n",
+        )
+        .unwrap();
+        let p = ProxyProvider::new(
+            "test",
+            &raw_file_provider("nodes.yaml"),
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        let leaf = &p.proxies()[0];
+        assert_eq!(leaf.adapter_type(), meow_common::AdapterType::Dns);
+        // `ProxyProvider::new` passes no cell — an embedder without the
+        // config lane gets an unbound leaf, which fails closed.
+        let metadata = meow_common::Metadata::default();
+        let conn = leaf.dial_udp(&metadata).await.expect("udp dial succeeds");
+        let dst = "9.9.9.9:53".parse().unwrap();
+        let query: &[u8] = &[
+            0x00, 0x2a, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 7, b'e', b'x',
+            b'a', b'm', b'p', b'l', b'e', 3, b'c', b'o', b'm', 0, 0x00, 0x01, 0x00, 0x01,
+        ];
+        conn.write_packet(query, &dst).await.unwrap();
+        let mut buf = [0u8; 2048];
+        let (n, _) = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            conn.read_packet(&mut buf),
+        )
+        .await
+        .expect("SERVFAIL still replies")
+        .unwrap();
+        assert!(n >= 12);
+        assert_eq!(buf[3] & 0x0f, 2);
+    }
+
+    /// `dialer-proxy` reaching a `type: dns` member from either stronger
+    /// level — the provider's own `dialer-proxy:` or `override.dialer-proxy`
+    /// — must warn rather than apply silently: an enforcement knob the
+    /// operator believes chains the node is being dropped (issue #974
+    /// review). The node-level key already warns inside `parse_dns_node`.
+    #[tokio::test]
+    async fn provider_dns_node_dialer_levels_warn() {
+        crate::test_support::install_global_discard_subscriber();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            "proxies:\n  - {name: dns-out, type: dns, dialer-proxy: node-front}\n",
+        )
+        .unwrap();
+        let dns_cell = meow_dns::new_dns_outbound_cell();
+
+        // Provider-level only — the warning names the provider's front.
+        let mut raw = raw_file_provider("nodes.yaml");
+        raw.dialer_proxy = Some("front".to_string());
+        let p = ProxyProvider::new_with_client_fingerprint(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+            None,
+            Some(Arc::clone(&dns_cell)),
+        )
+        .unwrap();
+        let cap = crate::test_support::WarnCapture::start();
+        p.refresh().await.unwrap();
+        let warns = cap.take();
+        assert!(
+            warns.contains("ignores `dialer-proxy` 'front'"),
+            "the provider-level front must warn: {warns}"
+        );
+        assert!(
+            warns.contains("`dialer-proxy` is ignored on type: dns"),
+            "the node-level key must warn: {warns}"
+        );
+
+        // `override` beats the provider level — the warning names the
+        // enforcement that actually reaches the node, and 'front' never
+        // surfaces.
+        let mut raw = raw_file_provider("nodes.yaml");
+        raw.dialer_proxy = Some("front".to_string());
+        raw.override_ = Some(HashMap::from([(
+            "dialer-proxy".to_string(),
+            serde_json::Value::String("enforced".to_string()),
+        )]));
+        let p = ProxyProvider::new_with_client_fingerprint(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+            None,
+            Some(Arc::clone(&dns_cell)),
+        )
+        .unwrap();
+        let cap = crate::test_support::WarnCapture::start();
+        p.refresh().await.unwrap();
+        let warns = cap.take();
+        assert!(
+            warns.contains("ignores `dialer-proxy` 'enforced'"),
+            "the override front must warn: {warns}"
+        );
+        assert!(
+            !warns.contains("`dialer-proxy` 'front'"),
+            "the overridden provider front must not warn: {warns}"
+        );
+
+        // `override.dialer-proxy: ""` is the explicit clear — it overwrites
+        // the provider level too, so no front reaches the node and nothing
+        // warns.
+        let mut raw = raw_file_provider("nodes.yaml");
+        raw.dialer_proxy = Some("front".to_string());
+        raw.override_ = Some(HashMap::from([(
+            "dialer-proxy".to_string(),
+            serde_json::Value::String(String::new()),
+        )]));
+        let p = ProxyProvider::new_with_client_fingerprint(
+            "test",
+            &raw,
+            Some(dir.path()),
+            true,
+            false,
+            Default::default(),
+            None,
+            Some(Arc::clone(&dns_cell)),
+        )
+        .unwrap();
+        let cap = crate::test_support::WarnCapture::start();
+        p.refresh().await.unwrap();
+        let warns = cap.take();
+        assert!(
+            !warns.contains("ignores `dialer-proxy`"),
+            "an empty override must not warn as an enforced front: {warns}"
+        );
+    }
+
     /// A refresh that *changes* the `dialer-proxy` name must retarget the
     /// chain — not just re-apply or drop it.
     #[tokio::test]
@@ -4029,6 +4363,7 @@ header:
             &Default::default(),
             None,
             deadline,
+            None,
             &mut DroppedProviders::default(),
         )
         .await
@@ -4351,6 +4686,7 @@ header:
             &Default::default(),
             None,
             None,
+            None,
             &mut DroppedProviders::default(),
         )
         .await
@@ -4392,6 +4728,7 @@ header:
             &Default::default(),
             None,
             None,
+            None,
             &mut DroppedProviders::default(),
         )
         .await
@@ -4419,6 +4756,7 @@ header:
             &Default::default(),
             None,
             None,
+            None,
             &mut DroppedProviders::default(),
         )
         .await
@@ -4440,6 +4778,7 @@ header:
             false,
             true,
             &Default::default(),
+            None,
             None,
             None,
             &mut DroppedProviders::default(),
@@ -4524,6 +4863,7 @@ header:
             false,
             Default::default(),
             Some("chrome"),
+            None,
         )
         .unwrap();
         assert!(p.initial_load_blocking(false).unwrap());
@@ -4736,6 +5076,7 @@ header:
             &Default::default(),
             None,
             None,
+            None,
             &mut DroppedProviders::default(),
         )
         .await
@@ -4782,6 +5123,7 @@ header:
                 &Default::default(),
                 None,
                 Some(Duration::from_millis(50)),
+                None,
                 &mut DroppedProviders::default(),
             ),
         )
