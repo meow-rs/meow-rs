@@ -2599,12 +2599,17 @@ fn is_usable_global_target(name: &str, proxies: &HashMap<SmolStr, Arc<dyn Proxy>
     !BUILTIN_GLOBAL_POLICIES
         .iter()
         .any(|policy| name.eq_ignore_ascii_case(policy))
-        // A rematch leaf is a routing control, not a dialable outbound —
-        // it stays in the member list (upstream `proxyList` semantics)
-        // but can never be the selector's default pick (issue #974).
-        && proxies
-            .get(name)
-            .is_some_and(|p| p.adapter_type() != AdapterType::Rematch)
+        // Rematch and dns leaves are routing controls / in-process resolver
+        // endpoints, not dialable outbounds — they stay in the member list
+        // (upstream `proxyList` semantics) but can never be the synthetic
+        // GLOBAL selector's primary pick, on ANY path this predicate feeds:
+        // the last-MATCH scan, the first-group scan, the leaf scan — the
+        // picked name then becomes `default_position`, which is also the
+        // selector's fallback for a saved/invalid selection (issue #974
+        // review: an ordinary TCP flow must never default to a dns leaf).
+        && proxies.get(name).is_some_and(|p| {
+            !matches!(p.adapter_type(), AdapterType::Rematch | AdapterType::Dns)
+        })
 }
 
 /// The target of the LAST top-level `MATCH,<target>` rule — the config's
@@ -11912,6 +11917,36 @@ rules:
             "the rematch leaf stays a GLOBAL member: {names:?}"
         );
         assert_eq!(names[0], "node", "the primary is a dialable outbound");
+    }
+
+    /// The same verdict for a `type: dns` leaf (issue #974 review): it
+    /// is a resolver endpoint, not a dialable outbound — a `MATCH,dns-out`
+    /// rule must not prime it, and the member-order fallback must skip it
+    /// too. It still lists as a member so an explicit selection fails
+    /// closed at dial.
+    #[test]
+    fn auto_global_never_primes_a_dns_leaf() {
+        let yaml = r#"
+proxies:
+  - { name: dns-out, type: dns }
+  - { name: node, type: socks5, server: 127.0.0.1, port: 1 }
+rules:
+  - "MATCH,dns-out"
+"#;
+        let RebuildResult { proxies, .. } =
+            rebuild_from_raw(&raw_config(yaml)).expect("a dns leaf beside a transport builds");
+        let members = proxies["GLOBAL"]
+            .member_proxies()
+            .expect("a select group exposes members");
+        let names: Vec<&str> = members.iter().map(|p| p.name()).collect();
+        assert!(
+            names.contains(&"dns-out"),
+            "the dns leaf stays a GLOBAL member: {names:?}"
+        );
+        assert_eq!(
+            names[0], "node",
+            "the primary is a dialable outbound even when MATCH names the dns leaf"
+        );
     }
 
     /// A blank `dialer-proxy` on a `type: rematch` node is unset, not a
