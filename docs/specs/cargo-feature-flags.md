@@ -26,7 +26,7 @@ exist yet.
 | Feature | Crate | What it gates |
 |---------|-------|---------------|
 | `ss` | `meow-proxy` | Shadowsocks adapter + `shadowsocks` crate dep; carries no built-in SIP003 plugin transport — each is a per-plugin feature below |
-| `ss-obfs` | `meow-proxy` | Built-in `ss` plugin: simple-obfs HTTP/TLS wrap (`plugin: obfs`/`simple-obfs`, implies `ss` + `meow-transport/simple-obfs`; in `default`/`full`, not `minimal`) |
+| `ss-obfs` | `meow-proxy` | Built-in `ss` plugin: simple-obfs HTTP/TLS wrap (`plugin: obfs`/`simple-obfs`, implies `ss` + `meow-transport/simple-obfs`; in `default`/`full`/`minimal`) |
 | `ss-v2ray-plugin` | `meow-proxy` | Built-in `ss` plugin: v2ray-plugin WebSocket(+TLS) transport (`plugin: v2ray-plugin`, implies `ss`; in `default`/`full`, not `minimal`) |
 | `shadow-tls` | `meow-proxy` | Built-in `ss` plugin: shadow-tls v1/v2/v3 cover-TLS transport (implies `ss`; in `default`/`full`, not `minimal`) |
 | `restls` | `meow-proxy` | Built-in `ss` plugin: restls record-level TLS transport (implies `ss`; in `default`/`full`, not `minimal`) |
@@ -46,7 +46,8 @@ The `ss` built-in-plugin contract is fully per-plugin: `ss-obfs` and
 `ss-v2ray-plugin` joined the four heavier SIP003 transports as opt-in
 features re-bundled into `default`/`full` (ADR-0007 2026-11-21 addendum —
 the pair's ~19 KB of symbols tipped `minimal` past its 8 MiB aarch64-musl
-cap, so `minimal` carries none of them). All built-in plugin names
+cap; `ss-obfs` was later restored to `minimal`, leaving `ss-v2ray-plugin`
+the only `plugin:` transport excluded). All built-in plugin names
 (including `kcptun` and `ech-tls-tunnel`) stay *reserved* even when
 compiled out — a `plugin:` line naming one keeps the node bound as an
 unavailable placeholder (`meow -t`, boot and provider refresh all read it
@@ -88,7 +89,7 @@ plugin binary the operator pruned.
 | Bundle | Includes |
 |--------|---------|
 | `full` (default) | all features above |
-| `minimal` | `ss`, `trojan`, `transport-tls`, `transport-ws`, `listener-mixed`, `dns-server` — REST API always included (not optional) |
+| `minimal` | `ss` + `ss-obfs`, `trojan`, `transport-tls`, `transport-ws`, `listener-mixed`, `dns-server` — REST API always included (not optional) |
 
 **ADR-0007 §1 defines `minimal` as `tls,ws,ss,trojan,api`** — the "minimum useful set
 for a router operator." Dropping TLS would exclude SS+v2ray-plugin+TLS+ws, the

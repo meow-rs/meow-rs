@@ -224,7 +224,7 @@ Feature prerequisites: plain `ss` carries no built-in plugin transport —
 `obfs`/`simple-obfs` sit behind `ss-obfs` and `v2ray-plugin` behind
 `ss-v2ray-plugin`, while `gost-plugin`, `shadow-tls`, `restls` and `jls`
 each sit behind a same-named Cargo feature. All are re-bundled into
-`default`/`full` but absent from `minimal` — a `plugin:` line naming a
+`default`/`full`; `minimal` ships `ss-obfs` only — a `plugin:` line naming a
 compiled-out built-in keeps the node bound as an unavailable placeholder
 whose dials fail with a "not compiled into this build" error (it is never
 handed to the external-plugin spawn path). `kcptun` and `ech-tls-tunnel`
