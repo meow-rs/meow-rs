@@ -78,5 +78,43 @@ fn bench_rule_scan(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_rule_scan);
+fn bench_classical_provider(c: &mut Criterion) {
+    use meow_rules::{ClassicalRuleSet, ParserContext, RuleSet};
+
+    let mut group = c.benchmark_group("classical_provider");
+    for size in [16usize, 64, 32_768] {
+        let mut entries: Vec<String> = (0..size)
+            .map(|i| {
+                let kind = if i % 2 == 0 {
+                    "DOMAIN"
+                } else {
+                    "DOMAIN-SUFFIX"
+                };
+                format!("{kind},r{i}.example")
+            })
+            .collect();
+        entries.push(r"DOMAIN-REGEX,^rx[0-9]+\.example$".into());
+        let set = ClassicalRuleSet::from_entries(&entries, &ParserContext::empty());
+        for (name, host, expected) in [
+            ("first", "r0.example".to_owned(), true),
+            ("last", format!("sub.r{}.example", size - 1), true),
+            ("miss", "unlisted.example".to_owned(), false),
+        ] {
+            let meta = Metadata {
+                host: host.into(),
+                ..Default::default()
+            };
+            assert_eq!(set.matches(&meta, &RuleMatchHelper), expected);
+            group.bench_function(BenchmarkId::new(name, size), |b| {
+                b.iter(|| set.matches(black_box(&meta), &RuleMatchHelper));
+            });
+        }
+        group.bench_function(BenchmarkId::new("dns_mixed_case_miss", size), |b| {
+            b.iter(|| set.matches_domain(black_box("unLIsted.Example")));
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_rule_scan, bench_classical_provider);
 criterion_main!(benches);
