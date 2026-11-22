@@ -931,7 +931,7 @@ pub async fn connect_tcp(addr: SocketAddr) -> io::Result<TcpStream> {
         match stream.as_fd().try_clone_to_owned() {
             Ok(owned) => carrier.stash(std::net::TcpStream::from(owned)),
             Err(error) => {
-                tracing::debug!(%error, "brutal: failed to dup carrier socket")
+                tracing::debug!(%error, "brutal: failed to dup carrier socket");
             }
         }
     }
