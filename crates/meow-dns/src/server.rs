@@ -1580,6 +1580,16 @@ pub async fn serve_dns_outbound_stream<S: AsyncRead + AsyncWrite + Unpin>(
             stream.shutdown().await?;
             return Ok(());
         };
+        // Full-wire validation BEFORE any answer path: the local fast path
+        // only parses the question section, so a frame whose header claims
+        // records that are absent (e.g. ARCOUNT=1 with no additional) would
+        // otherwise earn a NOERROR/SERVFAIL reply to a malformed message.
+        // An undecodable message is a protocol event like a short body —
+        // close the stream without fabricating an answer (issue #974).
+        if Message::from_vec(&query).is_err() {
+            stream.shutdown().await?;
+            return Ok(());
+        }
         let response = match outbound_resolver_view(&cell) {
             OutboundView::Resolver(current) => {
                 match answer_wire(&query, &current, &budget).await? {
@@ -1731,9 +1741,15 @@ pub async fn answer_outbound_datagram(
     cell: &DnsOutboundCell,
     budget: &Arc<tokio::sync::Semaphore>,
 ) -> Option<Vec<u8>> {
-    // Decoded for the EDNS payload bound; decode failure does not pre-empt
-    // the verdict — `handle_query`'s own parser is the authority.
-    let query = Message::from_vec(wire).ok();
+    // Full-wire validation BEFORE any answer path: `try_answer_local`
+    // only parses the question section, so a datagram whose header claims
+    // records that are absent (e.g. ARCOUNT=1 with no additional) would
+    // otherwise earn a NOERROR/SERVFAIL reply to a malformed message.
+    // Undecodable wire is a silent drop — UDP semantics, the client
+    // retries (issue #974).
+    let Ok(query) = Message::from_vec(wire) else {
+        return None;
+    };
     let response = match outbound_resolver_view(cell) {
         OutboundView::Disabled => disabled_answer(wire)?,
         OutboundView::Resolver(resolver) => match DnsServer::try_answer_local(wire, &resolver) {
@@ -1757,21 +1773,19 @@ pub async fn answer_outbound_datagram(
             }
         },
     };
-    Some(fit_udp_response(query.as_ref(), &response))
+    Some(fit_udp_response(&query, &response))
 }
 
 /// Bound `response` to the payload the query's OPT record advertised
-/// (`None`/undecodable query → 512), at most [`MAX_OUTBOUND_UDP_REPLY`].
+/// (no OPT → the classic 512 floor), at most `MAX_OUTBOUND_UDP_REPLY`.
 /// Oversize answers drop whole additional, then authority, then answer
 /// records and set TC — the truncation a stub retries over TCP on. A
 /// response that cannot be re-decoded passes through unfit rather than
 /// being silently mauled.
-fn fit_udp_response(query: Option<&Message>, response: &[u8]) -> Vec<u8> {
+fn fit_udp_response(query: &Message, response: &[u8]) -> Vec<u8> {
     // `Message::max_payload` reads the OPT's advertised size, defaulting
     // to (and flooring at) the classic 512 without one.
-    let bound = query
-        .map_or(512, |q| usize::from(q.max_payload()))
-        .min(MAX_OUTBOUND_UDP_REPLY);
+    let bound = usize::from(query.max_payload()).min(MAX_OUTBOUND_UDP_REPLY);
     if response.len() <= bound {
         return response.to_vec();
     }
@@ -4819,6 +4833,191 @@ mod tests {
         );
     }
 
+    /// An undecodable datagram earns a silent drop — UDP semantics, the
+    /// client retries — never a NOERROR/SERVFAIL fabricated for wire that
+    /// is not a message. The verdict precedes even the enabled/disabled
+    /// view: an unbound cell drops malformed wire too. Well-formed
+    /// datagrams still answer (issue #974 review).
+    #[tokio::test]
+    async fn outbound_datagram_undecodable_drops_valid_answers() {
+        let cell = new_dns_outbound_cell();
+        *cell.write() = Some(new_resolver_slot(make("10.0.0.7".parse().unwrap())));
+        let budget = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+
+        // A valid-shaped A question whose ARCOUNT claims an additional
+        // record the datagram does not carry — the header parses, the
+        // message does not.
+        let mut malformed = sample_query(0x77, 1);
+        malformed[11] = 1;
+        assert!(
+            answer_outbound_datagram(&malformed, &cell, &budget)
+                .await
+                .is_none(),
+            "a header-consistent but undecodable datagram must drop"
+        );
+        assert!(
+            answer_outbound_datagram(&[0xde, 0xad], &cell, &budget)
+                .await
+                .is_none(),
+            "a sub-header datagram must drop"
+        );
+
+        let reply = answer_outbound_datagram(&sample_query(0x77, 1), &cell, &budget)
+            .await
+            .expect("a well-formed query still answers");
+        let msg = Message::from_vec(&reply).unwrap();
+        assert_eq!(msg.answers[0].data, RData::A("10.0.0.7".parse().unwrap()));
+
+        // The same malformed wire against an unbound view drops rather
+        // than earning the disabled generation's SERVFAIL.
+        let unbound = new_dns_outbound_cell();
+        assert!(
+            answer_outbound_datagram(&malformed, &unbound, &budget)
+                .await
+                .is_none(),
+            "undecodable wire drops before the disabled verdict runs"
+        );
+    }
+
+    /// Malformed framing on the outbound TCP lane is a protocol event:
+    /// a prefix beyond the 16 KiB cap is rejected the moment it is read —
+    /// the body is never touched and no answer is fabricated — while a
+    /// one-byte prefix or a body that ends early close the stream the
+    /// same way (issue #974 review).
+    #[tokio::test]
+    async fn outbound_stream_malformed_framing_closes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // Live-client case: the oversize prefix is a protocol verdict
+        // before any body byte — the peer sees the close immediately.
+        {
+            let cell = new_dns_outbound_cell();
+            *cell.write() = Some(new_resolver_slot(make("10.0.0.1".parse().unwrap())));
+            let (mut client, server) = tokio::io::duplex(4096);
+            let budget = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+            let serve = tokio::spawn(serve_dns_outbound_stream(server, cell, budget));
+            client
+                .write_all(&(OUTBOUND_TCP_FRAME_MAX as u16 + 1).to_be_bytes())
+                .await
+                .unwrap();
+            client.flush().await.unwrap();
+            assert_eq!(
+                client.read(&mut [0u8; 1]).await.unwrap(),
+                0,
+                "an oversize prefix must close without fabricating an answer"
+            );
+            assert!(serve.await.unwrap().is_err());
+        }
+
+        // EOF cases: a partial prefix and a partial body each end the
+        // stream on the read error — the client dropping is what makes
+        // the truncation visible.
+        for bytes in [vec![0x00], {
+            // A prefix promising 64 bytes with only 4 arriving.
+            let mut q = Vec::new();
+            q.extend_from_slice(&64u16.to_be_bytes());
+            q.extend_from_slice(&sample_query(1, 1)[..4]);
+            q
+        }] {
+            let cell = new_dns_outbound_cell();
+            *cell.write() = Some(new_resolver_slot(make("10.0.0.1".parse().unwrap())));
+            let (mut client, server) = tokio::io::duplex(4096);
+            let budget = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+            let serve = tokio::spawn(serve_dns_outbound_stream(server, cell, budget));
+            client.write_all(&bytes).await.unwrap();
+            drop(client);
+            assert!(
+                serve.await.unwrap().is_err(),
+                "a truncated frame must end the stream"
+            );
+        }
+    }
+
+    /// The 16 KiB cap is a boundary, not a rounding: exactly 16384 bytes
+    /// still crosses the prefix gate and — decodable here — earns an
+    /// answer, while 16385 closes the stream unread (issue #974 review).
+    /// Undecodable wire at any size closes without an answer.
+    #[tokio::test]
+    async fn outbound_stream_undecodable_and_frame_cap_close() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cell = new_dns_outbound_cell();
+        *cell.write() = Some(new_resolver_slot(make("10.0.0.1".parse().unwrap())));
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let budget = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+        let serve = tokio::spawn(serve_dns_outbound_stream(server, cell, budget));
+
+        // Exactly the cap: a decodable query carrying a ~16 KiB
+        // private-use additional record (opaque rdata, nothing to parse)
+        // — the frame passes the prefix gate and answers, proving 16384
+        // is served.
+        let mut big = sample_query(0x41, 1);
+        big[11] = 1; // ARCOUNT=1
+        let rdlen = OUTBOUND_TCP_FRAME_MAX - big.len() - 11;
+        big.push(0); // additional: root name
+        big.extend_from_slice(&65280u16.to_be_bytes()); // private QTYPE range
+        big.extend_from_slice(&1u16.to_be_bytes()); // class IN
+        big.extend_from_slice(&0u32.to_be_bytes()); // TTL
+        big.extend_from_slice(&(rdlen as u16).to_be_bytes());
+        big.resize(OUTBOUND_TCP_FRAME_MAX, 0);
+        assert_eq!(big.len(), OUTBOUND_TCP_FRAME_MAX);
+        let reply = outbound_exchange(&mut client, &big)
+            .await
+            .expect("a 16 KiB decodable frame must be served");
+        assert_eq!(Message::from_vec(&reply).unwrap().metadata.id, 0x41);
+
+        // ARCOUNT=1 with no additional record: header-consistent,
+        // undecodable — a protocol event like the short body, not a
+        // query. The stream closes without NOERROR or SERVFAIL.
+        let mut malformed = sample_query(0x66, 1);
+        malformed[11] = 1;
+        client
+            .write_all(&(malformed.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&malformed).await.unwrap();
+        client.flush().await.unwrap();
+        assert_eq!(
+            client.read(&mut [0u8; 1]).await.unwrap(),
+            0,
+            "undecodable wire must close without fabricating an answer"
+        );
+        drop(client);
+        serve.await.unwrap().unwrap();
+    }
+
+    /// A client half-close is not abandonment: the pending frame still
+    /// earns its answer, then the stream finishes on the drained EOF
+    /// (issue #974 review).
+    #[tokio::test]
+    async fn outbound_stream_half_close_drains_answer() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let cell = new_dns_outbound_cell();
+        *cell.write() = Some(new_resolver_slot(make("10.0.0.1".parse().unwrap())));
+        let (mut client, server) = tokio::io::duplex(4096);
+        let budget = Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT));
+        let serve = tokio::spawn(serve_dns_outbound_stream(server, cell, budget));
+
+        let query = sample_query(0x33, 1);
+        client
+            .write_all(&(query.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        client.write_all(&query).await.unwrap();
+        client.shutdown().await.unwrap();
+
+        let mut prefix = [0u8; 2];
+        client.read_exact(&mut prefix).await.unwrap();
+        let mut body = vec![0u8; usize::from(u16::from_be_bytes(prefix))];
+        client.read_exact(&mut body).await.unwrap();
+        let msg = Message::from_vec(&body).unwrap();
+        assert_eq!(msg.metadata.id, 0x33);
+        assert_eq!(msg.answers[0].data, RData::A("10.0.0.1".parse().unwrap()));
+
+        // After the drained answer, FIN — no further frames, no hang.
+        assert_eq!(client.read(&mut [0u8; 1]).await.unwrap(), 0);
+        serve.await.unwrap().unwrap();
+    }
+
     /// `disabled_answer` mirrors `handle_query`'s taxonomy: silence for a
     /// response packet or a truncated frame, NOTIMP for a non-QUERY
     /// opcode, FORMERR for a multi-question, SERVFAIL for a good query.
@@ -4879,10 +5078,8 @@ mod tests {
         let response = build(1);
         assert!(response.len() > 512);
         // No OPT on the query → 512 bound, TC set, still decodable.
-        let fitted = fit_udp_response(
-            Message::from_vec(&sample_query(1, 1)).ok().as_ref(),
-            &response,
-        );
+        let plain_query = Message::from_vec(&sample_query(1, 1)).unwrap();
+        let fitted = fit_udp_response(&plain_query, &response);
         assert!(fitted.len() <= 512);
         let msg = Message::from_vec(&fitted).unwrap();
         assert!(msg.metadata.truncation);
@@ -4891,7 +5088,7 @@ mod tests {
         let mut edns = hickory_proto::op::Edns::new();
         edns.set_max_payload(2048);
         edns_query.set_edns(edns);
-        let fitted = fit_udp_response(Some(&edns_query), &response);
+        let fitted = fit_udp_response(&edns_query, &response);
         assert_eq!(fitted, response);
     }
 }
