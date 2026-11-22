@@ -55,18 +55,19 @@ Upstream lives in `adapter/outbound/`. Current Rust adapters live in `crates/meo
 
 Upstream `adapter/outbound` supports these pluggable transports layered on top of adapters: `tls`, `ws`, `h2`, `http`, `grpc`, `httpupgrade`, `shadowtls`, `v2ray-plugin`, `simple-obfs`, `restls`, `mux/smux`.
 
-Rust port currently supports (each SS plugin sits behind its same-named
-cargo feature; `simple-obfs`/`v2ray-plugin` ride `ss` itself, the rest are
-opt-in and re-bundled into `default`/`full` but excluded from `minimal`):
+Rust port currently supports (each SS plugin sits behind its own cargo
+feature — `simple-obfs` behind `ss-obfs`, `v2ray-plugin` behind
+`ss-v2ray-plugin`, the rest same-named; all are re-bundled into
+`default`/`full`, and `minimal` carries `ss-obfs` only):
 
-- `v2ray-plugin` (websocket + TLS) — `crates/meow-proxy/src/v2ray_plugin.rs` (`ss`)
+- `v2ray-plugin` (websocket + TLS) — `crates/meow-proxy/src/v2ray_plugin.rs` (`ss-v2ray-plugin`)
 - `gost-plugin` (websocket + TLS + smux) — `crates/meow-proxy/src/gost_plugin.rs` (`gost-plugin`)
 - `shadow-tls` (cover-TLS record transport, v1/v2/v3) — `crates/meow-proxy/src/shadow_tls_plugin.rs` (`shadow-tls`)
 - `restls` (record-level TLS client + tagged records, tls12/tls13) — `crates/meow-proxy/src/restls_plugin.rs` (`restls`)
 - `jls` (record-level TLS 1.3 client with hello-random auth) — `crates/meow-proxy/src/jls_plugin.rs` (`jls`)
 - `kcptun` (KCP ARQ + crypt/FEC/snappy over UDP, smux v1 pool, UDP-over-TCP relay) — `crates/meow-proxy/src/kcptun_plugin.rs` (`kcptun`)
 - `ech-tls-tunnel` (TLS-in-TLS with ECH) — `crates/meow-proxy/src/ech_tls_tunnel.rs` (`ech-tls-tunnel`)
-- `simple-obfs` — `crates/meow-proxy/src/shadowsocks_adapter.rs` (`BuiltinObfs`) (`ss`)
+- `simple-obfs` — `crates/meow-proxy/src/shadowsocks_adapter.rs` (`BuiltinObfs`) (`ss-obfs`)
 
 | Transport        | Upstream | Rust | Status |
 |------------------|:--------:|:----:|--------|

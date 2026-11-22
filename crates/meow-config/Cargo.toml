@@ -12,9 +12,9 @@ homepage.workspace = true
 default = ["ss", "ss-obfs", "ss-v2ray-plugin", "trojan", "vless", "vless-vision", "vless-encryption", "ech-tls-tunnel", "vmess", "snell", "hysteria2", "mux", "kcptun", "shadow-tls", "restls", "jls", "gost-plugin"]
 ss = ["meow-proxy/ss"]
 # Built-in SIP003 plugin transports on the `ss` outbound — opt-in, each
-# implies `ss`; plain `ss` now carries none of them (ADR-0007: `minimal`
-# dropped even simple-obfs + v2ray-plugin after their symbols tipped the
-# 8 MiB aarch64-musl hard budget).
+# implies `ss`; plain `ss` carries none of them. The app `minimal`
+# bundle ships `ss-obfs`; `ss-v2ray-plugin` stays out (ADR-0007 8 MiB
+# aarch64-musl budget).
 ss-obfs = ["ss", "meow-proxy/ss-obfs"]
 ss-v2ray-plugin = ["ss", "meow-proxy/ss-v2ray-plugin"]
 shadow-tls = ["ss", "meow-proxy/shadow-tls"]

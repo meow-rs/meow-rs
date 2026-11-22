@@ -611,6 +611,28 @@ partial backtrace via frame-pointer/prologue heuristics, but a complete
 trace needs a rebuild that keeps the unwind tables and debug symbols
 (e.g. via the packager opt-out in `docs/benchmarks/binary-size.md`).
 
+## Addendum (2026-11-22): `ss-obfs` returns to `minimal`
+
+The 2026-11-21 addendum pruned both `ss-obfs` and `ss-v2ray-plugin` out of
+`minimal` to restore the 8 MiB cap; the C-dep unwind-table + zstd trims
+that landed the same day bought back ~289 KB. Operator demand for the
+dominant SIP003 transport makes `obfs` worth that headroom, so `minimal`
+now carries `ss-obfs` (`ss + meow-transport/simple-obfs`) again while
+`ss-v2ray-plugin` and the heavier plugins stay out.
+
+Measured on the reference host (zigbuild, same release profile):
+**8,213,192 B** — 175,416 B under the 8,388,608 B cap; per §6 the cap is
+unchanged, only the bundle contents moved.
+
+Consequences:
+
+- `minimal` (`ss` + `ss-obfs` + `trojan` + `dns-server` +
+  `listener-mixed`) accepts `plugin: obfs`/`simple-obfs`/`obfs-local`
+  nodes again; `plugin: v2ray-plugin` keeps the dead-placeholder +
+  feature-named dial error (`--features ss-v2ray-plugin`).
+- `full`/`default` are unchanged — both features were already bundled
+  there.
+
 ## References
 
 - `docs/roadmap.md` §M2 items 3 + 5 — pinned by this ADR.

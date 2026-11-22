@@ -20,7 +20,7 @@ Release profile: `lto = fat, strip = true, codegen-units = 1, panic = abort, opt
 Feature set measured:
 - **default**: `cargo build --release` (`full` bundle: ss, trojan, vless, dns-server, all listeners)
 - **minimal**: `--no-default-features --features minimal`
-  (`ss + trojan + dns-server + listener-mixed`)
+  (`ss + ss-obfs + trojan + dns-server + listener-mixed`)
 
 ## Size budgets (ADR-0007 §2)
 
@@ -410,3 +410,19 @@ nightly or upstream zig flags. Post-link `llvm-objcopy --remove-section`
 of all three sections shrank the file only 232 B — the payload bytes
 live inside `PT_LOAD` segments and cannot be reclaimed without
 relinking.
+
+## `ss-obfs` restored to `minimal` (2026-11-22)
+
+Measured 2026-11-22 on macOS/Apple Silicon with cargo-zigbuild + zig
+0.17.1, `--no-default-features --features minimal`, same release
+profile — the aarch64-musl leg the ADR-0007 hard gate runs:
+
+| Build | Size | vs 8 MiB cap (8,388,608 B) |
+|-------|------|---------------------------|
+| previous head (`minimal` without plugins, 2026-11-21 landed state) | 8,002,048 B (~7.63 MiB) | −386,560 B headroom |
+| this branch (`minimal` + `ss-obfs`) | **8,213,192 B (~7.83 MiB)** | **−175,416 B headroom** |
+
+`plugin: obfs`/`simple-obfs`/`obfs-local` nodes validate again under
+`minimal`; `plugin: v2ray-plugin` still answers with the
+`--features ss-v2ray-plugin` dead-placeholder contract. `default`/`full`
+feature sets unchanged.

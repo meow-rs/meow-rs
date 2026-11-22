@@ -74,8 +74,8 @@ public-suffix = ["meow-proxy/public-suffix"]
 # from `minimal` alongside `mux` (ADR-0007 binary-size caps).
 kcptun = ["meow-config/kcptun", "meow-proxy/kcptun"]
 # Built-in SIP003 plugin transports on the `ss` outbound — each implies
-# `ss`; in `full`/`default`, excluded from `minimal` (ADR-0007
-# binary-size caps), where `ss` carries none of them.
+# `ss`; in `full`/`default`. `minimal` carries `ss-obfs` only (the
+# dominant SIP003 transport); the rest stay out (ADR-0007 size caps).
 ss-obfs = ["ss", "meow-config/ss-obfs", "meow-proxy/ss-obfs"]
 ss-v2ray-plugin = ["ss", "meow-config/ss-v2ray-plugin", "meow-proxy/ss-v2ray-plugin"]
 shadow-tls = ["ss", "meow-config/shadow-tls", "meow-proxy/shadow-tls"]
@@ -126,7 +126,7 @@ listener-shadowsocks = ["meow-listener/listener-shadowsocks"]
 listener-wireguard = ["meow-listener/listener-wireguard", "wireguard"]
 
 # Convenience bundles
-minimal = ["ss", "trojan", "dns-server", "listener-mixed"]
+minimal = ["ss", "ss-obfs", "trojan", "dns-server", "listener-mixed"]
 full = [
     "ss", "ss-obfs", "ss-v2ray-plugin", "trojan", "vless", "vless-vision", "vless-encryption", "vmess", "snell", "hysteria2", "anytls", "wireguard", "ech-tls-tunnel", "mux", "kcptun",
     "shadow-tls", "restls", "jls", "gost-plugin",

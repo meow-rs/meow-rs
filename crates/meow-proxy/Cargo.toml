@@ -18,7 +18,7 @@ public-suffix = ["dep:psl"]
 ss = ["dep:shadowsocks"]
 # Built-in SIP003 plugin transports on the `ss` adapter — each an opt-in
 # feature implying `ss`; all are re-bundled into `default`/`full` so
-# release binaries are unchanged, while `minimal` carries none of them
+# release binaries are unchanged, while `minimal` carries `ss-obfs` only
 # (ADR-0007 binary-size caps). A `plugin:` line naming a compiled-out
 # built-in fails at parse with a "not compiled" error naming the feature
 # (`obfs`/`simple-obfs` → `ss-obfs`, `v2ray-plugin` → `ss-v2ray-plugin`);
