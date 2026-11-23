@@ -509,6 +509,29 @@ async fn probe_unix_socket(path: &std::path::Path) -> UnixProbe {
     }
 }
 
+/// Unlink `path` only if it still identifies the socket file that was
+/// probed stale — the `(dev, ino, ctime, ctime_nsec)` recorded before
+/// the probes. Two daemons can race the same stale path: between the
+/// stat and this unlink the loser may have already removed it and bound
+/// a live socket of its own, and deleting that replacement would kill
+/// it. The residual re-stat→unlink window cannot be closed: unix
+/// sockets have no unlink-by-handle (issue #974).
+#[cfg(unix)]
+fn reclaim_stale_socket(path: &std::path::Path, probed: (u64, u64, i64, i64)) -> Result<()> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let same = std::fs::symlink_metadata(path).is_ok_and(|md| {
+        md.file_type().is_socket() && (md.dev(), md.ino(), md.ctime(), md.ctime_nsec()) == probed
+    });
+    if !same {
+        anyhow::bail!(
+            "external-controller-unix: {} changed while it was probed; leaving it alone",
+            path.display()
+        );
+    }
+    std::fs::remove_file(path)
+        .with_context(|| format!("cannot reclaim stale socket {}", path.display()))
+}
+
 /// Bind `external-controller-unix` — meow's deliberately safer handling
 /// (issue #974): where upstream unlinks an existing path unconditionally,
 /// meow refuses a non-socket path, refuses another user's socket, and
@@ -547,9 +570,10 @@ pub async fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
                                 "external-controller-unix: reclaiming stale socket {}",
                                 resolved.display()
                             );
-                            std::fs::remove_file(&resolved).with_context(|| {
-                                format!("cannot reclaim stale socket {}", resolved.display())
-                            })?;
+                            reclaim_stale_socket(
+                                &resolved,
+                                (md.dev(), md.ino(), md.ctime(), md.ctime_nsec()),
+                            )?;
                         }
                         UnixProbe::Live => anyhow::bail!(
                             "external-controller-unix: {} is already serving a live socket",
@@ -813,4 +837,45 @@ pub fn bind_pipe(name: &str) -> Result<PipeEndpoint> {
         pending: Some(pending),
         security,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::reclaim_stale_socket;
+    use std::os::unix::fs::MetadataExt;
+
+    fn sock_ident(path: &std::path::Path) -> (u64, u64, i64, i64) {
+        let md = std::fs::symlink_metadata(path).unwrap();
+        (md.dev(), md.ino(), md.ctime(), md.ctime_nsec())
+    }
+
+    #[test]
+    fn reclaim_removes_the_probed_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let ident = sock_ident(&path);
+        reclaim_stale_socket(&path, ident).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn reclaim_refuses_a_swapped_socket() {
+        // A loser of the probe→unlink race must not delete the winner's
+        // live socket: the identity recorded at probe time no longer
+        // names the file (issue #974).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.sock");
+        drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+        let ident = sock_ident(&path);
+        std::fs::remove_file(&path).unwrap();
+        let _live = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(reclaim_stale_socket(&path, ident).is_err());
+        assert!(path.exists());
+        // A non-socket replacement is refused the same way.
+        let regular = dir.path().join("regular");
+        std::fs::write(&regular, b"x").unwrap();
+        assert!(reclaim_stale_socket(&regular, ident).is_err());
+        assert!(regular.exists());
+    }
 }
