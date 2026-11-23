@@ -2,10 +2,10 @@ use axum::{
     body::Body,
     extract::ws::{Message, WebSocketUpgrade},
     extract::{FromRequestParts, Path, Query, Request, State},
-    http::{header, request::Parts, uri::Authority, StatusCode},
+    http::{header, request::Parts, uri::Authority, Method, StatusCode, Version},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, patch, post, put},
+    routing::{delete, get, patch, post, put, MethodFilter},
     Router,
 };
 use dashmap::DashMap;
@@ -40,6 +40,19 @@ use crate::{
 
 struct MaybeWebSocket(Option<WebSocketUpgrade>);
 
+/// Whether the request is a WebSocket upgrade attempt on either HTTP
+/// version axum serves: `Upgrade: websocket` on HTTP/1.1, or an RFC 8441
+/// extended CONNECT on h2 — `axum::serve` advertises
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL` (no opt-out), so h2 clients may
+/// legitimately arrive this way (issue #974).
+fn is_websocket_attempt(method: &Method, version: Version, headers: &header::HeaderMap) -> bool {
+    headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+        || (*method == Method::CONNECT && version >= Version::HTTP_2)
+}
+
 impl<S> FromRequestParts<S> for MaybeWebSocket
 where
     S: Send + Sync,
@@ -47,12 +60,7 @@ where
     type Rejection = std::convert::Infallible;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let is_websocket = parts
-            .headers
-            .get(header::UPGRADE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-        if !is_websocket {
+        if !is_websocket_attempt(&parts.method, parts.version, &parts.headers) {
             return Ok(Self(None));
         }
         Ok(Self(
@@ -280,12 +288,7 @@ async fn require_auth_ws(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    let is_websocket = req
-        .headers()
-        .get(header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    let token_param = if is_websocket {
+    let token_param = if is_websocket_attempt(req.method(), req.version(), req.headers()) {
         query.get("token").map(std::string::String::as_str)
     } else {
         None
@@ -333,7 +336,9 @@ pub async fn mark_tls_transport(mut req: Request, next: Next) -> Response {
 /// runs after that attach, so `create_router` puts this behind a
 /// catch-all fallback service where the map sees the finished wire:
 /// `allow` is stripped from non-405s and a 405's combined list is
-/// rewritten into chi's per-method lines minus `HEAD` (issue #974).
+/// rewritten into chi's per-method lines minus `HEAD` — and minus the
+/// `CONNECT` the WS routes take for h2 extended-CONNECT upgrades, which
+/// upstream never advertises (issue #974).
 async fn allow_header_compat(mut resp: Response) -> Response {
     let Some(allow) = resp.headers_mut().remove(header::ALLOW) else {
         return resp;
@@ -347,7 +352,7 @@ async fn allow_header_compat(mut resp: Response) -> Response {
     for method in list
         .split(',')
         .map(str::trim)
-        .filter(|m| !m.is_empty() && *m != "HEAD")
+        .filter(|m| !m.is_empty() && *m != "HEAD" && *m != "CONNECT")
     {
         if let Ok(v) = method.parse() {
             resp.headers_mut().append(header::ALLOW, v);
@@ -517,7 +522,14 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/rules/{index}", delete(delete_rule))
         .route("/rules/disable", patch(disable_rules))
         .route("/rules/reorder", post(reorder_rules))
-        .route("/connections", get(get_connections))
+        // WebSocket-capable routes also take CONNECT so an RFC 8441
+        // extended-CONNECT upgrade over h2 reaches the handler — the
+        // route's `Allow` output keeps chi's shape (CONNECT filtered in
+        // `allow_header_compat`) (issue #974).
+        .route(
+            "/connections",
+            get(get_connections).on(MethodFilter::CONNECT, get_connections),
+        )
         .route(
             "/connections/{id}",
             get(get_connection).delete(close_connection),
@@ -530,18 +542,24 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(get_configs).put(put_configs).patch(update_configs),
         )
         .route("/metrics", get(get_metrics))
-        .route("/traffic", get(get_traffic))
+        .route(
+            "/traffic",
+            get(get_traffic).on(MethodFilter::CONNECT, get_traffic),
+        )
         .route(
             "/traffic/ledger",
             get(crate::traffic_ledger::get_ledger).delete(crate::traffic_ledger::clear_ledger),
         )
         .route("/statistics", get(get_statistics))
-        .route("/logs", get(get_logs))
+        .route("/logs", get(get_logs).on(MethodFilter::CONNECT, get_logs))
         .route(
             "/logbook",
             get(crate::logbook::get_logbook).delete(crate::logbook::clear_logbook),
         )
-        .route("/memory", get(get_memory))
+        .route(
+            "/memory",
+            get(get_memory).on(MethodFilter::CONNECT, get_memory),
+        )
         // Dashboard settings sync (zashboard), as mihomo's cache.db store.
         .route(
             "/storage/{key}",

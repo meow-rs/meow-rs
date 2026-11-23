@@ -673,6 +673,83 @@ mod tls {
     }
 
     #[tokio::test]
+    async fn tls_endpoint_h2_extended_connect_serves_websocket() {
+        // axum::serve advertises SETTINGS_ENABLE_CONNECT_PROTOCOL on h2
+        // with no opt-out (hardwired in its connection builder), so the WS
+        // routes must serve real RFC 8441 extended CONNECT upgrades:
+        // `:protocol: websocket` + `?token` auth → 200, then WS frames
+        // flow on the stream's DATA (issue #974).
+        let state = test_state(Default::default(), Some("s3cret"));
+        let endpoint = meow_api::endpoint::bind_tls("127.0.0.1:0", None, None)
+            .await
+            .unwrap();
+        let addr = endpoint.addr();
+        tokio::spawn(async move { axum::serve(endpoint, create_router(state)).await });
+
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut builder =
+            boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+        builder.set_verify(boring::ssl::SslVerifyMode::NONE);
+        builder.set_alpn_protos(b"\x02h2").unwrap();
+        let connector = builder.build();
+        let tls = tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
+            .await
+            .unwrap();
+        let (client, conn) = h2::client::handshake(tls).await.unwrap();
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+
+        async fn ws_connect(
+            client: &h2::client::SendRequest<bytes::Bytes>,
+            uri: &str,
+        ) -> (h2::client::ResponseFuture, h2::SendStream<bytes::Bytes>) {
+            let mut req = axum::http::Request::builder()
+                .method(axum::http::Method::CONNECT)
+                .uri(uri)
+                .header("sec-websocket-version", "13")
+                .body(())
+                .unwrap();
+            req.extensions_mut()
+                .insert(h2::ext::Protocol::from_static("websocket"));
+            client
+                .clone()
+                .ready()
+                .await
+                .unwrap()
+                .send_request(req, false)
+                .unwrap()
+        }
+
+        // Bearer still gates extended CONNECT — no credential → 401.
+        let (resp_fut, _send) = ws_connect(&client, "https://localhost/memory").await;
+        assert_eq!(resp_fut.await.unwrap().status(), StatusCode::UNAUTHORIZED);
+
+        // `?token=` is honored on h2 CONNECT like the HTTP/1.1 upgrade
+        // path (browser WS clients cannot set headers on either).
+        let (resp_fut, _send) = ws_connect(&client, "https://localhost/memory?token=s3cret").await;
+        let resp = resp_fut.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        // /memory's WS arm writes its first frame immediately — the
+        // upgraded stream's DATA must carry a real WebSocket text frame.
+        let mut recv = resp.into_body();
+        let mut payload = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !payload.windows(5).any(|w| w == b"inuse") {
+                let Some(chunk) = recv.data().await else {
+                    break;
+                };
+                let chunk = chunk.unwrap();
+                let _ = recv.flow_control().release_capacity(chunk.len());
+                payload.extend_from_slice(&chunk);
+            }
+        })
+        .await
+        .expect("timed out waiting for the websocket frame");
+        assert!(payload.windows(5).any(|w| w == b"inuse"), "{payload:?}");
+    }
+
+    #[tokio::test]
     async fn tls_endpoint_marks_https_scheme_for_origin_guard() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         // No secret → the browser origin guard (not Bearer) gates requests.
