@@ -2777,6 +2777,10 @@ mod tests {
         api.external_controller = Some("127.0.0.1:9090".parse().unwrap());
         assert!(api_endpoint_servable(&api));
         api.external_controller = None;
+        // The platform arms below assert on unix/pipe alone — a
+        // lingering TLS endpoint would answer true on an api-tls
+        // Windows build before the unix arm is even asked.
+        api.external_controller_tls = None;
         api.external_controller_unix = Some("meow.sock".into());
         assert_eq!(api_endpoint_servable(&api), cfg!(unix));
         api.external_controller_pipe = Some(r"\\.\pipe\meow".into());
