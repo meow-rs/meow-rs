@@ -112,6 +112,10 @@ mod tls {
             // std's TcpListener::bind sets this on unix — the raw path
             // must not lose it: a TIME_WAIT socket sharing the port
             // otherwise fails a restart's rebind with EADDRINUSE.
+            // Winsock's SO_REUSEADDR instead means "allow stealing an
+            // in-use port" (why std and tokio never set it there), so
+            // the flag is unix-only.
+            #[cfg(unix)]
             socket
                 .set_reuse_address(true)
                 .context("external-controller-tls: cannot set SO_REUSEADDR")?;
