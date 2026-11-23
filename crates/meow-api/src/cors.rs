@@ -26,10 +26,17 @@ use axum::{
 use crate::routes::AppState;
 
 /// The configured-path method set — upstream's `AllowedMethods`. `HEAD`
-/// is deliberately absent: a preflight asking for it is denied
+/// is deliberately absent: a preflight asking for it is denied and an
+/// actual `HEAD` gets no `Access-Control-Allow-Origin` either
 /// (weird-but-real, probe-verified); `OPTIONS` is the library's own
 /// special case.
 const ALLOWED_METHODS: &[&str] = &["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"];
+
+/// The configured-path request-header allowlist — upstream's
+/// `AllowedHeaders`: `Content-Type`, `Authorization` and `Origin`,
+/// case-insensitive. A preflight asking for anything else is denied in
+/// full, not trimmed (issue #974).
+const ALLOWED_HEADERS: &[&str] = &["content-type", "authorization", "origin"];
 
 /// `Access-Control-Max-Age` on a configured-path preflight.
 const MAX_AGE: &str = "300";
@@ -140,10 +147,14 @@ async fn handle_configured(state: &AppState, req: Request<Body>, next: Next) -> 
             .get(header::ORIGIN)
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
+        // Upstream's `handleActualRequest` gates the grant on the same
+        // allowlists as a preflight — origin *and* method — so a HEAD
+        // from an allowed origin still earns no ACAO (issue #974).
+        let method_allowed = ALLOWED_METHODS.contains(&req.method().as_str());
         let mut resp = next.run(req).await;
         let h = resp.headers_mut();
         if let Some(origin) = origin {
-            if origin_allowed(&cors.allow_origins, &origin) {
+            if method_allowed && origin_allowed(&cors.allow_origins, &origin) {
                 h.insert(
                     header::ACCESS_CONTROL_ALLOW_ORIGIN,
                     if allow_all(&cors.allow_origins) {
@@ -187,18 +198,28 @@ async fn handle_configured(state: &AppState, req: Request<Body>, next: Next) -> 
     if !ALLOWED_METHODS.contains(&req_method.as_str()) {
         return resp;
     }
-    // The configured path's `AllowedHeaders` is `["*"]` upstream — every
-    // requested header passes and is echoed canonicalized, in request order.
+    // Requested headers must be a case-insensitive subset of
+    // `AllowedHeaders` — one unsupported name denies the whole grant;
+    // allowed names echo canonicalized, in request order.
     let req_headers = req
         .headers()
         .get(header::ACCESS_CONTROL_REQUEST_HEADERS)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
-    let canonical: Vec<String> = req_headers
+    let requested: Vec<&str> = req_headers
         .split(',')
         .map(str::trim)
         .filter(|name| !name.is_empty())
-        .map(canonical_header_key)
+        .collect();
+    if !requested
+        .iter()
+        .all(|name| ALLOWED_HEADERS.contains(&name.to_ascii_lowercase().as_str()))
+    {
+        return resp;
+    }
+    let canonical: Vec<String> = requested
+        .iter()
+        .map(|name| canonical_header_key(name))
         .collect();
 
     let h = resp.headers_mut();
