@@ -46,7 +46,12 @@ reloads file-backed identities; meow snapshots them at bind),
 
 - The three listener keys and `tls.certificate`/`tls.private-key`
   weak-decode scalars — a string verbatim, a number rendered, a boolean
-  `"true"`/`"false"` — and hard-error on sequences and mappings.
+  `"true"`/`"false"` — and hard-error on sequences and mappings. The
+  coercion follows the YAML resolution — under YAML 1.2's core schema
+  only `true`/`false` are booleans, so `external-controller-tls: 5`
+  parses as `"5"` and `external-controller-tls: yes` keeps the literal
+  spelling `"yes"` (quoting changes nothing); the legacy bool spellings
+  are honoured only by `allow-private-network`, which is a typed bool.
 - `allow-origins` is a sequence; items weak-decode the same way. A bare
   scalar (`allow-origins: "*"`) is a hard error, `[]` is allowed and
   means allow-all.
@@ -61,10 +66,10 @@ reloads file-backed identities; meow snapshots them at bind),
   feed the listener identity.
 - `meow -t` and `PUT /configs` validate decode + shape only: no socket
   bind, no socket unlink/create, no PEM file read, no ephemeral cert
-  generation. One deliberate tightening: with the TLS listener declared,
-  a one-sided `tls.certificate`/`tls.private-key` pair and a malformed
-  *inline* PEM pair are build errors (`-t` sees them too), where upstream
-  defers every identity failure to endpoint bind and merely skips HTTPS.
+  generation. Like upstream, *every* identity failure — one-sided pair,
+  malformed inline PEM, unreadable path, invalid cert/key — defers to
+  endpoint bind and merely skips the HTTPS listener; the build keeps the
+  raw values.
 
 ## Runtime semantics
 
@@ -77,11 +82,19 @@ reloads file-backed identities; meow snapshots them at bind),
   is logged and skipped (`… — endpoint skipped`), never silently
   downgraded; if every configured endpoint failed, startup logs that no
   controller is available.
-- TLS identity resolution is pair-level like upstream: both values
-  containing `-----BEGIN` → inline PEM (validated at config build);
+- TLS identity resolution is pair-level like upstream, decided at
+  endpoint bind: both values containing `-----BEGIN` → inline PEM;
   otherwise both are file paths resolved under home/`SAFE_PATHS` and
-  read once at bind (bounded read, regular files only). A chain PEM
-  serves leaf-first.
+  read once (bounded read, regular files only). A *mixed* pair — one
+  inline, one path — is rejected before path resolution, and the error
+  never embeds the inline material as if it were a path. A chain PEM
+  serves leaf-first. Both unset → an ephemeral self-signed RSA-2048
+  `localhost` identity.
+- A bare `:port` on `external-controller-tls` resolves to the dual-stack
+  wildcard `[::]:port` with `IPV6_V6ONLY` explicitly off — upstream's
+  `net.Listen("tcp", …)` behavior on a dual-stack host. (The plain
+  `external-controller` keeps its pre-existing `0.0.0.0:port`
+  normalization at parse.)
 - The TLS accept loop bounds in-flight handshakes (128) and gives each
   a 10 s deadline so a slow-loris burst cannot stall accept; finished
   handshakes queue for axum (64).
@@ -103,19 +116,29 @@ serves without auth, and leaves a stale socket on exit. meow:
 - refuses a non-socket path and another user's socket;
 - probes an existing same-owner socket and reclaims it only when the
   connect fails `ECONNREFUSED` (verified stale);
-- binds owner-only `0600`;
+- binds owner-only `0600` — and a `chmod` failure fails the whole
+  endpoint bind rather than serving a world-accessible socket;
 - keeps Bearer auth (and the no-secret origin guard) on the socket —
   like the pipe and TLS transports;
 - removes only the socket path it created, via a guard that lives for
-  the daemon's lifetime.
+  the daemon's lifetime and re-verifies the path is still a socket with
+  the same `(dev, ino)` it bound — a swapped or recreated file is left
+  alone.
 
 ### Windows pipe
 
 Byte-mode `NamedPipeServer` instances, one pending instance always
 pre-created, remote clients rejected, `first_pipe_instance` claims the
-name. Serving is `cfg(windows)`; on other platforms a configured
-`external-controller-pipe` warns and is ignored (also at validate time).
-Windows parity is untested on real Windows.
+name. Every instance — the first and each replacement — is created under
+an owner-only security descriptor (SDDL `D:P(A;;GA;;;OW)`, a protected
+DACL granting the owner all access and nothing else), a deliberate
+hardening over upstream's default-ACL pipe that matches the `0600`
+posture of the Unix socket. If creating the *next* pending instance
+fails after a client already connected, the connected client is still
+served and creation retries on the next accept. Serving is
+`cfg(windows)`; on other platforms a configured `external-controller-pipe`
+warns and is ignored (also at validate time). Windows parity is untested
+on real Windows.
 
 ## CORS contract (two wire shapes, keyed on map *presence*)
 
@@ -147,12 +170,20 @@ top of a 403-rejected origin would leak a false promise (upstream's
   uppercased, from `GET POST PUT PATCH DELETE OPTIONS` — `HEAD` is
   never allowed (weird-but-real, probe-verified);
 - `Access-Control-Allow-Headers` echoes the requested header list
-  canonicalized (`Authorization`), in request order;
+  canonicalized (`Authorization`), in request order — but only when
+  every requested name passes the upstream allowlist
+  `{content-type, authorization, origin}` (case-insensitive); one
+  unsupported name denies the whole grant, it is not trimmed. (The
+  configured path never emits the absent-path's literal `*` here — a
+  `*` is a wildcard to Fetch only for non-credentialed requests, which
+  is why upstream's `AllowAll` shape gets away with it.);
 - `Access-Control-Max-Age: 300`;
 - `Access-Control-Allow-Private-Network: true` only when
   `allow-private-network` resolved true (default) *and* the request
   sent `Access-Control-Request-Private-Network: true` literally;
-- actual request → allowed origin echoes/`*(as above) + `Vary: origin`.
+- actual request → allowed origin echoes/`*(as above) + `Vary: origin`,
+  gated on the same method allowlist — an actual `HEAD` from an allowed
+  origin earns no `Access-Control-Allow-Origin`.
 - A bare `OPTIONS` without `Origin`/`Access-Control-Request-Method`
   is not a preflight — it falls through to the router (405 on `/`).
 
@@ -172,14 +203,15 @@ surface the TLS/CORS keys — private key material is never echoed.
   field decoders.
 - `crates/meow-config/src/lib.rs` — `ApiConfig` extension,
   `ApiCorsConfig` resolution, `has_servable_endpoint()`, the shared
-  BoringSSL acceptor builder + build-time identity gates.
+  BoringSSL acceptor builder invoked at endpoint bind only.
 - `crates/meow-config/src/validation.rs` — misplaced/member/platform
   warnings.
 - `crates/meow-config/src/safe_path.rs` — `resolve_home_contained`.
 - `crates/meow-api/src/cors.rs` — the two-path CORS middleware.
 - `crates/meow-api/src/endpoint.rs` — `bind_tls` (+ handshake driver,
-  ephemeral identity), `bind_unix` (+ stale reclaim, ownership guard),
-  `bind_pipe` (Windows).
+  ephemeral identity, dual-stack wildcard), `bind_unix` (+ stale
+  reclaim, `0600` enforcement, dev+ino cleanup guard), `bind_pipe`
+  (+ owner-only SDDL ACL, pending-instance preservation) on Windows.
 - `crates/meow-api/src/lib.rs` — `ApiServer` split: shared state,
   `router()`, `run_on`, `serve_on`, `serve_tls_on`.
 - `crates/meow-api/src/routes.rs` — CORS layer mount, `TlsTransport`
@@ -189,12 +221,16 @@ surface the TLS/CORS keys — private key material is never echoed.
 
 ## Test coverage
 
-- `crates/meow-config/tests/config_test.rs` — 14 parser tests: scalar
+- `crates/meow-config/tests/config_test.rs` — parser tests: scalar
   weak-decode, container hard errors, TLS shapes, misplaced keys,
-  warn-ignored members, CORS defaults/legacy bools, pair gates.
-- `crates/meow-api/tests/api_endpoint_test.rs` — 22 tests: CORS wire
-  shapes (both paths, wildcard/empty/glob/denied, HEAD, PNA, headers,
-  bare-OPTIONS), TLS serving + ALPN + scheme-marker origin guard,
-  configured/bad identities, Unix serve/auth/0600/reclaim/refuse/
-  cleanup/relative-home, PUT persistence without rebinding, GET
-  no-echo.
+  warn-ignored members, CORS defaults/legacy bools, shape-only pairs,
+  `has_servable_endpoint` per-transport.
+- `crates/meow-api/tests/api_endpoint_test.rs` — CORS wire shapes (both
+  paths, wildcard/empty/glob/denied, HEAD on preflight *and* actual,
+  header allowlist denial, PNA, bare-OPTIONS), TLS serving + real
+  negotiated-`h2` request + scheme-marker origin guard, configured/bad/
+  mixed-no-leak identities, Unix serve/auth/0600/reclaim/refuse/
+  swap-safe-cleanup/relative-home, PUT persistence without rebinding,
+  GET no-echo.
+- `crates/meow-app/src/main.rs` — `--ext-ctl-*` overrides, including the
+  empty-override-keeps-YAML rule.
