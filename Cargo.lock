@@ -2646,6 +2646,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64 0.22.1",
+ "boring",
  "dashmap",
  "hickory-proto",
  "httparse",
