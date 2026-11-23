@@ -92,11 +92,20 @@ reloads file-backed identities; meow snapshots them at bind),
   never embeds the inline material as if it were a path. A chain PEM
   serves leaf-first. Both unset → an ephemeral self-signed RSA-2048
   `localhost` identity.
-- A bare `:port` on `external-controller-tls` resolves to the dual-stack
-  wildcard `[::]:port` with `IPV6_V6ONLY` explicitly off — upstream's
-  `net.Listen("tcp", …)` behavior on a dual-stack host. (The plain
+- A bare `:port` on `external-controller-tls` tries `[::]:port` first —
+  dual-stack, `IPV6_V6ONLY` explicitly off, `SO_REUSEADDR` on — and falls
+  back to `0.0.0.0:port` when the host cannot do IPv6; a hostname's
+  answers are reordered v4-first and each is tried until one binds —
+  upstream's `net.Listen("tcp", …)` behavior. (The plain
   `external-controller` keeps its pre-existing `0.0.0.0:port`
   normalization at parse.)
+- The TLS listener advertises h2 via ALPN and answers RFC 8441
+  extended-CONNECT (`CONNECT` + `:protocol = websocket`) WebSocket
+  upgrades on the WS-capable routes — axum's serve layer enables the
+  protocol unconditionally, so the routes/auth path understands it
+  rather than refusing; `?token=` authenticates those upgrades the same
+  as HTTP/1.1's. `CONNECT` never leaks into the chi-shaped `Allow`
+  headers.
 - The TLS accept loop bounds in-flight handshakes (128) and gives each
   a 10 s deadline so a slow-loris burst cannot stall accept; finished
   handshakes queue for axum (64).
@@ -108,7 +117,9 @@ reloads file-backed identities; meow snapshots them at bind),
   TLS address or socket path is never published as an `http://`
   endpoint.
 - Headless connection tracking is selected only when *no* servable
-  endpoint is configured.
+  endpoint is configured — servable at startup meaning configured *and*
+  compiled into this build (a TLS-only config on a no-`api-tls` build is
+  headless).
 
 ### `api-tls` build feature
 
@@ -135,10 +146,20 @@ Upstream unlinks whatever occupies the path, binds, `chmod 0666`s it,
 serves without auth, and leaves a stale socket on exit. meow:
 
 - refuses a non-socket path and another user's socket;
-- probes an existing same-owner socket and reclaims it only when the
-  connect fails `ECONNREFUSED` (verified stale);
-- binds owner-only `0600` — and a `chmod` failure fails the whole
-  endpoint bind rather than serving a world-accessible socket;
+- probes an existing same-owner socket with a 500 ms-bounded connect;
+  `ECONNREFUSED` twice (50 ms apart — macOS/BSD refuse once the backlog
+  is full, so one refusal is ambiguous) means stale, success means live,
+  and a timeout or any other error means uncertain: the path is left
+  alone and the endpoint skipped;
+- before unlinking a verified-stale socket re-stats the path and unlinks
+  only when `(dev, ino, ctime, ctime_nsec)` still names the probed file —
+  a racing re-bind leaves a *different* socket, which is kept (the
+  residual stat→unlink window is inherent: unix sockets have no
+  unlink-by-handle);
+- binds owner-only `0600` by binding a private sibling path, `chmod`ing
+  it, then renaming into place — the configured path never exists with
+  permissive mode; a `chmod` failure fails the whole endpoint bind
+  rather than serving a world-accessible socket;
 - keeps Bearer auth (and the no-secret origin guard) on the socket —
   like the pipe and TLS transports;
 - removes only the socket path it created, via a guard that lives for
@@ -231,14 +252,16 @@ surface the TLS/CORS keys — private key material is never echoed.
 - `crates/meow-config/src/safe_path.rs` — `resolve_home_contained`.
 - `crates/meow-api/src/cors.rs` — the configured-path CORS middleware.
 - `crates/meow-api/src/endpoint.rs` — `bind_tls` (+ BoringSSL acceptor
-  builder, handshake driver, ephemeral identity, dual-stack wildcard)
-  under `api-tls`, `bind_unix` (+ stale reclaim, `0600` enforcement,
-  dev+ino cleanup guard), `bind_pipe` (+ owner-only SDDL ACL,
-  pending-instance preservation) on Windows.
+  builder, handshake driver, ephemeral identity, v4-first/dual-stack
+  candidate binding) under `api-tls`, `bind_unix` (+ bounded stale
+  probe, identity-verified reclaim, `0600`-via-rename, dev+ino cleanup
+  guard), `bind_pipe` (+ owner-only SDDL ACL, pending-instance
+  preservation) on Windows.
 - `crates/meow-api/src/lib.rs` — `ApiServer` split: shared state,
   `router()`, `run_on`, `serve_on`, `serve_tls_on`.
 - `crates/meow-api/src/routes.rs` — CORS layer mount, `TlsTransport`
-  scheme marker, PUT snapshot warning.
+  scheme marker, PUT snapshot warning, h2 extended-CONNECT WebSocket
+  recognition/auth and `Allow`-header filtering.
 - `crates/meow-app/src/main.rs` — CLI overrides, multi-endpoint startup,
   Unix cleanup guard, headless gating.
 
@@ -251,9 +274,12 @@ surface the TLS/CORS keys — private key material is never echoed.
 - `crates/meow-api/tests/api_endpoint_test.rs` — CORS wire shapes (both
   paths, wildcard/empty/glob/denied, HEAD on preflight *and* actual,
   header allowlist denial, PNA, bare-OPTIONS), TLS serving + real
-  negotiated-`h2` request + scheme-marker origin guard, configured/bad/
-  mixed-no-leak identities, Unix serve/auth/0600/reclaim/refuse/
-  swap-safe-cleanup/relative-home, PUT persistence without rebinding,
+  negotiated-`h2` request + scheme-marker origin guard + h2
+  extended-CONNECT WebSocket auth/frame, TIME_WAIT rebind, hostname
+  v4-first bind, configured/bad/mixed-no-leak identities, Unix
+  serve/auth/0600/reclaim/refuse/swap-safe-cleanup/relative-home/
+  bounded-probe-under-full-backlog, PUT persistence without rebinding,
   GET no-echo.
 - `crates/meow-app/src/main.rs` — `--ext-ctl-*` overrides, including the
-  empty-override-keeps-YAML rule.
+  empty-override-keeps-YAML rule; `api_endpoint_servable` applies the
+  `api-tls` compile gate to the configured set.
