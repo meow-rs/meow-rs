@@ -1213,8 +1213,7 @@ pub async fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
     // and rename it onto the configured path already owner-only — the
     // final path is never observable permissive, and no process-global
     // umask dance is needed. rename preserves the inode and the
-    // listening fd (issue #974). Crash litter is single-owner by
-    // construction (the PID names it), so a leftover is safe to drop.
+    // listening fd (issue #974).
     let (listener, tmp) = bind_unix_staging(&resolved).await?;
     // Owner-only — the controller is authenticated, but the socket file
     // never needs the world-read/write upstream grants it. A failed
