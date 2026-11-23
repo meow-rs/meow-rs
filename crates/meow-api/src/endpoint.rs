@@ -740,6 +740,10 @@ fn unix_socket_holders(
 /// `socket:[ino]` fd links name — the route to the holder's cwd, the
 /// only frame a relative spelling resolves under (issue #974).
 #[cfg(any(target_os = "linux", target_os = "android"))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "uniform Result across the platform arms; the Apple arm bails on truncated tables"
+)]
 fn unix_socket_still_bound(path: &std::path::Path) -> Result<bool> {
     use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
