@@ -235,7 +235,8 @@ cargo test --lib --bin meow --bin meow-bench --bin meow-cli \
   --test direct_udp_binding \
   --test common_test --test dns_cache_test --test dns_response_rules --test config_test \
   --test tun_config_test --test sniffer_config_test --test dialer_proxy_group \
-  --test statistics_test --test rules_test --test api_test --test meow_cli_test \
+  --test statistics_test --test rules_test \
+  --test api_test --test api_endpoint_test --test api_logs_ws_test --test meow_cli_test \
   --test raii_guard_test --test http_connection_close \
   --test config_persistence_test --test systemd_config_test \
   --test launchd_config_test \

@@ -276,6 +276,80 @@ async fn cors_configured_head_method_denied() {
 }
 
 #[tokio::test]
+async fn cors_configured_head_actual_gets_no_acao() {
+    // Upstream gates the actual request on the same allowlist as the
+    // preflight: an allowed origin doing an actual HEAD still earns no
+    // Access-Control-Allow-Origin (issue #974).
+    let state = test_state(configured(&["https://ok.example"], true), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("HEAD")
+                .uri("/")
+                .header(header::ORIGIN, "https://ok.example")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!resp
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    assert_eq!(vary_values(&resp), vec!["origin"]);
+}
+
+#[tokio::test]
+async fn cors_configured_denied_request_header_denies_whole_preflight() {
+    // `AllowedHeaders` upstream is {content-type, authorization, origin};
+    // one unsupported requested header denies the whole grant — it is
+    // not trimmed to the allowed subset (issue #974).
+    let state = test_state(configured(&["*"], true), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight(
+            "https://any.example",
+            "GET",
+            Some("content-type,x-custom-header"),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!resp
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    assert!(!resp
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_HEADERS));
+    assert_eq!(
+        vary_values(&resp),
+        vec![
+            "origin",
+            "access-control-request-method",
+            "access-control-request-headers"
+        ]
+    );
+
+    // Case-insensitive allowlist: `ORIGIN` passes like `origin`.
+    let state = test_state(configured(&["*"], true), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight(
+            "https://any.example",
+            "GET",
+            Some("ORIGIN,Authorization"),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    assert_eq!(
+        resp.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
+        "Origin, Authorization"
+    );
+}
+
+#[tokio::test]
 async fn cors_configured_wildcard_replies_star() {
     let state = test_state(configured(&["*"], true), Some("s3cret"));
     let resp = create_router(state)
@@ -384,7 +458,9 @@ async fn tls_endpoint_serves_https_and_negotiates_alpn() {
     tokio::spawn(async move { axum::serve(endpoint, create_router(state)).await });
 
     // h2-only offer: the acceptor must negotiate it (upstream probe
-    // verified ALPN advertises `h2` first, then `http/1.1`).
+    // verified ALPN advertises `h2` first, then `http/1.1`) — and axum's
+    // `http2` feature must actually serve a real HTTP/2 request, not
+    // just negotiate the protocol.
     let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
     let mut builder = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
     builder.set_verify(boring::ssl::SslVerifyMode::NONE);
@@ -394,7 +470,31 @@ async fn tls_endpoint_serves_https_and_negotiates_alpn() {
         .await
         .unwrap();
     assert_eq!(tls.ssl().selected_alpn_protocol(), Some(b"h2".as_slice()));
-    drop(tls);
+    let (client, conn) = h2::client::handshake(tls).await.unwrap();
+    tokio::spawn(async move {
+        conn.await.unwrap();
+    });
+    let req = axum::http::Request::builder()
+        .uri("https://localhost/")
+        .header(header::AUTHORIZATION, "Bearer s3cret")
+        .body(())
+        .unwrap();
+    let (resp_fut, _send) = client
+        .ready()
+        .await
+        .unwrap()
+        .send_request(req, true)
+        .unwrap();
+    let resp = resp_fut.await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let mut body = resp.into_body();
+    let mut payload = Vec::new();
+    while let Some(chunk) = body.data().await {
+        let chunk = chunk.unwrap();
+        let _ = body.flow_control().release_capacity(chunk.len());
+        payload.extend_from_slice(&chunk);
+    }
+    assert_eq!(String::from_utf8(payload).unwrap(), "{\"hello\":\"meow\"}");
 
     // http/1.1-only offer: negotiated http/1.1 and a real request answers
     // the shared router — auth enforced like every other transport.
@@ -482,8 +582,8 @@ async fn tls_endpoint_configured_pem_pair() {
 
 #[tokio::test]
 async fn tls_endpoint_bad_pair_and_bad_addr_fail() {
-    // One-sided pairs never reach here in production (config build
-    // rejects them); the endpoint still refuses defensively.
+    // One-sided pairs are endpoint-local failures upstream (config build
+    // and `-t` stay shape-only, issue #974) — the endpoint bind refuses.
     assert!(
         meow_api::endpoint::bind_tls("127.0.0.1:0", Some("-----BEGIN CERTIFICATE-----"), None)
             .await
@@ -502,6 +602,50 @@ async fn tls_endpoint_bad_pair_and_bad_addr_fail() {
         meow_api::endpoint::bind_tls("no-such-host.invalid:0", None, None)
             .await
             .is_err()
+    );
+}
+
+#[tokio::test]
+async fn tls_endpoint_mixed_inline_and_path_fails_without_leaking_material() {
+    // A mixed pair (one inline PEM, one file path) is rejected before
+    // path resolution — upstream refuses it and the error must never
+    // embed the inline PEM text as if it were a filesystem path
+    // (issue #974).
+    let err = meow_api::endpoint::bind_tls(
+        "127.0.0.1:0",
+        Some("-----BEGIN CERTIFICATE-----\nbogus-cert\n-----END CERTIFICATE-----"),
+        Some("keys/private.pem"),
+    )
+    .await
+    .err()
+    .expect("mixed pair must fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("both inline PEM or both file paths"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        !msg.contains("bogus-cert"),
+        "error leaked PEM material: {msg}"
+    );
+
+    // The mirror image — path cert + inline key — same refusal.
+    let err = meow_api::endpoint::bind_tls(
+        "127.0.0.1:0",
+        Some("certs/server.pem"),
+        Some("-----BEGIN PRIVATE KEY-----\nbogus-key\n-----END PRIVATE KEY-----"),
+    )
+    .await
+    .err()
+    .expect("mixed pair must fail");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("both inline PEM or both file paths"),
+        "unexpected error: {msg}"
+    );
+    assert!(
+        !msg.contains("bogus-key"),
+        "error leaked PEM material: {msg}"
     );
 }
 
@@ -594,14 +738,29 @@ mod unix {
 
     #[tokio::test]
     async fn unix_endpoint_relative_path_resolves_under_home() {
+        // `set_home_dir` is process-global one-shot (`-d` semantics), so
+        // a relative configured path lands under that home — not the
+        // caller's CWD — and missing parents are created (issue #974).
         let dir = tempfile::tempdir().unwrap();
-        let sock = dir.path().join("sub/rel.sock");
-        // Absolute here — the home-relative resolution is exercised by
-        // the config-path unit tests; this pins creation of missing
-        // parents.
-        let (_endpoint, guard) = meow_api::endpoint::bind_unix(sock.to_str().unwrap()).unwrap();
-        assert!(sock.exists());
+        meow_common::set_home_dir(dir.path().to_path_buf());
+        let (_endpoint, guard) = meow_api::endpoint::bind_unix("sub/rel.sock").unwrap();
+        assert_eq!(guard.path(), dir.path().join("sub/rel.sock").as_path());
+        assert!(dir.path().join("sub/rel.sock").exists());
         drop(guard);
+    }
+
+    #[tokio::test]
+    async fn unix_endpoint_cleanup_only_removes_its_own_socket() {
+        // The guard must not unlink a path that was swapped behind its
+        // back: cleanup re-checks the file is still a socket *and* still
+        // the same (dev, ino) it bound (issue #974).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("swap.sock");
+        let (_endpoint, guard) = meow_api::endpoint::bind_unix(path.to_str().unwrap()).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(&path, b"not the daemon's socket").unwrap();
+        drop(guard);
+        assert_eq!(std::fs::read(&path).unwrap(), b"not the daemon's socket");
     }
 
     #[tokio::test]
