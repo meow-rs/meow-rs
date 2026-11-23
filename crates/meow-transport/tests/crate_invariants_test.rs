@@ -543,6 +543,13 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         1,
         "bind_udp's fall-through when no binding/protector is installed",
     ),
+    // Inbound controller sockets, not outbound dials.
+    (
+        "crates/meow-api/src/endpoint.rs",
+        "Socket::new(",
+        1,
+        "the external-controller-tls listener's dual-stack [::] bind",
+    ),
     // Vendored anytls: its own protect helper and its server side.
     (
         "crates/meow-anytls/src/util/socket_protect.rs",
