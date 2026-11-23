@@ -60,13 +60,11 @@ mod tls {
                     }
                 };
             // The v4 twin is appended after [::] so the dual-stack
-            // wildcard keeps its lead — the escape hatch only.
+            // wildcard keeps its lead — the escape hatch only; with it
+            // pushed the list can never be empty.
             let fallback = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port);
             if !addrs.contains(&fallback) {
                 addrs.push(fallback);
-            }
-            if addrs.is_empty() {
-                anyhow::bail!("controller address '{addr}' resolved to nothing");
             }
             return Ok(ListenTarget::Wildcard(addrs));
         }
