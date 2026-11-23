@@ -162,9 +162,14 @@ serves without auth, and leaves a stale socket on exit. meow:
   targets, `/proc/net/unix` on Linux/Android (where refusal is already
   conclusive and the table is a second opinion), and a conservative
   "cannot prove" on other unixes, which keeps the file and skips the
-  endpoint. A live answer means live, and a timeout or any other probe
-  error means uncertain: the path is left alone and the endpoint
-  skipped;
+  endpoint. Spellings the kernel recorded relative are resolved under
+  the *holder's* cwd (`PROC_PIDVNODEPATHINFO` on Apple; the `socket:[ino]`
+  fd link → `/proc/<pid>/cwd` chain on Linux), never under meow's own;
+  and an enumeration that cannot be fetched whole — the pid list or a
+  per-pid fd table still filling its capped buffer — answers "cannot
+  prove" rather than a silent "not bound". A live answer means live,
+  and a timeout or any other probe error means uncertain: the path is
+  left alone and the endpoint skipped;
 - before unlinking a verified-stale socket re-stats the path and unlinks
   only when `(dev, ino, ctime, ctime_nsec)` still names the probed file —
   a racing re-bind leaves a *different* socket, which is kept (the

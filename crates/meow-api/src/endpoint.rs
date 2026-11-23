@@ -680,10 +680,62 @@ fn unix_socket_still_bound(path: &std::path::Path) -> Result<bool> {
     apple::socket_bound_at(path)
 }
 
-/// The `/proc/net/unix` arm — kernel ABI: one row per live socket,
-/// bound path in the last column.
+/// `/proc/*/fd` `socket:[ino]` links → the pids holding each wanted
+/// sockfs inode. Best-effort: pid dirs that cannot be read (other
+/// uids, hidepid mounts) are skipped — on a locked-down /proc the
+/// map is partial by nature.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unix_socket_holders(
+    want: &std::collections::HashSet<u64>,
+) -> std::collections::HashMap<u64, Vec<u32>> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut found: std::collections::HashMap<u64, Vec<u32>> = Default::default();
+    let Ok(proc_dir) = std::fs::read_dir("/proc") else {
+        return found;
+    };
+    for pid_dir in proc_dir.flatten() {
+        let Some(pid) = pid_dir
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(fds) = std::fs::read_dir(pid_dir.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            let Ok(link) = std::fs::read_link(fd.path()) else {
+                continue;
+            };
+            let Some(ino) = link
+                .as_os_str()
+                .as_bytes()
+                .strip_prefix(b"socket:[")
+                .and_then(|rest| rest.strip_suffix(b"]"))
+                .and_then(|num| std::str::from_utf8(num).ok())
+                .and_then(|num| num.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            if want.contains(&ino) {
+                found.entry(ino).or_default().push(pid);
+            }
+        }
+    }
+    found
+}
+
+/// The `/proc/net/unix` arm — kernel ABI: one row per live socket.
+/// The last column is the bound path *spelling* (a relative bind keeps
+/// its relative spelling); the seventh column's inode is the socket's
+/// own sockfs inode — never the bound file's, so it cannot be compared
+/// to the file's `st_ino` directly, but it is the same inode the
+/// `socket:[ino]` fd links name — the route to the holder's cwd, the
+/// only frame a relative spelling resolves under (issue #974).
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn unix_socket_still_bound(path: &std::path::Path) -> Result<bool> {
+    use std::ffi::OsStr;
     use std::os::unix::ffi::OsStrExt;
     let theirs = path.as_os_str().as_bytes();
     let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
@@ -693,15 +745,58 @@ fn unix_socket_still_bound(path: &std::path::Path) -> Result<bool> {
         // the probe's own answer stands.
         return Ok(false);
     };
+    // `(sockfs ino, relative spelling)` — rows the spelling checks
+    // cannot decide; resolved below under each holder's cwd.
+    let mut deferred: Vec<(u64, Vec<u8>)> = Vec::new();
     for line in table.split(|&b| b == b'\n') {
         // `Num RefCount Protocol Flags Type St Inode Path` — the path
         // is everything after the seventh field (it may contain
         // spaces).
-        let Some(bound) = line.splitn(8, |&b| b == b' ').nth(7) else {
+        let mut fields = line.splitn(8, |&b| b == b' ');
+        let ino = fields
+            .by_ref()
+            .nth(6)
+            .and_then(|f| std::str::from_utf8(f).ok()?.parse::<u64>().ok());
+        let Some(bound) = fields.next() else {
             continue;
         };
+        if bound.is_empty() {
+            continue;
+        }
         if bound == theirs || bound == canon {
             return Ok(true);
+        }
+        if bound[0] == b'/' {
+            // An absolute spelling still misses when it was written
+            // under a symlinked parent — canonicalize decides.
+            if std::fs::canonicalize(std::path::Path::new(OsStr::from_bytes(bound)))
+                .is_ok_and(|c| c.as_os_str().as_bytes() == canon)
+            {
+                return Ok(true);
+            }
+        } else if let Some(ino) = ino {
+            deferred.push((ino, bound.to_vec()));
+        }
+    }
+    if deferred.is_empty() {
+        return Ok(false);
+    }
+    let want: std::collections::HashSet<u64> = deferred.iter().map(|(ino, _)| *ino).collect();
+    let holders = unix_socket_holders(&want);
+    for (ino, spelling) in deferred {
+        let Some(pids) = holders.get(&ino) else {
+            continue;
+        };
+        for &pid in pids {
+            let Ok(cwd) = std::fs::read_link(format!("/proc/{pid}/cwd")) else {
+                continue;
+            };
+            let joined = cwd.join(OsStr::from_bytes(&spelling));
+            if joined.as_os_str().as_bytes() == theirs
+                || std::fs::canonicalize(&joined).is_ok_and(|c| c.as_os_str().as_bytes() == canon)
+            {
+                return Ok(true);
+            }
         }
     }
     Ok(false)
@@ -725,9 +820,10 @@ fn unix_socket_still_bound(_path: &std::path::Path) -> Result<bool> {
 /// peers report it in `unsi_caddr`) — either proves the path is live.
 #[cfg(target_vendor = "apple")]
 mod apple {
+    use std::collections::HashMap;
     use std::mem::{offset_of, size_of, size_of_val, ManuallyDrop};
     use std::os::unix::ffi::OsStrExt;
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
 
     use anyhow::{Context, Result};
 
@@ -735,8 +831,10 @@ mod apple {
     const PROX_FDTYPE_SOCKET: u32 = 2;
     const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
     const SOCKINFO_UN: libc::c_int = 3;
+    const PROC_PIDVNODEPATHINFO: libc::c_int = 9;
     const SOCK_MAXADDRLEN: usize = 255;
     const VINFO_STAT_BYTES: usize = 136;
+    const MAXPATHLEN: usize = 1024;
     /// Cap on one pid's fd table — a pathological table beyond this
     /// is reported truncated, never grown without bound.
     const MAX_PID_FDS: usize = 65536;
@@ -812,6 +910,19 @@ mod apple {
         pfi: ProcFileinfo,
         psi: SocketInfo,
     }
+    #[repr(C)]
+    struct VnodeInfoPath {
+        vi_stat: [u8; VINFO_STAT_BYTES],
+        vi_type: i32,
+        vi_pad: i32,
+        vi_fsid: [i32; 2],
+        vip_path: [libc::c_char; MAXPATHLEN],
+    }
+    #[repr(C)]
+    struct ProcVnodePathInfo {
+        pvi_cdir: VnodeInfoPath,
+        pvi_rdir: VnodeInfoPath,
+    }
 
     // Pinned to <sys/proc_info.h> at compile time — a layout drift
     // fails the build rather than feeding reads at wrong offsets.
@@ -821,15 +932,21 @@ mod apple {
     const _: () = assert!(offset_of!(SocketFdinfo, psi.soi_proto) == 264);
     const _: () = assert!(offset_of!(UnSockinfo, unsi_addr) == 16);
     const _: () = assert!(offset_of!(libc::sockaddr_un, sun_path) == 2);
+    const _: () = assert!(size_of::<VnodeInfoPath>() == 1176);
+    const _: () = assert!(size_of::<ProcVnodePathInfo>() == 2352);
+    const _: () = assert!(offset_of!(VnodeInfoPath, vip_path) == 152);
+
+    /// A fixed C char buffer's bytes, NUL-trimmed.
+    fn c_bytes(raw: &[libc::c_char]) -> &[u8] {
+        // SAFETY: reading the fixed-size array in place.
+        let raw = unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), raw.len()) };
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        &raw[..end]
+    }
 
     /// One `sockaddr_un`'s path bytes, NUL-trimmed.
     fn sun_path_bytes(sun: &libc::sockaddr_un) -> &[u8] {
-        // SAFETY: reading the fixed-size array in place.
-        let raw = unsafe {
-            std::slice::from_raw_parts(sun.sun_path.as_ptr().cast::<u8>(), sun.sun_path.len())
-        };
-        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
-        &raw[..end]
+        c_bytes(&sun.sun_path)
     }
 
     /// The spellings that name `path` — the path itself plus its
@@ -846,23 +963,62 @@ mod apple {
         out
     }
 
-    /// One candidate address against the spellings — raw first, then
+    /// pid's cwd — the frame that resolves a relative `unsi_addr`
+    /// spelling (`socket_fdinfo`'s `soi_stat` is never populated for
+    /// sockets — `fill_socketinfo` leaves the `vinfo_stat` zeroed, so
+    /// there is no dev/ino shortcut in the ABI). `None` when the
+    /// kernel cannot produce it — the spelling is then a residual
+    /// miss, never resolved against the wrong cwd (issue #974).
+    fn proc_cwd(pid: libc::pid_t) -> Option<PathBuf> {
+        // SAFETY: `pvi` is a POD buffer of the flavor's exact size.
+        let mut pvi: ProcVnodePathInfo = unsafe { std::mem::zeroed() };
+        let n = unsafe {
+            libc::proc_pidinfo(
+                pid,
+                PROC_PIDVNODEPATHINFO,
+                0,
+                (&mut pvi as *mut ProcVnodePathInfo).cast(),
+                size_of::<ProcVnodePathInfo>() as libc::c_int,
+            )
+        };
+        if n < size_of::<ProcVnodePathInfo>() as libc::c_int {
+            return None;
+        }
+        let path = c_bytes(&pvi.pvi_cdir.vip_path);
+        if path.is_empty() {
+            None
+        } else {
+            Some(PathBuf::from(std::ffi::OsStr::from_bytes(path)))
+        }
+    }
+
+    /// Whether `spelling` names `path` — exact first, then
     /// canonicalized on both sides (the bound path may be written
     /// under a different spelling; a live socket's file exists, so
-    /// canonicalize resolves it).
-    fn matches(ours: &[Vec<u8>], theirs: &[u8]) -> bool {
-        if theirs.is_empty() {
+    /// canonicalize resolves it). The kernel reports `unsi_addr`
+    /// verbatim as spelled at bind time, so a relative spelling is
+    /// meaningful only under the *holder's* cwd — `None` leaves it
+    /// unresolved rather than resolved against this process's cwd.
+    fn bound_matches(ours: &[Vec<u8>], spelling: &[u8], cwd: Option<&Path>) -> bool {
+        if spelling.is_empty() {
             return false;
         }
-        if ours.iter().any(|o| o.as_slice() == theirs) {
+        if ours.iter().any(|o| o.as_slice() == spelling) {
             return true;
         }
-        std::fs::canonicalize(Path::new(std::ffi::OsStr::from_bytes(theirs)))
-            .ok()
-            .is_some_and(|c| {
-                ours.iter()
-                    .any(|o| o.as_slice() == c.as_os_str().as_bytes())
-            })
+        let spelled = Path::new(std::ffi::OsStr::from_bytes(spelling));
+        let absolute;
+        let spelled: &Path = if spelled.is_absolute() {
+            spelled
+        } else {
+            let Some(cwd) = cwd else { return false };
+            absolute = cwd.join(spelled);
+            absolute.as_path()
+        };
+        std::fs::canonicalize(spelled).ok().is_some_and(|c| {
+            ours.iter()
+                .any(|o| o.as_slice() == c.as_os_str().as_bytes())
+        })
     }
 
     /// How complete one pid's fd-table fetch proved to be. `proc_pidinfo`
@@ -1020,6 +1176,7 @@ mod apple {
         let ours = path_spellings(path);
         let pids = list_all_pids()?;
         let mut fds: Vec<ProcFdinfo> = Vec::with_capacity(64);
+        let mut cwds: HashMap<libc::pid_t, Option<PathBuf>> = HashMap::new();
         let mut inspected = 0usize;
         let mut truncated = 0usize;
         for &pid in &pids {
@@ -1054,8 +1211,21 @@ mod apple {
                 // populated the `un` union arm for a unix socket.
                 let un = unsafe { &*info.psi.soi_proto.un };
                 let bound = sun_path_bytes(unsafe { &un.unsi_addr.sun });
+                // A relative bound spelling names nothing under this
+                // process's cwd — resolve it under the holder's
+                // (fetched lazily, once per pid that needs one).
+                // `unsi_caddr` is the *peer's* bound spelling: a
+                // relative one resolves under the peer's cwd, which
+                // the fd carries no handle to — it stays an
+                // exact/canonical match, and the peer's own fd covers
+                // the path anyway.
+                let cwd = if !bound.is_empty() && bound[0] != b'/' {
+                    cwds.entry(pid).or_insert_with(|| proc_cwd(pid)).as_deref()
+                } else {
+                    None
+                };
                 let peer = sun_path_bytes(unsafe { &un.unsi_caddr.sun });
-                if matches(&ours, bound) || matches(&ours, peer) {
+                if bound_matches(&ours, bound, cwd) || bound_matches(&ours, peer, None) {
                     return Ok(true);
                 }
             }
@@ -1074,6 +1244,65 @@ mod apple {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// A relative spelling resolves under the holder's cwd —
+        /// "held.sock" under `dir` names `dir/held.sock`; under any
+        /// other cwd (or none) it is not this file.
+        #[test]
+        fn relative_spelling_resolves_under_the_holder_cwd() {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("held.sock");
+            std::fs::File::create(&sock).unwrap();
+            let ours = path_spellings(&sock);
+            assert!(bound_matches(&ours, b"held.sock", Some(dir.path())));
+            let other = tempfile::tempdir().unwrap();
+            assert!(!bound_matches(&ours, b"held.sock", Some(other.path())));
+            assert!(!bound_matches(&ours, b"held.sock", None));
+            assert!(!bound_matches(&ours, b"gone.sock", Some(dir.path())));
+            assert!(bound_matches(&ours, sock.as_os_str().as_bytes(), None));
+        }
+
+        /// A socket *bound* with a relative spelling — the kernel
+        /// reports the bind-time string, so only the holder's cwd
+        /// resolves it. The holder is a re-exec'd copy of this test
+        /// whose cwd is set to the socket's directory (a fork would
+        /// share this process's cwd; a child process's differs as the
+        /// real case requires).
+        #[test]
+        fn relatively_bound_socket_is_detected() {
+            const HELPER_ENV: &str = "MEOW_TEST_REL_BIND_DIR";
+            if let Ok(dir) = std::env::var(HELPER_ENV) {
+                // Helper mode: bind "rel.sock" under `dir`, then hold.
+                std::env::set_current_dir(dir).unwrap();
+                let _listener = std::os::unix::net::UnixListener::bind("rel.sock").unwrap();
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                return;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .arg("relatively_bound_socket_is_detected")
+                .env(HELPER_ENV, dir.path())
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let sock = dir.path().join("rel.sock");
+            for _ in 0..100 {
+                if sock.exists() {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            assert!(sock.exists(), "helper never bound rel.sock");
+            let seen = socket_bound_at(&sock);
+            let _ = child.kill();
+            let _ = child.wait();
+            assert!(
+                matches!(seen, Ok(true)),
+                "a relatively-bound socket was missed: {seen:?}"
+            );
+        }
 
         /// Scripted `proc_listallpids`: `None` is the size probe,
         /// `Some(buf)` fills `min(len, live)` like the kernel. Here the
