@@ -851,6 +851,16 @@ mod tls {
     }
 
     #[tokio::test]
+    async fn tls_endpoint_localhost_binds_v4() {
+        // Hostname listen addresses resolve v4-first (issue #974): the
+        // bound endpoint lands on 127.0.0.1, not ::1.
+        let endpoint = meow_api::endpoint::bind_tls("localhost:0", None, None)
+            .await
+            .unwrap();
+        assert!(endpoint.addr().is_ipv4(), "{}", endpoint.addr());
+    }
+
+    #[tokio::test]
     async fn tls_endpoint_bad_pair_and_bad_addr_fail() {
         // One-sided pairs are endpoint-local failures upstream (config build
         // and `-t` stay shape-only, issue #974) — the endpoint bind refuses.
