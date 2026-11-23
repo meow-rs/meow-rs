@@ -673,6 +673,81 @@ fn sun_path_capacity() -> usize {
         - 1
 }
 
+/// `from` → `to` as a C-string pair for the platform rename primitive.
+#[cfg(any(target_vendor = "apple", target_os = "linux", target_os = "android"))]
+fn paths_as_cstrings(
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> std::io::Result<(std::ffi::CString, std::ffi::CString)> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &std::path::Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "path contains an interior NUL byte",
+            )
+        })
+    };
+    Ok((c(from)?, c(to)?))
+}
+
+/// Move `from` onto `to` without replacing an existing entry — the
+/// atomic no-replace publish the unix endpoint needs: between the
+/// stale-socket check and this call a racing peer may have bound its
+/// own live socket or dropped an unrelated file at the path, and a
+/// plain `rename` would silently overwrite it (issue #974). Every arm
+/// answers EEXIST on an occupied target; other errors propagate.
+#[cfg(target_vendor = "apple")]
+fn rename_no_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let (from, to) = paths_as_cstrings(from, to)?;
+    // SAFETY: both are valid NUL-terminated path strings.
+    let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The Linux arm — `renameat2(RENAME_NOREPLACE)` (kernel ≥ 3.15).
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_no_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    let (from, to) = paths_as_cstrings(from, to)?;
+    // SAFETY: syscall numbers and the flag are kernel ABI; the glibc
+    // wrapper arrived too late to rely on its name being exported.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The fallback arm — no first-class atomic rename-no-replace exists,
+/// so hardlink + drop the staging name gives the same publish: `link`
+/// answers EEXIST on an occupied target and a socket file hardlinks
+/// like any other filesystem object.
+#[cfg(all(
+    unix,
+    not(target_vendor = "apple"),
+    not(target_os = "linux"),
+    not(target_os = "android")
+))]
+fn rename_no_replace(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    std::fs::hard_link(from, to)?;
+    let _ = std::fs::remove_file(from);
+    Ok(())
+}
+
 /// Bind the pid-unique staging sibling the configured path is published
 /// from. The name is claimed by `bind` itself — never by unlinking what
 /// may be someone else's file — and every cleanup of `tmp` after this
@@ -835,7 +910,10 @@ pub async fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
             )
         });
     }
-    if let Err(e) = std::fs::rename(&tmp, &resolved) {
+    // Publish atomically without replacing: EEXIST means someone else
+    // won the path between our check and now — keep their file and let
+    // this endpoint be skipped.
+    if let Err(e) = rename_no_replace(&tmp, &resolved) {
         let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| {
             format!(
