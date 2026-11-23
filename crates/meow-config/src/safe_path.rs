@@ -161,6 +161,16 @@ fn resolve_contained_impl(
     Ok(abs_joined)
 }
 
+/// Resolve a controller-supplied filesystem path — the `tls.certificate`
+/// and `tls.private-key` inputs of `external-controller-tls` (issue #974)
+/// — under the meow home directory, requiring it to stay inside home or a
+/// `SAFE_PATHS` root, mirroring mihomo's `C.Path.IsSafePath` check on
+/// absolute paths. Returns the normalized path to open so the checked
+/// path and the read path cannot diverge lexically.
+pub fn resolve_home_contained(requested: &Path) -> Result<PathBuf, String> {
+    resolve_contained(&meow_common::resolved_home_dir(), requested)
+}
+
 fn warn_skip_active(requested: &Path, base: &Path, how: &str) {
     warn!(
         "{SKIP_ENV} is set: allowing provider path '{}' that escapes the provider \

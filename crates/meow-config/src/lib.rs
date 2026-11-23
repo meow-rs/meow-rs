@@ -27,6 +27,7 @@ pub mod rule_parser;
 pub mod rule_provider;
 pub mod rule_provider_refresh;
 mod safe_path;
+pub use safe_path::resolve_home_contained;
 pub mod sub_rules_parser;
 pub mod subscription;
 pub mod subscription_userinfo;
@@ -1180,8 +1181,68 @@ pub struct ListenerConfig {
     pub named: Vec<NamedListener>,
 }
 
+/// The `external-controller-cors:` section resolved for serving (issue
+/// #974) — a startup snapshot like the listener addresses: `PUT /configs`
+/// commits the raw section but the live policy stays frozen until restart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApiCorsConfig {
+    /// Resolved `allow-origins`: default `["*"]`; an explicit `[]` and a
+    /// `*` entry both mean allow-all (weird-but-real, probe-verified).
+    pub allow_origins: Vec<String>,
+    /// Resolved `allow-private-network`: default `true`.
+    pub allow_private_network: bool,
+}
+
+impl Default for ApiCorsConfig {
+    /// Upstream's `cors.New` defaults — the same resolution an absent
+    /// `external-controller-cors:` map gets under a configured secret.
+    fn default() -> Self {
+        Self {
+            allow_origins: vec!["*".to_string()],
+            allow_private_network: true,
+        }
+    }
+}
+
+impl ApiCorsConfig {
+    /// Resolve the raw section. Under a configured secret, absent and
+    /// present maps resolve identically on the `["*"]`/`true` defaults —
+    /// upstream gates its permissive `AllowAll` middleware on an explicit
+    /// `secret: ""`, not on the map's presence (issue #974).
+    pub fn from_raw(raw: Option<&raw::RawCors>) -> Self {
+        match raw {
+            None => Self::default(),
+            Some(cors) => Self {
+                allow_origins: cors
+                    .allow_origins
+                    .clone()
+                    .unwrap_or_else(|| vec!["*".to_string()]),
+                allow_private_network: cors.allow_private_network.unwrap_or(true),
+            },
+        }
+    }
+}
+
 pub struct ApiConfig {
     pub external_controller: Option<SocketAddr>,
+    /// `external-controller-tls` — the HTTPS controller's listen address,
+    /// still a string: `-t` validates shape only, and the endpoint may be
+    /// a hostname resolved at bind time (issue #974).
+    pub external_controller_tls: Option<String>,
+    /// `external-controller-unix` — the Unix-domain socket path (relative
+    /// resolves under the meow home at bind time).
+    pub external_controller_unix: Option<String>,
+    /// `external-controller-pipe` — the Windows named-pipe name; parsed
+    /// on every platform, served only on Windows.
+    pub external_controller_pipe: Option<String>,
+    /// `tls.certificate` — inline PEM or path; used only with
+    /// `external_controller_tls`. `None` (both absent) means the listener
+    /// generates an ephemeral self-signed identity at bind, like mihomo.
+    pub tls_certificate: Option<String>,
+    /// `tls.private-key` — the `tls_certificate` pair.
+    pub tls_private_key: Option<String>,
+    /// `external-controller-cors` resolved for serving.
+    pub cors: ApiCorsConfig,
     pub secret: Option<String>,
     /// Resolved directory of static files for a third-party web UI, served at
     /// `/ui` in place of the built-in panel. `None` keeps the built-in panel.
@@ -1190,6 +1251,20 @@ pub struct ApiConfig {
     /// Download URL recorded from `external-ui-url`; auto-download is not
     /// performed, but it is surfaced in a warning when the directory is absent.
     pub external_ui_url: Option<String>,
+}
+
+impl ApiConfig {
+    /// Whether any controller endpoint is configured that this platform
+    /// can serve — a Unix socket needs `cfg(unix)`, the named pipe needs
+    /// Windows (issue #974). The `external-controller-tls` check reports
+    /// *configured*, not *compiled*: meow-app's `api-tls` feature owns
+    /// that gate and warns at startup when the binary lacks it.
+    pub fn has_servable_endpoint(&self) -> bool {
+        self.external_controller.is_some()
+            || self.external_controller_tls.is_some()
+            || (cfg!(unix) && self.external_controller_unix.is_some())
+            || (cfg!(windows) && self.external_controller_pipe.is_some())
+    }
 }
 
 /// When set, config loading validates structure only and performs no remote
@@ -7774,11 +7849,59 @@ async fn build_config_inner(
             }
             dir
         });
+    // `external-controller-{tls,unix,pipe}` keep their strings: `-t` must
+    // validate shape only, and each is resolved at endpoint bind (like
+    // upstream, which never parses them into SockAddrs). `""` disables.
+    let external_controller_tls = raw
+        .external_controller_tls
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    // `tls.certificate`/`tls.private-key` are the HTTPS listener's
+    // identity. Like upstream, build validates *shape only*: a one-sided
+    // pair, malformed inline PEM, and unreadable file paths all defer to
+    // endpoint bind, where the failure logs and skips just that endpoint
+    // (issue #974). Deferring keeps a broken identity from killing the
+    // whole config — `-t` accepts the same documents upstream's does —
+    // and no PEM material or file I/O is touched here.
+    let tls_certificate = raw
+        .tls
+        .as_ref()
+        .and_then(|t| t.certificate.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let tls_private_key = raw
+        .tls
+        .as_ref()
+        .and_then(|t| t.private_key.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    if external_controller_tls.is_none() && (tls_certificate.is_some() || tls_private_key.is_some())
+    {
+        warn!(
+            "tls.certificate/tls.private-key set without external-controller-tls; \
+             the keys only feed the HTTPS controller listener and are ignored"
+        );
+    }
     let api = ApiConfig {
         external_controller: parse_optional_socket_addr(
             "external-controller",
             raw.external_controller.as_deref(),
         )?,
+        external_controller_tls,
+        external_controller_unix: raw
+            .external_controller_unix
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        external_controller_pipe: raw
+            .external_controller_pipe
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        tls_certificate,
+        tls_private_key,
+        cors: ApiCorsConfig::from_raw(raw.external_controller_cors.as_ref()),
         secret: raw.secret.clone(),
         external_ui,
         external_ui_url: raw

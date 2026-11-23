@@ -344,6 +344,308 @@ impl<'de> serde::de::Visitor<'de> for ScalarKeyVisitor {
     }
 }
 
+/// Weak YAML→string coercion, matching mihomo's Go decoder (issue #974):
+/// a scalar — string verbatim, number rendered, boolean `"true"`/`"false"`
+/// — coerces into a string field (`external-controller-tls: 5` parses as
+/// `"5"`); a sequence or mapping is a hard decode error. `null`/absent
+/// stays `None`.
+fn deserialize_weak_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct WeakString;
+
+    impl<'de> Visitor<'de> for WeakString {
+        type Value = Option<String>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a scalar (string, number or boolean)")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_any(self)
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_i128<E: de::Error>(self, v: i128) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_u128<E: de::Error>(self, v: u128) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_char<E: de::Error>(self, v: char) -> Result<Self::Value, E> {
+            Ok(Some(v.to_string()))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            Ok(Some(v.to_owned()))
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+            Err(<A::Error as de::Error>::custom(
+                "cannot unmarshal sequence into string",
+            ))
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+            Err(<A::Error as de::Error>::custom(
+                "cannot unmarshal mapping into string",
+            ))
+        }
+    }
+
+    deserializer.deserialize_option(WeakString)
+}
+
+/// One `allow-origins` element under mihomo's weak decoder — scalar items
+/// coerce to their string form, containers error (issue #974).
+struct WeakOrigin(String);
+
+impl<'de> Deserialize<'de> for WeakOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserialize_weak_string(deserializer).map(|opt| WeakOrigin(opt.unwrap_or_default()))
+    }
+}
+
+/// `external-controller-cors.allow-origins`: a sequence of (weak) strings
+/// or `null` — a bare scalar is a hard error upstream (`cannot unmarshal
+/// !!str into []string`), so it is one here too (issue #974).
+fn deserialize_allow_origins<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, SeqAccess, Visitor};
+    use std::fmt;
+
+    struct Origins;
+
+    impl<'de> Visitor<'de> for Origins {
+        type Value = Option<Vec<String>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a sequence of origin strings")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_any(self)
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            while let Some(WeakOrigin(s)) = seq.next_element::<WeakOrigin>()? {
+                v.push(s);
+            }
+            Ok(Some(v))
+        }
+
+        fn visit_bool<E: de::Error>(self, _v: bool) -> Result<Self::Value, E> {
+            Err(E::custom("cannot unmarshal bool into []string"))
+        }
+
+        fn visit_i64<E: de::Error>(self, _v: i64) -> Result<Self::Value, E> {
+            Err(E::custom("cannot unmarshal int into []string"))
+        }
+
+        fn visit_u64<E: de::Error>(self, _v: u64) -> Result<Self::Value, E> {
+            Err(E::custom("cannot unmarshal int into []string"))
+        }
+
+        fn visit_f64<E: de::Error>(self, _v: f64) -> Result<Self::Value, E> {
+            Err(E::custom("cannot unmarshal float into []string"))
+        }
+
+        fn visit_str<E: de::Error>(self, _v: &str) -> Result<Self::Value, E> {
+            Err(E::custom("cannot unmarshal string into []string"))
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+            Err(<A::Error as de::Error>::custom(
+                "cannot unmarshal mapping into []string",
+            ))
+        }
+    }
+
+    deserializer.deserialize_option(Origins)
+}
+
+/// `external-controller-cors.allow-private-network` under mihomo's
+/// decoder (issue #974): `true`/`false` plus the legacy YAML bool
+/// spellings (`yes`/`no`/`on`/`off`/`y`/`n`, any case) are accepted;
+/// numbers and the quoted strings `"true"`/`"false"` are rejected, and
+/// `null` retains the default.
+fn deserialize_legacy_bool<'de, D>(deserializer: D) -> Result<Option<bool>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, Visitor};
+    use std::fmt;
+
+    struct LegacyBool;
+
+    impl<'de> Visitor<'de> for LegacyBool {
+        type Value = Option<bool>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a boolean")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_any(self)
+        }
+
+        fn visit_bool<E: de::Error>(self, v: bool) -> Result<Self::Value, E> {
+            Ok(Some(v))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Self::Value, E> {
+            match v.to_ascii_lowercase().as_str() {
+                "y" | "yes" | "on" => Ok(Some(true)),
+                "n" | "no" | "off" => Ok(Some(false)),
+                _ => Err(E::custom(format!(
+                    "cannot unmarshal string '{v}' into bool"
+                ))),
+            }
+        }
+
+        fn visit_string<E: de::Error>(self, v: String) -> Result<Self::Value, E> {
+            self.visit_str(&v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Self::Value, E> {
+            Err(E::custom(format!("cannot unmarshal int '{v}' into bool")))
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Self::Value, E> {
+            Err(E::custom(format!("cannot unmarshal int '{v}' into bool")))
+        }
+
+        fn visit_f64<E: de::Error>(self, v: f64) -> Result<Self::Value, E> {
+            Err(E::custom(format!("cannot unmarshal float '{v}' into bool")))
+        }
+
+        fn visit_seq<A: de::SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+            Err(<A::Error as de::Error>::custom(
+                "cannot unmarshal sequence into bool",
+            ))
+        }
+
+        fn visit_map<A: de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+            Err(<A::Error as de::Error>::custom(
+                "cannot unmarshal mapping into bool",
+            ))
+        }
+    }
+
+    deserializer.deserialize_option(LegacyBool)
+}
+
+/// The `external-controller-cors:` section (issue #974) — mihomo's
+/// `RawCors`. A partial map overrides only the supplied keys;
+/// [`crate::ApiCorsConfig`] resolves the rest (`allow-origins: ["*"]`,
+/// `allow-private-network: true`). Under a configured secret, absent and
+/// present maps resolve identically — upstream's permissive `AllowAll`
+/// middleware fires only on an explicit `secret: ""` — but the `Option`
+/// stays so a saved config preserves whether the map was written.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawCors {
+    /// `allow-origins` — sequence of origins/`globs`; `null` or absent
+    /// resolves `["*"]`, and an explicit `[]` allow-lists every origin
+    /// (weird-but-real, probe-verified). Scalar items weak-decode.
+    #[serde(default, deserialize_with = "deserialize_allow_origins")]
+    pub allow_origins: Option<Vec<String>>,
+    /// `allow-private-network` — gate the `Access-Control-Allow-
+    /// Private-Network` preflight response header; default `true`.
+    #[serde(default, deserialize_with = "deserialize_legacy_bool")]
+    pub allow_private_network: Option<bool>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
+/// The top-level `tls:` section (issue #974) — mihomo's `RawTLS`.
+/// `certificate`/`private-key` serve the `external-controller-tls`
+/// listener (they never start a listener by themselves); the remaining
+/// upstream members are parsed and warn-ignored this batch.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub struct RawTls {
+    /// `certificate` — inline PEM or a path (resolved under the meow
+    /// home, subject to the home/`SAFE_PATHS` check), paired with
+    /// `private-key`. Scalar coercion like the listener keys.
+    #[serde(default, deserialize_with = "deserialize_weak_string")]
+    pub certificate: Option<String>,
+    /// `private-key` — same contract as `certificate`.
+    #[serde(default, deserialize_with = "deserialize_weak_string")]
+    pub private_key: Option<String>,
+    /// `client-auth-type` — upstream mTLS client-auth mode. Parsed for
+    /// compatibility, warn-ignored this batch.
+    pub client_auth_type: Option<serde_json::Value>,
+    /// `client-auth-certificates` — upstream client CA pool. Parsed for
+    /// compatibility, warn-ignored this batch.
+    pub client_auth_certificates: Option<serde_json::Value>,
+    /// `ech-key` — upstream ECH key material. Parsed for compatibility,
+    /// warn-ignored this batch.
+    pub ech_key: Option<serde_json::Value>,
+    /// `custom-certifactes` — upstream's misspelled key (sic), parsed
+    /// for compatibility and warn-ignored this batch.
+    pub custom_certifactes: Option<serde_json::Value>,
+    /// Unmodelled keys — warned on by `validation` (issue #974).
+    #[serde(flatten)]
+    pub extra: BTreeMap<String, UnknownYamlValue>,
+}
+
 /// `geodata:` YAML subsection — path overrides, download URLs, auto-update.
 ///
 /// Fields `geodata-mode`, `geodata-loader`, `geosite-matcher`, and
@@ -433,6 +735,31 @@ pub struct RawConfig {
     pub log_level: Option<String>,
     pub ipv6: Option<bool>,
     pub external_controller: Option<String>,
+    /// `external-controller-tls` — a separate HTTPS controller listener
+    /// (issue #974). Kept as a string until endpoint bind so `-t`
+    /// validates shape only; `""`/unset disables it. Weak scalar coercion
+    /// matches mihomo's decoder (`5` → `"5"`).
+    #[serde(default, deserialize_with = "deserialize_weak_string")]
+    pub external_controller_tls: Option<String>,
+    /// `external-controller-unix` — HTTP over a Unix-domain socket,
+    /// resolved relative to the daemon home at bind time (issue #974).
+    /// `""`/unset disables it. Same weak coercion.
+    #[serde(default, deserialize_with = "deserialize_weak_string")]
+    pub external_controller_unix: Option<String>,
+    /// `external-controller-pipe` — Windows named-pipe controller
+    /// (issue #974); parsed on every platform but served only on Windows.
+    /// `""`/unset disables it. Same weak coercion.
+    #[serde(default, deserialize_with = "deserialize_weak_string")]
+    pub external_controller_pipe: Option<String>,
+    /// `external-controller-cors:` — the controller's CORS policy
+    /// (issue #974). The `Option` preserves whether the map was written
+    /// for round-tripping; for serving, absent and present resolve
+    /// identically under a configured secret.
+    pub external_controller_cors: Option<RawCors>,
+    /// `tls:` — mihomo's top-level TLS section (issue #974); this batch
+    /// uses only `certificate`/`private-key` for the
+    /// `external-controller-tls` listener.
+    pub tls: Option<RawTls>,
     /// Path to a directory of static files for a third-party web dashboard
     /// (e.g. metacubexd, yacd). When set, it is served at `/ui` instead of the
     /// built-in panel (issue #223, mihomo-compatible).

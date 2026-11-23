@@ -200,6 +200,11 @@ cargo test -p meow-proxy --features wireguard --lib --test wireguard_integration
 # `minimal` must not pull the WG stack: must print nothing.
 cargo tree -p meow-app --no-default-features --features minimal --edges normal | grep -wE 'meow-wireguard|meow-wgstack|smoltcp'
 
+# `minimal` must not pull the HTTPS controller's TLS edge (`api-tls`, issue
+# #974): boring/tokio-boring stay in the graph via meow-transport, so this
+# checks meow-api's *direct* deps — must print nothing.
+cargo tree -p meow-api --no-default-features --depth 1 --edges normal | grep -wE 'boring|tokio-boring|socket2'
+
 # The WireGuard *inbound* (`listeners: - type: wireguard`) is a second opt-in
 # behind meow-listener's `listener-wireguard` (meow-app `full`): responder
 # demux, AnyIP smoltcp stack and the inner-UDP reply builder compile only
@@ -235,7 +240,8 @@ cargo test --lib --bin meow --bin meow-bench --bin meow-cli \
   --test direct_udp_binding \
   --test common_test --test dns_cache_test --test dns_response_rules --test config_test \
   --test tun_config_test --test sniffer_config_test --test dialer_proxy_group \
-  --test statistics_test --test rules_test --test api_test --test meow_cli_test \
+  --test statistics_test --test rules_test \
+  --test api_test --test api_endpoint_test --test api_logs_ws_test --test meow_cli_test \
   --test raii_guard_test --test http_connection_close \
   --test config_persistence_test --test systemd_config_test \
   --test launchd_config_test \

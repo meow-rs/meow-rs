@@ -3,6 +3,8 @@
 //! Runtime control of proxies, rules, connections, config, traffic, and DNS,
 //! plus the built-in web dashboard.
 
+pub mod cors;
+pub mod endpoint;
 pub mod log_stream;
 mod logbook;
 pub mod routes;
@@ -298,34 +300,14 @@ pub fn ensure_listeners_supported(
 }
 
 pub struct ApiServer {
-    tunnel: Tunnel,
-    listen_addr: SocketAddr,
-    secret: Option<String>,
-    /// Backing config file — `None` when the daemon was loaded via
-    /// `--config-string` (persist endpoints refuse then; issue #717).
-    config_path: Option<String>,
-    raw_config: Arc<RwLock<RawConfig>>,
-    log_tx: broadcast::Sender<LogMessage>,
-    proxy_providers: Arc<DashMap<String, Arc<ProxyProvider>>>,
-    rule_providers: Arc<RwLock<HashMap<String, Arc<RuleProvider>>>>,
-    /// Shared supervisor the API commit paths reconcile after every
-    /// registry swap (issue #543).
-    rule_provider_refresh: Arc<meow_config::rule_provider_refresh::RefreshSupervisor>,
-    /// Shared supervisor the commit paths reconcile so `proxy-providers`
-    /// `interval:` declarations gain/lose their refresh task (issue #625).
-    proxy_provider_refresh:
-        Arc<meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor>,
-    listeners: Vec<NamedListener>,
-    external_ui: Option<PathBuf>,
-    /// Shared handle the embedder fills once the standalone DNS server is
-    /// spawned; `PUT /configs` rebinds or hot-swaps it (issue #514).
-    dns_server: Arc<RwLock<Option<routes::DnsServerHandle>>>,
-    /// Provider-dialer cell `PUT /configs` rebuilds hand to newly declared
-    /// providers (issue #489).
-    provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
-    /// The NTP supervisor's reconcile handle, forwarded into `AppState`
-    /// (issue #974).
-    ntp_reconcile: Option<routes::NtpReconcile>,
+    /// The plain `external-controller` TCP address, when configured — the
+    /// only endpoint whose bind is startup-fatal (issue #974).
+    listen_addr: Option<SocketAddr>,
+    /// The shared router state built once in [`Self::new`]: every
+    /// configured transport — plain TCP, `external-controller-tls`,
+    /// `external-controller-unix`, `external-controller-pipe` — serves a
+    /// clone of the router over this one `AppState` (issue #974).
+    state: Arc<routes::AppState>,
 }
 
 impl ApiServer {
@@ -337,8 +319,9 @@ impl ApiServer {
     )]
     pub fn new(
         tunnel: Tunnel,
-        listen_addr: SocketAddr,
+        listen_addr: Option<SocketAddr>,
         secret: Option<String>,
+        cors: meow_config::ApiCorsConfig,
         config_path: Option<String>,
         raw_config: Arc<RwLock<RawConfig>>,
         log_tx: broadcast::Sender<LogMessage>,
@@ -349,37 +332,80 @@ impl ApiServer {
             meow_config::proxy_provider_refresh::ProxyProviderRefreshSupervisor,
         >,
         listeners: Vec<NamedListener>,
-        external_ui: Option<PathBuf>,
+        external_ui: Option<&std::path::Path>,
         dns_server: Arc<RwLock<Option<routes::DnsServerHandle>>>,
         provider_dialer_registry: meow_proxy::dialer::ProxyRegistry,
         ntp_reconcile: Option<routes::NtpReconcile>,
     ) -> Self {
         Self {
-            tunnel,
             listen_addr,
-            secret,
-            config_path,
-            raw_config,
-            log_tx,
-            proxy_providers,
-            rule_providers,
-            rule_provider_refresh,
-            proxy_provider_refresh,
-            listeners,
-            external_ui,
-            dns_server,
-            provider_dialer_registry,
-            ntp_reconcile,
+            state: Arc::new(routes::AppState {
+                tunnel,
+                secret,
+                config_path,
+                raw_config,
+                log_tx,
+                proxy_providers,
+                rule_providers,
+                rule_provider_refresh,
+                proxy_provider_refresh,
+                listeners,
+                external_ui: resolve_external_ui(external_ui),
+                traffic_feed: Default::default(),
+                dns_server,
+                ui_storage: Default::default(),
+                provider_dialer_registry,
+                ntp_reconcile,
+                cors,
+            }),
         }
     }
 
-    /// Bind and serve in one call. Kept for callers that await `run()`
-    /// directly and can observe its error; embedders that spawn the serve
-    /// loop should bind themselves and use [`Self::run_on`] so bind
-    /// failures surface at startup instead of inside a detached task.
+    /// A fresh router over the shared state — one per configured endpoint
+    /// transport (issue #974). Routes, auth and the CORS middleware are
+    /// identical on all of them.
+    pub fn router(&self) -> axum::Router {
+        routes::create_router(Arc::clone(&self.state))
+    }
+
+    /// Bind and serve the plain `external-controller` TCP listener in one
+    /// call. Kept for callers that await `run()` directly and can observe
+    /// its error; embedders that spawn the serve loop should bind
+    /// themselves and use [`Self::run_on`] so bind failures surface at
+    /// startup instead of inside a detached task.
     pub async fn run(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let listener = tokio::net::TcpListener::bind(self.listen_addr).await?;
+        let addr = self
+            .listen_addr
+            .ok_or("external-controller is not configured")?;
+        let listener = tokio::net::TcpListener::bind(addr).await?;
         self.run_on(listener).await
+    }
+
+    /// Serve one already-bound endpoint — TLS, Unix socket or named pipe —
+    /// over the shared router (issue #974). Keeps `axum` out of the
+    /// embedder's hands.
+    pub async fn serve_on<L>(&self, listener: L) -> std::io::Result<()>
+    where
+        L: axum::serve::Listener,
+        L::Addr: std::fmt::Debug,
+    {
+        axum::serve(listener, self.router()).await
+    }
+
+    /// `serve_on` for `external-controller-tls`: the router clone carries
+    /// the [`routes::TlsTransport`] marker so the no-secret origin guard
+    /// sees the `https` scheme the decrypted bytes can't express
+    /// (issue #974). Only compiled with the `api-tls` feature.
+    #[cfg(feature = "api-tls")]
+    pub async fn serve_tls_on<L>(&self, listener: L) -> std::io::Result<()>
+    where
+        L: axum::serve::Listener,
+        L::Addr: std::fmt::Debug,
+    {
+        let app = self
+            .router()
+            .layer(axum::middleware::from_fn(routes::mark_tls_transport));
+        axum::serve(listener, app).await
     }
 
     /// Serve on a pre-bound listener (issue #641 — the startup path binds
@@ -388,48 +414,33 @@ impl ApiServer {
         &self,
         listener: tokio::net::TcpListener,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let state = Arc::new(routes::AppState {
-            tunnel: self.tunnel.clone(),
-            secret: self.secret.clone(),
-            config_path: self.config_path.clone(),
-            raw_config: Arc::clone(&self.raw_config),
-            log_tx: self.log_tx.clone(),
-            proxy_providers: Arc::clone(&self.proxy_providers),
-            rule_providers: Arc::clone(&self.rule_providers),
-            rule_provider_refresh: Arc::clone(&self.rule_provider_refresh),
-            proxy_provider_refresh: Arc::clone(&self.proxy_provider_refresh),
-            listeners: self.listeners.clone(),
-            external_ui: self.resolve_external_ui(),
-            traffic_feed: Default::default(),
-            dns_server: Arc::clone(&self.dns_server),
-            ui_storage: Default::default(),
-            provider_dialer_registry: self.provider_dialer_registry.clone(),
-            ntp_reconcile: self.ntp_reconcile.clone(),
-        });
+        let app = self.router();
 
-        let app = routes::create_router(state);
-
-        let bound = listener.local_addr().unwrap_or(self.listen_addr);
+        let bound = listener
+            .local_addr()
+            .ok()
+            .or(self.listen_addr)
+            .map_or_else(|| "<unknown>".to_string(), |a| a.to_string());
         info!("REST API listening on {bound}");
         info!("Web UI available at http://{bound}/ui");
         axum::serve(listener, app).await?;
         Ok(())
     }
+}
 
-    /// Validate the configured external-UI directory. Returns the path only when
-    /// it exists as a directory; otherwise logs a warning and falls back to the
-    /// built-in panel (issue #223).
-    fn resolve_external_ui(&self) -> Option<PathBuf> {
-        let dir = self.external_ui.as_ref()?;
-        if dir.is_dir() {
-            info!("Serving external Web UI from {}", dir.display());
-            Some(dir.clone())
-        } else {
-            warn!(
-                "external-ui directory {} not found; serving the built-in panel instead",
-                dir.display()
-            );
-            None
-        }
+/// Validate the configured external-UI directory. Returns the path only when
+/// it exists as a directory; otherwise logs a warning and falls back to the
+/// built-in panel (issue #223).
+fn resolve_external_ui(dir: Option<&std::path::Path>) -> Option<PathBuf> {
+    let dir = dir?;
+    if dir.is_dir() {
+        info!("Serving external Web UI from {}", dir.display());
+        Some(dir.to_path_buf())
+    } else {
+        warn!(
+            "external-ui directory {} not found; serving the built-in panel instead",
+            dir.display()
+        );
+        None
     }
 }

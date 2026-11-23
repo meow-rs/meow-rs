@@ -2,10 +2,10 @@ use axum::{
     body::Body,
     extract::ws::{Message, WebSocketUpgrade},
     extract::{FromRequestParts, Path, Query, Request, State},
-    http::{header, request::Parts, uri::Authority, StatusCode},
+    http::{header, request::Parts, uri::Authority, Method, StatusCode, Version},
     middleware::{self, Next},
     response::{IntoResponse, Json, Response},
-    routing::{delete, get, patch, post, put},
+    routing::{delete, get, patch, post, put, MethodFilter},
     Router,
 };
 use dashmap::DashMap;
@@ -26,7 +26,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
-use tower_http::cors::{AllowHeaders, CorsLayer};
+use tower::Layer;
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "listener-tun")]
@@ -40,19 +40,40 @@ use crate::{
 
 struct MaybeWebSocket(Option<WebSocketUpgrade>);
 
+/// Whether the request is a WebSocket upgrade attempt on either HTTP
+/// version axum serves: `Upgrade: websocket` on HTTP/1.1, or an RFC 8441
+/// extended CONNECT on h2 — `axum::serve` advertises
+/// `SETTINGS_ENABLE_CONNECT_PROTOCOL` (no opt-out), so h2 clients may
+/// legitimately arrive this way (issue #974).
+fn is_websocket_attempt(method: &Method, version: Version, headers: &header::HeaderMap) -> bool {
+    headers
+        .get(header::UPGRADE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
+        || (*method == Method::CONNECT && version >= Version::HTTP_2)
+}
+
 impl<S> FromRequestParts<S> for MaybeWebSocket
 where
     S: Send + Sync,
 {
-    type Rejection = std::convert::Infallible;
+    type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
-        let is_websocket = parts
-            .headers
-            .get(header::UPGRADE)
-            .and_then(|v| v.to_str().ok())
-            .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-        if !is_websocket {
+        // CONNECT only reaches these routes for an RFC 8441 upgrade —
+        // anything that is not a valid upgrade is an ordinary
+        // method-mismatch, answered like upstream chi's 405 for a
+        // GET-only route (never the route's GET body, which would fake
+        // a tunnel).
+        if parts.method == Method::CONNECT {
+            return WebSocketUpgrade::from_request_parts(parts, state)
+                .await
+                .map(|upgrade| Self(Some(upgrade)))
+                .map_err(|_| {
+                    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "GET")]).into_response()
+                });
+        }
+        if !is_websocket_attempt(&parts.method, parts.version, &parts.headers) {
             return Ok(Self(None));
         }
         Ok(Self(
@@ -123,6 +144,9 @@ pub struct AppState {
     pub dns_server: Arc<RwLock<Option<DnsServerHandle>>>,
     /// `/storage/{key}`, opened on first use (`crate::storage`).
     pub ui_storage: crate::storage::UiStorageSlot,
+    /// `external-controller-cors` resolved at startup — every transport
+    /// (TCP/TLS/unix/pipe) serves this one policy (issue #974).
+    pub cors: meow_config::ApiCorsConfig,
 }
 
 /// Handle to the running standalone DNS server (config `dns.listen`).
@@ -277,12 +301,7 @@ async fn require_auth_ws(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "));
 
-    let is_websocket = req
-        .headers()
-        .get(header::UPGRADE)
-        .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("websocket"));
-    let token_param = if is_websocket {
+    let token_param = if is_websocket_attempt(req.method(), req.version(), req.headers()) {
         query.get("token").map(std::string::String::as_str)
     } else {
         None
@@ -305,6 +324,54 @@ async fn require_auth_ws(
         )
             .into_response()
     }
+}
+
+/// Marker extension the `external-controller-tls` router clone inserts:
+/// the no-secret origin guard compares `Origin` against the transport's
+/// real scheme, and an HTTP/1.1 request line carries no scheme of its own
+/// — without the marker a same-origin `https://` dashboard would look
+/// cross-scheme (issue #974).
+#[derive(Clone, Copy)]
+pub struct TlsTransport;
+
+/// Outer layer for the TLS endpoint's router — runs before the origin
+/// guard inside `create_router`.
+pub async fn mark_tls_transport(mut req: Request, next: Next) -> Response {
+    req.extensions_mut().insert(TlsTransport);
+    next.run(req).await
+}
+
+/// chi emits `Allow` only on a real 405 — one header line per registered
+/// method — while axum's `MethodRouter` attaches a combined `allow:`
+/// (including the `HEAD` `get` implies) to *every* response that passes
+/// through its method fallback: the 405, but also preflights and auth
+/// rejections answered by middleware. Nothing layered inside `Router`
+/// runs after that attach, so `create_router` puts this behind a
+/// catch-all fallback service where the map sees the finished wire:
+/// `allow` is stripped from non-405s and a 405's combined list is
+/// rewritten into chi's per-method lines minus `HEAD` — and minus the
+/// `CONNECT` the WS routes take for h2 extended-CONNECT upgrades, which
+/// upstream never advertises (issue #974).
+async fn allow_header_compat(mut resp: Response) -> Response {
+    let Some(allow) = resp.headers_mut().remove(header::ALLOW) else {
+        return resp;
+    };
+    if resp.status() != StatusCode::METHOD_NOT_ALLOWED {
+        return resp;
+    }
+    let Ok(list) = allow.to_str() else {
+        return resp;
+    };
+    for method in list
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && *m != "HEAD" && *m != "CONNECT")
+    {
+        if let Ok(v) = method.parse() {
+            resp.headers_mut().append(header::ALLOW, v);
+        }
+    }
+    resp
 }
 
 /// Restrict browser access when the controller has no token. In particular,
@@ -369,7 +436,12 @@ fn controller_origin_allowed(req: &Request) -> bool {
         "https" => 443,
         _ => return false,
     };
-    if scheme != req.uri().scheme_str().unwrap_or("http") {
+    let served_scheme = if req.extensions().get::<TlsTransport>().is_some() {
+        "https"
+    } else {
+        req.uri().scheme_str().unwrap_or("http")
+    };
+    if scheme != served_scheme {
         return false;
     }
     let Ok(origin_authority) = origin_authority.parse::<Authority>() else {
@@ -463,29 +535,44 @@ pub fn create_router(state: Arc<AppState>) -> Router {
         .route("/rules/{index}", delete(delete_rule))
         .route("/rules/disable", patch(disable_rules))
         .route("/rules/reorder", post(reorder_rules))
-        .route("/connections", get(get_connections))
+        // WebSocket-capable routes also take CONNECT so an RFC 8441
+        // extended-CONNECT upgrade over h2 reaches the handler — the
+        // route's `Allow` output keeps chi's shape (CONNECT filtered in
+        // `allow_header_compat`) (issue #974).
+        .route(
+            "/connections",
+            get(get_connections).on(MethodFilter::CONNECT, get_connections),
+        )
         .route(
             "/connections/{id}",
             get(get_connection).delete(close_connection),
         )
         .route("/connections", delete(close_all_connections))
+        // Registered in upstream's handler order so the 405 `Allow` lines
+        // come out identical (issue #974).
         .route(
             "/configs",
-            get(get_configs).patch(update_configs).put(put_configs),
+            get(get_configs).put(put_configs).patch(update_configs),
         )
         .route("/metrics", get(get_metrics))
-        .route("/traffic", get(get_traffic))
+        .route(
+            "/traffic",
+            get(get_traffic).on(MethodFilter::CONNECT, get_traffic),
+        )
         .route(
             "/traffic/ledger",
             get(crate::traffic_ledger::get_ledger).delete(crate::traffic_ledger::clear_ledger),
         )
         .route("/statistics", get(get_statistics))
-        .route("/logs", get(get_logs))
+        .route("/logs", get(get_logs).on(MethodFilter::CONNECT, get_logs))
         .route(
             "/logbook",
             get(crate::logbook::get_logbook).delete(crate::logbook::clear_logbook),
         )
-        .route("/memory", get(get_memory))
+        .route(
+            "/memory",
+            get(get_memory).on(MethodFilter::CONNECT, get_memory),
+        )
         // Dashboard settings sync (zashboard), as mihomo's cache.db store.
         .route(
             "/storage/{key}",
@@ -576,13 +663,26 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     };
 
     let router = router.layer(middleware::map_request(assume_json_body));
+    // CORS answers preflights outside Bearer auth on every transport —
+    // upstream mounts the middleware on the router itself. Deliberate
+    // divergence (issue #974): the no-secret mode keeps its no-grants
+    // posture and mounts no CORS layer at all — cross-origin dashboards
+    // must configure a secret.
     let router = if auth_required {
-        // Fetch requires Authorization to be named explicitly in a preflight.
-        router.layer(CorsLayer::permissive().allow_headers(AllowHeaders::mirror_request()))
+        router.layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::cors::handle,
+        ))
     } else {
         router
     };
-    router.with_state(state)
+    let app = router.with_state(state);
+    // `allow_header_compat` has to see the response after the method
+    // router attaches `allow`, so the routes are served behind a catch-all
+    // fallback service — a `Route` endpoint carries no allow list of its
+    // own, so nothing re-adds the header the shim removed (issue #974).
+    Router::new()
+        .fallback_service(middleware::map_response::<_, ()>(allow_header_compat).layer(app))
 }
 
 // ── Basic endpoints ──────────────────────────────────────────────────
@@ -4464,7 +4564,15 @@ async fn swap_config_and_reconcile_tun(
     // every settle is hoisted above the publish so a cancelled request
     // never leaves a committed document whose tail (the keepalive install
     // and `ntp:` reconcile) never ran.
-    let (old_enable, tun_changed, specs, new_log_level, logbook_enable, geo_schedule_changed) = {
+    let (
+        old_enable,
+        tun_changed,
+        specs,
+        new_log_level,
+        logbook_enable,
+        geo_schedule_changed,
+        controller_changed,
+    ) = {
         let guard = state.raw_config.read();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
@@ -4500,6 +4608,17 @@ async fn swap_config_and_reconcile_tun(
         // that to the operator rather than letting it sit silently stale.
         let geo_schedule_changed = meow_config::geodata::update_schedule(&guard)
             != meow_config::geodata::update_schedule(&candidate);
+        // The controller listener surface — addresses, CORS, the `tls:`
+        // identity — is a startup snapshot like the geo schedule: the PUT
+        // commits the raw document but listeners/CORS only re-evaluate on
+        // restart, so flag it rather than let it sit silently stale
+        // (issue #974).
+        let controller_changed = guard.external_controller != candidate.external_controller
+            || guard.external_controller_tls != candidate.external_controller_tls
+            || guard.external_controller_unix != candidate.external_controller_unix
+            || guard.external_controller_pipe != candidate.external_controller_pipe
+            || guard.external_controller_cors != candidate.external_controller_cors
+            || guard.tls != candidate.tls;
         (
             old,
             tun_changed,
@@ -4507,6 +4626,7 @@ async fn swap_config_and_reconcile_tun(
             new_log_level,
             logbook_enable,
             geo_schedule_changed,
+            controller_changed,
         )
     };
 
@@ -4865,6 +4985,13 @@ async fn swap_config_and_reconcile_tun(
             "geodata update schedule changed (geo-auto-update / geo-update-interval / \
              geodata.auto-update*): the running schedule is a startup snapshot — \
              restart meow to apply it"
+        );
+    }
+    if controller_changed {
+        warn!(
+            "external-controller* / external-controller-cors / tls changed: the \
+             controller listener surface is a startup snapshot — restart meow to \
+             rebind or re-apply it"
         );
     }
     logbook::reconfigure(logbook_enable);
@@ -7472,6 +7599,7 @@ mod outbound_flush_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            cors: Default::default(),
         })
     }
 
@@ -7800,6 +7928,7 @@ mod global_route_binding_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            cors: Default::default(),
         })
     }
 

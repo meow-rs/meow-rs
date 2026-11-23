@@ -4446,6 +4446,10 @@ strict-bogus-key: 1
             "disable-keep-alive",
             "dns",
             "external-controller",
+            "external-controller-cors",
+            "external-controller-pipe",
+            "external-controller-tls",
+            "external-controller-unix",
             "external-ui",
             "external-ui-name",
             "external-ui-url",
@@ -4496,6 +4500,7 @@ strict-bogus-key: 1
             "tcp-keepalive-idle",
             "tcp-keepalive-interval",
             "tcp-keepalive-probes",
+            "tls",
             "tproxy-port",
             "tproxy-sni",
             "traffic-ledger",
@@ -5041,6 +5046,291 @@ mod ntp_resolution {
         assert!(
             e.to_string().contains("ntp.interval"),
             "the ntp range defect must surface before the strict ECH defect: {e}"
+        );
+    }
+}
+
+// ─── issue #974: extended external-controller surface ──────────────────
+
+mod api_listener_config {
+    use super::*;
+
+    #[tokio::test]
+    async fn extended_controller_keys_parse_and_stay_strings() {
+        let yaml = r#"
+external-controller: "127.0.0.1:9090"
+external-controller-tls: "127.0.0.1:9443"
+external-controller-unix: "meow.sock"
+external-controller-pipe: '\\.\pipe\meow'
+"#;
+        let config = load_config_from_str(yaml).await.unwrap();
+        assert_eq!(
+            config.api.external_controller_tls.as_deref(),
+            Some("127.0.0.1:9443")
+        );
+        assert_eq!(
+            config.api.external_controller_unix.as_deref(),
+            Some("meow.sock")
+        );
+        assert_eq!(
+            config.api.external_controller_pipe.as_deref(),
+            Some("\\\\.\\pipe\\meow")
+        );
+        assert!(config.api.external_controller.is_some());
+    }
+
+    #[tokio::test]
+    async fn extended_controller_keys_weak_decode_scalars() {
+        // mihomo's Go decoder coerces scalars into string fields — `5`
+        // becomes `"5"` and never errors at parse (it fails at bind).
+        for key in [
+            "external-controller-tls",
+            "external-controller-unix",
+            "external-controller-pipe",
+        ] {
+            let yaml = format!("{key}: 5\n");
+            let config = load_config_from_str(&yaml)
+                .await
+                .unwrap_or_else(|e| panic!("{key}: 5 must parse: {e}"));
+            let got = match key {
+                "external-controller-tls" => &config.api.external_controller_tls,
+                "external-controller-unix" => &config.api.external_controller_unix,
+                _ => &config.api.external_controller_pipe,
+            };
+            assert_eq!(got.as_deref(), Some("5"), "{key}");
+        }
+        // YAML 1.2's core schema resolves only `true`/`false` as booleans:
+        // a legacy `yes` spelling reaches the weak decoder as a plain
+        // string and passes through verbatim — unquoted or quoted makes
+        // no difference (issue #974).
+        for spelling in [
+            "external-controller-tls: yes\n",
+            "external-controller-tls: 'yes'\n",
+        ] {
+            let config = load_config_from_str(spelling).await.unwrap();
+            assert_eq!(
+                config.api.external_controller_tls.as_deref(),
+                Some("yes"),
+                "{spelling}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn extended_controller_keys_reject_containers() {
+        for key in [
+            "external-controller-tls",
+            "external-controller-unix",
+            "external-controller-pipe",
+        ] {
+            assert!(
+                load_config_from_str(&format!("{key}: [a, b]\n"))
+                    .await
+                    .is_err(),
+                "{key} sequence must be a hard error"
+            );
+            assert!(
+                load_config_from_str(&format!("{key}:\n  nested: true\n"))
+                    .await
+                    .is_err(),
+                "{key} mapping must be a hard error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_one_sided_pair_is_shape_only_at_build() {
+        // Upstream `-t` accepts a one-sided pair — every identity
+        // failure defers to endpoint bind, so the values are kept and
+        // bind_tls fails just that endpoint at startup (issue #974).
+        for yaml in [
+            "external-controller-tls: '127.0.0.1:9443'\ntls:\n  certificate: x\n",
+            "external-controller-tls: '127.0.0.1:9443'\ntls:\n  private-key: x\n",
+        ] {
+            let config = load_config_from_str(yaml)
+                .await
+                .expect("one-sided tls pair must build (shape only)");
+            assert!(config.api.external_controller_tls.is_some());
+        }
+        let cert_only = load_config_from_str(
+            "external-controller-tls: '127.0.0.1:9443'\ntls:\n  certificate: x\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cert_only.api.tls_certificate.as_deref(), Some("x"));
+        assert_eq!(cert_only.api.tls_private_key, None);
+    }
+
+    #[tokio::test]
+    async fn extended_endpoints_alone_count_as_servable() {
+        // Startup must not treat `external-controller` as the only real
+        // endpoint — TLS-only (every platform) and unix-only (unix
+        // platforms) configs keep the API up (issue #974).
+        let config = load_config_from_str("external-controller-tls: '127.0.0.1:9443'\n")
+            .await
+            .unwrap();
+        assert!(config.api.has_servable_endpoint());
+        #[cfg(unix)]
+        {
+            let config = load_config_from_str("external-controller-unix: 'meow.sock'\n")
+                .await
+                .unwrap();
+            assert!(config.api.has_servable_endpoint());
+        }
+        // The pipe endpoint serves nowhere but Windows — on Darwin/Linux
+        // a pipe-only config is not servable, on Windows it is.
+        let config = load_config_from_str("external-controller-pipe: '\\\\.\\pipe\\meow'\n")
+            .await
+            .unwrap();
+        assert_eq!(config.api.has_servable_endpoint(), cfg!(windows));
+        // And nothing at all → nothing servable.
+        let config = load_config_from_str("").await.unwrap();
+        assert!(!config.api.has_servable_endpoint());
+    }
+
+    #[tokio::test]
+    async fn tls_pem_file_paths_do_not_read_at_build() {
+        // `-t` parity at build: file-path PEMs resolve at endpoint bind —
+        // a nonexistent path must not be read here.
+        let yaml = "external-controller-tls: '127.0.0.1:9443'\ntls:\n  certificate: /nonexistent/cert.pem\n  private-key: /nonexistent/key.pem\n";
+        let config = load_config_from_str(yaml)
+            .await
+            .expect("file-path pair must not be read at build");
+        assert_eq!(
+            config.api.tls_certificate.as_deref(),
+            Some("/nonexistent/cert.pem")
+        );
+    }
+
+    #[tokio::test]
+    async fn tls_keys_without_listener_warn_but_parse() {
+        // `tls:` cert/key without `external-controller-tls` are inert:
+        // parse keeps them and startup just never binds TLS.
+        let yaml = "tls:\n  certificate: x\n  private-key: y\n";
+        let config = load_config_from_str(yaml).await.unwrap();
+        assert_eq!(config.api.tls_certificate.as_deref(), Some("x"));
+        assert!(config.api.external_controller_tls.is_none());
+    }
+
+    #[tokio::test]
+    async fn tls_ignored_members_parse() {
+        let yaml = "tls:\n  ech-key: abc\n  client-auth-type: require-and-verify\n  client-auth-certificates: x\n  custom-certifactes: y\n";
+        let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+        let tls = raw.tls.unwrap();
+        assert!(tls.ech_key.is_some());
+        assert!(tls.client_auth_type.is_some());
+        assert!(tls.client_auth_certificates.is_some());
+        assert!(tls.custom_certifactes.is_some());
+    }
+
+    #[tokio::test]
+    async fn tls_non_map_is_hard_error() {
+        for yaml in ["tls: []\n", "tls: 5\n"] {
+            assert!(
+                meow_config::parse_raw_yaml(yaml).is_err(),
+                "{yaml} must fail: tls is map-only"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn top_level_certificate_private_key_are_not_tls() {
+        // Never TLS aliases — they parse as unknown/misplaced top-level
+        // keys and must not feed the TLS identity.
+        let yaml = "external-controller-tls: '127.0.0.1:9443'\ncertificate: x\nprivate-key: y\n";
+        let config = load_config_from_str(yaml).await.unwrap();
+        assert!(config.api.tls_certificate.is_none());
+        assert!(config.api.tls_private_key.is_none());
+    }
+
+    #[tokio::test]
+    async fn cors_absent_and_present_resolve_identically() {
+        // Under a configured secret the map's presence does not select
+        // middleware — absent, `{}` and `null`-only maps all resolve to
+        // the configured path's `["*"]`/`true` defaults; upstream's
+        // permissive AllowAll fires only on `secret: ""` (issue #974).
+        for yaml in [
+            "mode: rule\n",
+            "external-controller-cors: {}\n",
+            "external-controller-cors:\n  allow-origins: null\n",
+        ] {
+            let config = load_config_from_str(yaml).await.unwrap();
+            assert_eq!(config.api.cors.allow_origins, vec!["*"], "{yaml}");
+            assert!(config.api.cors.allow_private_network, "{yaml}");
+        }
+
+        // Partial maps merge by key.
+        let config = load_config_from_str(
+            "external-controller-cors:\n  allow-origins: ['https://a.example']\n  allow-private-network: false\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(config.api.cors.allow_origins, vec!["https://a.example"]);
+        assert!(!config.api.cors.allow_private_network);
+
+        // Explicit empty list stays empty — the allow-all edge upstream.
+        let config = load_config_from_str("external-controller-cors:\n  allow-origins: []\n")
+            .await
+            .unwrap();
+        assert!(config.api.cors.allow_origins.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cors_scalar_items_weak_decode() {
+        let config = load_config_from_str(
+            "external-controller-cors:\n  allow-origins: [5, true, 'https://a.example']\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            config.api.cors.allow_origins,
+            vec!["5", "true", "https://a.example"]
+        );
+    }
+
+    #[tokio::test]
+    async fn cors_legacy_bool_spellings() {
+        let config =
+            load_config_from_str("external-controller-cors:\n  allow-private-network: yes\n")
+                .await
+                .unwrap();
+        assert!(config.api.cors.allow_private_network);
+        let config =
+            load_config_from_str("external-controller-cors:\n  allow-private-network: no\n")
+                .await
+                .unwrap();
+        assert!(!config.api.cors.allow_private_network);
+    }
+
+    #[tokio::test]
+    async fn cors_shape_errors_are_hard() {
+        for yaml in [
+            "external-controller-cors: []\n",
+            "external-controller-cors: 5\n",
+            "external-controller-cors:\n  allow-origins: '*'\n",
+            "external-controller-cors:\n  allow-private-network: 1\n",
+            "external-controller-cors:\n  allow-private-network: 'true'\n",
+        ] {
+            assert!(
+                meow_config::parse_raw_yaml(yaml).is_err(),
+                "{yaml} must be a hard parse error"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tls_bad_inline_pem_is_shape_only_at_build() {
+        // Inline PEM material is *content*, not shape — upstream accepts
+        // a bogus pair at `-t` and fails the endpoint at bind (issue
+        // #974), so build keeps the values untouched and never parses
+        // the PEM.
+        let yaml = "external-controller-tls: '127.0.0.1:9443'\ntls:\n  certificate: '-----BEGIN CERTIFICATE-----\\nbogus\\n-----END CERTIFICATE-----'\n  private-key: '-----BEGIN PRIVATE KEY-----\\nbogus\\n-----END PRIVATE KEY-----'\n";
+        let config = load_config_from_str(yaml)
+            .await
+            .expect("bogus inline PEM must build (shape only)");
+        assert_eq!(
+            config.api.tls_certificate.as_deref(),
+            Some("-----BEGIN CERTIFICATE-----\\nbogus\\n-----END CERTIFICATE-----")
         );
     }
 }

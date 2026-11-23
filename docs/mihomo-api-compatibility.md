@@ -11,6 +11,29 @@ Status meanings:
 - **Extension**: meow-rs API with no mihomo equivalent.
 - **Not implemented**: deliberately not registered; callers receive 404.
 
+## Listener transports
+
+Every route below serves identically over each configured controller
+endpoint — the plain `external-controller` TCP listener plus, like
+upstream, any of these coexisting listeners (issue #974, see
+[api-listener.md](specs/api-listener.md)):
+
+| Config key / CLI flag | Status | Notes |
+|---|---|---|
+| `external-controller-tls` / `--ext-ctl-tls` | Compatible | HTTPS via BoringSSL, ALPN `h2` then `http/1.1` (axum serves a real h2 on the `h2` ALPN). The endpoint is the `api-tls` build feature — `full`/`default` ship it, `minimal` parses the key but warns at startup that the HTTPS controller is not compiled into the build. Identity from `tls.certificate`/`tls.private-key` — both inline PEM or both home/`SAFE_PATHS`-contained file paths (a mixed pair is refused without embedding the inline material in errors); both unset serves an ephemeral self-signed RSA-2048 cert. Identity failures are endpoint-local like upstream: `-t`/load is shape-only, a bad pair just skips the TLS listener at bind. No PEM file watching. |
+| `external-controller-unix` / `--ext-ctl-unix` | Compatible | Unix socket, relative path under the daemon home. Deliberate divergences: refuses non-socket/other-user paths, reclaims only a verified stale socket, binds `0600` (not `0666`, and chmod failure fails the endpoint), keeps Bearer auth, and the cleanup guard unlinks only the exact socket it bound — re-verified by type and `(dev, ino)`. |
+| `external-controller-pipe` / `--ext-ctl-pipe` | Partial | Windows named pipe, byte mode, remote clients rejected, owner-only SDDL ACL on every instance; a failed next-instance creation still serves the already-connected client. Parsed but warn-ignored on non-Windows. |
+| `external-controller-cors` | Compatible | Always the configured `cors.New` wire shape: `allow-origins` (`*`/globs/echo, `[]` = allow-all), `allow-private-network` (default `true`), `Access-Control-Max-Age: 300`, `HEAD` never allowed (preflight or actual), request headers limited to `{content-type, authorization, origin}` — one bad name denies the preflight. An absent map resolves the `["*"]`/`true` defaults like upstream under a set/unset secret; upstream's permissive `AllowAll` fires only on `secret: ""`, and meow mounts no CORS layer without a secret at all, so it has no counterpart. |
+| `external-controller-routing-mark` | Not implemented | Parsed and warn-ignored; no controller-socket `SO_MARK`. |
+| `tls:` other members | Not implemented | `client-auth-type`, `client-auth-certificates`, `ech-key`, `custom-certifactes` (sic) parse and warn-ignore. |
+
+The listener surface is a startup snapshot: `PUT /configs` commits these
+keys to the document for the next boot and warns that a restart applies
+them — it never rebinds, reads PEMs or mutates CORS live. The plain TCP
+bind is the only startup-fatal endpoint; the new ones log-and-skip like
+upstream, and a config where every endpoint failed to bind logs that no
+controller is available.
+
 ## Panel runtime API
 
 | Route | Status | Notes |

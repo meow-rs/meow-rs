@@ -241,15 +241,8 @@ fn main() -> Result<()> {
     if args.age_secret_key.is_some() {
         anyhow::bail!("--age-secret-key is not yet supported");
     }
-    if args.ext_ctl_tls.is_some() {
-        anyhow::bail!("--ext-ctl-tls is not yet supported");
-    }
-    if args.ext_ctl_unix.is_some() {
-        anyhow::bail!("--ext-ctl-unix is not yet supported");
-    }
-    if args.ext_ctl_pipe.is_some() {
-        anyhow::bail!("--ext-ctl-pipe is not yet supported");
-    }
+    // `--ext-ctl-{tls,unix,pipe}` map onto the `external-controller-*`
+    // overrides applied after config load (issue #974).
 
     // Accepted for mihomo CLI compatibility but not implemented. Frontends may
     // pass these blindly, so warn instead of bailing (tracing is not yet
@@ -695,6 +688,12 @@ fn run_application_inner(
             config.api.external_controller = Some(addr);
             info!("External controller overridden by --ext-ctl: {addr}");
         }
+        apply_ext_controller_overrides(
+            args.ext_ctl_tls.as_deref(),
+            args.ext_ctl_unix.as_deref(),
+            args.ext_ctl_pipe.as_deref(),
+            &mut config.api,
+        );
         if let Some(ref ui) = args.ext_ui {
             config.api.external_ui = Some(std::path::PathBuf::from(ui));
             info!("External UI overridden by --ext-ui");
@@ -736,6 +735,44 @@ fn read_api_secret(path: &Path) -> Result<String> {
     }
     secret.truncate(line.len());
     Ok(secret)
+}
+
+/// The extended controller flags (`--ext-ctl-tls` / `-unix` / `-pipe`)
+/// override the matching raw keys verbatim (issue #974): strings,
+/// resolved at endpoint bind like the config values they replace. Like
+/// upstream, an *empty* override is not applied — `--ext-ctl-tls ''`
+/// must not erase a YAML endpoint.
+fn apply_ext_controller_overrides(
+    ext_ctl_tls: Option<&str>,
+    ext_ctl_unix: Option<&str>,
+    ext_ctl_pipe: Option<&str>,
+    api: &mut meow_config::ApiConfig,
+) {
+    if let Some(ctl) = ext_ctl_tls.filter(|s| !s.is_empty()) {
+        api.external_controller_tls = Some(ctl.to_owned());
+        info!("External controller TLS overridden by --ext-ctl-tls: {ctl}");
+    }
+    if let Some(ctl) = ext_ctl_unix.filter(|s| !s.is_empty()) {
+        api.external_controller_unix = Some(ctl.to_owned());
+        info!("External controller unix socket overridden by --ext-ctl-unix: {ctl}");
+    }
+    if let Some(ctl) = ext_ctl_pipe.filter(|s| !s.is_empty()) {
+        api.external_controller_pipe = Some(ctl.to_owned());
+        info!("External controller pipe overridden by --ext-ctl-pipe: {ctl}");
+    }
+}
+
+/// Whether this binary can actually serve one of the configured
+/// controller endpoints. `ApiConfig::has_servable_endpoint` reports the
+/// *configured* set; `external-controller-tls` additionally needs the
+/// `api-tls` build feature (`minimal` compiles the endpoint out,
+/// ADR-0007), so a TLS-only config on a TLS-less build is headless and
+/// must not spawn an API server that binds nothing (issue #974).
+fn api_endpoint_servable(api: &meow_config::ApiConfig) -> bool {
+    api.external_controller.is_some()
+        || (cfg!(feature = "api-tls") && api.external_controller_tls.is_some())
+        || (cfg!(unix) && api.external_controller_unix.is_some())
+        || (cfg!(windows) && api.external_controller_pipe.is_some())
 }
 
 /// Owner of the outbound-interface binding installed ahead of the config
@@ -1543,7 +1580,7 @@ async fn run(
             .and_then(|d| d.nftset.as_ref())
             .and_then(|n| n.parse().ok().flatten()),
     );
-    if config.api.external_controller.is_none() {
+    if !api_endpoint_servable(&config.api) {
         // No API can inspect individual connections. Keep cancellation handles
         // for cold reloads without storing their display metadata.
         tunnel.statistics().set_headless();
@@ -2047,7 +2084,31 @@ async fn run(
     // `GET /listeners` snapshot reports OS-assigned ports for `port: 0`
     // (ephemeral) listeners rather than the configured `0`.
     let mut controller_file = None;
-    if let Some(api_addr) = config.api.external_controller {
+    // Owns the `external-controller-unix` socket-path cleanup for the
+    // daemon's lifetime — declared out here so the guard drops at shutdown,
+    // not when the endpoint block ends (issue #974).
+    #[cfg(unix)]
+    let mut _unix_socket_guard: Option<meow_api::endpoint::UnixSocketGuard> = None;
+    // Non-native transports configured by config key or CLI override warn
+    // here too — `api_endpoint_servable` already excludes them, so an
+    // unsupported-only config would otherwise go silent (issue #974).
+    #[cfg(not(unix))]
+    if let Some(ref unix_path) = config.api.external_controller_unix {
+        warn!("external-controller-unix '{unix_path}' ignored — Unix sockets are unsupported on this platform");
+    }
+    #[cfg(not(windows))]
+    if let Some(ref pipe_name) = config.api.external_controller_pipe {
+        warn!("external-controller-pipe '{pipe_name}' ignored — named pipes are Windows-only");
+    }
+    // The HTTPS endpoint is a build feature, not just a platform gate:
+    // `minimal` leaves it out (ADR-0007) and parses the key as dead
+    // config — loud like the plugin placeholders, never silently dropped
+    // (issue #974).
+    #[cfg(not(feature = "api-tls"))]
+    if let Some(ref tls_addr) = config.api.external_controller_tls {
+        warn!("external-controller-tls '{tls_addr}' ignored — the HTTPS controller is not compiled into this build (feature 'api-tls')");
+    }
+    if api_endpoint_servable(&config.api) {
         // `external-ui-url` auto-download is gated behind the optional
         // `external-ui-download` feature (it pulls in the `zip` crate, against
         // the ADR-0007 size caps). Without the feature we just hint the user to
@@ -2078,10 +2139,11 @@ async fn run(
                 }
             }
         }
-        let api_server = ApiServer::new(
+        let api_server = std::sync::Arc::new(ApiServer::new(
             tunnel.clone(),
-            api_addr,
+            config.api.external_controller,
             config.api.secret.clone(),
+            config.api.cors.clone(),
             config_path.clone(),
             Arc::clone(&raw_config),
             log_tx.clone(),
@@ -2090,30 +2152,103 @@ async fn run(
             Arc::clone(&rule_provider_refresh),
             Arc::clone(&proxy_provider_refresh),
             named_listeners.clone(),
-            config.api.external_ui.clone(),
+            config.api.external_ui.as_deref(),
             Arc::clone(&dns_server_handle),
             config.provider_dialer_registry.clone(),
             Some({
                 let supervisor = Arc::clone(&ntp_supervisor);
                 Arc::new(move |cfg| supervisor.reconcile(cfg)) as meow_api::routes::NtpReconcile
             }),
-        );
-        // Bind eagerly like the DNS listener and the `listeners:` entries:
-        // an `external-controller` failure is a hard startup error, not a
-        // detached task that dies one log line deep (issue #641).
-        let socket = tokio::net::TcpListener::bind(api_addr)
+        ));
+        // Every configured endpoint attempts its own bind: the plain TCP
+        // controller stays startup-fatal (issue #641), while the TLS/unix/
+        // pipe listeners are best-effort — a bad one is logged and skipped
+        // so the rest still serve (issue #974).
+        let mut bound_any = false;
+        if let Some(api_addr) = config.api.external_controller {
+            let socket = tokio::net::TcpListener::bind(api_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("external-controller {api_addr}: {e}"))?;
+            controller_file = publish_controller(
+                &socket,
+                config.api.secret.as_deref(),
+                config_path.as_deref(),
+            );
+            bound_any = true;
+            let server = std::sync::Arc::clone(&api_server);
+            tokio::spawn(async move {
+                if let Err(e) = server.run_on(socket).await {
+                    error!("API server error: {}", e);
+                }
+            });
+        }
+        // On builds without `api-tls` the field is dead config — the warn
+        // above already named it; this arm is what the feature compiles.
+        #[cfg(feature = "api-tls")]
+        if let Some(ref tls_addr) = config.api.external_controller_tls {
+            match meow_api::endpoint::bind_tls(
+                tls_addr,
+                config.api.tls_certificate.as_deref(),
+                config.api.tls_private_key.as_deref(),
+            )
             .await
-            .map_err(|e| anyhow::anyhow!("external-controller {api_addr}: {e}"))?;
-        controller_file = publish_controller(
-            &socket,
-            config.api.secret.as_deref(),
-            config_path.as_deref(),
-        );
-        tokio::spawn(async move {
-            if let Err(e) = api_server.run_on(socket).await {
-                error!("API server error: {}", e);
+            {
+                Ok(endpoint) => {
+                    bound_any = true;
+                    info!("REST API (TLS) listening on https://{}", endpoint.addr());
+                    let server = std::sync::Arc::clone(&api_server);
+                    tokio::spawn(async move {
+                        if let Err(e) = server.serve_tls_on(endpoint).await {
+                            error!("API TLS server error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("external-controller-tls {tls_addr}: {e:#} — endpoint skipped");
+                }
             }
-        });
+        }
+        #[cfg(unix)]
+        if let Some(ref unix_path) = config.api.external_controller_unix {
+            match meow_api::endpoint::bind_unix(unix_path).await {
+                Ok((endpoint, guard)) => {
+                    bound_any = true;
+                    info!("REST API listening on unix://{}", guard.path().display());
+                    _unix_socket_guard = Some(guard);
+                    let server = std::sync::Arc::clone(&api_server);
+                    tokio::spawn(async move {
+                        if let Err(e) = server.serve_on(endpoint).await {
+                            error!("API unix server error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("external-controller-unix {unix_path}: {e:#} — endpoint skipped");
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        if let Some(ref pipe_name) = config.api.external_controller_pipe {
+            match meow_api::endpoint::bind_pipe(pipe_name) {
+                Ok(endpoint) => {
+                    bound_any = true;
+                    info!("REST API listening on named pipe {pipe_name}");
+                    let server = std::sync::Arc::clone(&api_server);
+                    tokio::spawn(async move {
+                        if let Err(e) = server.serve_on(endpoint).await {
+                            error!("API pipe server error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("external-controller-pipe '{pipe_name}': {e:#} — endpoint skipped");
+                }
+            }
+        }
+        if !bound_any {
+            error!("external-controller endpoints are configured but no controller is available");
+        }
     }
 
     // TUN inbound (issue #326) — spawned from the top-level `tun:` section,
@@ -2544,6 +2679,112 @@ mod tests {
             "controller-secret",
         ]);
         assert!(matches!(result, Err(e) if e.kind() == clap::error::ErrorKind::ArgumentConflict));
+    }
+
+    #[test]
+    fn empty_ext_ctl_overrides_keep_yaml_endpoints() {
+        // `--ext-ctl-tls ''` is an empty override: applied verbatim it
+        // would erase a configured endpoint — upstream skips empties
+        // (issue #974).
+        let args = Args::try_parse_from([
+            "meow",
+            "--ext-ctl-tls",
+            "",
+            "--ext-ctl-unix",
+            "",
+            "--ext-ctl-pipe",
+            "",
+        ])
+        .unwrap();
+        let mut api = meow_config::ApiConfig {
+            external_controller: None,
+            external_controller_tls: Some("127.0.0.1:9443".into()),
+            external_controller_unix: Some("/tmp/meow.sock".into()),
+            external_controller_pipe: Some(r"\\.\pipe\meow".into()),
+            tls_certificate: None,
+            tls_private_key: None,
+            cors: Default::default(),
+            secret: None,
+            external_ui: None,
+            external_ui_url: None,
+        };
+        apply_ext_controller_overrides(
+            args.ext_ctl_tls.as_deref(),
+            args.ext_ctl_unix.as_deref(),
+            args.ext_ctl_pipe.as_deref(),
+            &mut api,
+        );
+        assert_eq!(
+            api.external_controller_tls.as_deref(),
+            Some("127.0.0.1:9443")
+        );
+        assert_eq!(
+            api.external_controller_unix.as_deref(),
+            Some("/tmp/meow.sock")
+        );
+        assert_eq!(
+            api.external_controller_pipe.as_deref(),
+            Some(r"\\.\pipe\meow")
+        );
+
+        // Nonempty overrides replace — and a mix replaces only its own key.
+        let args = Args::try_parse_from(["meow", "--ext-ctl-unix", "/tmp/cli.sock"]).unwrap();
+        apply_ext_controller_overrides(
+            args.ext_ctl_tls.as_deref(),
+            args.ext_ctl_unix.as_deref(),
+            args.ext_ctl_pipe.as_deref(),
+            &mut api,
+        );
+        assert_eq!(
+            api.external_controller_unix.as_deref(),
+            Some("/tmp/cli.sock")
+        );
+        assert_eq!(
+            api.external_controller_tls.as_deref(),
+            Some("127.0.0.1:9443")
+        );
+        assert_eq!(
+            api.external_controller_pipe.as_deref(),
+            Some(r"\\.\pipe\meow")
+        );
+    }
+
+    #[test]
+    fn servable_gate_applies_the_api_tls_build_flag() {
+        // `ApiConfig::has_servable_endpoint` is the *configured* set;
+        // the startup predicate adds the compile gate: a TLS-only config
+        // is servable exactly when `api-tls` built the endpoint, else the
+        // daemon is headless (issue #974).
+        let base = meow_config::ApiConfig {
+            external_controller: None,
+            external_controller_tls: None,
+            external_controller_unix: None,
+            external_controller_pipe: None,
+            tls_certificate: None,
+            tls_private_key: None,
+            cors: Default::default(),
+            secret: None,
+            external_ui: None,
+            external_ui_url: None,
+        };
+        let mut api = meow_config::ApiConfig {
+            external_controller_tls: Some("127.0.0.1:9443".into()),
+            ..base
+        };
+        assert_eq!(api_endpoint_servable(&api), cfg!(feature = "api-tls"));
+        // Dead TLS config never drags a live endpoint down — a TLS+unix
+        // config on a TLS-less build still serves the socket.
+        api.external_controller = Some("127.0.0.1:9090".parse().unwrap());
+        assert!(api_endpoint_servable(&api));
+        api.external_controller = None;
+        // The platform arms below assert on unix/pipe alone — a
+        // lingering TLS endpoint would answer true on an api-tls
+        // Windows build before the unix arm is even asked.
+        api.external_controller_tls = None;
+        api.external_controller_unix = Some("meow.sock".into());
+        assert_eq!(api_endpoint_servable(&api), cfg!(unix));
+        api.external_controller_pipe = Some(r"\\.\pipe\meow".into());
+        assert_eq!(api_endpoint_servable(&api), cfg!(any(unix, windows)));
     }
 
     // Upstream `MRS\x01` fixture writers — the same shapes the

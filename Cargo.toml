@@ -148,7 +148,10 @@ webpki-root-certs = "1.0.10"
 # (Android `protect()`).
 hickory-proto = "0.26"
 
-# Web framework
+# Web framework — `http2` is deliberately NOT enabled here: it is
+# meow-api's `api-tls` feature that turns it on for the
+# `external-controller-tls` endpoint, so builds without the endpoint
+# never carry the h2 server code (issue #974).
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
@@ -338,5 +341,9 @@ meow-transport = { path = "crates/meow-transport", version = "0.29.0", default-f
 meow-proxy = { path = "crates/meow-proxy", version = "0.29.0", default-features = false }
 meow-tunnel = { path = "crates/meow-tunnel", version = "0.29.0" }
 meow-listener = { path = "crates/meow-listener", version = "0.29.0", default-features = false }
-meow-api = { path = "crates/meow-api", version = "0.29.0" }
+# default-features = false so `api-tls` is opt-in through each consumer's
+# feature graph — meow-app `minimal` must not inherit the endpoint's
+# BoringSSL/h2 code (issue #974). meow-api still defaults it on for its
+# own builds and test targets.
+meow-api = { path = "crates/meow-api", version = "0.29.0", default-features = false }
 meow-config = { path = "crates/meow-config", version = "0.29.0", default-features = false }
