@@ -26,7 +26,6 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
-use tower_http::cors::{AllowHeaders, CorsLayer};
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "listener-tun")]
@@ -123,6 +122,9 @@ pub struct AppState {
     pub dns_server: Arc<RwLock<Option<DnsServerHandle>>>,
     /// `/storage/{key}`, opened on first use (`crate::storage`).
     pub ui_storage: crate::storage::UiStorageSlot,
+    /// `external-controller-cors` resolved at startup — every transport
+    /// (TCP/TLS/unix/pipe) serves this one policy (issue #974).
+    pub cors: meow_config::ApiCorsConfig,
 }
 
 /// Handle to the running standalone DNS server (config `dns.listen`).
@@ -307,6 +309,21 @@ async fn require_auth_ws(
     }
 }
 
+/// Marker extension the `external-controller-tls` router clone inserts:
+/// the no-secret origin guard compares `Origin` against the transport's
+/// real scheme, and an HTTP/1.1 request line carries no scheme of its own
+/// — without the marker a same-origin `https://` dashboard would look
+/// cross-scheme (issue #974).
+#[derive(Clone, Copy)]
+pub struct TlsTransport;
+
+/// Outer layer for the TLS endpoint's router — runs before the origin
+/// guard inside `create_router`.
+pub async fn mark_tls_transport(mut req: Request, next: Next) -> Response {
+    req.extensions_mut().insert(TlsTransport);
+    next.run(req).await
+}
+
 /// Restrict browser access when the controller has no token. In particular,
 /// an arbitrary DNS name is never a trusted Host, even when Origin matches it.
 async fn require_controller_origin(req: Request, next: Next) -> Response {
@@ -369,7 +386,12 @@ fn controller_origin_allowed(req: &Request) -> bool {
         "https" => 443,
         _ => return false,
     };
-    if scheme != req.uri().scheme_str().unwrap_or("http") {
+    let served_scheme = if req.extensions().get::<TlsTransport>().is_some() {
+        "https"
+    } else {
+        req.uri().scheme_str().unwrap_or("http")
+    };
+    if scheme != served_scheme {
         return false;
     }
     let Ok(origin_authority) = origin_authority.parse::<Authority>() else {
@@ -576,9 +598,18 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     };
 
     let router = router.layer(middleware::map_request(assume_json_body));
+    // CORS answers preflights outside Bearer auth on every transport —
+    // upstream mounts the middleware on the router itself. Deliberate
+    // divergence (issue #974): the no-secret mode keeps its no-grants
+    // posture and mounts no CORS layer at all — cross-origin dashboards
+    // must configure a secret. The two response shapes (permissive
+    // absent-map vs configured `external-controller-cors:`) dispatch
+    // inside `cors::handle` on the startup snapshot.
     let router = if auth_required {
-        // Fetch requires Authorization to be named explicitly in a preflight.
-        router.layer(CorsLayer::permissive().allow_headers(AllowHeaders::mirror_request()))
+        router.layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            crate::cors::handle,
+        ))
     } else {
         router
     };
@@ -4464,7 +4495,15 @@ async fn swap_config_and_reconcile_tun(
     // every settle is hoisted above the publish so a cancelled request
     // never leaves a committed document whose tail (the keepalive install
     // and `ntp:` reconcile) never ran.
-    let (old_enable, tun_changed, specs, new_log_level, logbook_enable, geo_schedule_changed) = {
+    let (
+        old_enable,
+        tun_changed,
+        specs,
+        new_log_level,
+        logbook_enable,
+        geo_schedule_changed,
+        controller_changed,
+    ) = {
         let guard = state.raw_config.read();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
         // Semantic diff (issue #543): compare the PARSED `TunConfig`s so
@@ -4500,6 +4539,17 @@ async fn swap_config_and_reconcile_tun(
         // that to the operator rather than letting it sit silently stale.
         let geo_schedule_changed = meow_config::geodata::update_schedule(&guard)
             != meow_config::geodata::update_schedule(&candidate);
+        // The controller listener surface — addresses, CORS, the `tls:`
+        // identity — is a startup snapshot like the geo schedule: the PUT
+        // commits the raw document but listeners/CORS only re-evaluate on
+        // restart, so flag it rather than let it sit silently stale
+        // (issue #974).
+        let controller_changed = guard.external_controller != candidate.external_controller
+            || guard.external_controller_tls != candidate.external_controller_tls
+            || guard.external_controller_unix != candidate.external_controller_unix
+            || guard.external_controller_pipe != candidate.external_controller_pipe
+            || guard.external_controller_cors != candidate.external_controller_cors
+            || guard.tls != candidate.tls;
         (
             old,
             tun_changed,
@@ -4507,6 +4557,7 @@ async fn swap_config_and_reconcile_tun(
             new_log_level,
             logbook_enable,
             geo_schedule_changed,
+            controller_changed,
         )
     };
 
@@ -4865,6 +4916,13 @@ async fn swap_config_and_reconcile_tun(
             "geodata update schedule changed (geo-auto-update / geo-update-interval / \
              geodata.auto-update*): the running schedule is a startup snapshot — \
              restart meow to apply it"
+        );
+    }
+    if controller_changed {
+        warn!(
+            "external-controller* / external-controller-cors / tls changed: the \
+             controller listener surface is a startup snapshot — restart meow to \
+             rebind or re-apply it"
         );
     }
     logbook::reconfigure(logbook_enable);
@@ -7472,6 +7530,7 @@ mod outbound_flush_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            cors: Default::default(),
         })
     }
 

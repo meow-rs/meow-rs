@@ -97,6 +97,7 @@ fn test_state_with_backing(raw: RawConfig, config_path: Option<String>) -> Arc<A
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     })
 }
 
@@ -138,6 +139,7 @@ fn test_state_with_route(raw: RawConfig, named: Vec<(&str, Arc<dyn Proxy>)>) -> 
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     })
 }
 
@@ -186,6 +188,7 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     })
 }
 
@@ -337,6 +340,7 @@ async fn external_ui_serves_static_directory() {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     });
     let app = create_router(state);
 
@@ -4743,9 +4747,15 @@ async fn controller_with_secret_allows_authenticated_cross_origin_dashboards() {
         preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
         "*"
     );
+    // The absent-map permissive shape grants the literal `*` like
+    // upstream's chi AllowAll middleware (issue #974).
     assert_eq!(
         preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
-        "authorization,content-type"
+        "*"
+    );
+    assert_eq!(
+        preflight.headers()[header::ACCESS_CONTROL_ALLOW_METHODS],
+        "*"
     );
 
     let response = app
@@ -5254,6 +5264,7 @@ mod delay_support {
             traffic_feed: Default::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            cors: Default::default(),
         })
     }
 
@@ -5314,6 +5325,7 @@ mod delay_support {
             traffic_feed: Default::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            cors: Default::default(),
         })
     }
 }
@@ -6701,6 +6713,7 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     })
 }
 
@@ -6869,6 +6882,7 @@ async fn get_dns_query_txt_relays_upstream_sections_and_flags() {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     });
 
     let resp = create_router(state)

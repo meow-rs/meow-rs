@@ -51,6 +51,7 @@ fn make_state_with_cap(cap: usize) -> (Arc<AppState>, broadcast::Sender<LogMessa
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        cors: Default::default(),
     });
     (state, log_tx)
 }

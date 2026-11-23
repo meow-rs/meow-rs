@@ -241,15 +241,8 @@ fn main() -> Result<()> {
     if args.age_secret_key.is_some() {
         anyhow::bail!("--age-secret-key is not yet supported");
     }
-    if args.ext_ctl_tls.is_some() {
-        anyhow::bail!("--ext-ctl-tls is not yet supported");
-    }
-    if args.ext_ctl_unix.is_some() {
-        anyhow::bail!("--ext-ctl-unix is not yet supported");
-    }
-    if args.ext_ctl_pipe.is_some() {
-        anyhow::bail!("--ext-ctl-pipe is not yet supported");
-    }
+    // `--ext-ctl-{tls,unix,pipe}` map onto the `external-controller-*`
+    // overrides applied after config load (issue #974).
 
     // Accepted for mihomo CLI compatibility but not implemented. Frontends may
     // pass these blindly, so warn instead of bailing (tracing is not yet
@@ -694,6 +687,21 @@ fn run_application_inner(
                 .map_err(|e| anyhow::anyhow!("--ext-ctl: invalid address '{ctl}': {e}"))?;
             config.api.external_controller = Some(addr);
             info!("External controller overridden by --ext-ctl: {addr}");
+        }
+        // The extended controller flags override the matching raw keys
+        // verbatim (issue #974): strings, resolved at endpoint bind like
+        // the config values they replace.
+        if let Some(ref ctl) = args.ext_ctl_tls {
+            config.api.external_controller_tls = Some(ctl.clone());
+            info!("External controller TLS overridden by --ext-ctl-tls: {ctl}");
+        }
+        if let Some(ref ctl) = args.ext_ctl_unix {
+            config.api.external_controller_unix = Some(ctl.clone());
+            info!("External controller unix socket overridden by --ext-ctl-unix: {ctl}");
+        }
+        if let Some(ref ctl) = args.ext_ctl_pipe {
+            config.api.external_controller_pipe = Some(ctl.clone());
+            info!("External controller pipe overridden by --ext-ctl-pipe: {ctl}");
         }
         if let Some(ref ui) = args.ext_ui {
             config.api.external_ui = Some(std::path::PathBuf::from(ui));
@@ -1543,7 +1551,7 @@ async fn run(
             .and_then(|d| d.nftset.as_ref())
             .and_then(|n| n.parse().ok().flatten()),
     );
-    if config.api.external_controller.is_none() {
+    if !config.api.has_servable_endpoint() {
         // No API can inspect individual connections. Keep cancellation handles
         // for cold reloads without storing their display metadata.
         tunnel.statistics().set_headless();
@@ -2047,7 +2055,23 @@ async fn run(
     // `GET /listeners` snapshot reports OS-assigned ports for `port: 0`
     // (ephemeral) listeners rather than the configured `0`.
     let mut controller_file = None;
-    if let Some(api_addr) = config.api.external_controller {
+    // Owns the `external-controller-unix` socket-path cleanup for the
+    // daemon's lifetime — declared out here so the guard drops at shutdown,
+    // not when the endpoint block ends (issue #974).
+    #[cfg(unix)]
+    let mut _unix_socket_guard: Option<meow_api::endpoint::UnixSocketGuard> = None;
+    // Non-native transports configured by config key or CLI override warn
+    // here too — `has_servable_endpoint` already excludes them, so an
+    // unsupported-only config would otherwise go silent (issue #974).
+    #[cfg(not(unix))]
+    if let Some(ref unix_path) = config.api.external_controller_unix {
+        warn!("external-controller-unix '{unix_path}' ignored — Unix sockets are unsupported on this platform");
+    }
+    #[cfg(not(windows))]
+    if let Some(ref pipe_name) = config.api.external_controller_pipe {
+        warn!("external-controller-pipe '{pipe_name}' ignored — named pipes are Windows-only");
+    }
+    if config.api.has_servable_endpoint() {
         // `external-ui-url` auto-download is gated behind the optional
         // `external-ui-download` feature (it pulls in the `zip` crate, against
         // the ADR-0007 size caps). Without the feature we just hint the user to
@@ -2078,10 +2102,11 @@ async fn run(
                 }
             }
         }
-        let api_server = ApiServer::new(
+        let api_server = std::sync::Arc::new(ApiServer::new(
             tunnel.clone(),
-            api_addr,
+            config.api.external_controller,
             config.api.secret.clone(),
+            config.api.cors.clone(),
             config_path.clone(),
             Arc::clone(&raw_config),
             log_tx.clone(),
@@ -2090,30 +2115,100 @@ async fn run(
             Arc::clone(&rule_provider_refresh),
             Arc::clone(&proxy_provider_refresh),
             named_listeners.clone(),
-            config.api.external_ui.clone(),
+            config.api.external_ui.as_deref(),
             Arc::clone(&dns_server_handle),
             config.provider_dialer_registry.clone(),
             Some({
                 let supervisor = Arc::clone(&ntp_supervisor);
                 Arc::new(move |cfg| supervisor.reconcile(cfg)) as meow_api::routes::NtpReconcile
             }),
-        );
-        // Bind eagerly like the DNS listener and the `listeners:` entries:
-        // an `external-controller` failure is a hard startup error, not a
-        // detached task that dies one log line deep (issue #641).
-        let socket = tokio::net::TcpListener::bind(api_addr)
+        ));
+        // Every configured endpoint attempts its own bind: the plain TCP
+        // controller stays startup-fatal (issue #641), while the TLS/unix/
+        // pipe listeners are best-effort — a bad one is logged and skipped
+        // so the rest still serve (issue #974).
+        let mut bound_any = false;
+        if let Some(api_addr) = config.api.external_controller {
+            let socket = tokio::net::TcpListener::bind(api_addr)
+                .await
+                .map_err(|e| anyhow::anyhow!("external-controller {api_addr}: {e}"))?;
+            controller_file = publish_controller(
+                &socket,
+                config.api.secret.as_deref(),
+                config_path.as_deref(),
+            );
+            bound_any = true;
+            let server = std::sync::Arc::clone(&api_server);
+            tokio::spawn(async move {
+                if let Err(e) = server.run_on(socket).await {
+                    error!("API server error: {}", e);
+                }
+            });
+        }
+        if let Some(ref tls_addr) = config.api.external_controller_tls {
+            match meow_api::endpoint::bind_tls(
+                tls_addr,
+                config.api.tls_certificate.as_deref(),
+                config.api.tls_private_key.as_deref(),
+            )
             .await
-            .map_err(|e| anyhow::anyhow!("external-controller {api_addr}: {e}"))?;
-        controller_file = publish_controller(
-            &socket,
-            config.api.secret.as_deref(),
-            config_path.as_deref(),
-        );
-        tokio::spawn(async move {
-            if let Err(e) = api_server.run_on(socket).await {
-                error!("API server error: {}", e);
+            {
+                Ok(endpoint) => {
+                    bound_any = true;
+                    info!("REST API (TLS) listening on https://{}", endpoint.addr());
+                    let server = std::sync::Arc::clone(&api_server);
+                    tokio::spawn(async move {
+                        if let Err(e) = server.serve_tls_on(endpoint).await {
+                            error!("API TLS server error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("external-controller-tls {tls_addr}: {e:#} — endpoint skipped");
+                }
             }
-        });
+        }
+        #[cfg(unix)]
+        if let Some(ref unix_path) = config.api.external_controller_unix {
+            match meow_api::endpoint::bind_unix(unix_path) {
+                Ok((endpoint, guard)) => {
+                    bound_any = true;
+                    info!("REST API listening on unix://{}", guard.path().display());
+                    _unix_socket_guard = Some(guard);
+                    let server = std::sync::Arc::clone(&api_server);
+                    tokio::spawn(async move {
+                        if let Err(e) = server.serve_on(endpoint).await {
+                            error!("API unix server error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("external-controller-unix {unix_path}: {e:#} — endpoint skipped");
+                }
+            }
+        }
+
+        #[cfg(windows)]
+        if let Some(ref pipe_name) = config.api.external_controller_pipe {
+            match meow_api::endpoint::bind_pipe(pipe_name) {
+                Ok(endpoint) => {
+                    bound_any = true;
+                    info!("REST API listening on named pipe {pipe_name}");
+                    let server = std::sync::Arc::clone(&api_server);
+                    tokio::spawn(async move {
+                        if let Err(e) = server.serve_on(endpoint).await {
+                            error!("API pipe server error: {e}");
+                        }
+                    });
+                }
+                Err(e) => {
+                    error!("external-controller-pipe '{pipe_name}': {e:#} — endpoint skipped");
+                }
+            }
+        }
+        if !bound_any {
+            error!("external-controller endpoints are configured but no controller is available");
+        }
     }
 
     // TUN inbound (issue #326) — spawned from the top-level `tun:` section,

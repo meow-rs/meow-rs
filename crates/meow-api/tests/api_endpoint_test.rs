@@ -1,0 +1,762 @@
+//! Issue #974 — the extended controller surface: `external-controller-tls`,
+//! `external-controller-unix`, `external-controller-pipe` and
+//! `external-controller-cors`. Wire-level tests for the two-path CORS
+//! middleware and the TLS/Unix endpoint transports.
+
+use axum::http::{header, Request, StatusCode};
+use dashmap::DashMap;
+use meow_api::routes::{create_router, AppState};
+use meow_common::DnsMode;
+use meow_config::raw::RawConfig;
+use meow_dns::Resolver;
+use meow_trie::DomainTrie;
+use meow_tunnel::Tunnel;
+use parking_lot::RwLock;
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::broadcast;
+use tower::ServiceExt;
+
+fn test_raw_config() -> RawConfig {
+    RawConfig {
+        mixed_port: Some(7890),
+        mode: Some("rule".into()),
+        rules: Some(vec!["MATCH,DIRECT".into()]),
+        ..Default::default()
+    }
+}
+
+fn test_state(cors: meow_config::ApiCorsConfig, secret: Option<&str>) -> Arc<AppState> {
+    let resolver = Arc::new(Resolver::new(
+        vec!["8.8.8.8:53".parse().unwrap()],
+        vec![],
+        DnsMode::Normal,
+        DomainTrie::new(),
+        true,
+        true,
+    ));
+    let tunnel = Tunnel::new(resolver);
+    let raw = test_raw_config();
+    let meow_config::RebuildResult {
+        proxies,
+        rules,
+        sub_rules,
+        ..
+    } = meow_config::rebuild_from_raw(&raw).unwrap();
+    tunnel.update_proxies(proxies, Default::default());
+    tunnel.update_rules_with_sub_rules(rules, sub_rules);
+
+    Arc::new(AppState {
+        tunnel,
+        secret: secret.map(str::to_owned),
+        config_path: None,
+        raw_config: Arc::new(RwLock::new(raw)),
+        log_tx: broadcast::channel(16).0,
+        proxy_providers: Arc::new(DashMap::new()),
+        provider_dialer_registry: Default::default(),
+        ntp_reconcile: None,
+        rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        rule_provider_refresh: Default::default(),
+        proxy_provider_refresh: Default::default(),
+        listeners: vec![],
+        external_ui: None,
+        traffic_feed: Default::default(),
+        dns_server: Default::default(),
+        ui_storage: Default::default(),
+        cors,
+    })
+}
+
+async fn body_string(resp: axum::response::Response) -> String {
+    use http_body_util::BodyExt;
+    String::from_utf8(
+        resp.into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes()
+            .to_vec(),
+    )
+    .unwrap()
+}
+
+fn vary_values(resp: &axum::response::Response) -> Vec<String> {
+    resp.headers()
+        .get_all(header::VARY)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect()
+}
+
+fn preflight(
+    origin: &str,
+    method: &str,
+    req_headers: Option<&str>,
+    pna: bool,
+) -> Request<axum::body::Body> {
+    let mut b = Request::builder()
+        .method("OPTIONS")
+        .uri("/")
+        .header(header::ORIGIN, origin)
+        .header(header::ACCESS_CONTROL_REQUEST_METHOD, method);
+    if let Some(h) = req_headers {
+        b = b.header(header::ACCESS_CONTROL_REQUEST_HEADERS, h);
+    }
+    if pna {
+        b = b.header("access-control-request-private-network", "true");
+    }
+    b.body(axum::body::Body::empty()).unwrap()
+}
+
+// ── absent-map permissive path ──────────────────────────────────────
+
+#[tokio::test]
+async fn cors_absent_map_preflight_permissive_shape() {
+    let state = test_state(Default::default(), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight(
+            "https://dashboard.example",
+            "GET",
+            Some("authorization, x-anything"),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let h = resp.headers();
+    // The linked chi AllowAll middleware shape: literal `*` everywhere and
+    // ONE combined vary — never the configured path's per-name adds.
+    assert_eq!(h[header::ACCESS_CONTROL_ALLOW_METHODS], "*");
+    assert_eq!(h[header::ACCESS_CONTROL_ALLOW_HEADERS], "*");
+    assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    assert_eq!(
+        vary_values(&resp),
+        vec!["origin, access-control-request-method, access-control-request-headers"]
+    );
+}
+
+#[tokio::test]
+async fn cors_absent_map_actual_request_gets_star() {
+    let state = test_state(Default::default(), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header(header::ORIGIN, "https://dashboard.example")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    assert_eq!(vary_values(&resp), vec!["origin"]);
+}
+
+#[tokio::test]
+async fn cors_no_secret_mode_emits_no_grants() {
+    // Deliberate divergence (issue #974): without a controller secret the
+    // CORS middleware is not mounted at all — the origin guard answers a
+    // cross-origin preflight with 403 and no CORS headers ride.
+    let state = test_state(configured(&["*"], true), None);
+    let resp = create_router(state)
+        .oneshot(preflight("https://any.example", "GET", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert!(!resp
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    assert!(vary_values(&resp).is_empty());
+}
+
+#[tokio::test]
+async fn cors_absent_map_no_origin_gets_vary_only() {
+    let state = test_state(Default::default(), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!resp
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    assert_eq!(vary_values(&resp), vec!["origin"]);
+}
+
+// ── configured-map path ─────────────────────────────────────────────
+
+fn configured(origins: &[&str], pna: bool) -> meow_config::ApiCorsConfig {
+    meow_config::ApiCorsConfig {
+        configured: true,
+        allow_origins: origins.iter().map(ToString::to_string).collect(),
+        allow_private_network: pna,
+    }
+}
+
+#[tokio::test]
+async fn cors_configured_echoes_origin_and_mirrors_request() {
+    let state = test_state(configured(&["https://ok.example"], true), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight(
+            "https://ok.example",
+            "put",
+            Some("authorization,content-type"),
+            true,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let h = resp.headers();
+    assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "https://ok.example");
+    // The one requested method, uppercased.
+    assert_eq!(h[header::ACCESS_CONTROL_ALLOW_METHODS], "PUT");
+    // Requested headers echoed canonicalized, in request order.
+    assert_eq!(
+        h[header::ACCESS_CONTROL_ALLOW_HEADERS],
+        "Authorization, Content-Type"
+    );
+    assert_eq!(h[header::ACCESS_CONTROL_MAX_AGE], "300");
+    assert_eq!(h["access-control-allow-private-network"], "true");
+    assert_eq!(
+        vary_values(&resp),
+        vec![
+            "origin",
+            "access-control-request-method",
+            "access-control-request-headers"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cors_configured_denied_origin_preflight() {
+    let state = test_state(configured(&["https://ok.example"], true), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight("https://evil.example", "GET", None, false))
+        .await
+        .unwrap();
+    // Denied preflights still answer 200 — but only the vary trio rides.
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!resp
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    assert!(!resp
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_METHODS));
+    assert!(!resp.headers().contains_key(header::ACCESS_CONTROL_MAX_AGE));
+    assert_eq!(
+        vary_values(&resp),
+        vec![
+            "origin",
+            "access-control-request-method",
+            "access-control-request-headers"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cors_configured_head_method_denied() {
+    let state = test_state(configured(&["*"], true), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight("https://any.example", "HEAD", None, false))
+        .await
+        .unwrap();
+    // The allowed-methods set has no HEAD — denied like a foreign origin.
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!resp
+        .headers()
+        .contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+}
+
+#[tokio::test]
+async fn cors_configured_wildcard_replies_star() {
+    let state = test_state(configured(&["*"], true), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight("https://any.example", "GET", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    // Max-Age 300 rides the configured path even for `*`.
+    assert_eq!(resp.headers()[header::ACCESS_CONTROL_MAX_AGE], "300");
+    assert_eq!(
+        vary_values(&resp),
+        vec![
+            "origin",
+            "access-control-request-method",
+            "access-control-request-headers"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cors_configured_empty_origins_means_allow_all() {
+    // Weird-but-real, probe-verified: `allow-origins: []` is allow-all,
+    // not deny-all.
+    let state = test_state(configured(&[], true), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight("https://any.example", "GET", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+}
+
+#[tokio::test]
+async fn cors_configured_glob_origin_match() {
+    let state = test_state(configured(&["https://*.example.com"], true), Some("s3cret"));
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(preflight("https://a.example.com", "GET", None, false))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://a.example.com"
+    );
+    // …and the same glob denies a non-suffix origin, case-insensitively.
+    let resp = create_router(state)
+        .oneshot(preflight("https://a.Example.Com", "GET", None, false))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
+        "https://a.Example.Com"
+    );
+}
+
+#[tokio::test]
+async fn cors_configured_pna_requires_request_header() {
+    let state = test_state(configured(&["*"], true), Some("s3cret"));
+    // Flag on but the preflight did not ask for private-network access.
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(preflight("https://any.example", "GET", None, false))
+        .await
+        .unwrap();
+    assert!(!resp
+        .headers()
+        .contains_key("access-control-allow-private-network"));
+    // Flag off → never emitted even when the request asks.
+    let state = test_state(configured(&["*"], false), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight("https://any.example", "GET", None, true))
+        .await
+        .unwrap();
+    assert!(!resp
+        .headers()
+        .contains_key("access-control-allow-private-network"));
+}
+
+#[tokio::test]
+async fn cors_bare_options_reaches_router_as_405() {
+    // No Origin + no requested method → not a preflight, falls through to
+    // the router, which has no OPTIONS handler on `/`.
+    let state = test_state(configured(&["*"], true), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
+// ── TLS endpoint ────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn tls_endpoint_serves_https_and_negotiates_alpn() {
+    let state = test_state(Default::default(), Some("s3cret"));
+    // Ephemeral identity — no tls.certificate/tls.private-key.
+    let endpoint = meow_api::endpoint::bind_tls("127.0.0.1:0", None, None)
+        .await
+        .unwrap();
+    let addr = endpoint.addr();
+    tokio::spawn(async move { axum::serve(endpoint, create_router(state)).await });
+
+    // h2-only offer: the acceptor must negotiate it (upstream probe
+    // verified ALPN advertises `h2` first, then `http/1.1`).
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut builder = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+    builder.set_verify(boring::ssl::SslVerifyMode::NONE);
+    builder.set_alpn_protos(b"\x02h2").unwrap();
+    let connector = builder.build();
+    let tls = tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
+        .await
+        .unwrap();
+    assert_eq!(tls.ssl().selected_alpn_protocol(), Some(b"h2".as_slice()));
+    drop(tls);
+
+    // http/1.1-only offer: negotiated http/1.1 and a real request answers
+    // the shared router — auth enforced like every other transport.
+    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let mut builder = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+    builder.set_verify(boring::ssl::SslVerifyMode::NONE);
+    builder.set_alpn_protos(b"\x08http/1.1").unwrap();
+    let connector = builder.build();
+    let mut tls = tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
+        .await
+        .unwrap();
+    assert_eq!(
+        tls.ssl().selected_alpn_protocol(),
+        Some(b"http/1.1".as_slice())
+    );
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    tls.write_all(
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer s3cret\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
+    let mut buf = Vec::new();
+    tls.read_to_end(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf);
+    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+    assert!(text.contains("{\"hello\":\"meow\"}"), "{text}");
+}
+
+#[tokio::test]
+async fn tls_endpoint_marks_https_scheme_for_origin_guard() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    // No secret → the browser origin guard (not Bearer) gates requests.
+    // `serve_tls_on` inserts the TlsTransport marker so a same-origin
+    // `https://` dashboard over HTTP/1.1 is not rejected as cross-scheme
+    // (issue #974); `http://` still is.
+    let state = test_state(Default::default(), None);
+    let endpoint = meow_api::endpoint::bind_tls("127.0.0.1:0", None, None)
+        .await
+        .unwrap();
+    let addr = endpoint.addr();
+    let app = create_router(state).layer(axum::middleware::from_fn(
+        meow_api::routes::mark_tls_transport,
+    ));
+    tokio::spawn(async move { axum::serve(endpoint, app).await });
+
+    async fn https_get(addr: std::net::SocketAddr, origin: &str) -> String {
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut builder =
+            boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+        builder.set_verify(boring::ssl::SslVerifyMode::NONE);
+        let connector = builder.build();
+        let mut tls = tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
+            .await
+            .unwrap();
+        tls.write_all(
+            format!(
+                "GET / HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
+        let mut buf = Vec::new();
+        tls.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    let resp = https_get(addr, &format!("https://{addr}")).await;
+    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+    assert!(resp.contains("{\"hello\":\"meow\"}"), "{resp}");
+    let resp = https_get(addr, &format!("http://{addr}")).await;
+    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+}
+
+#[tokio::test]
+async fn tls_endpoint_configured_pem_pair() {
+    // A configured inline-PEM identity loads instead of the ephemeral one.
+    let (cert_pem, key_pem) = self_signed_pem();
+    let cert = String::from_utf8(cert_pem).unwrap();
+    let key = String::from_utf8(key_pem).unwrap();
+    meow_api::endpoint::bind_tls("127.0.0.1:0", Some(&cert), Some(&key))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn tls_endpoint_bad_pair_and_bad_addr_fail() {
+    // One-sided pairs never reach here in production (config build
+    // rejects them); the endpoint still refuses defensively.
+    assert!(
+        meow_api::endpoint::bind_tls("127.0.0.1:0", Some("-----BEGIN CERTIFICATE-----"), None)
+            .await
+            .is_err()
+    );
+    // Garbage PEM bytes fail the acceptor build.
+    assert!(meow_api::endpoint::bind_tls(
+        "127.0.0.1:0",
+        Some("-----BEGIN CERTIFICATE-----\nbogus\n-----END CERTIFICATE-----"),
+        Some("-----BEGIN PRIVATE KEY-----\nbogus\n-----END PRIVATE KEY-----")
+    )
+    .await
+    .is_err());
+    // An unresolvable listen address fails the same way.
+    assert!(
+        meow_api::endpoint::bind_tls("no-such-host.invalid:0", None, None)
+            .await
+            .is_err()
+    );
+}
+
+/// A throwaway self-signed cert/key pair in PEM form — what
+/// `tls.certificate`/`tls.private-key` inline values carry.
+fn self_signed_pem() -> (Vec<u8>, Vec<u8>) {
+    use boring::{
+        asn1::{Asn1Integer, Asn1Time},
+        bn::BigNum,
+        ec::{EcGroup, EcKey},
+        hash::MessageDigest,
+        nid::Nid,
+        pkey::PKey,
+        x509::{X509Name, X509},
+    };
+    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+    let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+    let mut name_b = X509Name::builder().unwrap();
+    name_b.append_entry_by_text("CN", "meow-test").unwrap();
+    let name = name_b.build();
+    let mut b = X509::builder().unwrap();
+    b.set_version(2).unwrap();
+    let bn = BigNum::from_u32(3).unwrap();
+    let serial = Asn1Integer::from_bn(&bn).unwrap();
+    b.set_serial_number(&serial).unwrap();
+    let not_before = Asn1Time::days_from_now(0).unwrap();
+    let not_after = Asn1Time::days_from_now(30).unwrap();
+    b.set_not_before(&not_before).unwrap();
+    b.set_not_after(&not_after).unwrap();
+    b.set_pubkey(&key).unwrap();
+    b.set_subject_name(&name).unwrap();
+    b.set_issuer_name(&name).unwrap();
+    b.sign(&key, MessageDigest::sha256()).unwrap();
+    let cert = b.build();
+    (
+        cert.to_pem().unwrap(),
+        key.ec_key().unwrap().private_key_to_pem().unwrap(),
+    )
+}
+
+// ── Unix endpoint (cfg(unix)) ───────────────────────────────────────
+
+#[cfg(unix)]
+mod unix {
+    use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn unix_get(path: &std::path::Path, auth: Option<&str>) -> String {
+        let mut stream = tokio::net::UnixStream::connect(path).await.unwrap();
+        let auth = auth
+            .map(|s| format!("Authorization: Bearer {s}\r\n"))
+            .unwrap_or_default();
+        stream
+            .write_all(
+                format!("GET / HTTP/1.1\r\nHost: localhost\r\n{auth}Connection: close\r\n\r\n")
+                    .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut buf = Vec::new();
+        stream.read_to_end(&mut buf).await.unwrap();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    #[tokio::test]
+    async fn unix_endpoint_serves_and_keeps_bearer_auth() {
+        // Deliberate meow divergence: upstream's unix socket is
+        // unauthenticated — meow keeps the same Bearer auth as TCP.
+        let state = test_state(Default::default(), Some("s3cret"));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let (endpoint, guard) = meow_api::endpoint::bind_unix(path.to_str().unwrap()).unwrap();
+        assert_eq!(guard.path(), path.as_path());
+        tokio::spawn(async move { axum::serve(endpoint, create_router(state)).await });
+        let resp = unix_get(&path, Some("s3cret")).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains("{\"hello\":\"meow\"}"), "{resp}");
+        let resp = unix_get(&path, None).await;
+        assert!(resp.starts_with("HTTP/1.1 401"), "{resp}");
+        // The bound socket is owner-only — never upstream's 0666.
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        // Dropping the guard removes the daemon's own socket file.
+        drop(guard);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn unix_endpoint_relative_path_resolves_under_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("sub/rel.sock");
+        // Absolute here — the home-relative resolution is exercised by
+        // the config-path unit tests; this pins creation of missing
+        // parents.
+        let (_endpoint, guard) = meow_api::endpoint::bind_unix(sock.to_str().unwrap()).unwrap();
+        assert!(sock.exists());
+        drop(guard);
+    }
+
+    #[tokio::test]
+    async fn unix_endpoint_reclaims_stale_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stale.sock");
+        // A dropped listener leaves a dead socket file — a live process
+        // reconnecting gets ECONNREFUSED, i.e. "stale".
+        drop(tokio::net::UnixListener::bind(&path).unwrap());
+        assert!(path.exists());
+        let (_endpoint, _guard) = meow_api::endpoint::bind_unix(path.to_str().unwrap()).unwrap();
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn unix_endpoint_refuses_live_socket_and_non_socket() {
+        let dir = tempfile::tempdir().unwrap();
+        // A live listener at the path → refuse, upstream would clobber.
+        let live = dir.path().join("live.sock");
+        let _listener = tokio::net::UnixListener::bind(&live).unwrap();
+        assert!(meow_api::endpoint::bind_unix(live.to_str().unwrap()).is_err());
+        // A regular file → refuse; the file must survive untouched
+        // (upstream's unconditional unlink is the documented divergence).
+        let file = dir.path().join("regular.txt");
+        std::fs::write(&file, b"not a socket").unwrap();
+        assert!(meow_api::endpoint::bind_unix(file.to_str().unwrap()).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"not a socket");
+    }
+}
+
+// ── PUT /configs persistence ────────────────────────────────────────
+
+#[tokio::test]
+async fn put_configs_persists_controller_surface_without_binding() {
+    use base64::Engine as _;
+    let state = test_state(Default::default(), None);
+    let dir = tempfile::tempdir().unwrap();
+    let sock = dir.path().join("put.sock");
+    let document = format!(
+        "mode: rule\n\
+         external-controller-tls: 127.0.0.1:9443\n\
+         external-controller-unix: {}\n\
+         external-controller-pipe: '\\\\.\\pipe\\meow'\n\
+         tls:\n  certificate: /nonexistent/cert.pem\n  private-key: /nonexistent/key.pem\n\
+         external-controller-cors:\n  allow-origins: ['https://ok.example']\n\
+         rules:\n  - MATCH,DIRECT\n",
+        sock.display()
+    );
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({
+                        "payload": base64::engine::general_purpose::STANDARD.encode(&document)
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NO_CONTENT,
+        "{}",
+        body_string(resp).await
+    );
+    // Committed verbatim — the keys survive the raw round-trip so a
+    // restart picks them up; GET /configs and PATCH never see them.
+    {
+        let committed = state.raw_config.read();
+        assert_eq!(
+            committed.external_controller_tls.as_deref(),
+            Some("127.0.0.1:9443")
+        );
+        assert_eq!(
+            committed.external_controller_unix.as_deref(),
+            Some(sock.to_str().unwrap())
+        );
+        assert_eq!(
+            committed.external_controller_pipe.as_deref(),
+            Some("\\\\.\\pipe\\meow")
+        );
+        let cors = committed.external_controller_cors.as_ref().unwrap();
+        assert_eq!(
+            cors.allow_origins.as_deref(),
+            Some(&["https://ok.example".to_string()][..])
+        );
+        assert_eq!(
+            committed.tls.as_ref().unwrap().certificate.as_deref(),
+            Some("/nonexistent/cert.pem")
+        );
+    }
+    // The PUT never bound or created anything: no socket file, no PEM
+    // read (the nonexistent path would have failed a read), no listener.
+    assert!(!sock.exists());
+    #[cfg(unix)]
+    assert!(tokio::net::UnixStream::connect(&sock).await.is_err());
+    assert!(tokio::net::TcpStream::connect("127.0.0.1:9443")
+        .await
+        .is_err());
+}
+
+#[tokio::test]
+async fn get_configs_never_echoes_controller_tls_keys() {
+    let mut raw = test_raw_config();
+    raw.external_controller_tls = Some("127.0.0.1:9443".into());
+    raw.tls = Some(meow_config::raw::RawTls {
+        private_key: Some("SECRET-KEY-MATERIAL".into()),
+        certificate: Some("CERT".into()),
+        ..Default::default()
+    });
+    let resolver = Arc::new(Resolver::new(
+        vec!["8.8.8.8:53".parse().unwrap()],
+        vec![],
+        DnsMode::Normal,
+        DomainTrie::new(),
+        true,
+        true,
+    ));
+    let tunnel = Tunnel::new(resolver);
+    let state = Arc::new(AppState {
+        tunnel,
+        secret: None,
+        config_path: None,
+        raw_config: Arc::new(RwLock::new(raw)),
+        log_tx: broadcast::channel(16).0,
+        proxy_providers: Arc::new(DashMap::new()),
+        provider_dialer_registry: Default::default(),
+        ntp_reconcile: None,
+        rule_providers: Arc::new(RwLock::new(HashMap::new())),
+        rule_provider_refresh: Default::default(),
+        proxy_provider_refresh: Default::default(),
+        listeners: vec![],
+        external_ui: None,
+        traffic_feed: Default::default(),
+        dns_server: Default::default(),
+        ui_storage: Default::default(),
+        cors: Default::default(),
+    });
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .uri("/configs")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    assert!(!body.contains("SECRET-KEY-MATERIAL"), "{body}");
+    assert!(!body.contains("private-key"), "{body}");
+    assert!(!body.contains("external-controller-tls"), "{body}");
+}
