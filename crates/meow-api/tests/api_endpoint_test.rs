@@ -967,6 +967,24 @@ mod unix {
     }
 
     #[tokio::test]
+    async fn unix_endpoint_binds_owner_only_under_permissive_umask() {
+        // `bind_unix` binds a pid-unique sibling, chmods it 0600 and
+        // renames it into place, so even umask(0) cannot produce a
+        // world-accessible socket at the configured path (issue #974).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("masked.sock");
+        let old = unsafe { libc::umask(0) };
+        let result = meow_api::endpoint::bind_unix(path.to_str().unwrap());
+        unsafe { libc::umask(old) };
+        let (_endpoint, _guard) = result.unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
+    #[tokio::test]
     async fn unix_endpoint_relative_path_resolves_under_home() {
         // `set_home_dir` is process-global one-shot (`-d` semantics), so
         // a relative configured path lands under that home — not the

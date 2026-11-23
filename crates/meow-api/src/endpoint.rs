@@ -538,7 +538,16 @@ pub fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
             })
         }
     }
-    let listener = tokio::net::UnixListener::bind(&resolved).with_context(|| {
+    // A bound socket file is created `0666 & ~umask` and stays that way
+    // until a post-bind chmod lands. Bind a pid-unique sibling instead
+    // and rename it onto the configured path already owner-only — the
+    // final path is never observable permissive, and no process-global
+    // umask dance is needed. rename preserves the inode and the
+    // listening fd (issue #974). Crash litter is single-owner by
+    // construction (the PID names it), so a leftover is safe to drop.
+    let tmp = resolved.with_extension(format!("meow-tmp-{}", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let listener = tokio::net::UnixListener::bind(&tmp).with_context(|| {
         format!(
             "external-controller-unix cannot bind {}",
             resolved.display()
@@ -547,12 +556,22 @@ pub fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
     // Owner-only — the controller is authenticated, but the socket file
     // never needs the world-read/write upstream grants it. A failed
     // chmod fails the endpoint: serving a permissive socket would defeat
-    // the divergence this mode exists for (issue #974).
-    if let Err(e) = std::fs::set_permissions(&resolved, std::fs::Permissions::from_mode(0o600)) {
-        let _ = std::fs::remove_file(&resolved);
+    // the divergence this mode exists for (issue #974). Applied to the
+    // sibling, so on failure only the temp name needs cleanup.
+    if let Err(e) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&tmp);
         return Err(e).with_context(|| {
             format!(
                 "external-controller-unix: cannot chmod {} to owner-only",
+                tmp.display()
+            )
+        });
+    }
+    if let Err(e) = std::fs::rename(&tmp, &resolved) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| {
+            format!(
+                "external-controller-unix: cannot move {} into place",
                 resolved.display()
             )
         });
