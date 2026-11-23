@@ -9,7 +9,13 @@ repository.workspace = true
 homepage.workspace = true
 
 [features]
-default = []
+default = ["api-tls"]
+# The `external-controller-tls` HTTPS endpoint: BoringSSL acceptor +
+# handshake driver plus axum's `http2` so ALPN-negotiated `h2` actually
+# serves (issue #974). Default-on; meow-app's `minimal` bundle leaves it
+# out (ADR-0007 caps) — a configured endpoint there parses fine and the
+# startup path warns that it is not compiled into this build.
+api-tls = ["dep:boring", "dep:tokio-boring", "dep:socket2", "axum/http2"]
 listener-tun = ["meow-listener/listener-tun"]
 
 [dependencies]
@@ -40,12 +46,12 @@ prometheus-client = "0.22"
 hickory-proto = { workspace = true }
 smol_str = { workspace = true }
 # Dual-stack controller binds clear IPV6_V6ONLY on the raw socket
-# (issue #974).
-socket2 = { workspace = true }
+# (issue #974) — only the `api-tls` endpoint needs it.
+socket2 = { workspace = true, optional = true }
 # The `external-controller-tls` listener's BoringSSL acceptor + handshake
 # driver (issue #974). BoringSSL is the workspace TLS backend.
-boring = { workspace = true }
-tokio-boring = { workspace = true }
+boring = { workspace = true, optional = true }
+tokio-boring = { workspace = true, optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # `geteuid` for the unix-socket stale-reclaim ownership check (issue #974);

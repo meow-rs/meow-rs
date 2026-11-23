@@ -2087,6 +2087,14 @@ async fn run(
     if let Some(ref pipe_name) = config.api.external_controller_pipe {
         warn!("external-controller-pipe '{pipe_name}' ignored — named pipes are Windows-only");
     }
+    // The HTTPS endpoint is a build feature, not just a platform gate:
+    // `minimal` leaves it out (ADR-0007) and parses the key as dead
+    // config — loud like the plugin placeholders, never silently dropped
+    // (issue #974).
+    #[cfg(not(feature = "api-tls"))]
+    if let Some(ref tls_addr) = config.api.external_controller_tls {
+        warn!("external-controller-tls '{tls_addr}' ignored — the HTTPS controller is not compiled into this build (feature 'api-tls')");
+    }
     if config.api.has_servable_endpoint() {
         // `external-ui-url` auto-download is gated behind the optional
         // `external-ui-download` feature (it pulls in the `zip` crate, against
@@ -2161,6 +2169,9 @@ async fn run(
                 }
             });
         }
+        // On builds without `api-tls` the field is dead config — the warn
+        // above already named it; this arm is what the feature compiles.
+        #[cfg(feature = "api-tls")]
         if let Some(ref tls_addr) = config.api.external_controller_tls {
             match meow_api::endpoint::bind_tls(
                 tls_addr,

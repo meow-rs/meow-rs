@@ -395,7 +395,8 @@ impl ApiServer {
     /// `serve_on` for `external-controller-tls`: the router clone carries
     /// the [`routes::TlsTransport`] marker so the no-secret origin guard
     /// sees the `https` scheme the decrypted bytes can't express
-    /// (issue #974).
+    /// (issue #974). Only compiled with the `api-tls` feature.
+    #[cfg(feature = "api-tls")]
     pub async fn serve_tls_on<L>(&self, listener: L) -> std::io::Result<()>
     where
         L: axum::serve::Listener,

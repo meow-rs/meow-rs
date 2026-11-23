@@ -112,6 +112,12 @@ listener-tun = ["meow-listener/listener-tun", "meow-api/listener-tun"]
 # pools in .bss (meow-lwip `libc-malloc`). Off in every bundle; for
 # memory-tight Linux devices.
 lwip-libc-malloc = ["meow-listener/lwip-libc-malloc"]
+# The `external-controller-tls` HTTPS endpoint — BoringSSL acceptor,
+# handshake driver and axum's `http2` server (issue #974). In `full`;
+# excluded from `minimal` (ADR-0007 binary-size caps), where a configured
+# endpoint parses fine and startup warns it is not compiled into this
+# build instead of binding.
+api-tls = ["meow-api/api-tls"]
 # Shadowsocks encrypted-server inbound. In `full` (about 200 KiB on
 # x86_64; the `shadowsocks` crate is already there for the `ss` outbound).
 # Not in `minimal`: it would take half the room left under that bundle's
@@ -133,6 +139,7 @@ full = [
     "dns-server", "dns-encrypted", "dns-doh-h2", "dns-quic",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
     "listener-shadowsocks", "listener-wireguard",
+    "api-tls",
     "logbook",
     "traffic-ledger",
     "public-suffix",
@@ -155,7 +162,10 @@ meow-rules = { workspace = true }
 meow-tunnel = { workspace = true }
 meow-listener = { workspace = true, default-features = false }
 meow-dns = { workspace = true, default-features = false }
-meow-api = { workspace = true }
+# default-features = false: meow-api defaults its `api-tls` endpoint on,
+# which would re-add the HTTPS controller's BoringSSL/h2 code to `minimal`
+# — the app-side `api-tls` feature (in `full`) forwards it explicitly.
+meow-api = { workspace = true, default-features = false }
 meow-proxy = { workspace = true, default-features = false }
 base64 = { workspace = true }
 tokio = { workspace = true }

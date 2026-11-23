@@ -19,7 +19,9 @@ a Unix-domain socket (`external-controller-unix`) and a Windows named pipe
 In scope:
 
 - `external-controller-tls` — a second TCP listener serving HTTPS with
-  BoringSSL, ALPN `h2` then `http/1.1`.
+  BoringSSL, ALPN `h2` then `http/1.1`. Compiled only under the
+  `api-tls` cargo feature (see below): in `full`/`default`, out of
+  `minimal`.
 - `tls.certificate` / `tls.private-key` — the HTTPS identity: inline PEM
   (both values containing `-----BEGIN`) or a pair of file paths resolved
   against the daemon home and `SAFE_PATHS`. Both unset with a declared
@@ -107,6 +109,25 @@ reloads file-backed identities; meow snapshots them at bind),
   endpoint.
 - Headless connection tracking is selected only when *no* servable
   endpoint is configured.
+
+### `api-tls` build feature
+
+The HTTPS endpoint alone is a cargo feature — `meow-api/api-tls`,
+forwarded as `meow-app/api-tls` — because its code cost is real: the
+BoringSSL `SslAcceptor` + RSA key generation plus axum's `http2` server
+(the `h2` ALPN must actually serve) add ~500 KB to the `minimal` bundle,
+so ADR-0007 keeps it in `full`/`default` and out of `minimal`. The Unix
+socket and named pipe are platform-gated only — no feature.
+
+Without `api-tls` the surface stays a dead placeholder like the compiled-
+out plugin transports: `external-controller-tls`, `tls.certificate` and
+`tls.private-key` parse and validate identically (`-t` accepts them),
+`PUT /configs` round-trips them for a later restart, but startup warns
+`external-controller-tls '…' ignored — the HTTPS controller is not
+compiled into this build (feature 'api-tls')` and the endpoint never
+binds. The workspace `axum` dependency carries no `http2` — the feature
+enables it only on meow-api's edge, so feature unification cannot leak
+the h2 server into a no-TLS build.
 
 ### Deliberate divergences (Unix socket)
 
@@ -202,16 +223,16 @@ surface the TLS/CORS keys — private key material is never echoed.
 - `crates/meow-config/src/raw.rs` — `RawCors`, `RawTls`, weak-scalar
   field decoders.
 - `crates/meow-config/src/lib.rs` — `ApiConfig` extension,
-  `ApiCorsConfig` resolution, `has_servable_endpoint()`, the shared
-  BoringSSL acceptor builder invoked at endpoint bind only.
+  `ApiCorsConfig` resolution, `has_servable_endpoint()`.
 - `crates/meow-config/src/validation.rs` — misplaced/member/platform
   warnings.
 - `crates/meow-config/src/safe_path.rs` — `resolve_home_contained`.
 - `crates/meow-api/src/cors.rs` — the two-path CORS middleware.
-- `crates/meow-api/src/endpoint.rs` — `bind_tls` (+ handshake driver,
-  ephemeral identity, dual-stack wildcard), `bind_unix` (+ stale
-  reclaim, `0600` enforcement, dev+ino cleanup guard), `bind_pipe`
-  (+ owner-only SDDL ACL, pending-instance preservation) on Windows.
+- `crates/meow-api/src/endpoint.rs` — `bind_tls` (+ BoringSSL acceptor
+  builder, handshake driver, ephemeral identity, dual-stack wildcard)
+  under `api-tls`, `bind_unix` (+ stale reclaim, `0600` enforcement,
+  dev+ino cleanup guard), `bind_pipe` (+ owner-only SDDL ACL,
+  pending-instance preservation) on Windows.
 - `crates/meow-api/src/lib.rs` — `ApiServer` split: shared state,
   `router()`, `run_on`, `serve_on`, `serve_tls_on`.
 - `crates/meow-api/src/routes.rs` — CORS layer mount, `TlsTransport`

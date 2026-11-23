@@ -1259,71 +1259,17 @@ pub struct ApiConfig {
 }
 
 impl ApiConfig {
-    /// Whether any controller endpoint this build can actually serve is
-    /// configured — platform-gated: a Unix socket needs `cfg(unix)`, the
-    /// named pipe needs Windows (issue #974).
+    /// Whether any controller endpoint is configured that this platform
+    /// can serve — a Unix socket needs `cfg(unix)`, the named pipe needs
+    /// Windows (issue #974). The `external-controller-tls` check reports
+    /// *configured*, not *compiled*: meow-app's `api-tls` feature owns
+    /// that gate and warns at startup when the binary lacks it.
     pub fn has_servable_endpoint(&self) -> bool {
         self.external_controller.is_some()
             || self.external_controller_tls.is_some()
             || (cfg!(unix) && self.external_controller_unix.is_some())
             || (cfg!(windows) && self.external_controller_pipe.is_some())
     }
-}
-
-/// Build the BoringSSL acceptor for the `external-controller-tls`
-/// listener from PEM material (leaf first, extra chain certs after) —
-/// called at endpoint bind, never at config build (`-t` touches no PEM
-/// material or files). `mozilla_intermediate_v5` floors at
-/// TLS 1.2; ALPN advertises exactly the protocols the HTTP stack serves.
-pub fn build_api_tls_acceptor(
-    cert_pem: &[u8],
-    key_pem: &[u8],
-) -> Result<boring::ssl::SslAcceptor, anyhow::Error> {
-    let certs = boring::x509::X509::stack_from_pem(cert_pem)
-        .map_err(|e| anyhow::anyhow!("tls.certificate: not a valid PEM certificate: {e}"))?;
-    if certs.is_empty() {
-        anyhow::bail!("tls.certificate: PEM carries no certificate");
-    }
-    let key = boring::pkey::PKey::private_key_from_pem(key_pem)
-        .map_err(|e| anyhow::anyhow!("tls.private-key: not a valid PEM private key: {e}"))?;
-    build_api_tls_acceptor_from_parts(&certs, &key)
-}
-
-/// The acceptor build itself, on already-decoded identity material — the
-/// `external-controller-tls` endpoint's ephemeral self-signed identity
-/// reaches the same builder without a PEM round-trip (issue #974).
-pub fn build_api_tls_acceptor_from_parts(
-    certs: &[boring::x509::X509],
-    key: &boring::pkey::PKey<boring::pkey::Private>,
-) -> Result<boring::ssl::SslAcceptor, anyhow::Error> {
-    let mut builder =
-        boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
-            .map_err(|e| anyhow::anyhow!("external-controller-tls: {e}"))?;
-    let leaf = certs
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("tls.certificate: no certificate"))?;
-    builder
-        .set_certificate(leaf)
-        .map_err(|e| anyhow::anyhow!("tls.certificate: {e}"))?;
-    for extra in &certs[1..] {
-        builder
-            .add_extra_chain_cert(extra.clone())
-            .map_err(|e| anyhow::anyhow!("tls.certificate chain: {e}"))?;
-    }
-    builder
-        .set_private_key(key)
-        .map_err(|e| anyhow::anyhow!("tls.private-key: {e}"))?;
-    builder.check_private_key().map_err(|e| {
-        anyhow::anyhow!("tls.certificate and tls.private-key do not form a pair: {e}")
-    })?;
-    // Server-side ALPN picks from the *client's* offer in preference
-    // order `h2` then `http/1.1` — `set_alpn_protos` applies to client
-    // contexts, not acceptors.
-    builder.set_alpn_select_callback(|_, client| {
-        boring::ssl::select_next_proto(b"\x02h2\x08http/1.1", client)
-            .ok_or(boring::ssl::AlpnError::NOACK)
-    });
-    Ok(builder.build())
 }
 
 /// When set, config loading validates structure only and performs no remote

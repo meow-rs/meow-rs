@@ -17,7 +17,9 @@ Additional controller endpoints can run alongside the plain listener —
 all of them serve the same API, auth and CORS policy:
 
 ```yaml
-external-controller-tls: 127.0.0.1:9443   # HTTPS (ALPN h2 / http/1.1)
+external-controller-tls: 127.0.0.1:9443   # HTTPS (ALPN h2 / http/1.1);
+                                          # `api-tls` build feature — not
+                                          # in the `minimal` bundle
 tls:
   certificate: /path/to/cert.pem          # or an inline PEM pair
   private-key: /path/to/key.pem           # unset pair = ephemeral self-signed

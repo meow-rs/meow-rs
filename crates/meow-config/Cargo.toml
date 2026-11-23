@@ -98,10 +98,6 @@ hickory-proto = { workspace = true }
 smol_str = { workspace = true }
 url = "2"
 httparse = "1"
-# Validates `tls.certificate`/`tls.private-key` inline-PEM pairs at config
-# build — the same BoringSSL acceptor the `external-controller-tls` listener
-# serves with (issue #974). Already linked transitively via meow-transport.
-boring = { workspace = true }
 # Optional: only compiled when the `external-ui-download` feature is enabled.
 # `deflate` is the only codec GitHub release zips use; skip the heavier ones.
 zip = { version = "9", default-features = false, features = ["deflate"], optional = true }

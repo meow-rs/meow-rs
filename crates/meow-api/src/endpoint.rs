@@ -7,310 +7,383 @@
 //! and skipped by the caller — only the plain `external-controller` TCP
 //! bind is a startup-fatal contract.
 
-use std::net::SocketAddr;
-use std::sync::Arc;
-
 use anyhow::{Context, Result};
-use tracing::{debug, warn};
-
-/// Resolve a controller listen address the way upstream does: a bare
-/// `:port` binds the dual-stack wildcard (Go's `Listen("tcp", ":port")`
-/// accepts v4 *and* v6), hostnames resolve through the resolver, and the
-/// first answer wins. Kept a string until bind so `-t` never performs
-/// this lookup.
-async fn resolve_listen_addr(addr: &str) -> Result<SocketAddr> {
-    let normalized = match addr.strip_prefix(':') {
-        Some(port) => format!("[::]:{port}"),
-        None => addr.to_owned(),
-    };
-    let mut addrs = tokio::net::lookup_host(&normalized)
-        .await
-        .with_context(|| format!("cannot resolve controller address '{addr}'"))?;
-    addrs
-        .next()
-        .with_context(|| format!("controller address '{addr}' resolved to nothing"))
-}
-
-/// Bind the resolved TLS listen address. An unspecified v6 address —
-/// reached through a bare `:port` or an explicit `[::]` — must accept
-/// v4-mapped clients like upstream, so `IPV6_V6ONLY` is forced off;
-/// platforms differ on the default (Windows defaults to v6-only).
-async fn bind_tcp_dual_stack(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
-    if addr.is_ipv6() && addr.ip().is_unspecified() {
-        let socket = socket2::Socket::new(
-            socket2::Domain::IPV6,
-            socket2::Type::STREAM,
-            Some(socket2::Protocol::TCP),
-        )
-        .context("external-controller-tls: cannot create socket")?;
-        socket
-            .set_only_v6(false)
-            .context("external-controller-tls: cannot clear IPV6_V6ONLY")?;
-        socket
-            .set_nonblocking(true)
-            .context("external-controller-tls: cannot set nonblocking")?;
-        socket
-            .bind(&addr.into())
-            .with_context(|| format!("external-controller-tls cannot bind {addr}"))?;
-        socket
-            .listen(1024)
-            .context("external-controller-tls: cannot listen")?;
-        tokio::net::TcpListener::from_std(socket.into())
-            .context("external-controller-tls: cannot adopt listener")
-    } else {
-        tokio::net::TcpListener::bind(addr)
-            .await
-            .with_context(|| format!("external-controller-tls cannot bind {addr}"))
-    }
-}
+use tracing::warn;
 
 // ── TLS (external-controller-tls) ──────────────────────────────────
 
-/// How long one TLS handshake may take before the accept side drops the
-/// connection — an idle ClientHello must not hold a handshake slot forever.
-const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Concurrent in-flight TLS handshakes — bounds the task-per-accept
-/// churn a slow-loris burst could otherwise pile up.
-const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 128;
-/// Handshaken connections waiting on axum's accept — bounds the channel
-/// so a serve stall cannot absorb unbounded finished handshakes.
-const TLS_READY_QUEUE: usize = 64;
-/// PEM file cap — a certificate chain with its key fits far under this;
-/// the bound keeps a wrong-path FIFO/device file from reading forever.
-const MAX_PEM_FILE_BYTES: u64 = 1 << 20;
+/// The HTTPS controller endpoint exists only under the `api-tls` feature
+/// (issue #974): BoringSSL's acceptor plus axum's `http2` server code
+/// cost ~500 KB in the `minimal` bundle, so ADR-0007 keeps the feature
+/// off there. Without it `external-controller-tls` is dead config the
+/// startup path warns about — parse/PUT keep working.
+#[cfg(feature = "api-tls")]
+mod tls {
+    use std::net::SocketAddr;
+    use std::sync::Arc;
 
-/// A bound `external-controller-tls` listener: TCP accept runs on a driver
-/// task that performs the BoringSSL handshake per connection and hands
-/// axum only finished `SslStream`s (the `tokio_boring` equivalent of a
-/// `TlsAcceptor` service).
-pub struct TlsEndpoint {
-    local_addr: SocketAddr,
-    rx: tokio::sync::mpsc::Receiver<(tokio_boring::SslStream<tokio::net::TcpStream>, SocketAddr)>,
-    driver: tokio::task::JoinHandle<()>,
-}
+    use anyhow::{Context, Result};
+    use tracing::{debug, warn};
 
-impl TlsEndpoint {
-    /// The bound address — for the startup log before the endpoint moves
-    /// into its serve task (same value as `Listener::local_addr`).
-    pub fn addr(&self) -> SocketAddr {
-        self.local_addr
+    /// Resolve a controller listen address the way upstream does: a bare
+    /// `:port` binds the dual-stack wildcard (Go's `Listen("tcp", ":port")`
+    /// accepts v4 *and* v6), hostnames resolve through the resolver, and the
+    /// first answer wins. Kept a string until bind so `-t` never performs
+    /// this lookup.
+    async fn resolve_listen_addr(addr: &str) -> Result<SocketAddr> {
+        let normalized = match addr.strip_prefix(':') {
+            Some(port) => format!("[::]:{port}"),
+            None => addr.to_owned(),
+        };
+        let mut addrs = tokio::net::lookup_host(&normalized)
+            .await
+            .with_context(|| format!("cannot resolve controller address '{addr}'"))?;
+        addrs
+            .next()
+            .with_context(|| format!("controller address '{addr}' resolved to nothing"))
     }
-}
 
-impl Drop for TlsEndpoint {
-    fn drop(&mut self) {
-        self.driver.abort();
-    }
-}
-
-impl axum::serve::Listener for TlsEndpoint {
-    type Io = tokio_boring::SslStream<tokio::net::TcpStream>;
-    type Addr = SocketAddr;
-
-    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        match self.rx.recv().await {
-            Some(conn) => conn,
-            // The driver only stops on panic or `Drop::abort` — axum's
-            // `Listener` contract has no error channel, so park rather
-            // than spin on a closed channel.
-            None => std::future::pending().await,
+    /// Bind the resolved TLS listen address. An unspecified v6 address —
+    /// reached through a bare `:port` or an explicit `[::]` — must accept
+    /// v4-mapped clients like upstream, so `IPV6_V6ONLY` is forced off;
+    /// platforms differ on the default (Windows defaults to v6-only).
+    async fn bind_tcp_dual_stack(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+        if addr.is_ipv6() && addr.ip().is_unspecified() {
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV6,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .context("external-controller-tls: cannot create socket")?;
+            socket
+                .set_only_v6(false)
+                .context("external-controller-tls: cannot clear IPV6_V6ONLY")?;
+            socket
+                .set_nonblocking(true)
+                .context("external-controller-tls: cannot set nonblocking")?;
+            socket
+                .bind(&addr.into())
+                .with_context(|| format!("external-controller-tls cannot bind {addr}"))?;
+            socket
+                .listen(1024)
+                .context("external-controller-tls: cannot listen")?;
+            tokio::net::TcpListener::from_std(socket.into())
+                .context("external-controller-tls: cannot adopt listener")
+        } else {
+            tokio::net::TcpListener::bind(addr)
+                .await
+                .with_context(|| format!("external-controller-tls cannot bind {addr}"))
         }
     }
 
-    fn local_addr(&self) -> std::io::Result<SocketAddr> {
-        Ok(self.local_addr)
+    /// How long one TLS handshake may take before the accept side drops the
+    /// connection — an idle ClientHello must not hold a handshake slot forever.
+    const TLS_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+    /// Concurrent in-flight TLS handshakes — bounds the task-per-accept
+    /// churn a slow-loris burst could otherwise pile up.
+    const MAX_CONCURRENT_TLS_HANDSHAKES: usize = 128;
+    /// Handshaken connections waiting on axum's accept — bounds the channel
+    /// so a serve stall cannot absorb unbounded finished handshakes.
+    const TLS_READY_QUEUE: usize = 64;
+    /// PEM file cap — a certificate chain with its key fits far under this;
+    /// the bound keeps a wrong-path FIFO/device file from reading forever.
+    const MAX_PEM_FILE_BYTES: u64 = 1 << 20;
+
+    /// A bound `external-controller-tls` listener: TCP accept runs on a driver
+    /// task that performs the BoringSSL handshake per connection and hands
+    /// axum only finished `SslStream`s (the `tokio_boring` equivalent of a
+    /// `TlsAcceptor` service).
+    pub struct TlsEndpoint {
+        local_addr: SocketAddr,
+        rx: tokio::sync::mpsc::Receiver<(
+            tokio_boring::SslStream<tokio::net::TcpStream>,
+            SocketAddr,
+        )>,
+        driver: tokio::task::JoinHandle<()>,
     }
-}
 
-/// Bind the HTTPS controller endpoint. Identity order matches mihomo: a
-/// configured `tls.certificate`/`tls.private-key` pair loads as inline PEM
-/// (both carry `-----BEGIN`) else as two home-relative file paths; with
-/// neither set the endpoint generates an ephemeral self-signed identity.
-/// Bind/identity failures are for the caller to log-and-skip.
-pub async fn bind_tls(
-    addr: &str,
-    certificate: Option<&str>,
-    private_key: Option<&str>,
-) -> Result<TlsEndpoint> {
-    let acceptor = match (certificate, private_key) {
-        (None, None) => {
-            debug!("external-controller-tls: no identity configured; generating an ephemeral self-signed certificate");
-            let (certs, key) = generate_self_signed_identity()?;
-            meow_config::build_api_tls_acceptor_from_parts(&certs, &key)?
+    impl TlsEndpoint {
+        /// The bound address — for the startup log before the endpoint moves
+        /// into its serve task (same value as `Listener::local_addr`).
+        pub fn addr(&self) -> SocketAddr {
+            self.local_addr
         }
-        (Some(cert), Some(key)) => {
-            let (cert_pem, key_pem) = load_identity_pair(cert, key)?;
-            meow_config::build_api_tls_acceptor(&cert_pem, &key_pem)?
-        }
-        // Like upstream, a one-sided pair is an endpoint-local failure:
-        // config build validates shape only, so this is the rejection
-        // point that logs and skips just this listener (issue #974).
-        _ => anyhow::bail!("tls.certificate and tls.private-key must be set together"),
-    };
-    let resolved = resolve_listen_addr(addr).await?;
-    let listener = bind_tcp_dual_stack(resolved).await?;
-    let local_addr = listener
-        .local_addr()
-        .context("external-controller-tls bound address")?;
-    let (tx, rx) = tokio::sync::mpsc::channel(TLS_READY_QUEUE);
-    let driver = tokio::spawn(drive_tls(listener, Arc::new(acceptor), tx));
-    Ok(TlsEndpoint {
-        local_addr,
-        rx,
-        driver,
-    })
-}
+    }
 
-async fn drive_tls(
-    listener: tokio::net::TcpListener,
-    acceptor: Arc<boring::ssl::SslAcceptor>,
-    tx: tokio::sync::mpsc::Sender<(tokio_boring::SslStream<tokio::net::TcpStream>, SocketAddr)>,
-) {
-    let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES));
-    loop {
-        if tx.is_closed() {
-            return;
+    impl Drop for TlsEndpoint {
+        fn drop(&mut self) {
+            self.driver.abort();
         }
-        match listener.accept().await {
-            Ok((stream, peer)) => {
-                // Awaiting the permit is the bound: with every slot held by
-                // in-flight handshakes the accept loop applies backpressure
-                // instead of piling up tasks (slow-loris guard).
-                let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
-                    return;
-                };
-                let acceptor = Arc::clone(&acceptor);
-                let tx = tx.clone();
-                tokio::spawn(async move {
-                    let _permit = permit;
-                    match tokio::time::timeout(
-                        TLS_HANDSHAKE_TIMEOUT,
-                        tokio_boring::accept(&acceptor, stream),
-                    )
-                    .await
-                    {
-                        Ok(Ok(tls)) => {
-                            let _ = tx.send((tls, peer)).await;
-                        }
-                        Ok(Err(e)) => {
-                            debug!("external-controller-tls handshake from {peer} failed: {e}");
-                        }
-                        Err(_) => {
-                            debug!("external-controller-tls handshake from {peer} timed out");
-                        }
-                    }
-                });
-            }
-            // Transient accept failure (fd exhaustion, …): log and retry
-            // after a beat, per axum's `Listener` contract.
-            Err(e) => {
-                warn!("external-controller-tls accept error: {e}");
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+
+    impl axum::serve::Listener for TlsEndpoint {
+        type Io = tokio_boring::SslStream<tokio::net::TcpStream>;
+        type Addr = SocketAddr;
+
+        async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+            match self.rx.recv().await {
+                Some(conn) => conn,
+                // The driver only stops on panic or `Drop::abort` — axum's
+                // `Listener` contract has no error channel, so park rather
+                // than spin on a closed channel.
+                None => std::future::pending().await,
             }
         }
+
+        fn local_addr(&self) -> std::io::Result<SocketAddr> {
+            Ok(self.local_addr)
+        }
+    }
+
+    /// Bind the HTTPS controller endpoint. Identity order matches mihomo: a
+    /// configured `tls.certificate`/`tls.private-key` pair loads as inline PEM
+    /// (both carry `-----BEGIN`) else as two home-relative file paths; with
+    /// neither set the endpoint generates an ephemeral self-signed identity.
+    /// Bind/identity failures are for the caller to log-and-skip.
+    pub async fn bind_tls(
+        addr: &str,
+        certificate: Option<&str>,
+        private_key: Option<&str>,
+    ) -> Result<TlsEndpoint> {
+        let acceptor = match (certificate, private_key) {
+            (None, None) => {
+                debug!("external-controller-tls: no identity configured; generating an ephemeral self-signed certificate");
+                let (certs, key) = generate_self_signed_identity()?;
+                build_api_tls_acceptor_from_parts(&certs, &key)?
+            }
+            (Some(cert), Some(key)) => {
+                let (cert_pem, key_pem) = load_identity_pair(cert, key)?;
+                build_api_tls_acceptor(&cert_pem, &key_pem)?
+            }
+            // Like upstream, a one-sided pair is an endpoint-local failure:
+            // config build validates shape only, so this is the rejection
+            // point that logs and skips just this listener (issue #974).
+            _ => anyhow::bail!("tls.certificate and tls.private-key must be set together"),
+        };
+        let resolved = resolve_listen_addr(addr).await?;
+        let listener = bind_tcp_dual_stack(resolved).await?;
+        let local_addr = listener
+            .local_addr()
+            .context("external-controller-tls bound address")?;
+        let (tx, rx) = tokio::sync::mpsc::channel(TLS_READY_QUEUE);
+        let driver = tokio::spawn(drive_tls(listener, Arc::new(acceptor), tx));
+        Ok(TlsEndpoint {
+            local_addr,
+            rx,
+            driver,
+        })
+    }
+
+    async fn drive_tls(
+        listener: tokio::net::TcpListener,
+        acceptor: Arc<boring::ssl::SslAcceptor>,
+        tx: tokio::sync::mpsc::Sender<(tokio_boring::SslStream<tokio::net::TcpStream>, SocketAddr)>,
+    ) {
+        let permits = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_TLS_HANDSHAKES));
+        loop {
+            if tx.is_closed() {
+                return;
+            }
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    // Awaiting the permit is the bound: with every slot held by
+                    // in-flight handshakes the accept loop applies backpressure
+                    // instead of piling up tasks (slow-loris guard).
+                    let Ok(permit) = Arc::clone(&permits).acquire_owned().await else {
+                        return;
+                    };
+                    let acceptor = Arc::clone(&acceptor);
+                    let tx = tx.clone();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        match tokio::time::timeout(
+                            TLS_HANDSHAKE_TIMEOUT,
+                            tokio_boring::accept(&acceptor, stream),
+                        )
+                        .await
+                        {
+                            Ok(Ok(tls)) => {
+                                let _ = tx.send((tls, peer)).await;
+                            }
+                            Ok(Err(e)) => {
+                                debug!("external-controller-tls handshake from {peer} failed: {e}");
+                            }
+                            Err(_) => {
+                                debug!("external-controller-tls handshake from {peer} timed out");
+                            }
+                        }
+                    });
+                }
+                // Transient accept failure (fd exhaustion, …): log and retry
+                // after a beat, per axum's `Listener` contract.
+                Err(e) => {
+                    warn!("external-controller-tls accept error: {e}");
+                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                }
+            }
+        }
+    }
+
+    /// `tls.certificate`/`tls.private-key` as PEM bytes: both `-----BEGIN`
+    /// strings are inline material; anything else is a pair of file paths —
+    /// upstream's pair-level fallback. The inline check classifies each
+    /// value *before* any path resolution: a mixed inline/path pair fails
+    /// here, so PEM bytes can never be echoed as a "path" into startup logs
+    /// (issue #974).
+    fn load_identity_pair(cert: &str, key: &str) -> Result<(Vec<u8>, Vec<u8>)> {
+        let cert_inline = cert.contains("-----BEGIN");
+        let key_inline = key.contains("-----BEGIN");
+        if cert_inline != key_inline {
+            anyhow::bail!(
+                "tls.certificate and tls.private-key must be both inline PEM or both file paths"
+            );
+        }
+        if cert_inline {
+            return Ok((cert.as_bytes().to_vec(), key.as_bytes().to_vec()));
+        }
+        let cert_path = std::path::Path::new(cert);
+        let key_path = std::path::Path::new(key);
+        let cert_resolved = meow_config::resolve_home_contained(cert_path)
+            .map_err(|e| anyhow::anyhow!("tls.certificate: {e}"))?;
+        let key_resolved = meow_config::resolve_home_contained(key_path)
+            .map_err(|e| anyhow::anyhow!("tls.private-key: {e}"))?;
+        Ok((
+            read_pem_file(&cert_resolved, "tls.certificate")?,
+            read_pem_file(&key_resolved, "tls.private-key")?,
+        ))
+    }
+
+    /// Bounded regular-file PEM read — the same discipline as the plugin
+    /// loaders: regular files only, `O_NONBLOCK` against FIFOs, and a hard
+    /// byte cap. Never called by `-t`/PUT (those validate shape only).
+    fn read_pem_file(path: &std::path::Path, what: &str) -> Result<Vec<u8>> {
+        use std::io::Read;
+        let meta = std::fs::metadata(path)
+            .with_context(|| format!("{what}: cannot stat {}", path.display()))?;
+        if !meta.is_file() {
+            anyhow::bail!("{what}: {} is not a regular file", path.display());
+        }
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
+        let file = opts
+            .open(path)
+            .with_context(|| format!("{what}: cannot open {}", path.display()))?;
+        let mut buf = Vec::new();
+        file.take(MAX_PEM_FILE_BYTES + 1)
+            .read_to_end(&mut buf)
+            .with_context(|| format!("{what}: cannot read {}", path.display()))?;
+        if buf.len() as u64 > MAX_PEM_FILE_BYTES {
+            anyhow::bail!(
+                "{what}: {} exceeds {} bytes",
+                path.display(),
+                MAX_PEM_FILE_BYTES
+            );
+        }
+        Ok(buf)
+    }
+
+    /// The ephemeral identity mihomo serves when `external-controller-tls`
+    /// has no configured PEMs: a fresh self-signed RSA-2048 certificate for
+    /// `localhost`/`127.0.0.1`/`::1`, valid a year.
+    fn generate_self_signed_identity() -> Result<(
+        Vec<boring::x509::X509>,
+        boring::pkey::PKey<boring::pkey::Private>,
+    )> {
+        use boring::{
+            asn1::{Asn1Integer, Asn1Time},
+            bn::BigNum,
+            hash::MessageDigest,
+            pkey::PKey,
+            rsa::Rsa,
+            x509::{extension::SubjectAlternativeName, X509Name, X509},
+        };
+        let key = PKey::from_rsa(Rsa::generate(2048)?)?;
+        let mut name_b = X509Name::builder()?;
+        name_b.append_entry_by_text("CN", "meow")?;
+        let name = name_b.build();
+        let mut b = X509::builder()?;
+        b.set_version(2)?;
+        let bn = BigNum::from_u32(1)?;
+        let serial = Asn1Integer::from_bn(&bn)?;
+        b.set_serial_number(&serial)?;
+        let not_before = Asn1Time::days_from_now(0)?;
+        let not_after = Asn1Time::days_from_now(365)?;
+        b.set_not_before(&not_before)?;
+        b.set_not_after(&not_after)?;
+        b.set_pubkey(&key)?;
+        b.set_subject_name(&name)?;
+        b.set_issuer_name(&name)?;
+        let mut san = SubjectAlternativeName::new();
+        san.dns("localhost");
+        san.ip("127.0.0.1");
+        san.ip("::1");
+        let ext = san.build(&b.x509v3_context(None, None))?;
+        b.append_extension(&ext)?;
+        b.sign(&key, MessageDigest::sha256())?;
+        Ok((vec![b.build()], key))
+    }
+
+    /// Build the BoringSSL acceptor for the `external-controller-tls`
+    /// listener from PEM material (leaf first, extra chain certs after) —
+    /// called at endpoint bind, never at config build (`-t` touches no PEM
+    /// material or files). `mozilla_intermediate_v5` floors at
+    /// TLS 1.2; ALPN advertises exactly the protocols the HTTP stack serves.
+    fn build_api_tls_acceptor(
+        cert_pem: &[u8],
+        key_pem: &[u8],
+    ) -> Result<boring::ssl::SslAcceptor, anyhow::Error> {
+        let certs = boring::x509::X509::stack_from_pem(cert_pem)
+            .map_err(|e| anyhow::anyhow!("tls.certificate: not a valid PEM certificate: {e}"))?;
+        if certs.is_empty() {
+            anyhow::bail!("tls.certificate: PEM carries no certificate");
+        }
+        let key = boring::pkey::PKey::private_key_from_pem(key_pem)
+            .map_err(|e| anyhow::anyhow!("tls.private-key: not a valid PEM private key: {e}"))?;
+        build_api_tls_acceptor_from_parts(&certs, &key)
+    }
+
+    /// The acceptor build itself, on already-decoded identity material — the
+    /// `external-controller-tls` endpoint's ephemeral self-signed identity
+    /// reaches the same builder without a PEM round-trip (issue #974).
+    fn build_api_tls_acceptor_from_parts(
+        certs: &[boring::x509::X509],
+        key: &boring::pkey::PKey<boring::pkey::Private>,
+    ) -> Result<boring::ssl::SslAcceptor, anyhow::Error> {
+        let mut builder =
+            boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
+                .map_err(|e| anyhow::anyhow!("external-controller-tls: {e}"))?;
+        let leaf = certs
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("tls.certificate: no certificate"))?;
+        builder
+            .set_certificate(leaf)
+            .map_err(|e| anyhow::anyhow!("tls.certificate: {e}"))?;
+        for extra in &certs[1..] {
+            builder
+                .add_extra_chain_cert(extra.clone())
+                .map_err(|e| anyhow::anyhow!("tls.certificate chain: {e}"))?;
+        }
+        builder
+            .set_private_key(key)
+            .map_err(|e| anyhow::anyhow!("tls.private-key: {e}"))?;
+        builder.check_private_key().map_err(|e| {
+            anyhow::anyhow!("tls.certificate and tls.private-key do not form a pair: {e}")
+        })?;
+        // Server-side ALPN picks from the *client's* offer in preference
+        // order `h2` then `http/1.1` — `set_alpn_protos` applies to client
+        // contexts, not acceptors.
+        builder.set_alpn_select_callback(|_, client| {
+            boring::ssl::select_next_proto(b"\x02h2\x08http/1.1", client)
+                .ok_or(boring::ssl::AlpnError::NOACK)
+        });
+        Ok(builder.build())
     }
 }
 
-/// `tls.certificate`/`tls.private-key` as PEM bytes: both `-----BEGIN`
-/// strings are inline material; anything else is a pair of file paths —
-/// upstream's pair-level fallback. The inline check classifies each
-/// value *before* any path resolution: a mixed inline/path pair fails
-/// here, so PEM bytes can never be echoed as a "path" into startup logs
-/// (issue #974).
-fn load_identity_pair(cert: &str, key: &str) -> Result<(Vec<u8>, Vec<u8>)> {
-    let cert_inline = cert.contains("-----BEGIN");
-    let key_inline = key.contains("-----BEGIN");
-    if cert_inline != key_inline {
-        anyhow::bail!(
-            "tls.certificate and tls.private-key must be both inline PEM or both file paths"
-        );
-    }
-    if cert_inline {
-        return Ok((cert.as_bytes().to_vec(), key.as_bytes().to_vec()));
-    }
-    let cert_path = std::path::Path::new(cert);
-    let key_path = std::path::Path::new(key);
-    let cert_resolved = meow_config::resolve_home_contained(cert_path)
-        .map_err(|e| anyhow::anyhow!("tls.certificate: {e}"))?;
-    let key_resolved = meow_config::resolve_home_contained(key_path)
-        .map_err(|e| anyhow::anyhow!("tls.private-key: {e}"))?;
-    Ok((
-        read_pem_file(&cert_resolved, "tls.certificate")?,
-        read_pem_file(&key_resolved, "tls.private-key")?,
-    ))
-}
-
-/// Bounded regular-file PEM read — the same discipline as the plugin
-/// loaders: regular files only, `O_NONBLOCK` against FIFOs, and a hard
-/// byte cap. Never called by `-t`/PUT (those validate shape only).
-fn read_pem_file(path: &std::path::Path, what: &str) -> Result<Vec<u8>> {
-    use std::io::Read;
-    let meta = std::fs::metadata(path)
-        .with_context(|| format!("{what}: cannot stat {}", path.display()))?;
-    if !meta.is_file() {
-        anyhow::bail!("{what}: {} is not a regular file", path.display());
-    }
-    let mut opts = std::fs::OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
-    let file = opts
-        .open(path)
-        .with_context(|| format!("{what}: cannot open {}", path.display()))?;
-    let mut buf = Vec::new();
-    file.take(MAX_PEM_FILE_BYTES + 1)
-        .read_to_end(&mut buf)
-        .with_context(|| format!("{what}: cannot read {}", path.display()))?;
-    if buf.len() as u64 > MAX_PEM_FILE_BYTES {
-        anyhow::bail!(
-            "{what}: {} exceeds {} bytes",
-            path.display(),
-            MAX_PEM_FILE_BYTES
-        );
-    }
-    Ok(buf)
-}
-
-/// The ephemeral identity mihomo serves when `external-controller-tls`
-/// has no configured PEMs: a fresh self-signed RSA-2048 certificate for
-/// `localhost`/`127.0.0.1`/`::1`, valid a year.
-fn generate_self_signed_identity() -> Result<(
-    Vec<boring::x509::X509>,
-    boring::pkey::PKey<boring::pkey::Private>,
-)> {
-    use boring::{
-        asn1::{Asn1Integer, Asn1Time},
-        bn::BigNum,
-        hash::MessageDigest,
-        pkey::PKey,
-        rsa::Rsa,
-        x509::{extension::SubjectAlternativeName, X509Name, X509},
-    };
-    let key = PKey::from_rsa(Rsa::generate(2048)?)?;
-    let mut name_b = X509Name::builder()?;
-    name_b.append_entry_by_text("CN", "meow")?;
-    let name = name_b.build();
-    let mut b = X509::builder()?;
-    b.set_version(2)?;
-    let bn = BigNum::from_u32(1)?;
-    let serial = Asn1Integer::from_bn(&bn)?;
-    b.set_serial_number(&serial)?;
-    let not_before = Asn1Time::days_from_now(0)?;
-    let not_after = Asn1Time::days_from_now(365)?;
-    b.set_not_before(&not_before)?;
-    b.set_not_after(&not_after)?;
-    b.set_pubkey(&key)?;
-    b.set_subject_name(&name)?;
-    b.set_issuer_name(&name)?;
-    let mut san = SubjectAlternativeName::new();
-    san.dns("localhost");
-    san.ip("127.0.0.1");
-    san.ip("::1");
-    let ext = san.build(&b.x509v3_context(None, None))?;
-    b.append_extension(&ext)?;
-    b.sign(&key, MessageDigest::sha256())?;
-    Ok((vec![b.build()], key))
-}
+#[cfg(feature = "api-tls")]
+pub use tls::{bind_tls, TlsEndpoint};
 
 // ── Unix socket (external-controller-unix) ─────────────────────────
 

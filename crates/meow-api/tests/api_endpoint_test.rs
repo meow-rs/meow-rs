@@ -445,245 +445,258 @@ async fn cors_bare_options_reaches_router_as_405() {
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
-// ── TLS endpoint ────────────────────────────────────────────────────
+// ── TLS endpoint (cfg(feature = "api-tls")) ─────────────────────────
 
-#[tokio::test]
-async fn tls_endpoint_serves_https_and_negotiates_alpn() {
-    let state = test_state(Default::default(), Some("s3cret"));
-    // Ephemeral identity — no tls.certificate/tls.private-key.
-    let endpoint = meow_api::endpoint::bind_tls("127.0.0.1:0", None, None)
-        .await
-        .unwrap();
-    let addr = endpoint.addr();
-    tokio::spawn(async move { axum::serve(endpoint, create_router(state)).await });
+// The whole section needs `boring`/`tokio_boring`, which are optional
+// deps of the crate — present only when `api-tls` compiled the endpoint
+// (issue #974).
+#[cfg(feature = "api-tls")]
+mod tls {
+    use super::*;
 
-    // h2-only offer: the acceptor must negotiate it (upstream probe
-    // verified ALPN advertises `h2` first, then `http/1.1`) — and axum's
-    // `http2` feature must actually serve a real HTTP/2 request, not
-    // just negotiate the protocol.
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let mut builder = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
-    builder.set_verify(boring::ssl::SslVerifyMode::NONE);
-    builder.set_alpn_protos(b"\x02h2").unwrap();
-    let connector = builder.build();
-    let tls = tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
-        .await
-        .unwrap();
-    assert_eq!(tls.ssl().selected_alpn_protocol(), Some(b"h2".as_slice()));
-    let (client, conn) = h2::client::handshake(tls).await.unwrap();
-    tokio::spawn(async move {
-        conn.await.unwrap();
-    });
-    let req = axum::http::Request::builder()
-        .uri("https://localhost/")
-        .header(header::AUTHORIZATION, "Bearer s3cret")
-        .body(())
-        .unwrap();
-    let (resp_fut, _send) = client
-        .ready()
-        .await
-        .unwrap()
-        .send_request(req, true)
-        .unwrap();
-    let resp = resp_fut.await.unwrap();
-    assert_eq!(resp.status(), StatusCode::OK);
-    let mut body = resp.into_body();
-    let mut payload = Vec::new();
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk.unwrap();
-        let _ = body.flow_control().release_capacity(chunk.len());
-        payload.extend_from_slice(&chunk);
-    }
-    assert_eq!(String::from_utf8(payload).unwrap(), "{\"hello\":\"meow\"}");
+    #[tokio::test]
+    async fn tls_endpoint_serves_https_and_negotiates_alpn() {
+        let state = test_state(Default::default(), Some("s3cret"));
+        // Ephemeral identity — no tls.certificate/tls.private-key.
+        let endpoint = meow_api::endpoint::bind_tls("127.0.0.1:0", None, None)
+            .await
+            .unwrap();
+        let addr = endpoint.addr();
+        tokio::spawn(async move { axum::serve(endpoint, create_router(state)).await });
 
-    // http/1.1-only offer: negotiated http/1.1 and a real request answers
-    // the shared router — auth enforced like every other transport.
-    let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
-    let mut builder = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
-    builder.set_verify(boring::ssl::SslVerifyMode::NONE);
-    builder.set_alpn_protos(b"\x08http/1.1").unwrap();
-    let connector = builder.build();
-    let mut tls = tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
-        .await
-        .unwrap();
-    assert_eq!(
-        tls.ssl().selected_alpn_protocol(),
-        Some(b"http/1.1".as_slice())
-    );
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    tls.write_all(
-        b"GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer s3cret\r\nConnection: close\r\n\r\n",
-    )
-    .await
-    .unwrap();
-    let mut buf = Vec::new();
-    tls.read_to_end(&mut buf).await.unwrap();
-    let text = String::from_utf8_lossy(&buf);
-    assert!(text.starts_with("HTTP/1.1 200"), "{text}");
-    assert!(text.contains("{\"hello\":\"meow\"}"), "{text}");
-}
-
-#[tokio::test]
-async fn tls_endpoint_marks_https_scheme_for_origin_guard() {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    // No secret → the browser origin guard (not Bearer) gates requests.
-    // `serve_tls_on` inserts the TlsTransport marker so a same-origin
-    // `https://` dashboard over HTTP/1.1 is not rejected as cross-scheme
-    // (issue #974); `http://` still is.
-    let state = test_state(Default::default(), None);
-    let endpoint = meow_api::endpoint::bind_tls("127.0.0.1:0", None, None)
-        .await
-        .unwrap();
-    let addr = endpoint.addr();
-    let app = create_router(state).layer(axum::middleware::from_fn(
-        meow_api::routes::mark_tls_transport,
-    ));
-    tokio::spawn(async move { axum::serve(endpoint, app).await });
-
-    async fn https_get(addr: std::net::SocketAddr, origin: &str) -> String {
+        // h2-only offer: the acceptor must negotiate it (upstream probe
+        // verified ALPN advertises `h2` first, then `http/1.1`) — and axum's
+        // `http2` feature must actually serve a real HTTP/2 request, not
+        // just negotiate the protocol.
         let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
         let mut builder =
             boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
         builder.set_verify(boring::ssl::SslVerifyMode::NONE);
+        builder.set_alpn_protos(b"\x02h2").unwrap();
+        let connector = builder.build();
+        let tls = tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
+            .await
+            .unwrap();
+        assert_eq!(tls.ssl().selected_alpn_protocol(), Some(b"h2".as_slice()));
+        let (client, conn) = h2::client::handshake(tls).await.unwrap();
+        tokio::spawn(async move {
+            conn.await.unwrap();
+        });
+        let req = axum::http::Request::builder()
+            .uri("https://localhost/")
+            .header(header::AUTHORIZATION, "Bearer s3cret")
+            .body(())
+            .unwrap();
+        let (resp_fut, _send) = client
+            .ready()
+            .await
+            .unwrap()
+            .send_request(req, true)
+            .unwrap();
+        let resp = resp_fut.await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let mut body = resp.into_body();
+        let mut payload = Vec::new();
+        while let Some(chunk) = body.data().await {
+            let chunk = chunk.unwrap();
+            let _ = body.flow_control().release_capacity(chunk.len());
+            payload.extend_from_slice(&chunk);
+        }
+        assert_eq!(String::from_utf8(payload).unwrap(), "{\"hello\":\"meow\"}");
+
+        // http/1.1-only offer: negotiated http/1.1 and a real request answers
+        // the shared router — auth enforced like every other transport.
+        let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let mut builder =
+            boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+        builder.set_verify(boring::ssl::SslVerifyMode::NONE);
+        builder.set_alpn_protos(b"\x08http/1.1").unwrap();
         let connector = builder.build();
         let mut tls = tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
             .await
             .unwrap();
+        assert_eq!(
+            tls.ssl().selected_alpn_protocol(),
+            Some(b"http/1.1".as_slice())
+        );
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
         tls.write_all(
-            format!(
-                "GET / HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n"
-            )
-            .as_bytes(),
-        )
-        .await
-        .unwrap();
+        b"GET / HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer s3cret\r\nConnection: close\r\n\r\n",
+    )
+    .await
+    .unwrap();
         let mut buf = Vec::new();
         tls.read_to_end(&mut buf).await.unwrap();
-        String::from_utf8_lossy(&buf).into_owned()
+        let text = String::from_utf8_lossy(&buf);
+        assert!(text.starts_with("HTTP/1.1 200"), "{text}");
+        assert!(text.contains("{\"hello\":\"meow\"}"), "{text}");
     }
 
-    let resp = https_get(addr, &format!("https://{addr}")).await;
-    assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
-    assert!(resp.contains("{\"hello\":\"meow\"}"), "{resp}");
-    let resp = https_get(addr, &format!("http://{addr}")).await;
-    assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
-}
+    #[tokio::test]
+    async fn tls_endpoint_marks_https_scheme_for_origin_guard() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // No secret → the browser origin guard (not Bearer) gates requests.
+        // `serve_tls_on` inserts the TlsTransport marker so a same-origin
+        // `https://` dashboard over HTTP/1.1 is not rejected as cross-scheme
+        // (issue #974); `http://` still is.
+        let state = test_state(Default::default(), None);
+        let endpoint = meow_api::endpoint::bind_tls("127.0.0.1:0", None, None)
+            .await
+            .unwrap();
+        let addr = endpoint.addr();
+        let app = create_router(state).layer(axum::middleware::from_fn(
+            meow_api::routes::mark_tls_transport,
+        ));
+        tokio::spawn(async move { axum::serve(endpoint, app).await });
 
-#[tokio::test]
-async fn tls_endpoint_configured_pem_pair() {
-    // A configured inline-PEM identity loads instead of the ephemeral one.
-    let (cert_pem, key_pem) = self_signed_pem();
-    let cert = String::from_utf8(cert_pem).unwrap();
-    let key = String::from_utf8(key_pem).unwrap();
-    meow_api::endpoint::bind_tls("127.0.0.1:0", Some(&cert), Some(&key))
+        async fn https_get(addr: std::net::SocketAddr, origin: &str) -> String {
+            let stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            let mut builder =
+                boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+            builder.set_verify(boring::ssl::SslVerifyMode::NONE);
+            let connector = builder.build();
+            let mut tls =
+                tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
+                    .await
+                    .unwrap();
+            tls.write_all(
+                format!(
+                "GET / HTTP/1.1\r\nHost: {addr}\r\nOrigin: {origin}\r\nConnection: close\r\n\r\n"
+            )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+            let mut buf = Vec::new();
+            tls.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).into_owned()
+        }
+
+        let resp = https_get(addr, &format!("https://{addr}")).await;
+        assert!(resp.starts_with("HTTP/1.1 200"), "{resp}");
+        assert!(resp.contains("{\"hello\":\"meow\"}"), "{resp}");
+        let resp = https_get(addr, &format!("http://{addr}")).await;
+        assert!(resp.starts_with("HTTP/1.1 403"), "{resp}");
+    }
+
+    #[tokio::test]
+    async fn tls_endpoint_configured_pem_pair() {
+        // A configured inline-PEM identity loads instead of the ephemeral one.
+        let (cert_pem, key_pem) = self_signed_pem();
+        let cert = String::from_utf8(cert_pem).unwrap();
+        let key = String::from_utf8(key_pem).unwrap();
+        meow_api::endpoint::bind_tls("127.0.0.1:0", Some(&cert), Some(&key))
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn tls_endpoint_bad_pair_and_bad_addr_fail() {
+        // One-sided pairs are endpoint-local failures upstream (config build
+        // and `-t` stay shape-only, issue #974) — the endpoint bind refuses.
+        assert!(meow_api::endpoint::bind_tls(
+            "127.0.0.1:0",
+            Some("-----BEGIN CERTIFICATE-----"),
+            None
+        )
         .await
-        .unwrap();
-}
+        .is_err());
+        // Garbage PEM bytes fail the acceptor build.
+        assert!(meow_api::endpoint::bind_tls(
+            "127.0.0.1:0",
+            Some("-----BEGIN CERTIFICATE-----\nbogus\n-----END CERTIFICATE-----"),
+            Some("-----BEGIN PRIVATE KEY-----\nbogus\n-----END PRIVATE KEY-----")
+        )
+        .await
+        .is_err());
+        // An unresolvable listen address fails the same way.
+        assert!(
+            meow_api::endpoint::bind_tls("no-such-host.invalid:0", None, None)
+                .await
+                .is_err()
+        );
+    }
 
-#[tokio::test]
-async fn tls_endpoint_bad_pair_and_bad_addr_fail() {
-    // One-sided pairs are endpoint-local failures upstream (config build
-    // and `-t` stay shape-only, issue #974) — the endpoint bind refuses.
-    assert!(
-        meow_api::endpoint::bind_tls("127.0.0.1:0", Some("-----BEGIN CERTIFICATE-----"), None)
-            .await
-            .is_err()
-    );
-    // Garbage PEM bytes fail the acceptor build.
-    assert!(meow_api::endpoint::bind_tls(
-        "127.0.0.1:0",
-        Some("-----BEGIN CERTIFICATE-----\nbogus\n-----END CERTIFICATE-----"),
-        Some("-----BEGIN PRIVATE KEY-----\nbogus\n-----END PRIVATE KEY-----")
-    )
-    .await
-    .is_err());
-    // An unresolvable listen address fails the same way.
-    assert!(
-        meow_api::endpoint::bind_tls("no-such-host.invalid:0", None, None)
-            .await
-            .is_err()
-    );
-}
+    #[tokio::test]
+    async fn tls_endpoint_mixed_inline_and_path_fails_without_leaking_material() {
+        // A mixed pair (one inline PEM, one file path) is rejected before
+        // path resolution — upstream refuses it and the error must never
+        // embed the inline PEM text as if it were a filesystem path
+        // (issue #974).
+        let err = meow_api::endpoint::bind_tls(
+            "127.0.0.1:0",
+            Some("-----BEGIN CERTIFICATE-----\nbogus-cert\n-----END CERTIFICATE-----"),
+            Some("keys/private.pem"),
+        )
+        .await
+        .err()
+        .expect("mixed pair must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("both inline PEM or both file paths"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains("bogus-cert"),
+            "error leaked PEM material: {msg}"
+        );
 
-#[tokio::test]
-async fn tls_endpoint_mixed_inline_and_path_fails_without_leaking_material() {
-    // A mixed pair (one inline PEM, one file path) is rejected before
-    // path resolution — upstream refuses it and the error must never
-    // embed the inline PEM text as if it were a filesystem path
-    // (issue #974).
-    let err = meow_api::endpoint::bind_tls(
-        "127.0.0.1:0",
-        Some("-----BEGIN CERTIFICATE-----\nbogus-cert\n-----END CERTIFICATE-----"),
-        Some("keys/private.pem"),
-    )
-    .await
-    .err()
-    .expect("mixed pair must fail");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("both inline PEM or both file paths"),
-        "unexpected error: {msg}"
-    );
-    assert!(
-        !msg.contains("bogus-cert"),
-        "error leaked PEM material: {msg}"
-    );
+        // The mirror image — path cert + inline key — same refusal.
+        let err = meow_api::endpoint::bind_tls(
+            "127.0.0.1:0",
+            Some("certs/server.pem"),
+            Some("-----BEGIN PRIVATE KEY-----\nbogus-key\n-----END PRIVATE KEY-----"),
+        )
+        .await
+        .err()
+        .expect("mixed pair must fail");
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("both inline PEM or both file paths"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains("bogus-key"),
+            "error leaked PEM material: {msg}"
+        );
+    }
 
-    // The mirror image — path cert + inline key — same refusal.
-    let err = meow_api::endpoint::bind_tls(
-        "127.0.0.1:0",
-        Some("certs/server.pem"),
-        Some("-----BEGIN PRIVATE KEY-----\nbogus-key\n-----END PRIVATE KEY-----"),
-    )
-    .await
-    .err()
-    .expect("mixed pair must fail");
-    let msg = format!("{err}");
-    assert!(
-        msg.contains("both inline PEM or both file paths"),
-        "unexpected error: {msg}"
-    );
-    assert!(
-        !msg.contains("bogus-key"),
-        "error leaked PEM material: {msg}"
-    );
-}
-
-/// A throwaway self-signed cert/key pair in PEM form — what
-/// `tls.certificate`/`tls.private-key` inline values carry.
-fn self_signed_pem() -> (Vec<u8>, Vec<u8>) {
-    use boring::{
-        asn1::{Asn1Integer, Asn1Time},
-        bn::BigNum,
-        ec::{EcGroup, EcKey},
-        hash::MessageDigest,
-        nid::Nid,
-        pkey::PKey,
-        x509::{X509Name, X509},
-    };
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
-    let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
-    let mut name_b = X509Name::builder().unwrap();
-    name_b.append_entry_by_text("CN", "meow-test").unwrap();
-    let name = name_b.build();
-    let mut b = X509::builder().unwrap();
-    b.set_version(2).unwrap();
-    let bn = BigNum::from_u32(3).unwrap();
-    let serial = Asn1Integer::from_bn(&bn).unwrap();
-    b.set_serial_number(&serial).unwrap();
-    let not_before = Asn1Time::days_from_now(0).unwrap();
-    let not_after = Asn1Time::days_from_now(30).unwrap();
-    b.set_not_before(&not_before).unwrap();
-    b.set_not_after(&not_after).unwrap();
-    b.set_pubkey(&key).unwrap();
-    b.set_subject_name(&name).unwrap();
-    b.set_issuer_name(&name).unwrap();
-    b.sign(&key, MessageDigest::sha256()).unwrap();
-    let cert = b.build();
-    (
-        cert.to_pem().unwrap(),
-        key.ec_key().unwrap().private_key_to_pem().unwrap(),
-    )
+    /// A throwaway self-signed cert/key pair in PEM form — what
+    /// `tls.certificate`/`tls.private-key` inline values carry.
+    fn self_signed_pem() -> (Vec<u8>, Vec<u8>) {
+        use boring::{
+            asn1::{Asn1Integer, Asn1Time},
+            bn::BigNum,
+            ec::{EcGroup, EcKey},
+            hash::MessageDigest,
+            nid::Nid,
+            pkey::PKey,
+            x509::{X509Name, X509},
+        };
+        let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap();
+        let key = PKey::from_ec_key(EcKey::generate(&group).unwrap()).unwrap();
+        let mut name_b = X509Name::builder().unwrap();
+        name_b.append_entry_by_text("CN", "meow-test").unwrap();
+        let name = name_b.build();
+        let mut b = X509::builder().unwrap();
+        b.set_version(2).unwrap();
+        let bn = BigNum::from_u32(3).unwrap();
+        let serial = Asn1Integer::from_bn(&bn).unwrap();
+        b.set_serial_number(&serial).unwrap();
+        let not_before = Asn1Time::days_from_now(0).unwrap();
+        let not_after = Asn1Time::days_from_now(30).unwrap();
+        b.set_not_before(&not_before).unwrap();
+        b.set_not_after(&not_after).unwrap();
+        b.set_pubkey(&key).unwrap();
+        b.set_subject_name(&name).unwrap();
+        b.set_issuer_name(&name).unwrap();
+        b.sign(&key, MessageDigest::sha256()).unwrap();
+        let cert = b.build();
+        (
+            cert.to_pem().unwrap(),
+            key.ec_key().unwrap().private_key_to_pem().unwrap(),
+        )
+    }
 }
 
 // ── Unix endpoint (cfg(unix)) ───────────────────────────────────────

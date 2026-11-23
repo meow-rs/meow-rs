@@ -84,12 +84,18 @@ plugin binary the operator pruned.
 |---------|-------|---------------|
 | `dns-server` | `meow-dns` | `hickory-server` DNS server dep (currently unconditional) |
 
+### API features
+
+| Feature | Crate | What it gates |
+|---------|-------|---------------|
+| `api-tls` | `meow-api` | `external-controller-tls` HTTPS endpoint (issue #974): BoringSSL `SslAcceptor` + ephemeral RSA identity + handshake driver, plus axum's `http2` server (enabled only on meow-api's axum edge so `minimal` never links h2 server code). In `full`/`default`, not `minimal` — a configured endpoint there parses as dead config and startup warns it is "not compiled into this build". Unix/pipe endpoints carry no feature |
+
 ### Convenience bundles (workspace root)
 
 | Bundle | Includes |
 |--------|---------|
 | `full` (default) | all features above |
-| `minimal` | `ss` + `ss-obfs`, `trojan`, `transport-tls`, `transport-ws`, `listener-mixed`, `dns-server` — REST API always included (not optional) |
+| `minimal` | `ss` + `ss-obfs`, `trojan`, `transport-tls`, `transport-ws`, `listener-mixed`, `dns-server` — REST API always included (not optional), but its HTTPS endpoint (`api-tls`) is not |
 
 **ADR-0007 §1 defines `minimal` as `tls,ws,ss,trojan,api`** — the "minimum useful set
 for a router operator." Dropping TLS would exclude SS+v2ray-plugin+TLS+ws, the
