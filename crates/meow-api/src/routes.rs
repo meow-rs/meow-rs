@@ -26,6 +26,7 @@ use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Mutex};
+use tower::Layer;
 use tracing::{debug, info, warn};
 
 #[cfg(feature = "listener-tun")]
@@ -324,6 +325,37 @@ pub async fn mark_tls_transport(mut req: Request, next: Next) -> Response {
     next.run(req).await
 }
 
+/// chi emits `Allow` only on a real 405 — one header line per registered
+/// method — while axum's `MethodRouter` attaches a combined `allow:`
+/// (including the `HEAD` `get` implies) to *every* response that passes
+/// through its method fallback: the 405, but also preflights and auth
+/// rejections answered by middleware. Nothing layered inside `Router`
+/// runs after that attach, so `create_router` puts this behind a
+/// catch-all fallback service where the map sees the finished wire:
+/// `allow` is stripped from non-405s and a 405's combined list is
+/// rewritten into chi's per-method lines minus `HEAD` (issue #974).
+async fn allow_header_compat(mut resp: Response) -> Response {
+    let Some(allow) = resp.headers_mut().remove(header::ALLOW) else {
+        return resp;
+    };
+    if resp.status() != StatusCode::METHOD_NOT_ALLOWED {
+        return resp;
+    }
+    let Ok(list) = allow.to_str() else {
+        return resp;
+    };
+    for method in list
+        .split(',')
+        .map(str::trim)
+        .filter(|m| !m.is_empty() && *m != "HEAD")
+    {
+        if let Ok(v) = method.parse() {
+            resp.headers_mut().append(header::ALLOW, v);
+        }
+    }
+    resp
+}
+
 /// Restrict browser access when the controller has no token. In particular,
 /// an arbitrary DNS name is never a trusted Host, even when Origin matches it.
 async fn require_controller_origin(req: Request, next: Next) -> Response {
@@ -491,9 +523,11 @@ pub fn create_router(state: Arc<AppState>) -> Router {
             get(get_connection).delete(close_connection),
         )
         .route("/connections", delete(close_all_connections))
+        // Registered in upstream's handler order so the 405 `Allow` lines
+        // come out identical (issue #974).
         .route(
             "/configs",
-            get(get_configs).patch(update_configs).put(put_configs),
+            get(get_configs).put(put_configs).patch(update_configs),
         )
         .route("/metrics", get(get_metrics))
         .route("/traffic", get(get_traffic))
@@ -613,7 +647,13 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     } else {
         router
     };
-    router.with_state(state)
+    let app = router.with_state(state);
+    // `allow_header_compat` has to see the response after the method
+    // router attaches `allow`, so the routes are served behind a catch-all
+    // fallback service — a `Route` endpoint carries no allow list of its
+    // own, so nothing re-adds the header the shim removed (issue #974).
+    Router::new()
+        .fallback_service(middleware::map_response::<_, ()>(allow_header_compat).layer(app))
 }
 
 // ── Basic endpoints ──────────────────────────────────────────────────

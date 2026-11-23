@@ -445,6 +445,106 @@ async fn cors_bare_options_reaches_router_as_405() {
     assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
 }
 
+// ── `Allow` header (upstream wire parity, issue #974) ───────────────
+//
+// chi emits `Allow` only on a real 405 — one header line per registered
+// method — while axum's method router attaches a combined `allow:` (with
+// the implicit `HEAD`) to every response through its method fallback,
+// preflights and auth rejections included. `create_router` wraps the
+// routes in a response map that strips it off non-405s and rewrites the
+// 405 into chi's shape.
+
+#[tokio::test]
+async fn allow_header_absent_on_preflights() {
+    // Allowed preflight (absent-map permissive path).
+    let state = test_state(Default::default(), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight("https://any.example", "GET", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!resp.headers().contains_key(header::ALLOW));
+
+    // Denied configured preflight answers 200 too — also no `allow`.
+    let state = test_state(configured(&["https://ok.example"], true), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight("https://evil.example", "GET", None, false))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(!resp.headers().contains_key(header::ALLOW));
+}
+
+#[tokio::test]
+async fn allow_header_absent_on_auth_rejection() {
+    // A bare OPTIONS with no token is answered by the auth middleware's
+    // 401 — upstream's wire carries no `allow` there either.
+    let state = test_state(Default::default(), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/configs")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(!resp.headers().contains_key(header::ALLOW));
+}
+
+#[tokio::test]
+async fn allow_header_405_uses_chi_per_method_lines() {
+    // `/configs` registers GET+PUT+PATCH — the 405 emits one `Allow:` line
+    // per method in upstream's order, and no implicit `HEAD`.
+    let state = test_state(Default::default(), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("OPTIONS")
+                .uri("/configs")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let allows: Vec<String> = resp
+        .headers()
+        .get_all(header::ALLOW)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(allows, vec!["GET", "PUT", "PATCH"]);
+    // chi's CORS middleware's `vary: Origin` rides its 405s too.
+    assert_eq!(vary_values(&resp), vec!["origin"]);
+
+    // A non-OPTIONS unhandled method takes the same fallback path — same
+    // shape on `/`, which registers only GET.
+    let state = test_state(Default::default(), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let allows: Vec<String> = resp
+        .headers()
+        .get_all(header::ALLOW)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(allows, vec!["GET"]);
+}
+
 // ── TLS endpoint (cfg(feature = "api-tls")) ─────────────────────────
 
 // The whole section needs `boring`/`tokio_boring`, which are optional
