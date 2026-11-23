@@ -93,19 +93,23 @@ reloads file-backed identities; meow snapshots them at bind),
   serves leaf-first. Both unset → an ephemeral self-signed RSA-2048
   `localhost` identity.
 - A bare `:port` on `external-controller-tls` tries `[::]:port` first —
-  dual-stack, `IPV6_V6ONLY` explicitly off, `SO_REUSEADDR` on — and falls
-  back to `0.0.0.0:port` when the host cannot do IPv6; a hostname's
-  answers are reordered v4-first and each is tried until one binds —
-  upstream's `net.Listen("tcp", …)` behavior. (The plain
-  `external-controller` keeps its pre-existing `0.0.0.0:port`
-  normalization at parse.)
+  dual-stack, `IPV6_V6ONLY` explicitly off, `SO_REUSEADDR` on unix only
+  (Winsock's flag permits port hijack, which is why std never sets it
+  there) — and falls back to `0.0.0.0:port` when the host cannot do
+  IPv6. A hostname resolves to *one* address — its answers are
+  reordered v4-first and only the first is bound, never retried —
+  upstream's `net.Listen("tcp", …)` behavior; candidate traversal is
+  the bare-port wildcard's alone. (The plain `external-controller`
+  keeps its pre-existing `0.0.0.0:port` normalization at parse.)
 - The TLS listener advertises h2 via ALPN and answers RFC 8441
   extended-CONNECT (`CONNECT` + `:protocol = websocket`) WebSocket
   upgrades on the WS-capable routes — axum's serve layer enables the
   protocol unconditionally, so the routes/auth path understands it
   rather than refusing; `?token=` authenticates those upgrades the same
-  as HTTP/1.1's. `CONNECT` never leaks into the chi-shaped `Allow`
-  headers.
+  as HTTP/1.1's. A `CONNECT` that is not a valid upgrade answers the
+  GET-only route's `405` + `Allow: GET` — it never receives the route's
+  GET body, which would fake a tunnel — and `CONNECT` never leaks into
+  the chi-shaped `Allow` headers.
 - The TLS accept loop bounds in-flight handshakes (128) and gives each
   a 10 s deadline so a slow-loris burst cannot stall accept; finished
   handshakes queue for axum (64).
@@ -146,20 +150,37 @@ Upstream unlinks whatever occupies the path, binds, `chmod 0666`s it,
 serves without auth, and leaves a stale socket on exit. meow:
 
 - refuses a non-socket path and another user's socket;
+- refuses a configured path that cannot fit `sun_path` (103 usable
+  bytes here) *before* touching the filesystem — the error names the
+  path and the limit, and the same check runs on the generated staging
+  sibling so a near-limit path cannot bind;
 - probes an existing same-owner socket with a 500 ms-bounded connect;
   `ECONNREFUSED` twice (50 ms apart — macOS/BSD refuse once the backlog
-  is full, so one refusal is ambiguous) means stale, success means live,
-  and a timeout or any other error means uncertain: the path is left
-  alone and the endpoint skipped;
+  is full, so one refusal is ambiguous) is still not proof of death:
+  before reclaiming, the kernel's own socket table is asked whether a
+  live process still binds the path — libproc fd enumeration on Apple
+  targets, `/proc/net/unix` on Linux/Android (where refusal is already
+  conclusive and the table is a second opinion), and a conservative
+  "cannot prove" on other unixes, which keeps the file and skips the
+  endpoint. A live answer means live, and a timeout or any other probe
+  error means uncertain: the path is left alone and the endpoint
+  skipped;
 - before unlinking a verified-stale socket re-stats the path and unlinks
   only when `(dev, ino, ctime, ctime_nsec)` still names the probed file —
   a racing re-bind leaves a *different* socket, which is kept (the
   residual stat→unlink window is inherent: unix sockets have no
   unlink-by-handle);
-- binds owner-only `0600` by binding a private sibling path, `chmod`ing
-  it, then renaming into place — the configured path never exists with
-  permissive mode; a `chmod` failure fails the whole endpoint bind
+- binds owner-only `0600` by binding an exclusively-claimed private
+  sibling (a `pid`-and-sequence staging name retried on collision, never
+  an unconditional unlink of whatever already sits there), `chmod`ing
+  it, then publishing into place — the configured path never exists
+  with permissive mode; a `chmod` failure fails the whole endpoint bind
   rather than serving a world-accessible socket;
+- the publish is atomic *no-replace* — `renamex_np(RENAME_EXCL)` on
+  Apple targets, `renameat2(RENAME_NOREPLACE)` on Linux/Android,
+  `link()`+drop elsewhere — so a racing occupant's file (another
+  daemon's live socket or an unrelated path) is never overwritten;
+  `EEXIST` keeps the target and skips the endpoint;
 - keeps Bearer auth (and the no-secret origin guard) on the socket —
   like the pipe and TLS transports;
 - removes only the socket path it created, via a guard that lives for
@@ -252,11 +273,13 @@ surface the TLS/CORS keys — private key material is never echoed.
 - `crates/meow-config/src/safe_path.rs` — `resolve_home_contained`.
 - `crates/meow-api/src/cors.rs` — the configured-path CORS middleware.
 - `crates/meow-api/src/endpoint.rs` — `bind_tls` (+ BoringSSL acceptor
-  builder, handshake driver, ephemeral identity, v4-first/dual-stack
-  candidate binding) under `api-tls`, `bind_unix` (+ bounded stale
-  probe, identity-verified reclaim, `0600`-via-rename, dev+ino cleanup
-  guard), `bind_pipe` (+ owner-only SDDL ACL, pending-instance
-  preservation) on Windows.
+  builder, handshake driver, ephemeral identity, wildcard-fallback /
+  hostname-single-answer resolution) under `api-tls`, `bind_unix` (+
+  sun_path preflight, bounded stale probe, kernel-table liveness
+  verification, identity-verified reclaim, exclusive staging name,
+  `0600` + atomic no-replace publish, dev+ino cleanup guard),
+  `bind_pipe` (+ owner-only SDDL ACL, pending-instance preservation)
+  on Windows.
 - `crates/meow-api/src/lib.rs` — `ApiServer` split: shared state,
   `router()`, `run_on`, `serve_on`, `serve_tls_on`.
 - `crates/meow-api/src/routes.rs` — CORS layer mount, `TlsTransport`
@@ -275,10 +298,12 @@ surface the TLS/CORS keys — private key material is never echoed.
   paths, wildcard/empty/glob/denied, HEAD on preflight *and* actual,
   header allowlist denial, PNA, bare-OPTIONS), TLS serving + real
   negotiated-`h2` request + scheme-marker origin guard + h2
-  extended-CONNECT WebSocket auth/frame, TIME_WAIT rebind, hostname
-  v4-first bind, configured/bad/mixed-no-leak identities, Unix
-  serve/auth/0600/reclaim/refuse/swap-safe-cleanup/relative-home/
-  bounded-probe-under-full-backlog, PUT persistence without rebinding,
+  extended-CONNECT WebSocket auth/frame, non-upgrade CONNECT 405,
+  orderly-close TIME_WAIT rebind with a no-flag negative probe,
+  hostname first-answer bind, configured/bad/mixed-no-leak identities,
+  Unix serve/auth/0600/reclaim/refuse/swap-safe-cleanup/relative-home/
+  bounded-probe-under-full-backlog with (dev, ino) identity asserts and
+  overlong-path named errors, PUT persistence without rebinding,
   GET no-echo.
 - `crates/meow-app/src/main.rs` — `--ext-ctl-*` overrides, including the
   empty-override-keeps-YAML rule; `api_endpoint_servable` applies the
