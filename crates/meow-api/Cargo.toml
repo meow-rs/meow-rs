@@ -39,6 +39,9 @@ base64 = "0.22"
 prometheus-client = "0.22"
 hickory-proto = { workspace = true }
 smol_str = { workspace = true }
+# Dual-stack controller binds clear IPV6_V6ONLY on the raw socket
+# (issue #974).
+socket2 = { workspace = true }
 # The `external-controller-tls` listener's BoringSSL acceptor + handshake
 # driver (issue #974). BoringSSL is the workspace TLS backend.
 boring = { workspace = true }
@@ -48,6 +51,15 @@ tokio-boring = { workspace = true }
 # `geteuid` for the unix-socket stale-reclaim ownership check (issue #974);
 # linux's rlimit probe rides the same dep.
 libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# `external-controller-pipe` installs a per-owner SDDL security descriptor
+# on every pipe instance (issue #974).
+windows-sys = { version = "0.60", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+] }
 
 [target.'cfg(not(target_os = "linux"))'.dependencies]
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
@@ -63,6 +75,9 @@ meow-config = { workspace = true, features = ["vless"] }
 meow-trie = { workspace = true }
 tower = { workspace = true }
 http-body-util = "0.1"
+# Wire-level h2 client for the ALPN-`h2` request test (issue #974).
+h2 = "0.4"
+bytes = "1"
 tempfile = "3"
 async-trait = { workspace = true }
 smallvec = { workspace = true }

@@ -148,8 +148,9 @@ webpki-root-certs = "1.0.10"
 # (Android `protect()`).
 hickory-proto = "0.26"
 
-# Web framework
-axum = { version = "0.8", features = ["ws"] }
+# Web framework — `http2` so the `external-controller-tls` endpoint can
+# serve the `h2` its ALPN advertises (issue #974).
+axum = { version = "0.8", features = ["ws", "http2"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 

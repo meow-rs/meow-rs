@@ -14,12 +14,13 @@ use anyhow::{Context, Result};
 use tracing::{debug, warn};
 
 /// Resolve a controller listen address the way upstream does: a bare
-/// `:port` binds all interfaces, hostnames resolve through the resolver,
-/// and the first answer wins. Kept a string until bind so `-t` never
-/// performs this lookup.
+/// `:port` binds the dual-stack wildcard (Go's `Listen("tcp", ":port")`
+/// accepts v4 *and* v6), hostnames resolve through the resolver, and the
+/// first answer wins. Kept a string until bind so `-t` never performs
+/// this lookup.
 async fn resolve_listen_addr(addr: &str) -> Result<SocketAddr> {
     let normalized = match addr.strip_prefix(':') {
-        Some(port) => format!("0.0.0.0:{port}"),
+        Some(port) => format!("[::]:{port}"),
         None => addr.to_owned(),
     };
     let mut addrs = tokio::net::lookup_host(&normalized)
@@ -28,6 +29,39 @@ async fn resolve_listen_addr(addr: &str) -> Result<SocketAddr> {
     addrs
         .next()
         .with_context(|| format!("controller address '{addr}' resolved to nothing"))
+}
+
+/// Bind the resolved TLS listen address. An unspecified v6 address —
+/// reached through a bare `:port` or an explicit `[::]` — must accept
+/// v4-mapped clients like upstream, so `IPV6_V6ONLY` is forced off;
+/// platforms differ on the default (Windows defaults to v6-only).
+async fn bind_tcp_dual_stack(addr: SocketAddr) -> Result<tokio::net::TcpListener> {
+    if addr.is_ipv6() && addr.ip().is_unspecified() {
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV6,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::TCP),
+        )
+        .context("external-controller-tls: cannot create socket")?;
+        socket
+            .set_only_v6(false)
+            .context("external-controller-tls: cannot clear IPV6_V6ONLY")?;
+        socket
+            .set_nonblocking(true)
+            .context("external-controller-tls: cannot set nonblocking")?;
+        socket
+            .bind(&addr.into())
+            .with_context(|| format!("external-controller-tls cannot bind {addr}"))?;
+        socket
+            .listen(1024)
+            .context("external-controller-tls: cannot listen")?;
+        tokio::net::TcpListener::from_std(socket.into())
+            .context("external-controller-tls: cannot adopt listener")
+    } else {
+        tokio::net::TcpListener::bind(addr)
+            .await
+            .with_context(|| format!("external-controller-tls cannot bind {addr}"))
+    }
 }
 
 // ── TLS (external-controller-tls) ──────────────────────────────────
@@ -108,14 +142,13 @@ pub async fn bind_tls(
             let (cert_pem, key_pem) = load_identity_pair(cert, key)?;
             meow_config::build_api_tls_acceptor(&cert_pem, &key_pem)?
         }
-        // build_config rejects a one-sided pair when the listener is
-        // declared; CLI overrides pass through the same ApiConfig.
+        // Like upstream, a one-sided pair is an endpoint-local failure:
+        // config build validates shape only, so this is the rejection
+        // point that logs and skips just this listener (issue #974).
         _ => anyhow::bail!("tls.certificate and tls.private-key must be set together"),
     };
     let resolved = resolve_listen_addr(addr).await?;
-    let listener = tokio::net::TcpListener::bind(resolved)
-        .await
-        .with_context(|| format!("external-controller-tls cannot bind {resolved}"))?;
+    let listener = bind_tcp_dual_stack(resolved).await?;
     let local_addr = listener
         .local_addr()
         .context("external-controller-tls bound address")?;
@@ -180,10 +213,19 @@ async fn drive_tls(
 
 /// `tls.certificate`/`tls.private-key` as PEM bytes: both `-----BEGIN`
 /// strings are inline material; anything else is a pair of file paths —
-/// upstream's pair-level fallback, so a mixed inline/path pair is an
-/// error (the PEM half can never resolve as a path).
+/// upstream's pair-level fallback. The inline check classifies each
+/// value *before* any path resolution: a mixed inline/path pair fails
+/// here, so PEM bytes can never be echoed as a "path" into startup logs
+/// (issue #974).
 fn load_identity_pair(cert: &str, key: &str) -> Result<(Vec<u8>, Vec<u8>)> {
-    if cert.contains("-----BEGIN") && key.contains("-----BEGIN") {
+    let cert_inline = cert.contains("-----BEGIN");
+    let key_inline = key.contains("-----BEGIN");
+    if cert_inline != key_inline {
+        anyhow::bail!(
+            "tls.certificate and tls.private-key must be both inline PEM or both file paths"
+        );
+    }
+    if cert_inline {
         return Ok((cert.as_bytes().to_vec(), key.as_bytes().to_vec()));
     }
     let cert_path = std::path::Path::new(cert);
@@ -230,7 +272,7 @@ fn read_pem_file(path: &std::path::Path, what: &str) -> Result<Vec<u8>> {
 }
 
 /// The ephemeral identity mihomo serves when `external-controller-tls`
-/// has no configured PEMs: a fresh self-signed P-256 certificate for
+/// has no configured PEMs: a fresh self-signed RSA-2048 certificate for
 /// `localhost`/`127.0.0.1`/`::1`, valid a year.
 fn generate_self_signed_identity() -> Result<(
     Vec<boring::x509::X509>,
@@ -239,14 +281,12 @@ fn generate_self_signed_identity() -> Result<(
     use boring::{
         asn1::{Asn1Integer, Asn1Time},
         bn::BigNum,
-        ec::{EcGroup, EcKey},
         hash::MessageDigest,
-        nid::Nid,
         pkey::PKey,
+        rsa::Rsa,
         x509::{extension::SubjectAlternativeName, X509Name, X509},
     };
-    let group = EcGroup::from_curve_name(Nid::X9_62_PRIME256V1)?;
-    let key = PKey::from_ec_key(EcKey::generate(&group)?)?;
+    let key = PKey::from_rsa(Rsa::generate(2048)?)?;
     let mut name_b = X509Name::builder()?;
     name_b.append_entry_by_text("CN", "meow")?;
     let name = name_b.build();
@@ -304,10 +344,16 @@ impl axum::serve::Listener for UnixEndpoint {
 }
 
 /// Removes the daemon's own socket file on drop — the guard outlives the
-/// serve task so a shutdown never leaves a stale socket behind.
+/// serve task so a shutdown never leaves a stale socket behind. It
+/// unlinks only the *same file* it bound: the recorded dev+inode must
+/// still identify a socket, so a swapped-in regular file or another
+/// process's socket is never deleted (issue #974).
 #[cfg(unix)]
 pub struct UnixSocketGuard {
     path: Option<std::path::PathBuf>,
+    /// `(st_dev, st_ino)` of the bound socket — the identity check Drop
+    /// applies before unlinking.
+    ident: (u64, u64),
 }
 
 #[cfg(unix)]
@@ -329,7 +375,17 @@ impl UnixSocketGuard {
 #[cfg(unix)]
 impl Drop for UnixSocketGuard {
     fn drop(&mut self) {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
         if let Some(path) = self.path.take() {
+            let ours = std::fs::symlink_metadata(&path)
+                .is_ok_and(|md| md.file_type().is_socket() && (md.dev(), md.ino()) == self.ident);
+            if !ours {
+                warn!(
+                    "external-controller-unix: {} was replaced; leaving it alone",
+                    path.display()
+                );
+                return;
+            }
             if let Err(e) = std::fs::remove_file(&path) {
                 warn!(
                     "external-controller-unix: cannot remove {}: {e}",
@@ -416,40 +472,134 @@ pub fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
         )
     })?;
     // Owner-only — the controller is authenticated, but the socket file
-    // never needs the world-read/write upstream grants it.
+    // never needs the world-read/write upstream grants it. A failed
+    // chmod fails the endpoint: serving a permissive socket would defeat
+    // the divergence this mode exists for (issue #974).
     if let Err(e) = std::fs::set_permissions(&resolved, std::fs::Permissions::from_mode(0o600)) {
-        warn!(
-            "external-controller-unix: cannot chmod {}: {e}",
-            resolved.display()
-        );
+        let _ = std::fs::remove_file(&resolved);
+        return Err(e).with_context(|| {
+            format!(
+                "external-controller-unix: cannot chmod {} to owner-only",
+                resolved.display()
+            )
+        });
     }
+    // Record the bound socket's identity so the guard removes only the
+    // file this process created.
+    let ident = std::fs::metadata(&resolved)
+        .map(|md| (md.dev(), md.ino()))
+        .with_context(|| {
+            format!(
+                "external-controller-unix: cannot stat bound socket {}",
+                resolved.display()
+            )
+        })?;
     Ok((
         UnixEndpoint { listener },
         UnixSocketGuard {
             path: Some(resolved),
+            ident,
         },
     ))
 }
 
 // ── Windows named pipe (external-controller-pipe) ──────────────────
 
+/// The restricted ACL every pipe instance carries (issue #974): a
+/// protected DACL granting GENERIC_ALL to the object owner only —
+/// upstream posture is a per-owner pipe, not a shared one. Built once
+/// per endpoint; `CreateNamedPipeW` copies the descriptor into each
+/// kernel object, so the owned buffer only needs to outlive each create
+/// call.
+#[cfg(windows)]
+struct PipeSecurity {
+    attrs: windows_sys::Win32::Security::SECURITY_ATTRIBUTES,
+    /// The `LocalAlloc`'d security descriptor `attrs` points at.
+    sd: *mut std::ffi::c_void,
+}
+
+// SAFETY: `sd` is an immutable kernel-owned descriptor read only inside
+// synchronous `CreateNamedPipeW` calls; no interior mutability crosses
+// the send boundary.
+#[cfg(windows)]
+unsafe impl Send for PipeSecurity {}
+#[cfg(windows)]
+unsafe impl Sync for PipeSecurity {}
+
+#[cfg(windows)]
+impl PipeSecurity {
+    /// SDDL `D:P(A;;GA;;;OW)` → `SECURITY_ATTRIBUTES` for
+    /// `ServerOptions::create_with_security_attributes_raw`.
+    fn new() -> std::io::Result<Self> {
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+        // "D:P(A;;GA;;;OW)" as UTF-16 + NUL.
+        let sddl: Vec<u16> = "D:P(A;;GA;;;OW)".encode_utf16().chain([0]).collect();
+        let mut sd = std::ptr::null_mut();
+        // SAFETY: `sddl` is a valid NUL-terminated UTF-16 string; `sd`
+        // receives a LocalAlloc'd descriptor on success.
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || sd.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self {
+            attrs: SECURITY_ATTRIBUTES {
+                nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+                lpSecurityDescriptor: sd,
+                bInheritHandle: 0,
+            },
+            sd,
+        })
+    }
+
+    fn as_raw(&self) -> *mut std::ffi::c_void {
+        &self.attrs as *const _ as *mut std::ffi::c_void
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PipeSecurity {
+    fn drop(&mut self) {
+        if !self.sd.is_null() {
+            // SAFETY: `sd` came from ConvertSDDL's LocalAlloc.
+            unsafe { windows_sys::Win32::Foundation::LocalFree(self.sd) };
+        }
+    }
+}
+
 /// A bound `external-controller-pipe` listener. One `NamedPipeServer`
 /// instance per connection: each `accept` waits on the pending instance's
-/// client connect, then pre-creates the next one. Byte mode + reject
-/// remote clients matches upstream's pipe semantics.
+/// client connect, then tries to pre-create the next one. Byte mode +
+/// reject remote clients + the restricted ACL matches upstream's pipe
+/// semantics; a failed next-instance create never costs the client that
+/// already connected — the following `accept` retries it (issue #974).
 #[cfg(windows)]
 pub struct PipeEndpoint {
     name: String,
-    pending: tokio::net::windows::named_pipe::NamedPipeServer,
+    pending: Option<tokio::net::windows::named_pipe::NamedPipeServer>,
+    security: PipeSecurity,
 }
 
 #[cfg(windows)]
 impl PipeEndpoint {
     fn new_instance(&self) -> std::io::Result<tokio::net::windows::named_pipe::NamedPipeServer> {
-        tokio::net::windows::named_pipe::ServerOptions::new()
-            .pipe_mode(tokio::net::windows::named_pipe::PipeMode::Byte)
-            .reject_remote_clients(true)
-            .create(&self.name)
+        // SAFETY: `security` outlives the synchronous create call; the
+        // descriptor is copied into the new pipe object.
+        unsafe {
+            tokio::net::windows::named_pipe::ServerOptions::new()
+                .pipe_mode(tokio::net::windows::named_pipe::PipeMode::Byte)
+                .reject_remote_clients(true)
+                .create_with_security_attributes_raw(&self.name, self.security.as_raw())
+        }
     }
 }
 
@@ -460,28 +610,33 @@ impl axum::serve::Listener for PipeEndpoint {
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
         loop {
-            match self.pending.connect().await {
-                Ok(()) => match self.new_instance() {
-                    Ok(next) => {
-                        let connected = std::mem::replace(&mut self.pending, next);
-                        return (connected, self.name.clone());
-                    }
-                    // A replacement-instance failure leaves `pending`
-                    // connected — drop it rather than leak a half state.
+            if self.pending.is_none() {
+                match self.new_instance() {
+                    Ok(next) => self.pending = Some(next),
                     Err(e) => {
-                        warn!("external-controller-pipe: cannot create next instance: {e}");
-                        match self.new_instance() {
-                            Ok(next) => self.pending = next,
-                            Err(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-                        }
+                        warn!("external-controller-pipe: cannot create instance: {e}");
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                        continue;
                     }
-                },
+                }
+            }
+            let pending = self.pending.as_mut().expect("pending set above");
+            match pending.connect().await {
+                Ok(()) => {
+                    let connected = match self.new_instance() {
+                        Ok(next) => self.pending.replace(next),
+                        Err(e) => {
+                            // Serve the client anyway — the next accept
+                            // recreates the pending slot.
+                            warn!("external-controller-pipe: cannot create next instance: {e}");
+                            self.pending.take()
+                        }
+                    };
+                    return (connected.expect("pending connected"), self.name.clone());
+                }
                 Err(e) => {
                     warn!("external-controller-pipe connect error: {e}");
-                    match self.new_instance() {
-                        Ok(next) => self.pending = next,
-                        Err(_) => tokio::time::sleep(std::time::Duration::from_secs(1)).await,
-                    }
+                    self.pending = None;
                 }
             }
         }
@@ -493,19 +648,24 @@ impl axum::serve::Listener for PipeEndpoint {
 }
 
 /// Bind `external-controller-pipe`. `first_pipe_instance` claims the name
-/// so a squatting pipe cannot already exist; the default security
-/// descriptor restricts access to the creating user and SYSTEM, which is
-/// the restricted-ACL posture upstream applies by hand.
+/// so a squatting pipe cannot already exist; the same owner-only ACL is
+/// installed on the first and every subsequent instance via
+/// `create_with_security_attributes_raw` (issue #974).
 #[cfg(windows)]
 pub fn bind_pipe(name: &str) -> Result<PipeEndpoint> {
-    let pending = tokio::net::windows::named_pipe::ServerOptions::new()
-        .first_pipe_instance(true)
-        .pipe_mode(tokio::net::windows::named_pipe::PipeMode::Byte)
-        .reject_remote_clients(true)
-        .create(name)
-        .with_context(|| format!("external-controller-pipe cannot create '{name}'"))?;
+    let security =
+        PipeSecurity::new().context("external-controller-pipe cannot build security descriptor")?;
+    let pending = unsafe {
+        tokio::net::windows::named_pipe::ServerOptions::new()
+            .first_pipe_instance(true)
+            .pipe_mode(tokio::net::windows::named_pipe::PipeMode::Byte)
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(name, security.as_raw())
+    }
+    .with_context(|| format!("external-controller-pipe cannot create '{name}'"))?;
     Ok(PipeEndpoint {
         name: name.to_owned(),
-        pending,
+        pending: Some(pending),
+        security,
     })
 }

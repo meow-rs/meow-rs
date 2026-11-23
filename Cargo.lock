@@ -1873,7 +1873,9 @@ checksum = "2c3e324da4c95177d6291d4c8730197c0d1822f8a9766814a4a44fa5ab797c9c"
 dependencies = [
  "atomic-waker",
  "bytes",
+ "futures-channel",
  "futures-core",
+ "h2",
  "http",
  "http-body",
  "httparse",
@@ -2499,8 +2501,10 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "boring",
+ "bytes",
  "dashmap",
  "futures",
+ "h2",
  "hickory-proto",
  "http-body-util",
  "libc",
@@ -2519,6 +2523,7 @@ dependencies = [
  "serde_json",
  "smallvec",
  "smol_str",
+ "socket2 0.5.10",
  "subtle",
  "sysinfo",
  "tempfile",
@@ -2531,6 +2536,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]
