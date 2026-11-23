@@ -673,6 +673,53 @@ fn sun_path_capacity() -> usize {
         - 1
 }
 
+/// Bind the pid-unique staging sibling the configured path is published
+/// from. The name is claimed by `bind` itself — never by unlinking what
+/// may be someone else's file — and every cleanup of `tmp` after this
+/// point removes only a name this call created (issue #974).
+#[cfg(unix)]
+async fn bind_unix_staging(
+    resolved: &std::path::Path,
+) -> Result<(tokio::net::UnixListener, std::path::PathBuf)> {
+    static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..8 {
+        let tmp = resolved.with_extension(format!(
+            "meow-tmp-{}-{}",
+            std::process::id(),
+            STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        // The staging sibling must fit sun_path too — a configured
+        // path near the limit fails here by name, not as a bind
+        // error on a name the config never wrote (issue #974).
+        if tmp.as_os_str().len() > sun_path_capacity() {
+            anyhow::bail!(
+                "external-controller-unix: {} leaves no room for the staging name within the {}-byte unix socket path limit",
+                resolved.display(),
+                sun_path_capacity()
+            );
+        }
+        match tokio::net::UnixListener::bind(&tmp) {
+            Ok(listener) => return Ok((listener, tmp)),
+            // A same-named file exists — most likely a crashed run's
+            // litter under a reused PID. Take the next name; the file
+            // is not this call's to remove.
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!(
+                        "external-controller-unix cannot bind {}",
+                        resolved.display()
+                    )
+                });
+            }
+        }
+    }
+    anyhow::bail!(
+        "external-controller-unix cannot claim a staging name alongside {}",
+        resolved.display()
+    )
+}
+
 /// Bind `external-controller-unix` — meow's deliberately safer handling
 /// (issue #974): where upstream unlinks an existing path unconditionally,
 /// meow refuses a non-socket path, refuses another user's socket, and
@@ -773,24 +820,7 @@ pub async fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
     // umask dance is needed. rename preserves the inode and the
     // listening fd (issue #974). Crash litter is single-owner by
     // construction (the PID names it), so a leftover is safe to drop.
-    let tmp = resolved.with_extension(format!("meow-tmp-{}", std::process::id()));
-    // The staging sibling must fit sun_path too — a configured path near
-    // the limit fails here by name, not as a bind error on a name the
-    // config never wrote (issue #974).
-    if tmp.as_os_str().len() > sun_path_capacity() {
-        anyhow::bail!(
-            "external-controller-unix: {} leaves no room for the staging name within the {}-byte unix socket path limit",
-            resolved.display(),
-            sun_path_capacity()
-        );
-    }
-    let _ = std::fs::remove_file(&tmp);
-    let listener = tokio::net::UnixListener::bind(&tmp).with_context(|| {
-        format!(
-            "external-controller-unix cannot bind {}",
-            resolved.display()
-        )
-    })?;
+    let (listener, tmp) = bind_unix_staging(&resolved).await?;
     // Owner-only — the controller is authenticated, but the socket file
     // never needs the world-read/write upstream grants it. A failed
     // chmod fails the endpoint: serving a permissive socket would defeat
