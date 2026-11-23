@@ -22,19 +22,9 @@ const UNSUPPORTED_KEYS: &[(&str, Option<u32>, &str)] = &[
         "superseded by geodata.auto-update-interval",
     ),
     (
-        "external-controller-tls",
+        "external-controller-routing-mark",
         Some(974),
-        "API TLS not implemented",
-    ),
-    (
-        "external-controller-unix",
-        Some(974),
-        "Unix socket API not implemented",
-    ),
-    (
-        "external-controller-pipe",
-        Some(974),
-        "named pipe API not implemented",
+        "controller listener SO_MARK not implemented",
     ),
     ("tunnels", Some(974), "inbound tunnels not implemented"),
     ("udp-over-tcp", None, "UDP-over-TCP not implemented"),
@@ -537,7 +527,64 @@ pub(crate) fn warn_store_fake_ip_alias(raw: &crate::raw::RawConfig) {
 /// - `dns.response-rules[]` uses `deny_unknown_fields` — a hard error by
 ///   design, not a warn.
 pub(crate) fn validate_and_warn(raw: &crate::raw::RawConfig) {
-    warn_extra("top-level config", &raw.extra);
+    // Top-level `certificate`/`private-key` are silently dead upstream —
+    // mihomo reads them NESTED under `tls:` (issue #974). Warn as
+    // misplaced with the canonical key names rather than lumping them
+    // into the unrecognized list; never interpreted as an identity.
+    let mut extra_keys: Vec<String> = raw.extra.keys().cloned().collect();
+    for key in ["certificate", "private-key"] {
+        if extra_keys.iter().any(|k| k == key) {
+            extra_keys.retain(|k| k != key);
+            warn!(
+                "misplaced key in top-level config: {key} (mihomo reads it nested \
+                 as tls.{key}; the top-level spelling is ignored)"
+            );
+        }
+    }
+    emit_unknown_keys_warn("top-level config", &extra_keys);
+
+    // Controller CORS + TLS sections (issue #974): known keys are
+    // implemented or warn-ignored below; anything else unknown warns
+    // scoped to its own section.
+    if let Some(cors) = &raw.external_controller_cors {
+        warn_extra("external-controller-cors", &cors.extra);
+    }
+    if let Some(tls) = &raw.tls {
+        warn_extra("tls", &tls.extra);
+        // Parsed-but-unimplemented `tls:` members — warn-ignore this
+        // batch, under `strict` too (Class B, ADR-0002).
+        for (key, present) in [
+            ("client-auth-type", tls.client_auth_type.is_some()),
+            (
+                "client-auth-certificates",
+                tls.client_auth_certificates.is_some(),
+            ),
+            ("ech-key", tls.ech_key.is_some()),
+            ("custom-certifactes", tls.custom_certifactes.is_some()),
+        ] {
+            if present {
+                warn!("unsupported key in tls: {key} (issue #974) — parsed but not implemented; ignored");
+            }
+        }
+    }
+    // Platform listeners upstream only serves on one OS: warn-ignore the
+    // configured key everywhere else, never a validation error.
+    if !cfg!(windows)
+        && raw
+            .external_controller_pipe
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+    {
+        warn!("external-controller-pipe is set but named pipes are only supported on Windows — ignored");
+    }
+    if !cfg!(unix)
+        && raw
+            .external_controller_unix
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+    {
+        warn!("external-controller-unix is set but Unix-domain sockets are only supported on Unix — ignored");
+    }
 
     // `global-client-fingerprint` names a uTLS profile; an unsupported
     // name degrades to the TLS backend's defaults on every inheriting

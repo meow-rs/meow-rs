@@ -27,6 +27,7 @@ pub mod rule_parser;
 pub mod rule_provider;
 pub mod rule_provider_refresh;
 mod safe_path;
+pub use safe_path::resolve_home_contained;
 pub mod sub_rules_parser;
 pub mod subscription;
 pub mod subscription_userinfo;
@@ -1180,8 +1181,73 @@ pub struct ListenerConfig {
     pub named: Vec<NamedListener>,
 }
 
+/// The `external-controller-cors:` section resolved for serving (issue
+/// #974) — a startup snapshot like the listener addresses: `PUT /configs`
+/// commits the raw section but the live policy stays frozen until restart.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ApiCorsConfig {
+    /// Whether an `external-controller-cors:` map was present at all —
+    /// upstream selects the configured `cors.New` middleware on a present
+    /// map (even `{}`) and the permissive `AllowAll` middleware when it
+    /// is absent; the two emit different wire shapes (see the issue
+    /// #974 appendix probes).
+    pub configured: bool,
+    /// Resolved `allow-origins`: default `["*"]`; an explicit `[]` and a
+    /// `*` entry both mean allow-all (weird-but-real, probe-verified).
+    pub allow_origins: Vec<String>,
+    /// Resolved `allow-private-network`: default `true`.
+    pub allow_private_network: bool,
+}
+
+impl Default for ApiCorsConfig {
+    /// The absent-map permissive defaults.
+    fn default() -> Self {
+        Self {
+            configured: false,
+            allow_origins: vec!["*".to_string()],
+            allow_private_network: true,
+        }
+    }
+}
+
+impl ApiCorsConfig {
+    /// Resolve the raw section: absent → permissive; present → per-key
+    /// merge over the `["*"]`/`true` defaults (issue #974).
+    pub fn from_raw(raw: Option<&raw::RawCors>) -> Self {
+        match raw {
+            None => Self::default(),
+            Some(cors) => Self {
+                configured: true,
+                allow_origins: cors
+                    .allow_origins
+                    .clone()
+                    .unwrap_or_else(|| vec!["*".to_string()]),
+                allow_private_network: cors.allow_private_network.unwrap_or(true),
+            },
+        }
+    }
+}
+
 pub struct ApiConfig {
     pub external_controller: Option<SocketAddr>,
+    /// `external-controller-tls` — the HTTPS controller's listen address,
+    /// still a string: `-t` validates shape only, and the endpoint may be
+    /// a hostname resolved at bind time (issue #974).
+    pub external_controller_tls: Option<String>,
+    /// `external-controller-unix` — the Unix-domain socket path (relative
+    /// resolves under the meow home at bind time).
+    pub external_controller_unix: Option<String>,
+    /// `external-controller-pipe` — the Windows named-pipe name; parsed
+    /// on every platform, served only on Windows.
+    pub external_controller_pipe: Option<String>,
+    /// `tls.certificate` — inline PEM or path; used only with
+    /// `external_controller_tls`. `None` (both absent) means the listener
+    /// generates an ephemeral self-signed identity at bind, like mihomo.
+    pub tls_certificate: Option<String>,
+    /// `tls.private-key` — the `tls_certificate` pair.
+    pub tls_private_key: Option<String>,
+    /// `external-controller-cors` resolved for serving.
+    pub cors: ApiCorsConfig,
     pub secret: Option<String>,
     /// Resolved directory of static files for a third-party web UI, served at
     /// `/ui` in place of the built-in panel. `None` keeps the built-in panel.
@@ -1190,6 +1256,74 @@ pub struct ApiConfig {
     /// Download URL recorded from `external-ui-url`; auto-download is not
     /// performed, but it is surfaced in a warning when the directory is absent.
     pub external_ui_url: Option<String>,
+}
+
+impl ApiConfig {
+    /// Whether any controller endpoint this build can actually serve is
+    /// configured — platform-gated: a Unix socket needs `cfg(unix)`, the
+    /// named pipe needs Windows (issue #974).
+    pub fn has_servable_endpoint(&self) -> bool {
+        self.external_controller.is_some()
+            || self.external_controller_tls.is_some()
+            || (cfg!(unix) && self.external_controller_unix.is_some())
+            || (cfg!(windows) && self.external_controller_pipe.is_some())
+    }
+}
+
+/// Build the BoringSSL acceptor for the `external-controller-tls`
+/// listener from PEM material (leaf first, extra chain certs after) —
+/// shared by the config-build validation gate and the endpoint itself,
+/// so what validates is what serves. `mozilla_intermediate_v5` floors at
+/// TLS 1.2; ALPN advertises exactly the protocols the HTTP stack serves.
+pub fn build_api_tls_acceptor(
+    cert_pem: &[u8],
+    key_pem: &[u8],
+) -> Result<boring::ssl::SslAcceptor, anyhow::Error> {
+    let certs = boring::x509::X509::stack_from_pem(cert_pem)
+        .map_err(|e| anyhow::anyhow!("tls.certificate: not a valid PEM certificate: {e}"))?;
+    if certs.is_empty() {
+        anyhow::bail!("tls.certificate: PEM carries no certificate");
+    }
+    let key = boring::pkey::PKey::private_key_from_pem(key_pem)
+        .map_err(|e| anyhow::anyhow!("tls.private-key: not a valid PEM private key: {e}"))?;
+    build_api_tls_acceptor_from_parts(&certs, &key)
+}
+
+/// The acceptor build itself, on already-decoded identity material — the
+/// `external-controller-tls` endpoint's ephemeral self-signed identity
+/// reaches the same builder without a PEM round-trip (issue #974).
+pub fn build_api_tls_acceptor_from_parts(
+    certs: &[boring::x509::X509],
+    key: &boring::pkey::PKey<boring::pkey::Private>,
+) -> Result<boring::ssl::SslAcceptor, anyhow::Error> {
+    let mut builder =
+        boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
+            .map_err(|e| anyhow::anyhow!("external-controller-tls: {e}"))?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("tls.certificate: no certificate"))?;
+    builder
+        .set_certificate(leaf)
+        .map_err(|e| anyhow::anyhow!("tls.certificate: {e}"))?;
+    for extra in &certs[1..] {
+        builder
+            .add_extra_chain_cert(extra.clone())
+            .map_err(|e| anyhow::anyhow!("tls.certificate chain: {e}"))?;
+    }
+    builder
+        .set_private_key(key)
+        .map_err(|e| anyhow::anyhow!("tls.private-key: {e}"))?;
+    builder.check_private_key().map_err(|e| {
+        anyhow::anyhow!("tls.certificate and tls.private-key do not form a pair: {e}")
+    })?;
+    // Server-side ALPN picks from the *client's* offer in preference
+    // order `h2` then `http/1.1` — `set_alpn_protos` applies to client
+    // contexts, not acceptors.
+    builder.set_alpn_select_callback(|_, client| {
+        boring::ssl::select_next_proto(b"\x02h2\x08http/1.1", client)
+            .ok_or(boring::ssl::AlpnError::NOACK)
+    });
+    Ok(builder.build())
 }
 
 /// When set, config loading validates structure only and performs no remote
@@ -7774,11 +7908,74 @@ async fn build_config_inner(
             }
             dir
         });
+    // `external-controller-{tls,unix,pipe}` keep their strings: `-t` must
+    // validate shape only, and each is resolved at endpoint bind (like
+    // upstream, which never parses them into SockAddrs). `""` disables.
+    let external_controller_tls = raw
+        .external_controller_tls
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    // `tls.certificate`/`tls.private-key` are the HTTPS listener's
+    // identity — both-or-neither *when the TLS listener is declared*
+    // (fatal-on-declared-listener, issue #974): a one-sided pair could
+    // never load an identity, so reject it at build where `-t` sees it
+    // too. Inline PEM pairs are validated here without touching the
+    // filesystem (what validates is what serves); file paths resolve at
+    // endpoint bind, after the home/SAFE_PATHS check.
+    let tls_certificate = raw
+        .tls
+        .as_ref()
+        .and_then(|t| t.certificate.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    let tls_private_key = raw
+        .tls
+        .as_ref()
+        .and_then(|t| t.private_key.as_deref())
+        .filter(|s| !s.is_empty())
+        .map(String::from);
+    if external_controller_tls.is_some() {
+        match (&tls_certificate, &tls_private_key) {
+            (Some(_), None) | (None, Some(_)) => {
+                anyhow::bail!(
+                    "external-controller-tls requires tls.certificate and tls.private-key \
+                     to be set together or both unset (ephemeral self-signed identity)"
+                );
+            }
+            (Some(cert), Some(key))
+                if cert.contains("-----BEGIN") && key.contains("-----BEGIN") =>
+            {
+                build_api_tls_acceptor(cert.as_bytes(), key.as_bytes())
+                    .map_err(|e| anyhow::anyhow!("tls: {e}"))?;
+            }
+            _ => {}
+        }
+    } else if tls_certificate.is_some() || tls_private_key.is_some() {
+        warn!(
+            "tls.certificate/tls.private-key set without external-controller-tls; \
+             the keys only feed the HTTPS controller listener and are ignored"
+        );
+    }
     let api = ApiConfig {
         external_controller: parse_optional_socket_addr(
             "external-controller",
             raw.external_controller.as_deref(),
         )?,
+        external_controller_tls,
+        external_controller_unix: raw
+            .external_controller_unix
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        external_controller_pipe: raw
+            .external_controller_pipe
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(String::from),
+        tls_certificate,
+        tls_private_key,
+        cors: ApiCorsConfig::from_raw(raw.external_controller_cors.as_ref()),
         secret: raw.secret.clone(),
         external_ui,
         external_ui_url: raw
