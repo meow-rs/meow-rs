@@ -862,17 +862,28 @@ mod tls {
             .await
             .unwrap();
         let port = endpoint.addr().port();
-        // A conn the server side closes — garbage instead of a
-        // ClientHello fails the handshake fast — leaves TIME_WAIT on
-        // the listener's port.
-        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        // A real handshake first — the accepted SslStream lands in the
+        // endpoint's ready queue. Dropping the endpoint then drops the
+        // queued stream, so the server side closes first with an
+        // orderly FIN — the only close that parks the accepted socket
+        // in TIME_WAIT (a failed-handshake RST would not).
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        client.write_all(b"not a ClientHello").await.unwrap();
-        // The TLS layer answers garbage with an alert record first; read
-        // until EOF/RST so the assert proves the accepted socket closed.
-        let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let mut builder =
+            boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
+        builder.set_verify(boring::ssl::SslVerifyMode::NONE);
+        let connector = builder.build();
+        let mut client =
+            tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
+                .await
+                .unwrap();
+        drop(endpoint);
+        // The server's FIN must actually arrive: read until EOF, then
+        // answer with the client's own close to finish the exchange —
+        // the accepted socket is TIME_WAIT only once both FINs cross.
+        use tokio::io::AsyncReadExt;
+        let eof = tokio::time::timeout(std::time::Duration::from_secs(3), async {
             let mut buf = [0u8; 64];
             loop {
                 match client.read(&mut buf).await {
@@ -882,10 +893,33 @@ mod tls {
             }
         })
         .await;
-        assert!(closed.is_ok(), "server kept the conn open");
-        drop(endpoint);
-        // A beat for the aborted driver to close the listener fd.
+        assert!(eof.is_ok(), "server kept the conn open");
+        drop(client);
+        // A beat for the last FIN+ACK to land server-side.
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        #[cfg(unix)]
+        {
+            // Prove the premise before crediting SO_REUSEADDR: a socket
+            // without the flag still gets EADDRINUSE — the TIME_WAIT is
+            // really there. (Winsock binds over TIME_WAIT by default, so
+            // this probe is unix-shaped only.)
+            let probe = socket2::Socket::new(
+                socket2::Domain::IPV6,
+                socket2::Type::STREAM,
+                None,
+            )
+            .unwrap();
+            probe.set_only_v6(false).unwrap();
+            let bind_addr: std::net::SocketAddr = format!("[::]:{port}").parse().unwrap();
+            let err = probe
+                .bind(&socket2::SockAddr::from(bind_addr))
+                .unwrap_err();
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::AddrInUse,
+                "no TIME_WAIT on the port — the orderly close did not happen"
+            );
+        }
         let rebound = meow_api::endpoint::bind_tls(&format!(":{port}"), None, None)
             .await
             .expect("rebind must succeed over lingering TIME_WAIT");
