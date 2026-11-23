@@ -25,73 +25,84 @@ mod tls {
     use anyhow::{Context, Result};
     use tracing::{debug, warn};
 
-    /// Resolve a controller listen address into an ordered candidate list
-    /// the way upstream's `Listen("tcp", …)` behaves: a bare `:port` means
-    /// "the wildcard" — `[::]` dual-stack first (accepts v4 *and* v6),
-    /// `0.0.0.0` last for kernels that cannot do IPv6 — and a hostname's
-    /// answers are reordered v4-first (Go's resolver order), each tried in
-    /// turn until one binds. Kept a string until bind so `-t` never
-    /// performs this lookup.
-    async fn resolve_listen_addrs(addr: &str) -> Result<Vec<SocketAddr>> {
-        let bare_port = addr
+    /// What a controller listen address binds, resolved the way
+    /// upstream's `Listen("tcp", …)` behaves. Kept a string until bind
+    /// so `-t` never performs this lookup.
+    enum ListenTarget {
+        /// A bare `:port` means "the wildcard" — `[::]` dual-stack
+        /// first (accepts v4 *and* v6), `0.0.0.0` last for kernels
+        /// that cannot do IPv6. Each candidate is tried in turn.
+        Wildcard(Vec<SocketAddr>),
+        /// A hostname binds the one answer Go's resolver order would
+        /// serve first — the first v4 answer, else the first — once;
+        /// alternate answers are not retried.
+        Single(SocketAddr),
+    }
+
+    async fn resolve_listen_target(addr: &str) -> Result<ListenTarget> {
+        if let Some(port) = addr
             .strip_prefix(':')
             .map(str::parse::<u16>)
             .transpose()
-            .with_context(|| format!("controller address '{addr}': bad port"))?;
-        let normalized = match bare_port {
-            Some(port) => format!("[::]:{port}"),
-            None => addr.to_owned(),
-        };
-        let mut addrs: Vec<SocketAddr> = match tokio::net::lookup_host(&normalized).await {
-            Ok(found) => found.collect(),
-            Err(e) => {
-                // Even resolving [::] needs IPv6 support in the resolver;
-                // the port-only contract is "the wildcard", so a v6-less
-                // host degrades to the v4 wildcard rather than failing.
-                match bare_port {
-                    Some(port) => {
+            .with_context(|| format!("controller address '{addr}': bad port"))?
+        {
+            // Even resolving [::] needs IPv6 support in the resolver;
+            // the port-only contract is "the wildcard", so a v6-less
+            // host degrades to the v4 wildcard rather than failing.
+            let mut addrs: Vec<SocketAddr> =
+                match tokio::net::lookup_host(format!("[::]:{port}")).await {
+                    Ok(found) => found.collect(),
+                    Err(_) => {
                         vec![SocketAddr::new(
                             std::net::Ipv4Addr::UNSPECIFIED.into(),
                             port,
                         )]
                     }
-                    None => {
-                        return Err(e)
-                            .with_context(|| format!("cannot resolve controller address '{addr}'"))
-                    }
-                }
-            }
-        };
-        addrs.sort_by_key(std::net::SocketAddr::is_ipv6);
-        if let Some(port) = bare_port {
-            // Appended after the family sort so the dual-stack wildcard
-            // keeps its lead; the v4 twin is the escape hatch only.
+                };
+            // The v4 twin is appended after [::] so the dual-stack
+            // wildcard keeps its lead — the escape hatch only.
             let fallback = SocketAddr::new(std::net::Ipv4Addr::UNSPECIFIED.into(), port);
             if !addrs.contains(&fallback) {
                 addrs.push(fallback);
             }
+            if addrs.is_empty() {
+                anyhow::bail!("controller address '{addr}' resolved to nothing");
+            }
+            return Ok(ListenTarget::Wildcard(addrs));
         }
+        let mut addrs: Vec<SocketAddr> = tokio::net::lookup_host(addr)
+            .await
+            .with_context(|| format!("cannot resolve controller address '{addr}'"))?
+            .collect();
         if addrs.is_empty() {
             anyhow::bail!("controller address '{addr}' resolved to nothing");
         }
-        Ok(addrs)
+        // Go's resolver order prefers v4 — stable-sort the family so
+        // each family keeps its resolver order, then take the first.
+        addrs.sort_by_key(SocketAddr::is_ipv6);
+        Ok(ListenTarget::Single(addrs[0]))
     }
 
-    /// Bind the first candidate that takes — hostname answers beyond the
-    /// preferred one, or the `:port` v4 fall-back, are what the rest of
-    /// the list is for.
-    async fn bind_tcp_first(addrs: &[SocketAddr]) -> Result<tokio::net::TcpListener> {
-        let mut last_err = None;
-        for addr in addrs {
-            match bind_tcp_dual_stack(*addr).await {
-                Ok(listener) => return Ok(listener),
-                Err(e) => {
-                    warn!("external-controller-tls cannot bind {addr}: {e:#}");
-                    last_err = Some(e);
+    /// Bind the resolved target — the wildcard list's first candidate
+    /// that takes (the `:port` v6-capability fallback), or the
+    /// hostname's single pick.
+    async fn bind_listen_target(target: &ListenTarget) -> Result<tokio::net::TcpListener> {
+        match target {
+            ListenTarget::Single(addr) => bind_tcp_dual_stack(*addr).await,
+            ListenTarget::Wildcard(addrs) => {
+                let mut last_err = None;
+                for addr in addrs {
+                    match bind_tcp_dual_stack(*addr).await {
+                        Ok(listener) => return Ok(listener),
+                        Err(e) => {
+                            warn!("external-controller-tls cannot bind {addr}: {e:#}");
+                            last_err = Some(e);
+                        }
+                    }
                 }
+                Err(last_err.unwrap_or_else(|| anyhow::anyhow!("nothing to bind")))
             }
         }
-        Err(last_err.unwrap_or_else(|| anyhow::anyhow!("nothing to bind")))
     }
 
     /// Bind the resolved TLS listen address. An unspecified v6 address —
@@ -221,8 +232,8 @@ mod tls {
             // point that logs and skips just this listener (issue #974).
             _ => anyhow::bail!("tls.certificate and tls.private-key must be set together"),
         };
-        let candidates = resolve_listen_addrs(addr).await?;
-        let listener = bind_tcp_first(&candidates).await?;
+        let target = resolve_listen_target(addr).await?;
+        let listener = bind_listen_target(&target).await?;
         let local_addr = listener
             .local_addr()
             .context("external-controller-tls bound address")?;
@@ -450,7 +461,10 @@ mod tls {
         async fn resolve_bare_port_offers_dual_stack_then_v4() {
             // `:port` = "the wildcard": [::] dual-stack first, 0.0.0.0
             // last for hosts that cannot do IPv6 (issue #974).
-            let addrs = resolve_listen_addrs(":9090").await.unwrap();
+            let ListenTarget::Wildcard(addrs) = resolve_listen_target(":9090").await.unwrap()
+            else {
+                panic!("bare port must resolve to wildcard candidates");
+            };
             assert_eq!(
                 addrs.as_slice(),
                 [
@@ -461,30 +475,34 @@ mod tls {
         }
 
         #[tokio::test]
-        async fn resolve_orders_hostname_answers_v4_first() {
+        async fn resolve_picks_hostname_v4_answer_once() {
             // localhost answers both families in every stock hosts file;
-            // the reorder must prefer v4 (issue #974).
-            let addrs = resolve_listen_addrs("localhost:0").await.unwrap();
-            assert!(
-                addrs.len() >= 2,
-                "localhost unexpectedly single-stack: {addrs:?}"
-            );
-            assert!(addrs[0].is_ipv4(), "v4 answer must lead: {addrs:?}");
+            // the single pick must be the first v4 one (issue #974).
+            let all: Vec<SocketAddr> = tokio::net::lookup_host("localhost:0")
+                .await
+                .unwrap()
+                .collect();
+            assert!(all.len() >= 2, "localhost unexpectedly single-stack: {all:?}");
+            let ListenTarget::Single(addr) = resolve_listen_target("localhost:0").await.unwrap()
+            else {
+                panic!("hostname must resolve to a single bind target");
+            };
+            assert!(addr.is_ipv4(), "v4 answer must be the pick: {addr}");
         }
 
         #[tokio::test]
         async fn resolve_bad_bare_port_fails() {
-            assert!(resolve_listen_addrs(":notaport").await.is_err());
+            assert!(resolve_listen_target(":notaport").await.is_err());
         }
 
         #[tokio::test]
-        async fn bind_first_walks_candidates_past_failures() {
+        async fn bind_wildcard_walks_candidates_past_failures() {
             // 192.0.2.1 (TEST-NET-1) is never a local address: the first
             // candidate fails and the loop must reach the second.
-            let listener = bind_tcp_first(&[
+            let listener = bind_listen_target(&ListenTarget::Wildcard(vec![
                 SocketAddr::new(std::net::Ipv4Addr::new(192, 0, 2, 1).into(), 0),
                 SocketAddr::new(std::net::Ipv4Addr::LOCALHOST.into(), 0),
-            ])
+            ]))
             .await
             .unwrap();
             assert_eq!(
