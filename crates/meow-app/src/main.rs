@@ -762,6 +762,19 @@ fn apply_ext_controller_overrides(
     }
 }
 
+/// Whether this binary can actually serve one of the configured
+/// controller endpoints. `ApiConfig::has_servable_endpoint` reports the
+/// *configured* set; `external-controller-tls` additionally needs the
+/// `api-tls` build feature (`minimal` compiles the endpoint out,
+/// ADR-0007), so a TLS-only config on a TLS-less build is headless and
+/// must not spawn an API server that binds nothing (issue #974).
+fn api_endpoint_servable(api: &meow_config::ApiConfig) -> bool {
+    api.external_controller.is_some()
+        || (cfg!(feature = "api-tls") && api.external_controller_tls.is_some())
+        || (cfg!(unix) && api.external_controller_unix.is_some())
+        || (cfg!(windows) && api.external_controller_pipe.is_some())
+}
+
 /// Owner of the outbound-interface binding installed ahead of the config
 /// build (see [`preinstall_global_route_binding`]); handed to the TUN
 /// listener, which keeps it for as long as its routes exist.
@@ -1567,7 +1580,7 @@ async fn run(
             .and_then(|d| d.nftset.as_ref())
             .and_then(|n| n.parse().ok().flatten()),
     );
-    if !config.api.has_servable_endpoint() {
+    if !api_endpoint_servable(&config.api) {
         // No API can inspect individual connections. Keep cancellation handles
         // for cold reloads without storing their display metadata.
         tunnel.statistics().set_headless();
@@ -2077,7 +2090,7 @@ async fn run(
     #[cfg(unix)]
     let mut _unix_socket_guard: Option<meow_api::endpoint::UnixSocketGuard> = None;
     // Non-native transports configured by config key or CLI override warn
-    // here too — `has_servable_endpoint` already excludes them, so an
+    // here too — `api_endpoint_servable` already excludes them, so an
     // unsupported-only config would otherwise go silent (issue #974).
     #[cfg(not(unix))]
     if let Some(ref unix_path) = config.api.external_controller_unix {
@@ -2095,7 +2108,7 @@ async fn run(
     if let Some(ref tls_addr) = config.api.external_controller_tls {
         warn!("external-controller-tls '{tls_addr}' ignored — the HTTPS controller is not compiled into this build (feature 'api-tls')");
     }
-    if config.api.has_servable_endpoint() {
+    if api_endpoint_servable(&config.api) {
         // `external-ui-url` auto-download is gated behind the optional
         // `external-ui-download` feature (it pulls in the `zip` crate, against
         // the ADR-0007 size caps). Without the feature we just hint the user to
@@ -2734,6 +2747,40 @@ mod tests {
             api.external_controller_pipe.as_deref(),
             Some(r"\\.\pipe\meow")
         );
+    }
+
+    #[test]
+    fn servable_gate_applies_the_api_tls_build_flag() {
+        // `ApiConfig::has_servable_endpoint` is the *configured* set;
+        // the startup predicate adds the compile gate: a TLS-only config
+        // is servable exactly when `api-tls` built the endpoint, else the
+        // daemon is headless (issue #974).
+        let base = meow_config::ApiConfig {
+            external_controller: None,
+            external_controller_tls: None,
+            external_controller_unix: None,
+            external_controller_pipe: None,
+            tls_certificate: None,
+            tls_private_key: None,
+            cors: Default::default(),
+            secret: None,
+            external_ui: None,
+            external_ui_url: None,
+        };
+        let mut api = meow_config::ApiConfig {
+            external_controller_tls: Some("127.0.0.1:9443".into()),
+            ..base
+        };
+        assert_eq!(api_endpoint_servable(&api), cfg!(feature = "api-tls"));
+        // Dead TLS config never drags a live endpoint down — a TLS+unix
+        // config on a TLS-less build still serves the socket.
+        api.external_controller = Some("127.0.0.1:9090".parse().unwrap());
+        assert!(api_endpoint_servable(&api));
+        api.external_controller = None;
+        api.external_controller_unix = Some("meow.sock".into());
+        assert_eq!(api_endpoint_servable(&api), cfg!(unix));
+        api.external_controller_pipe = Some(r"\\.\pipe\meow".into());
+        assert_eq!(api_endpoint_servable(&api), cfg!(any(unix, windows)));
     }
 
     // Upstream `MRS\x01` fixture writers — the same shapes the
