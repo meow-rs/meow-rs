@@ -688,21 +688,12 @@ fn run_application_inner(
             config.api.external_controller = Some(addr);
             info!("External controller overridden by --ext-ctl: {addr}");
         }
-        // The extended controller flags override the matching raw keys
-        // verbatim (issue #974): strings, resolved at endpoint bind like
-        // the config values they replace.
-        if let Some(ref ctl) = args.ext_ctl_tls {
-            config.api.external_controller_tls = Some(ctl.clone());
-            info!("External controller TLS overridden by --ext-ctl-tls: {ctl}");
-        }
-        if let Some(ref ctl) = args.ext_ctl_unix {
-            config.api.external_controller_unix = Some(ctl.clone());
-            info!("External controller unix socket overridden by --ext-ctl-unix: {ctl}");
-        }
-        if let Some(ref ctl) = args.ext_ctl_pipe {
-            config.api.external_controller_pipe = Some(ctl.clone());
-            info!("External controller pipe overridden by --ext-ctl-pipe: {ctl}");
-        }
+        apply_ext_controller_overrides(
+            args.ext_ctl_tls.as_deref(),
+            args.ext_ctl_unix.as_deref(),
+            args.ext_ctl_pipe.as_deref(),
+            &mut config.api,
+        );
         if let Some(ref ui) = args.ext_ui {
             config.api.external_ui = Some(std::path::PathBuf::from(ui));
             info!("External UI overridden by --ext-ui");
@@ -744,6 +735,31 @@ fn read_api_secret(path: &Path) -> Result<String> {
     }
     secret.truncate(line.len());
     Ok(secret)
+}
+
+/// The extended controller flags (`--ext-ctl-tls` / `-unix` / `-pipe`)
+/// override the matching raw keys verbatim (issue #974): strings,
+/// resolved at endpoint bind like the config values they replace. Like
+/// upstream, an *empty* override is not applied — `--ext-ctl-tls ''`
+/// must not erase a YAML endpoint.
+fn apply_ext_controller_overrides(
+    ext_ctl_tls: Option<&str>,
+    ext_ctl_unix: Option<&str>,
+    ext_ctl_pipe: Option<&str>,
+    api: &mut meow_config::ApiConfig,
+) {
+    if let Some(ctl) = ext_ctl_tls.filter(|s| !s.is_empty()) {
+        api.external_controller_tls = Some(ctl.to_owned());
+        info!("External controller TLS overridden by --ext-ctl-tls: {ctl}");
+    }
+    if let Some(ctl) = ext_ctl_unix.filter(|s| !s.is_empty()) {
+        api.external_controller_unix = Some(ctl.to_owned());
+        info!("External controller unix socket overridden by --ext-ctl-unix: {ctl}");
+    }
+    if let Some(ctl) = ext_ctl_pipe.filter(|s| !s.is_empty()) {
+        api.external_controller_pipe = Some(ctl.to_owned());
+        info!("External controller pipe overridden by --ext-ctl-pipe: {ctl}");
+    }
 }
 
 /// Owner of the outbound-interface binding installed ahead of the config
@@ -2639,6 +2655,74 @@ mod tests {
             "controller-secret",
         ]);
         assert!(matches!(result, Err(e) if e.kind() == clap::error::ErrorKind::ArgumentConflict));
+    }
+
+    #[test]
+    fn empty_ext_ctl_overrides_keep_yaml_endpoints() {
+        // `--ext-ctl-tls ''` is an empty override: applied verbatim it
+        // would erase a configured endpoint — upstream skips empties
+        // (issue #974).
+        let args = Args::try_parse_from([
+            "meow",
+            "--ext-ctl-tls",
+            "",
+            "--ext-ctl-unix",
+            "",
+            "--ext-ctl-pipe",
+            "",
+        ])
+        .unwrap();
+        let mut api = meow_config::ApiConfig {
+            external_controller: None,
+            external_controller_tls: Some("127.0.0.1:9443".into()),
+            external_controller_unix: Some("/tmp/meow.sock".into()),
+            external_controller_pipe: Some(r"\\.\pipe\meow".into()),
+            tls_certificate: None,
+            tls_private_key: None,
+            cors: Default::default(),
+            secret: None,
+            external_ui: None,
+            external_ui_url: None,
+        };
+        apply_ext_controller_overrides(
+            args.ext_ctl_tls.as_deref(),
+            args.ext_ctl_unix.as_deref(),
+            args.ext_ctl_pipe.as_deref(),
+            &mut api,
+        );
+        assert_eq!(
+            api.external_controller_tls.as_deref(),
+            Some("127.0.0.1:9443")
+        );
+        assert_eq!(
+            api.external_controller_unix.as_deref(),
+            Some("/tmp/meow.sock")
+        );
+        assert_eq!(
+            api.external_controller_pipe.as_deref(),
+            Some(r"\\.\pipe\meow")
+        );
+
+        // Nonempty overrides replace — and a mix replaces only its own key.
+        let args = Args::try_parse_from(["meow", "--ext-ctl-unix", "/tmp/cli.sock"]).unwrap();
+        apply_ext_controller_overrides(
+            args.ext_ctl_tls.as_deref(),
+            args.ext_ctl_unix.as_deref(),
+            args.ext_ctl_pipe.as_deref(),
+            &mut api,
+        );
+        assert_eq!(
+            api.external_controller_unix.as_deref(),
+            Some("/tmp/cli.sock")
+        );
+        assert_eq!(
+            api.external_controller_tls.as_deref(),
+            Some("127.0.0.1:9443")
+        );
+        assert_eq!(
+            api.external_controller_pipe.as_deref(),
+            Some(r"\\.\pipe\meow")
+        );
     }
 
     // Upstream `MRS\x01` fixture writers — the same shapes the
