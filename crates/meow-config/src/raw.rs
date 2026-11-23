@@ -593,10 +593,10 @@ where
 /// The `external-controller-cors:` section (issue #974) — mihomo's
 /// `RawCors`. A partial map overrides only the supplied keys;
 /// [`crate::ApiCorsConfig`] resolves the rest (`allow-origins: ["*"]`,
-/// `allow-private-network: true`). Whether the map is present at all is
-/// itself meaningful upstream — absent selects the permissive `AllowAll`
-/// middleware, present (even `{}`) selects the configured `cors.New`
-/// path — so [`RawConfig::external_controller_cors`] keeps the `Option`.
+/// `allow-private-network: true`). Under a configured secret, absent and
+/// present maps resolve identically — upstream's permissive `AllowAll`
+/// middleware fires only on an explicit `secret: ""` — but the `Option`
+/// stays so a saved config preserves whether the map was written.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Default)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawCors {
@@ -752,9 +752,9 @@ pub struct RawConfig {
     #[serde(default, deserialize_with = "deserialize_weak_string")]
     pub external_controller_pipe: Option<String>,
     /// `external-controller-cors:` — the controller's CORS policy
-    /// (issue #974). The `Option` is load-bearing: absent selects
-    /// upstream's permissive `AllowAll` middleware, present (even `{}`)
-    /// selects the configured path.
+    /// (issue #974). The `Option` preserves whether the map was written
+    /// for round-tripping; for serving, absent and present resolve
+    /// identically under a configured secret.
     pub external_controller_cors: Option<RawCors>,
     /// `tls:` — mihomo's top-level TLS section (issue #974); this batch
     /// uses only `certificate`/`private-key` for the

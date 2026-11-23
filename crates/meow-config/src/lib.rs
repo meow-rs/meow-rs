@@ -1186,12 +1186,6 @@ pub struct ListenerConfig {
 /// commits the raw section but the live policy stays frozen until restart.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApiCorsConfig {
-    /// Whether an `external-controller-cors:` map was present at all —
-    /// upstream selects the configured `cors.New` middleware on a present
-    /// map (even `{}`) and the permissive `AllowAll` middleware when it
-    /// is absent; the two emit different wire shapes (see the issue
-    /// #974 appendix probes).
-    pub configured: bool,
     /// Resolved `allow-origins`: default `["*"]`; an explicit `[]` and a
     /// `*` entry both mean allow-all (weird-but-real, probe-verified).
     pub allow_origins: Vec<String>,
@@ -1200,10 +1194,10 @@ pub struct ApiCorsConfig {
 }
 
 impl Default for ApiCorsConfig {
-    /// The absent-map permissive defaults.
+    /// Upstream's `cors.New` defaults — the same resolution an absent
+    /// `external-controller-cors:` map gets under a configured secret.
     fn default() -> Self {
         Self {
-            configured: false,
             allow_origins: vec!["*".to_string()],
             allow_private_network: true,
         }
@@ -1211,13 +1205,14 @@ impl Default for ApiCorsConfig {
 }
 
 impl ApiCorsConfig {
-    /// Resolve the raw section: absent → permissive; present → per-key
-    /// merge over the `["*"]`/`true` defaults (issue #974).
+    /// Resolve the raw section. Under a configured secret, absent and
+    /// present maps resolve identically on the `["*"]`/`true` defaults —
+    /// upstream gates its permissive `AllowAll` middleware on an explicit
+    /// `secret: ""`, not on the map's presence (issue #974).
     pub fn from_raw(raw: Option<&raw::RawCors>) -> Self {
         match raw {
             None => Self::default(),
             Some(cors) => Self {
-                configured: true,
                 allow_origins: cors
                     .allow_origins
                     .clone()

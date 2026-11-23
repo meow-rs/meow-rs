@@ -636,9 +636,7 @@ pub fn create_router(state: Arc<AppState>) -> Router {
     // upstream mounts the middleware on the router itself. Deliberate
     // divergence (issue #974): the no-secret mode keeps its no-grants
     // posture and mounts no CORS layer at all — cross-origin dashboards
-    // must configure a secret. The two response shapes (permissive
-    // absent-map vs configured `external-controller-cors:`) dispatch
-    // inside `cors::handle` on the startup snapshot.
+    // must configure a secret.
     let router = if auth_required {
         router.layer(middleware::from_fn_with_state(
             Arc::clone(&state),

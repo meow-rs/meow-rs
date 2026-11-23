@@ -1,18 +1,19 @@
 //! Controller CORS middleware (issue #974).
 //!
-//! Mirrors the wire behaviour of the linked metacubex/chi CORS package
-//! upstream uses on the controller router, which `tower-http::CorsLayer`
-//! cannot reproduce: two distinct response shapes keyed on whether an
-//! `external-controller-cors:` map was *present* in the config at all.
+//! Mirrors the wire behaviour of the configured `cors.New` middleware
+//! upstream links on the controller router, which `tower-http::CorsLayer`
+//! cannot reproduce: the echo'd `Origin`, the single requested method
+//! uppercased, canonical requested headers, `Access-Control-Max-Age:
+//! 300`, three separate `vary` adds, a denied preflight answered `200`
+//! with only the `vary` trio, and `HEAD` never in the allow-methods set.
 //!
-//! - **Absent map** → the permissive `AllowAll` shape: literal `*` for
-//!   allow-methods/-headers/-origin on a 200 preflight and a single
-//!   combined `vary` header.
-//! - **Present map** (even `{}`) → the configured `cors.New` shape: the
-//!   echo'd `Origin`, the single requested method uppercased, canonical
-//!   requested headers, `Access-Control-Max-Age: 300`, three separate
-//!   `vary` adds, a denied preflight answered `200` with only the `vary`
-//!   trio, and `HEAD` never in the allow-methods set.
+//! The `external-controller-cors:` map's *presence* does not select
+//! middleware: under a configured secret an absent map serves this same
+//! configured path on `["*"]`/`true` defaults. Upstream's permissive
+//! `AllowAll` shape fires only under an explicit `secret: ""`
+//! (probe-verified), and meow mounts no CORS layer without a secret at
+//! all (deliberate divergence — the origin guard already 403s
+//! cross-origin requests), so AllowAll has no meow counterpart.
 
 use std::sync::Arc;
 
@@ -46,9 +47,6 @@ const AC_ALLOW_PRIVATE_NETWORK: &str = "access-control-allow-private-network";
 const VARY_ORIGIN: HeaderValue = HeaderValue::from_static("origin");
 const VARY_ACRM: HeaderValue = HeaderValue::from_static("access-control-request-method");
 const VARY_ACRH: HeaderValue = HeaderValue::from_static("access-control-request-headers");
-const VARY_COMBINED: HeaderValue = HeaderValue::from_static(
-    "origin, access-control-request-method, access-control-request-headers",
-);
 const STAR: HeaderValue = HeaderValue::from_static("*");
 
 /// `true` when the request is a CORS preflight: `OPTIONS` carrying both
@@ -114,32 +112,17 @@ fn canonical_header_key(s: &str) -> String {
     out
 }
 
-/// The permissive `AllowAll` middleware — verbatim wire mirror of the
-/// absent-map upstream shape (issue #974).
-async fn handle_permissive(req: Request<Body>, next: Next) -> Response<Body> {
-    if is_preflight(&req) {
-        let mut resp = Response::new(Body::empty());
-        *resp.status_mut() = StatusCode::OK;
-        let h = resp.headers_mut();
-        h.insert(header::ACCESS_CONTROL_ALLOW_METHODS, STAR);
-        h.insert(header::ACCESS_CONTROL_ALLOW_HEADERS, STAR);
-        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, STAR);
-        h.insert(header::VARY, VARY_COMBINED);
-        return resp;
-    }
-    let had_origin = req.headers().contains_key(header::ORIGIN);
-    let mut resp = next.run(req).await;
-    let h = resp.headers_mut();
-    if had_origin {
-        h.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, STAR);
-    }
-    h.append(header::VARY, VARY_ORIGIN);
-    resp
-}
-
 /// The configured `cors.New` middleware — verbatim wire mirror of the
-/// present-map upstream shape (issue #974).
-async fn handle_configured(state: &AppState, req: Request<Body>, next: Next) -> Response<Body> {
+/// upstream shape (issue #974). Mounted outside Bearer auth (so
+/// preflights answer) only when a secret is configured — the no-secret
+/// controller deliberately emits no CORS grants behind its
+/// Host/Origin/Fetch-Site guard. Every transport — plain TCP, TLS, the
+/// Unix socket and the Windows named pipe — serves the same router.
+pub async fn handle(
+    State(state): State<Arc<AppState>>,
+    req: Request<Body>,
+    next: Next,
+) -> Response<Body> {
     let cors = &state.cors;
     if !is_preflight(&req) {
         let origin = req
@@ -254,22 +237,4 @@ async fn handle_configured(state: &AppState, req: Request<Body>, next: Next) -> 
         h.insert(AC_ALLOW_PRIVATE_NETWORK, HeaderValue::from_static("true"));
     }
     resp
-}
-
-/// Dispatch on the startup snapshot — the two middlewares never mix their
-/// header sets (issue #974). Mounted outside Bearer auth (so preflights
-/// answer) only when a secret is configured — the no-secret controller
-/// deliberately emits no CORS grants behind its Host/Origin/Fetch-Site
-/// guard. Every transport — plain TCP, TLS, the Unix socket and the
-/// Windows named pipe — serves the same router.
-pub async fn handle(
-    State(state): State<Arc<AppState>>,
-    req: Request<Body>,
-    next: Next,
-) -> Response<Body> {
-    if state.cors.configured {
-        handle_configured(&state, req, next).await
-    } else {
-        handle_permissive(req, next).await
-    }
 }

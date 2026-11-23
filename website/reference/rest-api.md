@@ -32,8 +32,9 @@ external-controller-cors:
 
 - **REST auth:** `Authorization: Bearer <secret>`.
 - **WebSocket auth:** the bearer header *or* `?token=<secret>`.
-- **Browser access:** With a secret, CORS is permissive (`Access-Control-Allow-Origin: *`)
-  unless `external-controller-cors:` configures it. Without a secret, use an IP
+- **Browser access:** With a secret, an unset `external-controller-cors:` resolves
+  allow-all defaults (`Access-Control-Allow-Origin: *`) in upstream's configured
+  `cors.New` shape. Without a secret, use an IP
   address or `localhost` and keep the dashboard on the controller's origin — an
   `https://` origin counts as same-origin over `external-controller-tls`.
   This applies to both REST and WebSocket requests, on every transport.

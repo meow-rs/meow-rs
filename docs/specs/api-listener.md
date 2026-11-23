@@ -31,8 +31,8 @@ In scope:
 - `external-controller-pipe` — parsed on every platform, served on
   Windows only (`\\.\pipe\NAME`, byte mode, remote clients rejected).
 - `external-controller-cors:` — `allow-origins` and
-  `allow-private-network`, with two distinct middleware wire shapes
-  depending on whether the map is *present at all*.
+  `allow-private-network`; under a configured secret, absent and
+  present maps serve the same configured-middleware wire shape.
 - CLI flags `--ext-ctl-tls`, `--ext-ctl-unix`, `--ext-ctl-pipe` —
   post-load overrides over the matching config keys.
 - `external-controller-routing-mark`, `tls.client-auth-type`,
@@ -161,25 +161,27 @@ served and creation retries on the next accept. Serving is
 warns and is ignored (also at validate time). Windows parity is untested
 on real Windows.
 
-## CORS contract (two wire shapes, keyed on map *presence*)
+## CORS contract (the configured `cors.New` shape)
 
 Mounted identically on every transport, outside Bearer auth so
-preflights answer; it does not make actual routes public. One
-deliberate divergence: with no `secret` configured the middleware is
-not mounted at all — the Host/Origin/Sec-Fetch-Site guard already
-admits only same-origin browser requests, and emitting CORS grants on
-top of a 403-rejected origin would leak a false promise (upstream's
-`AllowAll` would answer `*`).
+preflights answer; it does not make actual routes public. Upstream's
+middleware selection (probe-verified, issue #974):
 
-**Absent map** → upstream's permissive `AllowAll` middleware:
+| `external-controller-cors:` map | `secret` | Upstream middleware |
+|---|---|---|
+| present | any | configured path (resolved keys) |
+| absent | `""` explicitly | permissive `AllowAll` (`*` grants, combined `vary`) |
+| absent | set or unset | configured path on `["*"]`/`true` defaults |
 
-- preflight → `200` + `Access-Control-Allow-Origin/Methods/Headers: *`
-  + one combined `Vary: origin, access-control-request-method,
-  access-control-request-headers`;
-- actual request with `Origin` → `Access-Control-Allow-Origin: *`;
-- every response appends `Vary: origin`.
+Only an explicit `secret: ""` fires the permissive path — map presence
+alone never does. meow mounts the CORS layer only under a configured
+secret, so the `AllowAll` row has no meow counterpart: with `secret`
+unset *or* `""` the controller mounts no CORS middleware at all and the
+Host/Origin/Sec-Fetch-Site guard answers cross-origin preflights 403 —
+it already admits only same-origin browser requests, and emitting `*`
+grants on top of a 403-rejected origin would leak a false promise.
 
-**Present map** (even `{}`) → the configured `cors.New` path:
+The configured-path wire shape:
 
 - preflight → always `200` with the `vary` trio (three separate
   headers); CORS headers ride only when origin, method and requested
@@ -195,9 +197,9 @@ top of a 403-rejected origin would leak a false promise (upstream's
   every requested name passes the upstream allowlist
   `{content-type, authorization, origin}` (case-insensitive); one
   unsupported name denies the whole grant, it is not trimmed. (The
-  configured path never emits the absent-path's literal `*` here — a
-  `*` is a wildcard to Fetch only for non-credentialed requests, which
-  is why upstream's `AllowAll` shape gets away with it.);
+  configured path never emits `AllowAll`'s literal `*` here — a `*` is
+  a wildcard to Fetch only for non-credentialed requests, which is why
+  upstream's `AllowAll` shape gets away with it.);
 - `Access-Control-Max-Age: 300`;
 - `Access-Control-Allow-Private-Network: true` only when
   `allow-private-network` resolved true (default) *and* the request
@@ -227,7 +229,7 @@ surface the TLS/CORS keys — private key material is never echoed.
 - `crates/meow-config/src/validation.rs` — misplaced/member/platform
   warnings.
 - `crates/meow-config/src/safe_path.rs` — `resolve_home_contained`.
-- `crates/meow-api/src/cors.rs` — the two-path CORS middleware.
+- `crates/meow-api/src/cors.rs` — the configured-path CORS middleware.
 - `crates/meow-api/src/endpoint.rs` — `bind_tls` (+ BoringSSL acceptor
   builder, handshake driver, ephemeral identity, dual-stack wildcard)
   under `api-tls`, `bind_unix` (+ stale reclaim, `0600` enforcement,

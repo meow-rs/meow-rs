@@ -4747,16 +4747,18 @@ async fn controller_with_secret_allows_authenticated_cross_origin_dashboards() {
         preflight.headers()[header::ACCESS_CONTROL_ALLOW_ORIGIN],
         "*"
     );
-    // The absent-map permissive shape grants the literal `*` like
-    // upstream's chi AllowAll middleware (issue #974).
+    // Absent map under a configured secret resolves `["*"]`/`true` — the
+    // configured-path shape: method echo, canonicalized header echo and
+    // max-age 300 (issue #974).
     assert_eq!(
         preflight.headers()[header::ACCESS_CONTROL_ALLOW_HEADERS],
-        "*"
+        "Authorization, Content-Type"
     );
     assert_eq!(
         preflight.headers()[header::ACCESS_CONTROL_ALLOW_METHODS],
-        "*"
+        "GET"
     );
+    assert_eq!(preflight.headers()[header::ACCESS_CONTROL_MAX_AGE], "300");
 
     let response = app
         .oneshot(

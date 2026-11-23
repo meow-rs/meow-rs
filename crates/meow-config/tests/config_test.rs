@@ -5244,27 +5244,20 @@ external-controller-pipe: '\\.\pipe\meow'
     }
 
     #[tokio::test]
-    async fn cors_absent_is_permissive_and_present_merges() {
-        // Absent map → `configured: false` → the permissive middleware shape.
-        let config = load_config_from_str("mode: rule\n").await.unwrap();
-        assert!(!config.api.cors.configured);
-        assert_eq!(config.api.cors.allow_origins, vec!["*"]);
-        assert!(config.api.cors.allow_private_network);
-
-        // `{}` → configured path with all defaults.
-        let config = load_config_from_str("external-controller-cors: {}\n")
-            .await
-            .unwrap();
-        assert!(config.api.cors.configured);
-        assert_eq!(config.api.cors.allow_origins, vec!["*"]);
-        assert!(config.api.cors.allow_private_network);
-
-        // `null` behaves as absent-key → defaults, still configured.
-        let config = load_config_from_str("external-controller-cors:\n  allow-origins: null\n")
-            .await
-            .unwrap();
-        assert!(config.api.cors.configured);
-        assert_eq!(config.api.cors.allow_origins, vec!["*"]);
+    async fn cors_absent_and_present_resolve_identically() {
+        // Under a configured secret the map's presence does not select
+        // middleware — absent, `{}` and `null`-only maps all resolve to
+        // the configured path's `["*"]`/`true` defaults; upstream's
+        // permissive AllowAll fires only on `secret: ""` (issue #974).
+        for yaml in [
+            "mode: rule\n",
+            "external-controller-cors: {}\n",
+            "external-controller-cors:\n  allow-origins: null\n",
+        ] {
+            let config = load_config_from_str(yaml).await.unwrap();
+            assert_eq!(config.api.cors.allow_origins, vec!["*"], "{yaml}");
+            assert!(config.api.cors.allow_private_network, "{yaml}");
+        }
 
         // Partial maps merge by key.
         let config = load_config_from_str(

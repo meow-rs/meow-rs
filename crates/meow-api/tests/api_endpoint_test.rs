@@ -1,7 +1,7 @@
 //! Issue #974 — the extended controller surface: `external-controller-tls`,
 //! `external-controller-unix`, `external-controller-pipe` and
-//! `external-controller-cors`. Wire-level tests for the two-path CORS
-//! middleware and the TLS/Unix endpoint transports.
+//! `external-controller-cors`. Wire-level tests for the configured-path
+//! CORS middleware and the TLS/Unix endpoint transports.
 
 use axum::http::{header, Request, StatusCode};
 use dashmap::DashMap;
@@ -108,10 +108,50 @@ fn preflight(
     b.body(axum::body::Body::empty()).unwrap()
 }
 
-// ── absent-map permissive path ──────────────────────────────────────
+// ── absent map → configured defaults ────────────────────────────────
+//
+// Probe-corrected (issue #974): under a configured secret an absent
+// `external-controller-cors:` map serves the configured `cors.New` path
+// on `["*"]`/`true` defaults — upstream's permissive AllowAll fires only
+// on an explicit `secret: ""`, which meow serves no CORS for at all.
 
 #[tokio::test]
-async fn cors_absent_map_preflight_permissive_shape() {
+async fn cors_absent_map_preflight_uses_configured_defaults() {
+    let state = test_state(Default::default(), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(preflight(
+            "https://dashboard.example",
+            "GET",
+            Some("authorization, content-type"),
+            false,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let h = resp.headers();
+    // The resolved defaults are `["*"]`/`true`, so the allow-all `*`
+    // rides `ACAO` — but everything else is the configured shape.
+    assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    assert_eq!(h[header::ACCESS_CONTROL_ALLOW_METHODS], "GET");
+    assert_eq!(
+        h[header::ACCESS_CONTROL_ALLOW_HEADERS],
+        "Authorization, Content-Type"
+    );
+    assert_eq!(h[header::ACCESS_CONTROL_MAX_AGE], "300");
+    assert_eq!(
+        vary_values(&resp),
+        vec![
+            "origin",
+            "access-control-request-method",
+            "access-control-request-headers"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn cors_absent_map_preflight_denies_unlisted_request_header() {
+    // The configured-path header allowlist applies even to absent-map
+    // defaults — `x-anything` denies the whole grant.
     let state = test_state(Default::default(), Some("s3cret"));
     let resp = create_router(state)
         .oneshot(preflight(
@@ -124,19 +164,20 @@ async fn cors_absent_map_preflight_permissive_shape() {
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let h = resp.headers();
-    // The linked chi AllowAll middleware shape: literal `*` everywhere and
-    // ONE combined vary — never the configured path's per-name adds.
-    assert_eq!(h[header::ACCESS_CONTROL_ALLOW_METHODS], "*");
-    assert_eq!(h[header::ACCESS_CONTROL_ALLOW_HEADERS], "*");
-    assert_eq!(h[header::ACCESS_CONTROL_ALLOW_ORIGIN], "*");
+    assert!(!h.contains_key(header::ACCESS_CONTROL_ALLOW_ORIGIN));
+    assert!(!h.contains_key(header::ACCESS_CONTROL_ALLOW_METHODS));
     assert_eq!(
         vary_values(&resp),
-        vec!["origin, access-control-request-method, access-control-request-headers"]
+        vec![
+            "origin",
+            "access-control-request-method",
+            "access-control-request-headers"
+        ]
     );
 }
 
 #[tokio::test]
-async fn cors_absent_map_actual_request_gets_star() {
+async fn cors_absent_map_actual_request_uses_defaults() {
     let state = test_state(Default::default(), Some("s3cret"));
     let resp = create_router(state)
         .oneshot(
@@ -195,7 +236,6 @@ async fn cors_absent_map_no_origin_gets_vary_only() {
 
 fn configured(origins: &[&str], pna: bool) -> meow_config::ApiCorsConfig {
     meow_config::ApiCorsConfig {
-        configured: true,
         allow_origins: origins.iter().map(ToString::to_string).collect(),
         allow_private_network: pna,
     }
@@ -456,7 +496,7 @@ async fn cors_bare_options_reaches_router_as_405() {
 
 #[tokio::test]
 async fn allow_header_absent_on_preflights() {
-    // Allowed preflight (absent-map permissive path).
+    // Allowed preflight (absent map → configured defaults).
     let state = test_state(Default::default(), Some("s3cret"));
     let resp = create_router(state)
         .oneshot(preflight("https://any.example", "GET", None, false))
