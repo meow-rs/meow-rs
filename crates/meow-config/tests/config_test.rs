@@ -5099,6 +5099,21 @@ external-controller-pipe: '\\.\pipe\meow'
             };
             assert_eq!(got.as_deref(), Some("5"), "{key}");
         }
+        // YAML 1.2's core schema resolves only `true`/`false` as booleans:
+        // a legacy `yes` spelling reaches the weak decoder as a plain
+        // string and passes through verbatim — unquoted or quoted makes
+        // no difference (issue #974).
+        for spelling in [
+            "external-controller-tls: yes\n",
+            "external-controller-tls: 'yes'\n",
+        ] {
+            let config = load_config_from_str(spelling).await.unwrap();
+            assert_eq!(
+                config.api.external_controller_tls.as_deref(),
+                Some("yes"),
+                "{spelling}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -5124,22 +5139,53 @@ external-controller-pipe: '\\.\pipe\meow'
     }
 
     #[tokio::test]
-    async fn tls_section_requires_both_pems_with_tls_listener() {
-        // One-sided pair + declared TLS listener is a hard build error
-        // (fatal-on-declared-listener).
+    async fn tls_one_sided_pair_is_shape_only_at_build() {
+        // Upstream `-t` accepts a one-sided pair — every identity
+        // failure defers to endpoint bind, so the values are kept and
+        // bind_tls fails just that endpoint at startup (issue #974).
         for yaml in [
             "external-controller-tls: '127.0.0.1:9443'\ntls:\n  certificate: x\n",
             "external-controller-tls: '127.0.0.1:9443'\ntls:\n  private-key: x\n",
         ] {
-            let e = load_config_from_str(yaml)
+            let config = load_config_from_str(yaml)
                 .await
-                .err()
-                .expect("one-sided tls pair must fail");
-            assert!(
-                e.to_string().contains("tls.certificate"),
-                "expected the pair check to name the keys: {e}"
-            );
+                .expect("one-sided tls pair must build (shape only)");
+            assert!(config.api.external_controller_tls.is_some());
         }
+        let cert_only = load_config_from_str(
+            "external-controller-tls: '127.0.0.1:9443'\ntls:\n  certificate: x\n",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cert_only.api.tls_certificate.as_deref(), Some("x"));
+        assert_eq!(cert_only.api.tls_private_key, None);
+    }
+
+    #[tokio::test]
+    async fn extended_endpoints_alone_count_as_servable() {
+        // Startup must not treat `external-controller` as the only real
+        // endpoint — TLS-only (every platform) and unix-only (unix
+        // platforms) configs keep the API up (issue #974).
+        let config = load_config_from_str("external-controller-tls: '127.0.0.1:9443'\n")
+            .await
+            .unwrap();
+        assert!(config.api.has_servable_endpoint());
+        #[cfg(unix)]
+        {
+            let config = load_config_from_str("external-controller-unix: 'meow.sock'\n")
+                .await
+                .unwrap();
+            assert!(config.api.has_servable_endpoint());
+        }
+        // The pipe endpoint serves nowhere but Windows — on Darwin/Linux
+        // a pipe-only config is not servable, on Windows it is.
+        let config = load_config_from_str("external-controller-pipe: '\\\\.\\pipe\\meow'\n")
+            .await
+            .unwrap();
+        assert_eq!(config.api.has_servable_endpoint(), cfg!(windows));
+        // And nothing at all → nothing servable.
+        let config = load_config_from_str("").await.unwrap();
+        assert!(!config.api.has_servable_endpoint());
     }
 
     #[tokio::test]
@@ -5280,14 +5326,18 @@ external-controller-pipe: '\\.\pipe\meow'
     }
 
     #[tokio::test]
-    async fn tls_bad_inline_pem_fails_at_build() {
-        // Inline-PEM pair: no filesystem involved — the cert *content* is
-        // validated at build when the TLS listener is declared.
+    async fn tls_bad_inline_pem_is_shape_only_at_build() {
+        // Inline PEM material is *content*, not shape — upstream accepts
+        // a bogus pair at `-t` and fails the endpoint at bind (issue
+        // #974), so build keeps the values untouched and never parses
+        // the PEM.
         let yaml = "external-controller-tls: '127.0.0.1:9443'\ntls:\n  certificate: '-----BEGIN CERTIFICATE-----\\nbogus\\n-----END CERTIFICATE-----'\n  private-key: '-----BEGIN PRIVATE KEY-----\\nbogus\\n-----END PRIVATE KEY-----'\n";
-        let e = load_config_from_str(yaml)
+        let config = load_config_from_str(yaml)
             .await
-            .err()
-            .expect("bogus inline PEM must fail at build");
-        assert!(e.to_string().contains("tls"), "{e}");
+            .expect("bogus inline PEM must build (shape only)");
+        assert_eq!(
+            config.api.tls_certificate.as_deref(),
+            Some("-----BEGIN CERTIFICATE-----\\nbogus\\n-----END CERTIFICATE-----")
+        );
     }
 }

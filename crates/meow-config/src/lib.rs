@@ -1272,8 +1272,8 @@ impl ApiConfig {
 
 /// Build the BoringSSL acceptor for the `external-controller-tls`
 /// listener from PEM material (leaf first, extra chain certs after) —
-/// shared by the config-build validation gate and the endpoint itself,
-/// so what validates is what serves. `mozilla_intermediate_v5` floors at
+/// called at endpoint bind, never at config build (`-t` touches no PEM
+/// material or files). `mozilla_intermediate_v5` floors at
 /// TLS 1.2; ALPN advertises exactly the protocols the HTTP stack serves.
 pub fn build_api_tls_acceptor(
     cert_pem: &[u8],
@@ -7917,12 +7917,12 @@ async fn build_config_inner(
         .filter(|s| !s.is_empty())
         .map(String::from);
     // `tls.certificate`/`tls.private-key` are the HTTPS listener's
-    // identity — both-or-neither *when the TLS listener is declared*
-    // (fatal-on-declared-listener, issue #974): a one-sided pair could
-    // never load an identity, so reject it at build where `-t` sees it
-    // too. Inline PEM pairs are validated here without touching the
-    // filesystem (what validates is what serves); file paths resolve at
-    // endpoint bind, after the home/SAFE_PATHS check.
+    // identity. Like upstream, build validates *shape only*: a one-sided
+    // pair, malformed inline PEM, and unreadable file paths all defer to
+    // endpoint bind, where the failure logs and skips just that endpoint
+    // (issue #974). Deferring keeps a broken identity from killing the
+    // whole config — `-t` accepts the same documents upstream's does —
+    // and no PEM material or file I/O is touched here.
     let tls_certificate = raw
         .tls
         .as_ref()
@@ -7935,23 +7935,8 @@ async fn build_config_inner(
         .and_then(|t| t.private_key.as_deref())
         .filter(|s| !s.is_empty())
         .map(String::from);
-    if external_controller_tls.is_some() {
-        match (&tls_certificate, &tls_private_key) {
-            (Some(_), None) | (None, Some(_)) => {
-                anyhow::bail!(
-                    "external-controller-tls requires tls.certificate and tls.private-key \
-                     to be set together or both unset (ephemeral self-signed identity)"
-                );
-            }
-            (Some(cert), Some(key))
-                if cert.contains("-----BEGIN") && key.contains("-----BEGIN") =>
-            {
-                build_api_tls_acceptor(cert.as_bytes(), key.as_bytes())
-                    .map_err(|e| anyhow::anyhow!("tls: {e}"))?;
-            }
-            _ => {}
-        }
-    } else if tls_certificate.is_some() || tls_private_key.is_some() {
+    if external_controller_tls.is_none() && (tls_certificate.is_some() || tls_private_key.is_some())
+    {
         warn!(
             "tls.certificate/tls.private-key set without external-controller-tls; \
              the keys only feed the HTTPS controller listener and are ignored"
