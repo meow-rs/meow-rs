@@ -673,6 +673,14 @@ fn reclaim_stale_socket(path: &std::path::Path, probed: (u64, u64, i64, i64)) ->
 /// the table is a second opinion for a `shutdown`-not-`close`d
 /// listener), and nowhere on other unixes, which stay conservative
 /// (issue #974).
+///
+/// Residual `Ok(false)` surface: the enumeration sees only what this
+/// uid may inspect — other users' fd tables are denied by the
+/// same-user check on Apple and hidden by hidepid `/proc` mounts on
+/// Linux — so a socket bound by another user stays invisible. A
+/// relative `unsi_addr` spelling whose holder's cwd cannot be read
+/// (dead mid-scan, denied, or chdir'd since the bind) misses the same
+/// way. No path fabricates an `Ok(true)`.
 #[cfg(target_vendor = "apple")]
 fn unix_socket_still_bound(path: &std::path::Path) -> Result<bool> {
     apple::socket_bound_at(path)
