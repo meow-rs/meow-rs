@@ -7859,6 +7859,7 @@ mod global_route_binding_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            cors: Default::default(),
         })
     }
 
