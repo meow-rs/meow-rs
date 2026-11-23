@@ -725,7 +725,7 @@ fn unix_socket_still_bound(_path: &std::path::Path) -> Result<bool> {
 /// peers report it in `unsi_caddr`) — either proves the path is live.
 #[cfg(target_vendor = "apple")]
 mod apple {
-    use std::mem::{offset_of, size_of, ManuallyDrop};
+    use std::mem::{offset_of, size_of, size_of_val, ManuallyDrop};
     use std::os::unix::ffi::OsStrExt;
     use std::path::Path;
 
@@ -738,8 +738,11 @@ mod apple {
     const SOCK_MAXADDRLEN: usize = 255;
     const VINFO_STAT_BYTES: usize = 136;
     /// Cap on one pid's fd table — a pathological table beyond this
-    /// is truncated, never grown without bound.
+    /// is reported truncated, never grown without bound.
     const MAX_PID_FDS: usize = 65536;
+    /// The same bound on the system pid list — a fuller table refuses
+    /// rather than silently dropping holder pids from the scan.
+    const MAX_ALL_PIDS: usize = 65536;
 
     #[repr(C)]
     struct ProcFdinfo {
@@ -862,73 +865,168 @@ mod apple {
             })
     }
 
-    /// Fill `fds` with pid's fd table. Returns false when the table
-    /// could not be read at all (dead pid, or denied). A NULL buffer
-    /// makes `proc_pidinfo` report the byte count the table needs —
-    /// size to that first instead of growing blind.
-    fn list_fds(pid: i32, fds: &mut Vec<ProcFdinfo>) -> bool {
-        fds.clear();
-        // SAFETY: no buffer is touched when none is passed.
-        let need = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
-        if need <= 0 {
-            return false;
-        }
-        let want = (need as usize)
-            .div_ceil(size_of::<ProcFdinfo>())
-            .min(MAX_PID_FDS);
-        if fds.capacity() < want {
-            fds.reserve(want - fds.len());
-        }
-        let byte_cap = (fds.capacity() * size_of::<ProcFdinfo>()) as libc::c_int;
-        // SAFETY: `fds` exposes `byte_cap` bytes of valid capacity.
-        let n = unsafe {
-            libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), byte_cap)
-        };
-        if n <= 0 {
-            return false;
-        }
-        // SAFETY: the kernel wrote `n` bytes; clamp in case the table
-        // grew between the probe and the fetch.
-        unsafe { fds.set_len((n as usize / size_of::<ProcFdinfo>()).min(fds.capacity())) };
-        true
+    /// How complete one pid's fd-table fetch proved to be. `proc_pidinfo`
+    /// reports the bytes it *wrote*, capped at the buffer it was given —
+    /// a full buffer is the ambiguous case (the kernel never says "there
+    /// was more"), so the fetch must be grown and retried rather than the
+    /// prefix trusted.
+    enum FdTable {
+        /// `fds` holds every fd the process had.
+        Complete,
+        /// The table outgrew the fetch cap — `fds` holds a prefix.
+        Truncated,
+        /// Dead pid, denied, or a transient read failure.
+        Unreadable,
     }
 
-    /// `path` still bound by a live process anywhere on the system.
-    pub fn socket_bound_at(path: &Path) -> Result<bool> {
-        let ours = path_spellings(path);
-        let mut pids = vec![0 as libc::pid_t; 4096];
-        // SAFETY: `pids` is valid for writes of its byte capacity.
-        let n = unsafe {
-            libc::proc_listallpids(
-                pids.as_mut_ptr().cast(),
-                (pids.len() * size_of::<libc::pid_t>()) as libc::c_int,
-            )
-        };
-        if n < 0 {
+    /// Probe/fill loop behind `list_fds`, split out for the unit tests:
+    /// `call` is `proc_pidinfo(PROC_PIDLISTFDS)` — `None` is the
+    /// NULL-buffer size probe (bytes needed), `Some(buf)` a fetch into
+    /// `buf`'s spare capacity (bytes written). `cap` bounds the entry
+    /// count; a table still filling the capped buffer is `Truncated`.
+    fn gather_fd_table(
+        mut call: impl FnMut(Option<&mut Vec<ProcFdinfo>>) -> i32,
+        fds: &mut Vec<ProcFdinfo>,
+        cap: usize,
+    ) -> FdTable {
+        let need = call(None);
+        if need <= 0 {
+            return FdTable::Unreadable;
+        }
+        let mut want = (need as usize).div_ceil(size_of::<ProcFdinfo>()).min(cap);
+        loop {
+            fds.clear();
+            if fds.capacity() < want {
+                fds.reserve(want);
+            }
+            let n = call(Some(fds));
+            if n <= 0 {
+                return FdTable::Unreadable;
+            }
+            if (n as usize) < fds.capacity() * size_of::<ProcFdinfo>() {
+                return FdTable::Complete;
+            }
+            if want >= cap {
+                return FdTable::Truncated;
+            }
+            let need = call(None);
+            if need <= 0 {
+                return FdTable::Unreadable;
+            }
+            want = (need as usize)
+                .div_ceil(size_of::<ProcFdinfo>())
+                .max(want * 2)
+                .min(cap);
+        }
+    }
+
+    /// Fill `fds` with pid's fd table — probe-sized first (a NULL
+    /// buffer makes `proc_pidinfo` report the needed bytes), then
+    /// refetched larger until the answer stops filling the buffer.
+    fn list_fds(pid: i32, fds: &mut Vec<ProcFdinfo>) -> FdTable {
+        gather_fd_table(
+            |buffer: Option<&mut Vec<ProcFdinfo>>| unsafe {
+                match buffer {
+                    // SAFETY: a NULL buffer is the size probe — nothing
+                    // is written.
+                    None => libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0),
+                    Some(buf) => {
+                        // SAFETY: `buf` exposes `capacity` valid
+                        // `ProcFdinfo` slots.
+                        let n = libc::proc_pidinfo(
+                            pid,
+                            PROC_PIDLISTFDS,
+                            0,
+                            buf.as_mut_ptr().cast(),
+                            (buf.capacity() * size_of::<ProcFdinfo>()) as libc::c_int,
+                        );
+                        if n <= 0 {
+                            return n;
+                        }
+                        // SAFETY: the kernel wrote `n` bytes; clamp in
+                        // case the table shrank mid-fetch.
+                        buf.set_len((n as usize / size_of::<ProcFdinfo>()).min(buf.capacity()));
+                        n
+                    }
+                }
+            },
+            fds,
+            MAX_PID_FDS,
+        )
+    }
+
+    /// Enumerate all pids. `proc_listallpids` reports the count it
+    /// *wrote* — never the count it needed — so a return equal to the
+    /// buffer's capacity is ambiguous the same way the fd table is:
+    /// size from the NULL probe, grow on a still-full answer, and
+    /// refuse to call a possibly-cut list authoritative past `cap`
+    /// (issue #974).
+    fn list_all_pids() -> Result<Vec<libc::pid_t>> {
+        gather_pids(
+            |buffer: Option<&mut [libc::pid_t]>| unsafe {
+                match buffer {
+                    // SAFETY: a NULL buffer is the size probe — nothing
+                    // is written.
+                    None => libc::proc_listallpids(std::ptr::null_mut(), 0),
+                    // SAFETY: the slice is valid for `len` pid_t writes.
+                    Some(buf) => libc::proc_listallpids(
+                        buf.as_mut_ptr().cast(),
+                        size_of_val(buf) as libc::c_int,
+                    ),
+                }
+            },
+            MAX_ALL_PIDS,
+        )
+    }
+
+    /// The grow-until-not-full loop behind `list_all_pids`, split out
+    /// for the unit tests — `call` is `proc_listallpids` with `None` as
+    /// the NULL-buffer size probe.
+    fn gather_pids(
+        mut call: impl FnMut(Option<&mut [libc::pid_t]>) -> i32,
+        cap: usize,
+    ) -> Result<Vec<libc::pid_t>> {
+        let need = call(None);
+        if need < 0 {
             return Err(std::io::Error::last_os_error()).context("proc_listallpids");
         }
-        if n as usize > pids.len() {
-            // Rare — the pid count outgrew the buffer between calls;
-            // size to what the kernel asked for and retry once.
-            pids.resize(n as usize + 64, 0);
-            let n = unsafe {
-                libc::proc_listallpids(
-                    pids.as_mut_ptr().cast(),
-                    (pids.len() * size_of::<libc::pid_t>()) as libc::c_int,
-                )
-            };
+        let mut size = ((need as usize) + 64).min(cap);
+        loop {
+            let mut pids = vec![0 as libc::pid_t; size];
+            let n = call(Some(&mut pids));
             if n < 0 {
                 return Err(std::io::Error::last_os_error()).context("proc_listallpids");
             }
-            pids.truncate((n as usize).min(pids.len()));
-        } else {
-            pids.truncate(n as usize);
+            if (n as usize) < size {
+                pids.truncate(n as usize);
+                return Ok(pids);
+            }
+            if size >= cap {
+                anyhow::bail!(
+                    "proc_listallpids: the pid table still fills a {cap}-entry buffer; the tail is uninspected"
+                );
+            }
+            let need = call(None).max(0) as usize;
+            size = (size * 2).max(need + 64).min(cap);
         }
+    }
+
+    /// `path` still bound by a live process anywhere on the system.
+    /// A pid that vanished mid-scan or denied its fd table is skipped,
+    /// but an enumeration the cap cut short — the pid list, or one
+    /// pid's fd table — fails the call: `Ok(false)` over a tail the
+    /// kernel never showed would reclaim a live socket (issue #974).
+    pub fn socket_bound_at(path: &Path) -> Result<bool> {
+        let ours = path_spellings(path);
+        let pids = list_all_pids()?;
         let mut fds: Vec<ProcFdinfo> = Vec::with_capacity(64);
         let mut inspected = 0usize;
+        let mut truncated = 0usize;
         for &pid in &pids {
-            if !list_fds(pid, &mut fds) {
-                continue;
+            match list_fds(pid, &mut fds) {
+                FdTable::Unreadable => continue,
+                FdTable::Truncated => truncated += 1,
+                FdTable::Complete => {}
             }
             inspected += 1;
             for fd in &fds {
@@ -965,7 +1063,118 @@ mod apple {
         if inspected == 0 {
             anyhow::bail!("could not inspect any process's fd table");
         }
+        if truncated > 0 {
+            anyhow::bail!(
+                "{truncated} process fd table(s) outgrew the {MAX_PID_FDS}-fd cap; enumeration is partial"
+            );
+        }
         Ok(false)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// Scripted `proc_listallpids`: `None` is the size probe,
+        /// `Some(buf)` fills `min(len, live)` like the kernel. Here the
+        /// table outgrows the probe before the first fetch — the
+        /// full-buffer answer must trigger growth, not be trusted.
+        #[test]
+        fn full_pid_buffer_grows_until_the_answer_fits() {
+            let mut live = 4i32;
+            let mut calls = 0;
+            let pids = gather_pids(
+                &mut |buf: Option<&mut [libc::pid_t]>| {
+                    calls += 1;
+                    match buf {
+                        None => live,
+                        Some(b) => {
+                            if calls == 2 {
+                                live = 9000; // the table exploded mid-scan
+                            }
+                            let n = b.len().min(live as usize);
+                            for (i, p) in b[..n].iter_mut().enumerate() {
+                                *p = i as libc::pid_t + 1;
+                            }
+                            n as i32
+                        }
+                    }
+                },
+                MAX_ALL_PIDS,
+            )
+            .unwrap();
+            assert_eq!(pids.len(), 9000);
+            assert!(pids.iter().all(|&p| p > 0));
+        }
+
+        /// A table that still fills the capped buffer cannot answer
+        /// `Ok(false)` — the tail may hold the socket's owner.
+        #[test]
+        fn still_full_pid_buffer_at_cap_is_refused() {
+            let r = gather_pids(
+                &mut |buf: Option<&mut [libc::pid_t]>| match buf {
+                    None => 200,
+                    Some(b) => b.len().min(200) as i32,
+                },
+                128,
+            );
+            assert!(r.is_err());
+        }
+
+        /// Same contract one level down: an fd table past the cap is
+        /// `Truncated`, which `socket_bound_at` turns into an error
+        /// rather than a false "unbound".
+        #[test]
+        fn fd_table_beyond_cap_is_reported_truncated() {
+            let mut fds = Vec::new();
+            let t = gather_fd_table(
+                &mut |buf: Option<&mut Vec<ProcFdinfo>>| match buf {
+                    None => 300 * size_of::<ProcFdinfo>() as i32,
+                    Some(b) => {
+                        let n = (b.capacity() * size_of::<ProcFdinfo>())
+                            .min(300 * size_of::<ProcFdinfo>());
+                        // SAFETY: test buffer, contents never read.
+                        unsafe { b.set_len(n / size_of::<ProcFdinfo>()) };
+                        n as i32
+                    }
+                },
+                &mut fds,
+                64,
+            );
+            assert!(matches!(t, FdTable::Truncated));
+        }
+
+        /// And the growth path: a table that outgrew the probe before
+        /// the first fetch converges to `Complete` once the buffer
+        /// stops coming back full.
+        #[test]
+        fn fd_table_grown_mid_fetch_completes() {
+            let mut fds = Vec::new();
+            let mut probes = 0;
+            let t = gather_fd_table(
+                &mut |buf: Option<&mut Vec<ProcFdinfo>>| match buf {
+                    None => {
+                        probes += 1;
+                        // The first probe under-reports (8); the real
+                        // table is 50 entries.
+                        let n = if probes == 1 { 8 } else { 50 };
+                        n * size_of::<ProcFdinfo>() as i32
+                    }
+                    Some(b) => {
+                        let n = (b.capacity() * size_of::<ProcFdinfo>())
+                            .min(50 * size_of::<ProcFdinfo>());
+                        // SAFETY: test buffer, contents never read.
+                        unsafe { b.set_len(n / size_of::<ProcFdinfo>()) };
+                        n as i32
+                    }
+                },
+                &mut fds,
+                1024,
+            );
+            assert!(matches!(t, FdTable::Complete));
+            assert_eq!(fds.len(), 50);
+            assert!(probes > 1, "a full buffer should force a re-probe");
+        }
     }
 }
 /// mandatory NUL terminator (104 on Apple targets, 108 on Linux).
