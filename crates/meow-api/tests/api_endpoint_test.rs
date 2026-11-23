@@ -874,10 +874,9 @@ mod tls {
             boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls()).unwrap();
         builder.set_verify(boring::ssl::SslVerifyMode::NONE);
         let connector = builder.build();
-        let mut client =
-            tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
-                .await
-                .unwrap();
+        let mut client = tokio_boring::connect(connector.configure().unwrap(), "localhost", stream)
+            .await
+            .unwrap();
         drop(endpoint);
         // The server's FIN must actually arrive: read until EOF, then
         // answer with the client's own close to finish the exchange —
@@ -903,17 +902,11 @@ mod tls {
             // without the flag still gets EADDRINUSE — the TIME_WAIT is
             // really there. (Winsock binds over TIME_WAIT by default, so
             // this probe is unix-shaped only.)
-            let probe = socket2::Socket::new(
-                socket2::Domain::IPV6,
-                socket2::Type::STREAM,
-                None,
-            )
-            .unwrap();
+            let probe =
+                socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::STREAM, None).unwrap();
             probe.set_only_v6(false).unwrap();
             let bind_addr: std::net::SocketAddr = format!("[::]:{port}").parse().unwrap();
-            let err = probe
-                .bind(&socket2::SockAddr::from(bind_addr))
-                .unwrap_err();
+            let err = probe.bind(&socket2::SockAddr::from(bind_addr)).unwrap_err();
             assert_eq!(
                 err.kind(),
                 std::io::ErrorKind::AddrInUse,

@@ -482,7 +482,10 @@ mod tls {
                 .await
                 .unwrap()
                 .collect();
-            assert!(all.len() >= 2, "localhost unexpectedly single-stack: {all:?}");
+            assert!(
+                all.len() >= 2,
+                "localhost unexpectedly single-stack: {all:?}"
+            );
             let ListenTarget::Single(addr) = resolve_listen_target("localhost:0").await.unwrap()
             else {
                 panic!("hostname must resolve to a single bind target");
@@ -866,9 +869,7 @@ mod apple {
     fn list_fds(pid: i32, fds: &mut Vec<ProcFdinfo>) -> bool {
         fds.clear();
         // SAFETY: no buffer is touched when none is passed.
-        let need = unsafe {
-            libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
-        };
+        let need = unsafe { libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0) };
         if need <= 0 {
             return false;
         }

@@ -70,11 +70,7 @@ where
                 .await
                 .map(|upgrade| Self(Some(upgrade)))
                 .map_err(|_| {
-                    (
-                        StatusCode::METHOD_NOT_ALLOWED,
-                        [(header::ALLOW, "GET")],
-                    )
-                        .into_response()
+                    (StatusCode::METHOD_NOT_ALLOWED, [(header::ALLOW, "GET")]).into_response()
                 });
         }
         if !is_websocket_attempt(&parts.method, parts.version, &parts.headers) {
