@@ -57,9 +57,26 @@ impl<S> FromRequestParts<S> for MaybeWebSocket
 where
     S: Send + Sync,
 {
-    type Rejection = std::convert::Infallible;
+    type Rejection = Response;
 
     async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        // CONNECT only reaches these routes for an RFC 8441 upgrade —
+        // anything that is not a valid upgrade is an ordinary
+        // method-mismatch, answered like upstream chi's 405 for a
+        // GET-only route (never the route's GET body, which would fake
+        // a tunnel).
+        if parts.method == Method::CONNECT {
+            return WebSocketUpgrade::from_request_parts(parts, state)
+                .await
+                .map(|upgrade| Self(Some(upgrade)))
+                .map_err(|_| {
+                    (
+                        StatusCode::METHOD_NOT_ALLOWED,
+                        [(header::ALLOW, "GET")],
+                    )
+                        .into_response()
+                });
+        }
         if !is_websocket_attempt(&parts.method, parts.version, &parts.headers) {
             return Ok(Self(None));
         }

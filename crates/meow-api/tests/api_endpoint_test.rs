@@ -585,6 +585,51 @@ async fn allow_header_405_uses_chi_per_method_lines() {
     assert_eq!(allows, vec!["GET"]);
 }
 
+#[tokio::test]
+async fn connect_without_valid_upgrade_gets_405_not_route_body() {
+    // CONNECT is registered on the WS routes only to carry an RFC 8441
+    // upgrade — anything else is upstream's 405 for the GET-only route,
+    // never the JSON body (which would fake a tunnel) (issue #974).
+    let state = test_state(Default::default(), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("CONNECT")
+                .uri("/memory")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+    let allows: Vec<String> = resp
+        .headers()
+        .get_all(header::ALLOW)
+        .iter()
+        .map(|v| v.to_str().unwrap().to_string())
+        .collect();
+    assert_eq!(allows, vec!["GET"]);
+
+    // Same answer when the request *tries* to look like an upgrade but
+    // cannot complete one (HTTP/1.1 CONNECT is never upgradable).
+    let state = test_state(Default::default(), Some("s3cret"));
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("CONNECT")
+                .uri("/memory")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .header(header::UPGRADE, "websocket")
+                .header(header::SEC_WEBSOCKET_VERSION, "13")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::METHOD_NOT_ALLOWED);
+}
+
 // ── TLS endpoint (cfg(feature = "api-tls")) ─────────────────────────
 
 // The whole section needs `boring`/`tokio_boring`, which are optional
