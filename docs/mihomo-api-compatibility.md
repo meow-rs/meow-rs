@@ -11,6 +11,29 @@ Status meanings:
 - **Extension**: meow-rs API with no mihomo equivalent.
 - **Not implemented**: deliberately not registered; callers receive 404.
 
+## Listener transports
+
+Every route below serves identically over each configured controller
+endpoint — the plain `external-controller` TCP listener plus, like
+upstream, any of these coexisting listeners (issue #974, see
+[api-listener.md](specs/api-listener.md)):
+
+| Config key / CLI flag | Status | Notes |
+|---|---|---|
+| `external-controller-tls` / `--ext-ctl-tls` | Compatible | HTTPS via BoringSSL, ALPN `h2` then `http/1.1`. Identity from `tls.certificate`/`tls.private-key` (inline PEM pair or home/`SAFE_PATHS`-contained file pair); both unset serves an ephemeral self-signed cert. A one-sided pair or malformed inline PEM is a `-t`/load error — upstream defers it to bind. No PEM file watching. |
+| `external-controller-unix` / `--ext-ctl-unix` | Compatible | Unix socket, relative path under the daemon home. Deliberate divergences: refuses non-socket/other-user paths, reclaims only a verified stale socket, binds `0600` (not `0666`), keeps Bearer auth, unlinks only its own socket on exit. |
+| `external-controller-pipe` / `--ext-ctl-pipe` | Partial | Windows named pipe, byte mode, remote clients rejected. Parsed but warn-ignored on non-Windows. |
+| `external-controller-cors` | Compatible | Two wire shapes like upstream's chi middleware: absent map = permissive `AllowAll`; present map (even `{}`) = the configured path — `allow-origins` (`*`/globs/echo, `[]` = allow-all), `allow-private-network` (default `true`), `Access-Control-Max-Age: 300`, `HEAD` never preflight-allowed. |
+| `external-controller-routing-mark` | Not implemented | Parsed and warn-ignored; no controller-socket `SO_MARK`. |
+| `tls:` other members | Not implemented | `client-auth-type`, `client-auth-certificates`, `ech-key`, `custom-certifactes` (sic) parse and warn-ignore. |
+
+The listener surface is a startup snapshot: `PUT /configs` commits these
+keys to the document for the next boot and warns that a restart applies
+them — it never rebinds, reads PEMs or mutates CORS live. The plain TCP
+bind is the only startup-fatal endpoint; the new ones log-and-skip like
+upstream, and a config where every endpoint failed to bind logs that no
+controller is available.
+
 ## Panel runtime API
 
 | Route | Status | Notes |

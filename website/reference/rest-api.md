@@ -10,14 +10,31 @@ external-controller: 127.0.0.1:9090
 secret: "a-long-random-string"
 ```
 
-Without `external-controller`, the API does not start. See
+Without any `external-controller*` key, the API does not start. See
 [Authentication](../guide/authentication) for the auth model.
+
+Additional controller endpoints can run alongside the plain listener —
+all of them serve the same API, auth and CORS policy:
+
+```yaml
+external-controller-tls: 127.0.0.1:9443   # HTTPS (ALPN h2 / http/1.1)
+tls:
+  certificate: /path/to/cert.pem          # or an inline PEM pair
+  private-key: /path/to/key.pem           # unset pair = ephemeral self-signed
+external-controller-unix: api.sock        # Unix socket under the daemon home
+external-controller-pipe: '\\.\pipe\meow' # Windows only
+external-controller-cors:
+  allow-origins: ["https://board.example"]
+  allow-private-network: true
+```
 
 - **REST auth:** `Authorization: Bearer <secret>`.
 - **WebSocket auth:** the bearer header *or* `?token=<secret>`.
-- **Browser access:** With a secret, CORS is permissive (`Access-Control-Allow-Origin: *`).
-  Without a secret, use an IP address or `localhost` and keep the dashboard on the
-  controller's origin. This applies to both REST and WebSocket requests.
+- **Browser access:** With a secret, CORS is permissive (`Access-Control-Allow-Origin: *`)
+  unless `external-controller-cors:` configures it. Without a secret, use an IP
+  address or `localhost` and keep the dashboard on the controller's origin — an
+  `https://` origin counts as same-origin over `external-controller-tls`.
+  This applies to both REST and WebSocket requests, on every transport.
 
 ```bash
 curl -H 'Authorization: Bearer <secret>' http://127.0.0.1:9090/proxies
