@@ -1406,6 +1406,7 @@ mod apple {
         }
     }
 }
+/// Bytes a filesystem socket path may occupy — `sun_path` minus its
 /// mandatory NUL terminator (104 on Apple targets, 108 on Linux).
 #[cfg(unix)]
 fn sun_path_capacity() -> usize {
