@@ -1171,6 +1171,41 @@ mod unix {
     }
 
     #[tokio::test]
+    async fn unix_endpoint_refuses_overlong_path_by_name() {
+        // sun_path caps a filesystem socket at 103/107 usable bytes —
+        // an over-limit config must fail by name before any filesystem
+        // work, and a near-limit path must also leave room for the
+        // staging sibling it is bound under (issue #974).
+        let cap = unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+            .sun_path
+            .len()
+            - 1;
+        let dir = tempfile::tempdir().unwrap();
+        let too_long = dir.path().join("x".repeat(cap));
+        let err = meow_api::endpoint::bind_unix(too_long.to_str().unwrap())
+            .await
+            .err()
+            .expect("over-limit path must fail");
+        assert!(
+            format!("{err}").contains("socket path limit"),
+            "unexpected error: {err}"
+        );
+        // Resolved exactly at the cap: itself legal, but the staging
+        // name cannot fit alongside it — same named refusal.
+        let name_len = cap - dir.path().as_os_str().len() - 1;
+        let near = dir.path().join("y".repeat(name_len));
+        assert!(near.as_os_str().len() <= cap);
+        let err = meow_api::endpoint::bind_unix(near.to_str().unwrap())
+            .await
+            .err()
+            .expect("near-limit path must fail");
+        assert!(
+            format!("{err}").contains("socket path limit"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
     async fn unix_endpoint_refuses_live_socket_and_non_socket() {
         let dir = tempfile::tempdir().unwrap();
         // A live listener at the path → refuse, upstream would clobber.

@@ -663,6 +663,16 @@ fn reclaim_stale_socket(path: &std::path::Path, probed: (u64, u64, i64, i64)) ->
         .with_context(|| format!("cannot reclaim stale socket {}", path.display()))
 }
 
+/// Bytes a filesystem socket path may occupy — `sun_path` minus its
+/// mandatory NUL terminator (104 on Apple targets, 108 on Linux).
+#[cfg(unix)]
+fn sun_path_capacity() -> usize {
+    unsafe { std::mem::zeroed::<libc::sockaddr_un>() }
+        .sun_path
+        .len()
+        - 1
+}
+
 /// Bind `external-controller-unix` — meow's deliberately safer handling
 /// (issue #974): where upstream unlinks an existing path unconditionally,
 /// meow refuses a non-socket path, refuses another user's socket, and
@@ -679,6 +689,16 @@ pub async fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
     } else {
         meow_common::resolved_home_dir().join(requested)
     };
+    // The path length is an entry invariant, checked by name before any
+    // filesystem work: `sun_path` is 104/108 bytes, so an over-long
+    // config fails here rather than inside bind.
+    if resolved.as_os_str().len() > sun_path_capacity() {
+        anyhow::bail!(
+            "external-controller-unix: {} exceeds the {}-byte unix socket path limit",
+            resolved.display(),
+            sun_path_capacity()
+        );
+    }
     match std::fs::symlink_metadata(&resolved) {
         Ok(md) if md.file_type().is_socket() => {
             if md.uid() != unsafe { libc::geteuid() } {
@@ -754,6 +774,16 @@ pub async fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
     // listening fd (issue #974). Crash litter is single-owner by
     // construction (the PID names it), so a leftover is safe to drop.
     let tmp = resolved.with_extension(format!("meow-tmp-{}", std::process::id()));
+    // The staging sibling must fit sun_path too — a configured path near
+    // the limit fails here by name, not as a bind error on a name the
+    // config never wrote (issue #974).
+    if tmp.as_os_str().len() > sun_path_capacity() {
+        anyhow::bail!(
+            "external-controller-unix: {} leaves no room for the staging name within the {}-byte unix socket path limit",
+            resolved.display(),
+            sun_path_capacity()
+        );
+    }
     let _ = std::fs::remove_file(&tmp);
     let listener = tokio::net::UnixListener::bind(&tmp).with_context(|| {
         format!(
