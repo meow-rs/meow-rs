@@ -58,6 +58,12 @@ mod tls {
             socket
                 .set_only_v6(false)
                 .context("external-controller-tls: cannot clear IPV6_V6ONLY")?;
+            // std's TcpListener::bind sets this on unix — the raw path
+            // must not lose it: a TIME_WAIT socket sharing the port
+            // otherwise fails a restart's rebind with EADDRINUSE.
+            socket
+                .set_reuse_address(true)
+                .context("external-controller-tls: cannot set SO_REUSEADDR")?;
             socket
                 .set_nonblocking(true)
                 .context("external-controller-tls: cannot set nonblocking")?;

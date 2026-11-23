@@ -808,6 +808,49 @@ mod tls {
     }
 
     #[tokio::test]
+    async fn tls_endpoint_rebinds_through_time_wait() {
+        // SO_REUSEADDR on the raw dual-stack socket: the `[::]` path
+        // binds through socket2, which unlike std's TcpListener::bind
+        // does not set the flag — without it a restart overlapping
+        // TIME_WAIT sockets on the port gets EADDRINUSE (issue #974).
+        let endpoint = meow_api::endpoint::bind_tls(":0", None, None)
+            .await
+            .unwrap();
+        let port = endpoint.addr().port();
+        // A conn the server side closes — garbage instead of a
+        // ClientHello fails the handshake fast — leaves TIME_WAIT on
+        // the listener's port.
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        client.write_all(b"not a ClientHello").await.unwrap();
+        // The TLS layer answers garbage with an alert record first; read
+        // until EOF/RST so the assert proves the accepted socket closed.
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut buf = [0u8; 64];
+            loop {
+                match client.read(&mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => {}
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "server kept the conn open");
+        drop(endpoint);
+        // A beat for the aborted driver to close the listener fd.
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        let rebound = meow_api::endpoint::bind_tls(&format!(":{port}"), None, None)
+            .await
+            .expect("rebind must succeed over lingering TIME_WAIT");
+        // The dual-stack candidate itself bound — a v4 fallback could
+        // not produce a v6 address, so this proves reuse on the raw
+        // socket rather than a silently degraded bind.
+        assert!(rebound.addr().is_ipv6());
+    }
+
+    #[tokio::test]
     async fn tls_endpoint_bad_pair_and_bad_addr_fail() {
         // One-sided pairs are endpoint-local failures upstream (config build
         // and `-t` stay shape-only, issue #974) — the endpoint bind refuses.
