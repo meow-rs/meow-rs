@@ -2197,7 +2197,7 @@ async fn run(
         }
         #[cfg(unix)]
         if let Some(ref unix_path) = config.api.external_controller_unix {
-            match meow_api::endpoint::bind_unix(unix_path) {
+            match meow_api::endpoint::bind_unix(unix_path).await {
                 Ok((endpoint, guard)) => {
                     bound_any = true;
                     info!("REST API listening on unix://{}", guard.path().display());

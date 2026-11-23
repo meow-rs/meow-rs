@@ -469,6 +469,46 @@ impl Drop for UnixSocketGuard {
     }
 }
 
+/// Upper bound on one liveness probe of an existing socket file. A
+/// blocking connect can stall indefinitely when the peer is alive but
+/// its accept queue is full — startup must not hang on it: a timed-out
+/// or otherwise inconclusive probe is treated as "live or uncertain"
+/// and the endpoint is skipped rather than the file deleted (issue #974).
+#[cfg(unix)]
+const STALE_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Beat between the two refusal probes: BSD/macOS answers
+/// `ECONNREFUSED` for a saturated accept queue too, so a single refusal
+/// is not proof of staleness — a queue that drained connects on the
+/// second probe (issue #974).
+#[cfg(unix)]
+const STALE_REPROBE_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// One bounded connect probe of an existing socket file.
+#[cfg(unix)]
+enum UnixProbe {
+    /// The connect completed — something is listening.
+    Live,
+    /// `ECONNREFUSED` — nothing accepted the connect.
+    Refused,
+    /// Neither of the above (a full backlog's `EAGAIN`, the probe
+    /// timeout, …) — live-or-uncertain: the file stays.
+    Uncertain(std::io::Error),
+}
+
+#[cfg(unix)]
+async fn probe_unix_socket(path: &std::path::Path) -> UnixProbe {
+    match tokio::time::timeout(STALE_PROBE_TIMEOUT, tokio::net::UnixStream::connect(path)).await {
+        Ok(Ok(_)) => UnixProbe::Live,
+        Ok(Err(e)) if e.raw_os_error() == Some(libc::ECONNREFUSED) => UnixProbe::Refused,
+        Ok(Err(e)) => UnixProbe::Uncertain(e),
+        Err(_) => UnixProbe::Uncertain(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "probe timed out",
+        )),
+    }
+}
+
 /// Bind `external-controller-unix` — meow's deliberately safer handling
 /// (issue #974): where upstream unlinks an existing path unconditionally,
 /// meow refuses a non-socket path, refuses another user's socket, and
@@ -477,7 +517,7 @@ impl Drop for UnixSocketGuard {
 /// upstream's `0666` opens the controller to every local user; meow also
 /// keeps Bearer auth on, deliberate divergences both.
 #[cfg(unix)]
-pub fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
+pub async fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
     use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
     let requested = std::path::Path::new(path);
     let resolved = if requested.is_absolute() {
@@ -494,21 +534,34 @@ pub fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
                     resolved.display()
                 );
             }
-            match std::os::unix::net::UnixStream::connect(&resolved) {
-                Ok(_) => anyhow::bail!(
+            match probe_unix_socket(&resolved).await {
+                UnixProbe::Live => anyhow::bail!(
                     "external-controller-unix: {} is already serving a live socket",
                     resolved.display()
                 ),
-                Err(e) if e.raw_os_error() == Some(libc::ECONNREFUSED) => {
-                    warn!(
-                        "external-controller-unix: reclaiming stale socket {}",
-                        resolved.display()
-                    );
-                    std::fs::remove_file(&resolved).with_context(|| {
-                        format!("cannot reclaim stale socket {}", resolved.display())
-                    })?;
+                UnixProbe::Refused => {
+                    tokio::time::sleep(STALE_REPROBE_DELAY).await;
+                    match probe_unix_socket(&resolved).await {
+                        UnixProbe::Refused => {
+                            warn!(
+                                "external-controller-unix: reclaiming stale socket {}",
+                                resolved.display()
+                            );
+                            std::fs::remove_file(&resolved).with_context(|| {
+                                format!("cannot reclaim stale socket {}", resolved.display())
+                            })?;
+                        }
+                        UnixProbe::Live => anyhow::bail!(
+                            "external-controller-unix: {} is already serving a live socket",
+                            resolved.display()
+                        ),
+                        UnixProbe::Uncertain(e) => anyhow::bail!(
+                            "external-controller-unix: cannot probe existing socket {}: {e}",
+                            resolved.display()
+                        ),
+                    }
                 }
-                Err(e) => anyhow::bail!(
+                UnixProbe::Uncertain(e) => anyhow::bail!(
                     "external-controller-unix: cannot probe existing socket {}: {e}",
                     resolved.display()
                 ),

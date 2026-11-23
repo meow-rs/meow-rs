@@ -947,7 +947,9 @@ mod unix {
         let state = test_state(Default::default(), Some("s3cret"));
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("api.sock");
-        let (endpoint, guard) = meow_api::endpoint::bind_unix(path.to_str().unwrap()).unwrap();
+        let (endpoint, guard) = meow_api::endpoint::bind_unix(path.to_str().unwrap())
+            .await
+            .unwrap();
         assert_eq!(guard.path(), path.as_path());
         tokio::spawn(async move { axum::serve(endpoint, create_router(state)).await });
         let resp = unix_get(&path, Some("s3cret")).await;
@@ -974,7 +976,7 @@ mod unix {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("masked.sock");
         let old = unsafe { libc::umask(0) };
-        let result = meow_api::endpoint::bind_unix(path.to_str().unwrap());
+        let result = meow_api::endpoint::bind_unix(path.to_str().unwrap()).await;
         unsafe { libc::umask(old) };
         let (_endpoint, _guard) = result.unwrap();
         use std::os::unix::fs::PermissionsExt;
@@ -991,7 +993,7 @@ mod unix {
         // caller's CWD — and missing parents are created (issue #974).
         let dir = tempfile::tempdir().unwrap();
         meow_common::set_home_dir(dir.path().to_path_buf());
-        let (_endpoint, guard) = meow_api::endpoint::bind_unix("sub/rel.sock").unwrap();
+        let (_endpoint, guard) = meow_api::endpoint::bind_unix("sub/rel.sock").await.unwrap();
         assert_eq!(guard.path(), dir.path().join("sub/rel.sock").as_path());
         assert!(dir.path().join("sub/rel.sock").exists());
         drop(guard);
@@ -1004,7 +1006,9 @@ mod unix {
         // the same (dev, ino) it bound (issue #974).
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("swap.sock");
-        let (_endpoint, guard) = meow_api::endpoint::bind_unix(path.to_str().unwrap()).unwrap();
+        let (_endpoint, guard) = meow_api::endpoint::bind_unix(path.to_str().unwrap())
+            .await
+            .unwrap();
         std::fs::remove_file(&path).unwrap();
         std::fs::write(&path, b"not the daemon's socket").unwrap();
         drop(guard);
@@ -1019,7 +1023,52 @@ mod unix {
         // reconnecting gets ECONNREFUSED, i.e. "stale".
         drop(tokio::net::UnixListener::bind(&path).unwrap());
         assert!(path.exists());
-        let (_endpoint, _guard) = meow_api::endpoint::bind_unix(path.to_str().unwrap()).unwrap();
+        let (_endpoint, _guard) = meow_api::endpoint::bind_unix(path.to_str().unwrap())
+            .await
+            .unwrap();
+        assert!(path.exists());
+    }
+
+    #[tokio::test]
+    async fn unix_endpoint_full_accept_queue_does_not_stall_bind() {
+        // A live listener whose accept queue is full can stall a
+        // blocking connect() indefinitely — the stale-socket probe is
+        // bounded, so `bind_unix` must give up on the socket instead of
+        // hanging startup (issue #974).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("full.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        // Fill the accept backlog without accepting: once a connect
+        // fails or times out, the queue is provably full.
+        let mut pending = Vec::new();
+        for _ in 0..300 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                tokio::net::UnixStream::connect(&path),
+            )
+            .await
+            {
+                Ok(Ok(stream)) => pending.push(stream),
+                _ => break,
+            }
+        }
+        let started = std::time::Instant::now();
+        let first = meow_api::endpoint::bind_unix(path.to_str().unwrap()).await;
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        // The full-queue answer is platform-dependent: Linux refuses the
+        // probe with EAGAIN (inconclusive → endpoint skipped, file kept),
+        // while BSD/macOS answers ECONNREFUSED like a dead socket and the
+        // re-probe still refuses — a reclaim, the same take-over upstream
+        // does unconditionally. Either way the path stays a socket.
+        if let Err(e) = &first {
+            assert!(path.exists(), "{e}");
+        }
+        // Once the backlog drains, a socket at the path is genuinely
+        // live — a follow-up attempt must refuse it.
+        drop(pending);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let second = meow_api::endpoint::bind_unix(path.to_str().unwrap()).await;
+        assert!(second.is_err());
         assert!(path.exists());
     }
 
@@ -1029,12 +1078,16 @@ mod unix {
         // A live listener at the path → refuse, upstream would clobber.
         let live = dir.path().join("live.sock");
         let _listener = tokio::net::UnixListener::bind(&live).unwrap();
-        assert!(meow_api::endpoint::bind_unix(live.to_str().unwrap()).is_err());
+        assert!(meow_api::endpoint::bind_unix(live.to_str().unwrap())
+            .await
+            .is_err());
         // A regular file → refuse; the file must survive untouched
         // (upstream's unconditional unlink is the documented divergence).
         let file = dir.path().join("regular.txt");
         std::fs::write(&file, b"not a socket").unwrap();
-        assert!(meow_api::endpoint::bind_unix(file.to_str().unwrap()).is_err());
+        assert!(meow_api::endpoint::bind_unix(file.to_str().unwrap())
+            .await
+            .is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"not a socket");
     }
 }
