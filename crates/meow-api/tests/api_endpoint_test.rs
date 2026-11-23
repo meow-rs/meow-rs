@@ -1132,10 +1132,19 @@ mod unix {
         // A live listener whose accept queue is full can stall a
         // blocking connect() indefinitely — the stale-socket probe is
         // bounded, so `bind_unix` must give up on the socket instead of
-        // hanging startup (issue #974).
+        // hanging startup (issue #974). And refusing is all it may do:
+        // wherever the probe's answer is ambiguous (BSD refuses a
+        // saturated queue like a dead one), the socket at the path is
+        // still a *live* listener — reclaim must leave it untouched.
+        fn dev_ino(path: &std::path::Path) -> (u64, u64) {
+            use std::os::unix::fs::MetadataExt;
+            let md = std::fs::symlink_metadata(path).unwrap();
+            (md.dev(), md.ino())
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("full.sock");
         let _listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let original = dev_ino(&path);
         // Fill the accept backlog without accepting: once a connect
         // fails or times out, the queue is provably full.
         let mut pending = Vec::new();
@@ -1153,21 +1162,19 @@ mod unix {
         let started = std::time::Instant::now();
         let first = meow_api::endpoint::bind_unix(path.to_str().unwrap()).await;
         assert!(started.elapsed() < std::time::Duration::from_secs(10));
-        // The full-queue answer is platform-dependent: Linux refuses the
-        // probe with EAGAIN (inconclusive → endpoint skipped, file kept),
-        // while BSD/macOS answers ECONNREFUSED like a dead socket and the
-        // re-probe still refuses — a reclaim, the same take-over upstream
-        // does unconditionally. Either way the path stays a socket.
-        if let Err(e) = &first {
-            assert!(path.exists(), "{e}");
-        }
+        // The full-queue answer is platform-dependent (EAGAIN on
+        // Linux, ECONNREFUSED on BSD/macOS) but the verdict is not:
+        // a live socket is never reclaimed. The path must still name
+        // the same socket file it started with.
+        assert!(first.is_err(), "bind over a live socket must refuse");
+        assert_eq!(dev_ino(&path), original, "the live socket was replaced");
         // Once the backlog drains, a socket at the path is genuinely
-        // live — a follow-up attempt must refuse it.
+        // live — a follow-up attempt must refuse it the same way.
         drop(pending);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         let second = meow_api::endpoint::bind_unix(path.to_str().unwrap()).await;
         assert!(second.is_err());
-        assert!(path.exists());
+        assert_eq!(dev_ino(&path), original);
     }
 
     #[tokio::test]

@@ -663,7 +663,310 @@ fn reclaim_stale_socket(path: &std::path::Path, probed: (u64, u64, i64, i64)) ->
         .with_context(|| format!("cannot reclaim stale socket {}", path.display()))
 }
 
-/// Bytes a filesystem socket path may occupy — `sun_path` minus its
+/// Whether a live process still holds a unix socket bound at `path` —
+/// asked only after the connect probe refuses, which is ambiguous
+/// where a saturated accept queue also answers `ECONNREFUSED`
+/// (BSD/macOS). The answer comes from kernel socket tables, not a
+/// third probe: libproc fd enumeration on Apple targets,
+/// `/proc/net/unix` on Linux (whose refusal is already conclusive —
+/// the table is a second opinion for a `shutdown`-not-`close`d
+/// listener), and nowhere on other unixes, which stay conservative
+/// (issue #974).
+#[cfg(target_vendor = "apple")]
+fn unix_socket_still_bound(path: &std::path::Path) -> Result<bool> {
+    apple::socket_bound_at(path)
+}
+
+/// The `/proc/net/unix` arm — kernel ABI: one row per live socket,
+/// bound path in the last column.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn unix_socket_still_bound(path: &std::path::Path) -> Result<bool> {
+    use std::os::unix::ffi::OsStrExt;
+    let theirs = path.as_os_str().as_bytes();
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let canon = canon.as_os_str().as_bytes();
+    let Ok(table) = std::fs::read("/proc/net/unix") else {
+        // Refusal is already conclusive on Linux — without the table
+        // the probe's own answer stands.
+        return Ok(false);
+    };
+    for line in table.split(|&b| b == b'\n') {
+        // `Num RefCount Protocol Flags Type St Inode Path` — the path
+        // is everything after the seventh field (it may contain
+        // spaces).
+        let Some(bound) = line.splitn(8, |&b| b == b' ').nth(7) else {
+            continue;
+        };
+        if bound == theirs || bound == canon {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// No kernel socket table to consult — the refused probe stays
+/// ambiguous, so the endpoint errs on the live side.
+#[cfg(all(
+    unix,
+    not(target_vendor = "apple"),
+    not(target_os = "linux"),
+    not(target_os = "android")
+))]
+fn unix_socket_still_bound(_path: &std::path::Path) -> Result<bool> {
+    anyhow::bail!("no kernel socket table is available on this platform")
+}
+
+/// The libproc arm — `proc_pidinfo`/`proc_pidfdinfo` are the public
+/// `<sys/proc_info.h>` ABI `lsof` enumerates processes with. A bound
+/// unix socket reports its `sun_path` in `unsi_addr` (and connected
+/// peers report it in `unsi_caddr`) — either proves the path is live.
+#[cfg(target_vendor = "apple")]
+mod apple {
+    use std::mem::{offset_of, size_of, ManuallyDrop};
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+
+    use anyhow::{Context, Result};
+
+    const PROC_PIDLISTFDS: libc::c_int = 1;
+    const PROX_FDTYPE_SOCKET: u32 = 2;
+    const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+    const SOCKINFO_UN: libc::c_int = 3;
+    const SOCK_MAXADDRLEN: usize = 255;
+    const VINFO_STAT_BYTES: usize = 136;
+    /// Cap on one pid's fd table — a pathological table beyond this
+    /// is truncated, never grown without bound.
+    const MAX_PID_FDS: usize = 65536;
+
+    #[repr(C)]
+    struct ProcFdinfo {
+        proc_fd: i32,
+        proc_fdtype: u32,
+    }
+    #[repr(C)]
+    struct ProcFileinfo {
+        fi_openflags: u32,
+        fi_status: u32,
+        fi_offset: i64,
+        fi_type: i32,
+        fi_rfu: i32,
+    }
+    #[repr(C)]
+    struct SockbufInfo {
+        sbi_cc: u32,
+        sbi_hiwat: u32,
+        sbi_mbcnt: u32,
+        sbi_mbmax: u32,
+        sbi_lowat: i32,
+        sbi_flags: i16,
+        sbi_timeo: i16,
+    }
+    #[repr(C)]
+    union UnsiAddr {
+        sun: libc::sockaddr_un,
+        _dummy: [u8; SOCK_MAXADDRLEN],
+    }
+    #[repr(C)]
+    struct UnSockinfo {
+        unsi_conn_so: u64,
+        unsi_conn_pcb: u64,
+        unsi_addr: UnsiAddr,
+        unsi_caddr: UnsiAddr,
+    }
+    #[repr(C)]
+    union SoiProto {
+        un: ManuallyDrop<UnSockinfo>,
+        _pad: [u8; size_of::<UnSockinfo>()],
+    }
+    #[repr(C)]
+    struct SocketInfo {
+        soi_stat: [u8; VINFO_STAT_BYTES],
+        soi_so: u64,
+        soi_pcb: u64,
+        soi_type: i32,
+        soi_protocol: i32,
+        soi_family: i32,
+        soi_options: i16,
+        soi_linger: i16,
+        soi_state: i16,
+        soi_qlen: i16,
+        soi_incqlen: i16,
+        soi_qlimit: i16,
+        soi_timeo: i16,
+        soi_error: u16,
+        soi_oobmark: u32,
+        soi_rcv: SockbufInfo,
+        soi_snd: SockbufInfo,
+        soi_kind: i32,
+        soi_rfu: u32,
+        soi_proto: SoiProto,
+    }
+    #[repr(C)]
+    struct SocketFdinfo {
+        pfi: ProcFileinfo,
+        psi: SocketInfo,
+    }
+
+    // Pinned to <sys/proc_info.h> at compile time — a layout drift
+    // fails the build rather than feeding reads at wrong offsets.
+    const _: () = assert!(size_of::<SocketFdinfo>() == 792);
+    const _: () = assert!(offset_of!(SocketFdinfo, psi.soi_family) == 184);
+    const _: () = assert!(offset_of!(SocketFdinfo, psi.soi_kind) == 256);
+    const _: () = assert!(offset_of!(SocketFdinfo, psi.soi_proto) == 264);
+    const _: () = assert!(offset_of!(UnSockinfo, unsi_addr) == 16);
+    const _: () = assert!(offset_of!(libc::sockaddr_un, sun_path) == 2);
+
+    /// One `sockaddr_un`'s path bytes, NUL-trimmed.
+    fn sun_path_bytes(sun: &libc::sockaddr_un) -> &[u8] {
+        // SAFETY: reading the fixed-size array in place.
+        let raw = unsafe {
+            std::slice::from_raw_parts(sun.sun_path.as_ptr().cast::<u8>(), sun.sun_path.len())
+        };
+        let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+        &raw[..end]
+    }
+
+    /// The spellings that name `path` — the path itself plus its
+    /// canonical form, so a socket bound through a symlink (`/tmp` →
+    /// `/private/tmp`, `/var` → `/private/var`) still matches.
+    fn path_spellings(path: &Path) -> Vec<Vec<u8>> {
+        let mut out = vec![path.as_os_str().as_bytes().to_vec()];
+        if let Ok(canon) = std::fs::canonicalize(path) {
+            let canon = canon.into_os_string().into_encoded_bytes();
+            if canon != out[0] {
+                out.push(canon);
+            }
+        }
+        out
+    }
+
+    /// One candidate address against the spellings — raw first, then
+    /// canonicalized on both sides (the bound path may be written
+    /// under a different spelling; a live socket's file exists, so
+    /// canonicalize resolves it).
+    fn matches(ours: &[Vec<u8>], theirs: &[u8]) -> bool {
+        if theirs.is_empty() {
+            return false;
+        }
+        if ours.iter().any(|o| o.as_slice() == theirs) {
+            return true;
+        }
+        std::fs::canonicalize(Path::new(std::ffi::OsStr::from_bytes(theirs)))
+            .ok()
+            .is_some_and(|c| {
+                ours.iter()
+                    .any(|o| o.as_slice() == c.as_os_str().as_bytes())
+            })
+    }
+
+    /// Fill `fds` with pid's fd table. Returns false when the table
+    /// could not be read at all (dead pid, or denied). A NULL buffer
+    /// makes `proc_pidinfo` report the byte count the table needs —
+    /// size to that first instead of growing blind.
+    fn list_fds(pid: i32, fds: &mut Vec<ProcFdinfo>) -> bool {
+        fds.clear();
+        // SAFETY: no buffer is touched when none is passed.
+        let need = unsafe {
+            libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, std::ptr::null_mut(), 0)
+        };
+        if need <= 0 {
+            return false;
+        }
+        let want = (need as usize)
+            .div_ceil(size_of::<ProcFdinfo>())
+            .min(MAX_PID_FDS);
+        if fds.capacity() < want {
+            fds.reserve(want - fds.len());
+        }
+        let byte_cap = (fds.capacity() * size_of::<ProcFdinfo>()) as libc::c_int;
+        // SAFETY: `fds` exposes `byte_cap` bytes of valid capacity.
+        let n = unsafe {
+            libc::proc_pidinfo(pid, PROC_PIDLISTFDS, 0, fds.as_mut_ptr().cast(), byte_cap)
+        };
+        if n <= 0 {
+            return false;
+        }
+        // SAFETY: the kernel wrote `n` bytes; clamp in case the table
+        // grew between the probe and the fetch.
+        unsafe { fds.set_len((n as usize / size_of::<ProcFdinfo>()).min(fds.capacity())) };
+        true
+    }
+
+    /// `path` still bound by a live process anywhere on the system.
+    pub fn socket_bound_at(path: &Path) -> Result<bool> {
+        let ours = path_spellings(path);
+        let mut pids = vec![0 as libc::pid_t; 4096];
+        // SAFETY: `pids` is valid for writes of its byte capacity.
+        let n = unsafe {
+            libc::proc_listallpids(
+                pids.as_mut_ptr().cast(),
+                (pids.len() * size_of::<libc::pid_t>()) as libc::c_int,
+            )
+        };
+        if n < 0 {
+            return Err(std::io::Error::last_os_error()).context("proc_listallpids");
+        }
+        if n as usize > pids.len() {
+            // Rare — the pid count outgrew the buffer between calls;
+            // size to what the kernel asked for and retry once.
+            pids.resize(n as usize + 64, 0);
+            let n = unsafe {
+                libc::proc_listallpids(
+                    pids.as_mut_ptr().cast(),
+                    (pids.len() * size_of::<libc::pid_t>()) as libc::c_int,
+                )
+            };
+            if n < 0 {
+                return Err(std::io::Error::last_os_error()).context("proc_listallpids");
+            }
+            pids.truncate((n as usize).min(pids.len()));
+        } else {
+            pids.truncate(n as usize);
+        }
+        let mut fds: Vec<ProcFdinfo> = Vec::with_capacity(64);
+        let mut inspected = 0usize;
+        for &pid in &pids {
+            if !list_fds(pid, &mut fds) {
+                continue;
+            }
+            inspected += 1;
+            for fd in &fds {
+                if fd.proc_fdtype != PROX_FDTYPE_SOCKET {
+                    continue;
+                }
+                // SAFETY: POD struct, fully overwritten by the kernel.
+                let mut info: SocketFdinfo = unsafe { std::mem::zeroed() };
+                let n = unsafe {
+                    libc::proc_pidfdinfo(
+                        pid,
+                        fd.proc_fd,
+                        PROC_PIDFDSOCKETINFO,
+                        (&mut info as *mut SocketFdinfo).cast(),
+                        size_of::<SocketFdinfo>() as libc::c_int,
+                    )
+                };
+                if n < size_of::<SocketFdinfo>() as libc::c_int {
+                    continue;
+                }
+                if info.psi.soi_family != libc::AF_UNIX || info.psi.soi_kind != SOCKINFO_UN {
+                    continue;
+                }
+                // SAFETY: `soi_kind == SOCKINFO_UN` — the kernel
+                // populated the `un` union arm for a unix socket.
+                let un = unsafe { &*info.psi.soi_proto.un };
+                let bound = sun_path_bytes(unsafe { &un.unsi_addr.sun });
+                let peer = sun_path_bytes(unsafe { &un.unsi_caddr.sun });
+                if matches(&ours, bound) || matches(&ours, peer) {
+                    return Ok(true);
+                }
+            }
+        }
+        if inspected == 0 {
+            anyhow::bail!("could not inspect any process's fd table");
+        }
+        Ok(false)
+    }
+}
 /// mandatory NUL terminator (104 on Apple targets, 108 on Linux).
 #[cfg(unix)]
 fn sun_path_capacity() -> usize {
@@ -839,14 +1142,30 @@ pub async fn bind_unix(path: &str) -> Result<(UnixEndpoint, UnixSocketGuard)> {
                     tokio::time::sleep(STALE_REPROBE_DELAY).await;
                     match probe_unix_socket(&resolved).await {
                         UnixProbe::Refused => {
-                            warn!(
-                                "external-controller-unix: reclaiming stale socket {}",
-                                resolved.display()
-                            );
-                            reclaim_stale_socket(
-                                &resolved,
-                                (md.dev(), md.ino(), md.ctime(), md.ctime_nsec()),
-                            )?;
+                            // A refusal does not prove death where a
+                            // saturated accept queue refuses too —
+                            // unlink only what the kernel says no
+                            // process still binds (issue #974).
+                            match unix_socket_still_bound(&resolved) {
+                                Ok(false) => {
+                                    warn!(
+                                        "external-controller-unix: reclaiming stale socket {}",
+                                        resolved.display()
+                                    );
+                                    reclaim_stale_socket(
+                                        &resolved,
+                                        (md.dev(), md.ino(), md.ctime(), md.ctime_nsec()),
+                                    )?;
+                                }
+                                Ok(true) => anyhow::bail!(
+                                    "external-controller-unix: {} is still bound by a live process",
+                                    resolved.display()
+                                ),
+                                Err(e) => anyhow::bail!(
+                                    "external-controller-unix: cannot prove {} is a dead socket: {e}",
+                                    resolved.display()
+                                ),
+                            }
                         }
                         UnixProbe::Live => anyhow::bail!(
                             "external-controller-unix: {} is already serving a live socket",
