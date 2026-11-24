@@ -26,12 +26,12 @@ const FRAME_OVERHEAD: usize = 7;
 /// contract rather than in either caller.
 const MAX_SCHEME_BYTES: usize = u16::MAX as usize;
 
-/// Validate `raw_scheme` exactly as `anytls_rs::PaddingFactory::new`
-/// accepts it. Returns `Err` with a human-readable message on any
-/// malformed `stop`, bad range endpoint, a packet whose total potential
-/// padding exceeds the protocol bound, or a scheme too long to ever
-/// ride the update frame.
-pub fn validate_scheme(raw_scheme: &[u8]) -> Result<(), String> {
+/// Validate `raw_scheme` and return its effective `stop` packet threshold.
+///
+/// Shared by `meow-config` (`validate_scheme`) and
+/// `anytls_rs::PaddingFactory::new` so validation and runtime construction
+/// cannot disagree on duplicate or whitespace-padded `stop` keys.
+pub fn parse_and_validate_scheme(raw_scheme: &[u8]) -> Result<u32, String> {
     if raw_scheme.len() > MAX_SCHEME_BYTES {
         return Err(format!(
             "padding scheme exceeds {MAX_SCHEME_BYTES} bytes — it must fit one frame"
@@ -41,10 +41,17 @@ pub fn validate_scheme(raw_scheme: &[u8]) -> Result<(), String> {
 
     // `StringMap::from_bytes` parity: `k=v` halves are taken VERBATIM
     // (no trimming — upstream `StringMapFromBytes` does not trim), last
-    // duplicate key winning.
+    // duplicate key winning. `stop` tolerates surrounding whitespace on
+    // key and value for backward compatibility with existing node configs;
+    // all trimmed `stop` spellings collapse into a single last-wins slot
+    // so validation and factory construction always pick the same value.
     let mut entries: Vec<(String, String)> = Vec::new();
+    let mut stop_raw: Option<&str> = None;
     for line in text.lines() {
         if let Some((key, value)) = line.split_once('=') {
+            if key.trim() == "stop" {
+                stop_raw = Some(value);
+            }
             match entries.iter_mut().find(|(k, _)| k == key) {
                 Some(slot) => slot.1 = value.to_string(),
                 None => entries.push((key.to_string(), value.to_string())),
@@ -52,19 +59,13 @@ pub fn validate_scheme(raw_scheme: &[u8]) -> Result<(), String> {
         }
     }
 
-    // `stop` tolerates whitespace around key and value — the pre-unify
-    // config parser trimmed both, and tightening it would reject node
-    // configs meow already accepted (N06). Numeric padding keys stay
-    // verbatim: a padded " 0" is a non-numeric key, ignored like
-    // upstream's StringMap.
-    match entries.iter().find(|(k, _)| k.trim() == "stop") {
-        Some((_, stop)) => {
-            stop.trim()
-                .parse::<u32>()
-                .map_err(|_| "invalid 'stop' value".to_string())?;
-        }
+    let stop = match stop_raw {
+        Some(stop) => stop
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| "invalid 'stop' value".to_string())?,
         None => return Err("missing 'stop' in padding scheme".to_string()),
-    }
+    };
 
     for (key, spec) in &entries {
         if key.parse::<u32>().is_err() {
@@ -94,5 +95,14 @@ pub fn validate_scheme(raw_scheme: &[u8]) -> Result<(), String> {
         }
     }
 
-    Ok(())
+    Ok(stop)
+}
+
+/// Validate `raw_scheme` exactly as `anytls_rs::PaddingFactory::new`
+/// accepts it. Returns `Err` with a human-readable message on any
+/// malformed `stop`, bad range endpoint, a packet whose total potential
+/// padding exceeds the protocol bound, or a scheme too long to ever
+/// ride the update frame.
+pub fn validate_scheme(raw_scheme: &[u8]) -> Result<(), String> {
+    parse_and_validate_scheme(raw_scheme).map(|_| ())
 }

@@ -55,19 +55,8 @@ impl PaddingFactory {
     /// same no-IO check `meow-config` runs on `padding-scheme:` — so the
     /// parse below cannot fail once it passes.
     pub fn new(raw_scheme: &[u8]) -> Result<Self, String> {
-        meow_common::anytls_padding::validate_scheme(raw_scheme)?;
+        let stop = meow_common::anytls_padding::parse_and_validate_scheme(raw_scheme)?;
         let scheme = StringMap::from_bytes(raw_scheme);
-
-        // Same whitespace tolerance as `validate_scheme` — the two MUST
-        // agree or validation could pass a scheme this parse rejects.
-        let stop = scheme
-            .iter()
-            .find(|(k, _)| k.trim() == "stop")
-            .map(|(_, v)| v)
-            .ok_or_else(|| "missing 'stop' in padding scheme".to_string())?
-            .trim()
-            .parse::<u32>()
-            .map_err(|_| "invalid 'stop' value".to_string())?;
 
         let mut sizes = HashMap::new();
         for (key, spec) in scheme.iter() {
@@ -256,6 +245,9 @@ mod tests {
         }
         assert!(PaddingFactory::new(b"stop=\n0=30-30").is_err());
         assert!(PaddingFactory::new(b"stop= 8 x\n0=30-30").is_err());
+        assert!(PaddingFactory::new(b"stop=8\n stop=bad\n0=30-30").is_err());
+        let dup = PaddingFactory::new(b"stop=8\n stop = 12 \n0=30-30").unwrap();
+        assert_eq!(dup.stop(), 12);
     }
 
     #[test]
