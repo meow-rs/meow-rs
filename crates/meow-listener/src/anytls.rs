@@ -343,12 +343,14 @@ impl AnytlsListener {
             // unblock) instead of leaking dials past connection teardown.
             let mut children = tokio::task::JoinSet::new();
             loop {
+                while children.try_join_next().is_some() {}
                 tokio::select! {
-                    // Admit the next stream AND reap finished children
-                    // in the same loop (N02): a JoinSet accumulates
-                    // completed-but-unjoined entries without bound
-                    // otherwise, past the 128-live-stream cap.
-                    stream = stream_rx.recv() => match stream {
+                    biased;
+                    // Reap ahead of admission and cap live JoinSet tasks at
+                    // `STREAM_ACCEPT_QUEUE` so rapid SYN/FIN churn cannot
+                    // outrun reaping and grow `children` past the 128 cap (N02).
+                    _ = children.join_next(), if !children.is_empty() => {}
+                    stream = stream_rx.recv(), if children.len() < Session::STREAM_ACCEPT_QUEUE => match stream {
                         Some(stream) => {
                             let session = Arc::clone(&session);
                             let inner = Arc::clone(&inner);
@@ -365,7 +367,6 @@ impl AnytlsListener {
                         }
                         None => break,
                     },
-                    _ = children.join_next(), if !children.is_empty() => {}
                 }
             }
             // Admission closed (session teardown dropped its sender):
@@ -963,27 +964,31 @@ mod tests {
             assert_eq!(proxy.dials.load(Ordering::SeqCst), 1);
 
             // Peer FIN on the healthy stream: upstream retires it with
-            // `closeLocally` — NO echo. The session must stay alive and
-            // a NEW stream (recycled work, fresh sid) must still ACK +
-            // relay — proving the retired stream left no stale state.
+            // `closeLocally` — NO echo. Reopening the SAME SID 7 (NEW-03)
+            // must still ACK + relay, and the retired gen-1 handler's
+            // teardown must not emit a late FIN/SynAck that kills gen-2.
             write_frame(&mut client, 3, 7, &[]).await;
-            write_frame(&mut client, 1, 9, &[]).await;
-            write_frame(&mut client, 2, 9, &socks_ipv4([5, 6, 7, 8], 443)).await;
-            write_frame(&mut client, 2, 9, b"ping2").await;
+            write_frame(&mut client, 1, 7, &[]).await;
+            write_frame(&mut client, 2, 7, &socks_ipv4([5, 6, 7, 8], 443)).await;
+            write_frame(&mut client, 2, 7, b"ping2").await;
             let (cmd, sid, _) = read_frame(&mut client).await;
-            assert_eq!((cmd, sid), (7, 9), "post-FIN stream must still ACK");
+            assert_eq!((cmd, sid), (7, 7), "recycled SID 7 must still ACK");
             let (cmd, sid, data) = read_frame(&mut client).await;
-            assert_eq!((cmd, sid), (2, 9));
+            assert_eq!((cmd, sid), (2, 7));
             assert_eq!(data, b"ping2");
             assert_eq!(proxy.dials.load(Ordering::SeqCst), 2);
-            // And nothing else arrived for the retired stream — no
-            // spurious FIN/PSH after stream 9's data.
+            // Send another PSH on the recycled SID 7 after a settle window
+            // to prove no late gen-1 FIN evicted or closed gen-2.
             assert!(
                 tokio::time::timeout(Duration::from_millis(150), client.read(&mut [0u8; 8]))
                     .await
                     .is_err(),
-                "retired stream 7 emitted a late frame"
+                "retired gen-1 of SID 7 emitted a late frame"
             );
+            write_frame(&mut client, 2, 7, b"ping3").await;
+            let (cmd, sid, data) = read_frame(&mut client).await;
+            assert_eq!((cmd, sid), (2, 7));
+            assert_eq!(data, b"ping3");
 
             client.shutdown().await.unwrap();
             drop(client);

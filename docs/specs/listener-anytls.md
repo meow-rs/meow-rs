@@ -42,11 +42,11 @@ crate's rustls `server` feature stays a dev fixture.
 | `users` | map string→string | `{}` | Ordered at build; each password stored as `SHA256(password)` — the wire credential. Empty table = upstream's reject-all state (warn, listener still serves). Empty username/password, duplicate usernames (parser rejects duplicate mapping keys first) and duplicate password digests are hard errors. |
 | `certificate` / `private-key` | string | — | Both or neither; both inline PEM (`-----BEGIN`) or both filesystem paths — mixed forms hard-error. |
 | `allow-insecure` | bool | `false` | `true` is the plaintext opt-in and is only legal **without** TLS material. With no certificate pair and no `allow-insecure` the build hard-errors. |
-| `padding-scheme` | string | crate default | Validated at build by `meow_common::anytls_padding` (same contract `PaddingFactory::new` enforces) so `-t`/`PUT` fail fast. |
+| `padding-scheme` | string | crate default | Validated at build by `meow_common::anytls_padding` (same contract `PaddingFactory::new` enforces) so `-t`/`PUT` fail fast; `""` normalizes to the default scheme. |
 | `listen` | string | `bind-address` | IP literal, `host:port`, or a comma-separated list of them. Each segment resolves through the shared `listen:port`/`port` merge — a segment port may differ from `port` only when `port` is `0`/absent; a conflict hard-errors. Empty segments hard-error. |
 | `enable` | bool | `true` | `true` warns (redundant — presence enables); `false` hard-errors. |
 | `udp` | bool | `true` | `true` warns (UoT always on); `false` hard-errors — there is no listener-level UoT off switch. |
-| `client-auth-type` / `client-auth-cert` / `ech-key` | — | — | Non-empty hard-errors (unsupported); whitespace-only is the empty case. |
+| `client-auth-type` / `client-auth-cert` / `ech-key` | — | — | Any non-empty raw string (including whitespace-only) hard-errors as unsupported; only absent or `""` is empty. |
 | `shadow-tls` / `res-tls` / `jls-config` | map | — | Recognized opaque blocks. `enable: true` hard-errors (an enabled front layer is a second security mode — the mutual-exclusion error fires first when a cert pair is also present); `enable: false`/absent warns and is ignored. Non-mapping shapes hard-error. |
 
 Foreign single-purpose keys (`cipher`, `password`, `simple-obfs`,
@@ -56,13 +56,13 @@ duplicate-port registry — same port on different addresses of one
 entry is legal, the same port claimed by a *different* listener
 hard-errors.
 
-All addresses bind **eagerly and atomically** at startup: any bind or
-socket-mark failure releases every socket and skips the listener — a
-partial listener never serves. Each socket receives `routing-mark`
-where the platform supports it; all sockets share one listener
-instance, user table, padding factory, `max-connections` quota and
-route override. `IN-PORT` on a multi-address entry reports the actual
-accepting port.
+All addresses bind **eagerly and atomically** at startup: any TLS
+identity, bind, or socket-mark failure releases every already-bound
+socket and fails startup — a partial or silently skipped listener never
+serves. Each socket receives `routing-mark` where the platform supports
+it; all sockets share one listener instance, user table, padding
+factory, `max-connections` quota and route override. `IN-PORT` on a
+multi-address entry reports the actual accepting port.
 
 ## Wire contract
 
@@ -73,17 +73,17 @@ chunks. Unknown digest closes the transport.
 Session semantics (upstream `session.go`):
 
 - Client `Settings` (`v`, `client`, optional `padding-md5`) arms SYN
-  admission — a SYN ahead of it is a protocol violation: Alert
-  "SYN before client Settings", close.
+  admission — a SYN ahead of a non-empty `Settings` is a protocol
+  violation: Alert `"client did not send its settings"`, close.
 - Missing/mismatched `padding-md5` (missing compares as `""`) pushes
   `UpdatePaddingScheme` with the raw scheme — before the version
   handshake, exactly like upstream.
 - `v >= 2` → `peer_version`, then `ServerSettings {v: 2, …}` (server
   extras merge first so `v` can never be shadowed).
-- `SYN` on a live stream id → Alert "duplicate stream id", close. The
-  stream count is bounded at 128: v2 peers get a SYNACK error payload
-  ("stream limit"), v1 peers — which have no refusal primitive — get
-  a drop.
+- `SYN` on a live stream id is ignored (`LoadOrStore` parity — existing
+  stream continues, session stays open). Live streams are bounded at 128
+  (and the accept queue at 128): excess SYNs are refused per-stream with
+  a bare `FIN` (no `SynAck`), keeping the session alive.
 - `handshake_success(sid)` is the only SYNACK producer: exactly one
   empty SYNACK for `v >= 2` peers, sent after the destination parses —
   before any dial — so a blocked rule lookup cannot reorder it behind

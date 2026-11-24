@@ -6513,7 +6513,14 @@ fn build_anytls_listener_spec(
         certificate: raw_l.certificate.clone(),
         private_key: raw_l.private_key.clone(),
         allow_insecure,
-        padding_scheme: raw_l.padding_scheme.clone(),
+        // Normalize `""` to `None`: both select `PaddingFactory::default()`
+        // at bind time, so `PUT /configs` projection diffs treat them as
+        // identical (F18).
+        padding_scheme: raw_l
+            .padding_scheme
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
         addresses,
     })
 }

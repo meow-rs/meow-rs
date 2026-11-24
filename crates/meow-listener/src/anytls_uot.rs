@@ -103,6 +103,18 @@ fn idle_ms() -> Uint {
     meow_tunnel::udp::DEFAULT_UDP_IDLE.as_millis() as Uint
 }
 
+fn touch_activity(stamp: &AtomicU) {
+    stamp.store(now_ms(), Ordering::Release);
+}
+
+/// Sample `stamp` BEFORE reading the monotonic clock so a concurrent
+/// `touch_activity` can never make `last` newer than `now` and wrap the
+/// subtraction into `Uint::MAX` (N03).
+fn elapsed_since(stamp: &AtomicU) -> Uint {
+    let last = stamp.load(Ordering::Acquire);
+    now_ms().wrapping_sub(last)
+}
+
 /// One live outbound UDP session: the bounded ingress queue plus the
 /// activity/deadness bookkeeping the sweeper and teardown need.
 struct UotSession {
@@ -224,21 +236,10 @@ pub(crate) async fn run_uot_stream(
             tick.tick().await; // first tick fires immediately — skip it
             loop {
                 tick.tick().await;
-                let now = now_ms();
                 let idle = idle_ms();
                 let mut table = sessions.lock();
                 table.retain(|_, s| {
-                    // Two reads bracketing the decision (N03): a `now`
-                    // snapshot taken before the activity load can wrap-
-                    // subtract a NEWER stamp into a huge age — evict only
-                    // when a fresh recheck still reports the same stale
-                    // stamp, i.e. nothing was active across the window.
-                    let a1 = s.last_activity.load(Ordering::Relaxed);
-                    if now.wrapping_sub(a1) < idle {
-                        return true;
-                    }
-                    let a2 = s.last_activity.load(Ordering::Relaxed);
-                    if a2 != a1 || now_ms().wrapping_sub(a2) < idle {
+                    if elapsed_since(&s.last_activity) < idle {
                         return true;
                     }
                     s.dead.store(true, Ordering::Relaxed);
@@ -332,7 +333,7 @@ pub(crate) async fn run_uot_stream(
             let deliver = {
                 let table = sessions.lock();
                 table.get(&key).map(|s| {
-                    s.last_activity.store(now_ms(), Ordering::Relaxed);
+                    touch_activity(&s.last_activity);
                     s.tx.clone()
                 })
             };
@@ -347,7 +348,7 @@ pub(crate) async fn run_uot_stream(
                         if table.len() >= MAX_UOT_SESSIONS {
                             let oldest = table
                                 .iter()
-                                .min_by_key(|(_, s)| s.last_activity.load(Ordering::Relaxed))
+                                .max_by_key(|(_, s)| elapsed_since(&s.last_activity))
                                 .map(|(k, _)| k.clone());
                             oldest.and_then(|k| table.remove(&k))
                         } else {
@@ -607,7 +608,7 @@ async fn run_uot_session(
             if out_tx.send(pkt).await.is_err() {
                 break;
             }
-            last_activity.store(now_ms(), Ordering::Relaxed);
+            touch_activity(&last_activity);
         }
     };
     tokio::pin!(reply);
@@ -616,7 +617,7 @@ async fn run_uot_session(
             // The idle arm derives from the SHARED activity stamp — a
             // receive-only-but-active target's replies refresh it the
             // same as sends do (N03).
-            let elapsed = now_ms().wrapping_sub(last_activity.load(Ordering::Relaxed));
+            let elapsed = elapsed_since(&last_activity);
             let idle_left = idle_ms().saturating_sub(elapsed);
             tokio::select! {
                 biased;
@@ -641,7 +642,7 @@ async fn run_uot_session(
                         };
                         match res {
                             Ok(n) if n == payload.len() => {
-                                last_activity.store(now_ms(), Ordering::Relaxed);
+                                touch_activity(&last_activity);
                             }
                             Ok(n) => {
                                 debug!(
@@ -658,12 +659,7 @@ async fn run_uot_session(
                     }
                 },
                 _ = tokio::time::sleep(Duration::from_millis(idle_left as u64)) => {
-                    // Re-confirm before retiring: an activity store
-                    // landing between the deadline's derivation and its
-                    // fire must not kill a live target (N03).
-                    if now_ms().wrapping_sub(last_activity.load(Ordering::Relaxed))
-                        < idle_ms()
-                    {
+                    if elapsed_since(&last_activity) < idle_ms() {
                         continue;
                     }
                     break;

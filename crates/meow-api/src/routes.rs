@@ -4633,12 +4633,39 @@ async fn swap_config_and_reconcile_tun(
         // counts as "changed" — conservative, since the committed doc
         // already built once.
         let listeners_changed = {
-            let resolved = |raw: &meow_config::raw::RawConfig| {
-                meow_config::resolve_named_listeners(raw)
-                    .ok()
-                    .and_then(|v| serde_json::to_value(v).ok())
+            let effective_keepalive = |raw: &meow_config::raw::RawConfig| {
+                raw.tcp_keepalive.unwrap_or(true).then(|| {
+                    (
+                        raw.tcp_keepalive_idle
+                            .unwrap_or(meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_IDLE_SECS),
+                        raw.tcp_keepalive_interval
+                            .unwrap_or(meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS),
+                        raw.tcp_keepalive_probes
+                            .unwrap_or(meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_PROBES),
+                    )
+                })
             };
-            resolved(&guard) != resolved(&candidate)
+            let has_top_level_tcp_inbound = |raw: &meow_config::raw::RawConfig| {
+                raw.port.unwrap_or(0) != 0
+                    || raw.socks_port.unwrap_or(0) != 0
+                    || raw.mixed_port.unwrap_or(0) != 0
+                    || raw.redir_port.unwrap_or(0) != 0
+                    || raw.tproxy_port.unwrap_or(0) != 0
+            };
+            let projection = |raw: &meow_config::raw::RawConfig| {
+                let list = meow_config::resolve_named_listeners(raw).ok()?;
+                let has_tcp_listener = has_top_level_tcp_inbound(raw)
+                    || list.iter().any(|l| {
+                        !matches!(
+                            l.spec,
+                            meow_config::ListenerSpec::WireGuard(_)
+                                | meow_config::ListenerSpec::Tun(_)
+                        )
+                    });
+                let keepalive = has_tcp_listener.then(|| effective_keepalive(raw));
+                serde_json::to_value((list, keepalive)).ok()
+            };
+            projection(&guard) != projection(&candidate)
         };
         (
             old,
