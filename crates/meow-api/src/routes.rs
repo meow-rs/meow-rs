@@ -4620,12 +4620,26 @@ async fn swap_config_and_reconcile_tun(
             || guard.external_controller_pipe != candidate.external_controller_pipe
             || guard.external_controller_cors != candidate.external_controller_cors
             || guard.tls != candidate.tls;
-        // `listeners:` is likewise a startup snapshot: a committed diff —
-        // any type's keys, including the anytls-only set the raw entry
-        // models — lands on restart only, so flag it exactly like the
-        // controller surface rather than silently stale (F18). Ordinary
-        // and forced PUTs share this commit point, so both warn.
-        let listeners_changed = guard.listeners != candidate.listeners;
+        // `listeners:` is likewise a startup snapshot — but the EFFECTIVE
+        // set is what `resolve_named_listeners` produces, and a raw
+        // `listeners:` array that did not change can still resolve
+        // differently when shared inputs move: the `allow-lan`/bind
+        // default, global `max-connections`, `sniffer:` (which deadens
+        // `tproxy-sni` synthesis), proxy names behind `listeners[].proxy`,
+        // `rule:` overrides, `routing-mark` — none live under the
+        // `listeners:` key (F18). Compare the resolved lists both ways:
+        // a raw diff that resolves identically is a respelling (no warn),
+        // an inherited change still warns. A failed old-side resolve
+        // counts as "changed" — conservative, since the committed doc
+        // already built once.
+        let listeners_changed = {
+            let resolved = |raw: &meow_config::raw::RawConfig| {
+                meow_config::resolve_named_listeners(raw)
+                    .ok()
+                    .and_then(|v| serde_json::to_value(v).ok())
+            };
+            resolved(&guard) != resolved(&candidate)
+        };
         (
             old,
             tun_changed,

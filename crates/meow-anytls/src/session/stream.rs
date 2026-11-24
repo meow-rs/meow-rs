@@ -46,16 +46,19 @@ impl Drop for OpeningStreamGuard {
 type PendingReadLock =
     Pin<Box<dyn Future<Output = tokio::sync::OwnedMutexGuard<StreamReader>> + Send>>;
 
-/// Unique per-process identity of a stream instance — stream *ids* are
-/// peer-assigned and can be recycled after a FIN, so the session tags
-/// outbound FINs with this and evicts only the matching generation
-/// (F05: a retired handler must not kill the recycled SID's new stream).
-static STREAM_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
 /// Stream represents a single data stream within a Session.
 pub struct Stream {
     id: u32,
-    generation: u64,
+    /// Self-weak bound by the session right after `Arc::new` — the
+    /// instance identity tagged onto this stream's FIN/SynAck frames.
+    /// Stream *ids* are peer-assigned and recyclable, so the wire writer
+    /// commits those frames only while this exact instance still owns
+    /// the sid in the session map (F05: a retired handler's frame must
+    /// not kill a recycled SID's new stream). A `Weak` needs no
+    /// instance counter, so the identity is portable to targets without
+    /// 64-bit atomics (F19/N05) and cannot collide with an un-reaped
+    /// old generation — its control block outlives the stream itself.
+    self_weak: Mutex<std::sync::Weak<Stream>>,
     reader: Arc<tokio::sync::Mutex<StreamReader>>,
     writer: StreamWriter,
     // Only synchronous admission and close operations run under this lock.
@@ -91,7 +94,7 @@ impl Stream {
         (
             Self {
                 id,
-                generation: STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                self_weak: Mutex::new(std::sync::Weak::new()),
                 reader: Arc::new(tokio::sync::Mutex::new(reader)),
                 writer,
                 write_state: Mutex::new(WriteState {
@@ -126,9 +129,19 @@ impl Stream {
         self.id
     }
 
-    /// This instance's unique identity — see [`STREAM_GENERATION`].
-    pub(crate) fn generation(&self) -> u64 {
-        self.generation
+    /// Bind the self-weak used to tag this instance's control frames.
+    /// Called by the session immediately after `Arc::new` — streams
+    /// only ever live inside an Arc.
+    pub(crate) fn bind_self(self: &Arc<Self>) {
+        *self.self_weak.lock().unwrap() = Arc::downgrade(self);
+    }
+
+    /// The owner token a control frame carries — `None` on an unbound
+    /// (bare) stream, which cannot collide under a recycled sid, so the
+    /// unconditional-legacy path is correct for it.
+    pub(crate) fn owner(&self) -> Option<std::sync::Weak<Stream>> {
+        let w = self.self_weak.lock().unwrap().clone();
+        (w.strong_count() > 0).then_some(w)
     }
 
     /// Mark the stream closed locally without emitting a `Fin` —
@@ -162,7 +175,7 @@ impl Stream {
                 Frame::control(Command::Fin, self.id),
                 None,
                 None,
-                Some(self.generation),
+                self.owner(),
             );
         }
         let waker = state.waker.take();

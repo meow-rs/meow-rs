@@ -17,7 +17,7 @@ test — no external node, no Docker.
 | duplicate username (parse-level dup-key policy) + duplicate password digest | `anytls_users_duplicate_name_and_password_error` |
 | non-string password | `anytls_users_nonstring_password_is_parse_error` |
 | no security mode; cert pair; `allow-insecure` plaintext; half pairs; mixed PEM/path forms | `anytls_security_mode_matrix` |
-| mTLS/ECH non-empty error, whitespace-only pass | `anytls_mtls_and_ech_hard_error_only_when_non_empty` |
+| mTLS/ECH non-empty error — whitespace-only counts (raw value); `""` passes | `anytls_mtls_and_ech_hard_error_only_when_non_empty` |
 | `shadow-tls`/`res-tls`/`jls-config` enabled→error, disabled→warn, non-mapping→error | `anytls_front_layers_enabled_error_disabled_warn` |
 | `enable: false` / `udp: false` errors; `true` spellings pass | `anytls_enable_and_udp_flags` |
 | `padding-scheme` shared-contract validation | `anytls_padding_scheme_validated_by_shared_contract` |
@@ -45,8 +45,8 @@ real frames over `Session::new_inbound` + `run_server`:
 | missing `padding-md5` → `UpdatePaddingScheme`, then `ServerSettings{v:2}`, then SYNACK on `handshake_success` | `v2_settings_then_synack_in_wire_order` |
 | v1 peer (correct md5): no `ServerSettings`, no SYNACK — next frame is the heartbeat answer | `v1_peer_gets_no_server_settings_or_synack` |
 | SYN before Settings → Alert + close | `syn_before_settings_alerts_and_closes` |
-| duplicate SYN sid → Alert + close, no second accept | `duplicate_stream_id_alerts_and_closes` |
-| stream-count bound: 129th SYN → SYNACK error payload (v2), session stays | `v2_stream_limit_refuses_with_synack_error` |
+| duplicate live SYN sid → ignored (upstream `LoadOrStore`), no Alert, session stays | `duplicate_stream_id_is_ignored` |
+| stream-count bound: 129th SYN → bare FIN (upstream refusal), session stays | `v2_stream_limit_refuses_with_fin` |
 
 ## W3 — resource bounds & UoT codec
 
@@ -58,6 +58,29 @@ real frames over `Session::new_inbound` + `run_server`:
 | uot family table ≠ SOCKS5 table; IPv4-mapped unmap | `uot_family_table_differs_from_socks` | `uot.rs` |
 | request/packet framing incl. zero-length datagram, oversize refusal, bind round-trip | `uot_request_and_packet_framing` | `uot.rs` |
 | multi-user auth preface: digest match/mismatch, padded preface | `util::auth::tests::*` | `util/auth.rs` |
+
+## W4 — production entry (listener → tunnel)
+
+`crates/meow-listener/src/anytls.rs` (`tests`) — a REAL `run_on` accept
+loop + TCP socket + `allow-insecure` plaintext + recording proxy:
+
+| Case | Test |
+| --- | --- |
+| auth preface → v2 ServerSettings → SYN → SynAck → echo data → refused marker (bare FIN, no ACK, no dial) → peer-FIN closeLocal + recycled-sid stream still ACKs | `production_entry_auth_stream_ack_fin_and_refusal` |
+| wrong digest → zero response bytes, socket closes | `production_entry_bad_auth_closes_silently` |
+
+`crates/meow-listener/src/anytls_uot.rs` (`tests`):
+
+| Case | Test |
+| --- | --- |
+| reply-side death retires session + closes conn (no JoinHandle double-await) | `reply_side_death_retires_session_and_closes_conn` |
+| aborted session task still closes its conn (association ownership) | `aborted_session_task_still_closes_conn` |
+
+`crates/meow-app/src/main.rs` (`tests`):
+
+| Case | Test |
+| --- | --- |
+| second-address bind failure errors AND releases the already-bound group | `anytls_partial_bind_failure_releases_the_whole_group` |
 
 ## Still open
 

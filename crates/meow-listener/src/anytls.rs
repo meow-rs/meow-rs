@@ -91,6 +91,10 @@ pub struct AnytlsListener {
     /// each `run_on` invocation (one semaphore per socket would
     /// multiply the real cap by address count).
     conn_slots: Option<Arc<Semaphore>>,
+    /// The configured cap behind `conn_slots` — the semaphore only
+    /// knows REMAINING permits, so saturation diagnostics must read
+    /// this, not the semaphore (N07).
+    conn_max: usize,
     /// Keepalive posture applied to every accepted socket (see
     /// [`crate::keepalive`]); `enabled: false` writes no sockopts.
     tcp_keepalive: TcpKeepaliveConfig,
@@ -113,11 +117,17 @@ impl AnytlsListener {
             .into_iter()
             .map(|(name, digest)| (digest, name))
             .collect();
+        // `padding-scheme: ""` is the absent form — mihomo treats an
+        // explicit empty string as "no scheme", i.e. the default
+        // factory. Non-empty values keep their bytes VERBATIM (the
+        // padding-md5 is computed over them).
         let padding = match spec.padding_scheme.as_deref() {
-            Some(scheme) => Arc::new(PaddingFactory::new(scheme.as_bytes()).map_err(|e| {
-                meow_common::MeowError::Config(format!("anytls listener: padding-scheme: {e}"))
-            })?),
-            None => PaddingFactory::default(),
+            Some(scheme) if !scheme.is_empty() => {
+                Arc::new(PaddingFactory::new(scheme.as_bytes()).map_err(|e| {
+                    meow_common::MeowError::Config(format!("anytls listener: padding-scheme: {e}"))
+                })?)
+            }
+            _ => PaddingFactory::default(),
         };
         let acceptor = match (&spec.certificate, &spec.private_key) {
             (Some(cert), Some(key)) => {
@@ -144,6 +154,7 @@ impl AnytlsListener {
             padding,
             conn_slots: (DEFAULT_MAX_CONNECTIONS > 0)
                 .then(|| Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS))),
+            conn_max: DEFAULT_MAX_CONNECTIONS,
             tcp_keepalive: TcpKeepaliveConfig::default(),
             route_override: None,
         })
@@ -160,6 +171,7 @@ impl AnytlsListener {
     /// [`DEFAULT_MAX_CONNECTIONS`]). `0` disables the cap.
     pub fn with_max_connections(mut self, max: usize) -> Self {
         self.conn_slots = (max > 0).then(|| Arc::new(Semaphore::new(max)));
+        self.conn_max = max;
         self
     }
 
@@ -186,10 +198,7 @@ impl AnytlsListener {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bound = listener.local_addr()?;
         let in_port = bound.port();
-        let max_connections = self
-            .conn_slots
-            .as_ref()
-            .map_or(0, |s| s.available_permits());
+        let max_connections = self.conn_max;
         info!(
             "AnyTLS listener '{}' on {} (tls={}, users={})",
             self.name,
@@ -326,33 +335,51 @@ impl AnytlsListener {
         let in_name = self.name.clone();
         let route_override = self.route_override.clone();
         let user: SmolStr = user.into();
+        let session_end = Arc::clone(&session);
         let dispatch = tokio::spawn(async move {
             // Every per-stream task the session spawns lives in ONE
             // supervision set: when the session dies, `JoinSet::abort_all`
             // retires the handlers (they drop their `Arc<Stream>` and
             // unblock) instead of leaking dials past connection teardown.
             let mut children = tokio::task::JoinSet::new();
-            while let Some(stream) = stream_rx.recv().await {
-                let session = Arc::clone(&session);
-                let inner = Arc::clone(&inner);
-                let ctx = FlowCtx {
-                    peer,
-                    in_name: in_name.clone(),
-                    in_port,
-                    user: user.clone(),
-                    route_override: route_override.clone(),
-                };
-                children.spawn(async move {
-                    handle_stream(stream, session, inner, ctx).await;
-                });
+            loop {
+                tokio::select! {
+                    // Admit the next stream AND reap finished children
+                    // in the same loop (N02): a JoinSet accumulates
+                    // completed-but-unjoined entries without bound
+                    // otherwise, past the 128-live-stream cap.
+                    stream = stream_rx.recv() => match stream {
+                        Some(stream) => {
+                            let session = Arc::clone(&session);
+                            let inner = Arc::clone(&inner);
+                            let ctx = FlowCtx {
+                                peer,
+                                in_name: in_name.clone(),
+                                in_port,
+                                user: user.clone(),
+                                route_override: route_override.clone(),
+                            };
+                            children.spawn(async move {
+                                handle_stream(stream, session, inner, ctx).await;
+                            });
+                        }
+                        None => break,
+                    },
+                    _ = children.join_next(), if !children.is_empty() => {}
+                }
             }
+            // Admission closed (session teardown dropped its sender):
+            // cancel every in-flight handler and WAIT for the cleanup —
+            // dropping a JoinSet only *requests* cancellation.
             children.abort_all();
             while children.join_next().await.is_some() {}
         });
-        // Await the session's death; the dispatch task ends when the
-        // stream-accept channel closes with the session maps.
+        // Await the session's death; `run_server`'s teardown drops the
+        // accept sender, ending the dispatch loop above — so JOIN it
+        // rather than abort: its exit is what retires the children.
         let _ = runner.await;
-        dispatch.abort();
+        let _ = session_end.close().await;
+        let _ = dispatch.await;
     }
 }
 
@@ -367,34 +394,55 @@ pub(crate) struct FlowCtx {
     pub route_override: Option<meow_common::InboundRouteOverride>,
 }
 
+/// The stream's single close owner (F04): scope exit — normal return,
+/// the death arm winning, or an outer abort dropping this future — runs
+/// `Stream::close` exactly once via the guard; it never depends on
+/// reaching a trailing statement (F04).
+struct StreamOwner(Arc<anytls_rs::session::Stream>);
+
+impl Drop for StreamOwner {
+    fn drop(&mut self) {
+        self.0.close();
+    }
+}
+
 /// Per-stream dispatch umbrella: race the stream's work against its
 /// death (peer FIN, admission eviction, session teardown), then close
-/// through ONE point. `Stream::close` is dieOnce-guarded, so a
-/// retired-mid-dispatch stream emits no second FIN; the queued FIN's
-/// drain-time eviction retires exactly this generation (F04/F05).
+/// through ONE owner. `Stream::close` is dieOnce-guarded and the
+/// FIN it queues carries this instance's owner token, so a retired
+/// generation can neither wire a stale FIN nor evict a recycled SID
+/// (F04/F05).
 async fn handle_stream(
     stream: Arc<anytls_rs::session::Stream>,
     session: Arc<Session>,
     inner: Arc<meow_tunnel::TunnelInner>,
     ctx: FlowCtx,
 ) {
+    let _owner = StreamOwner(Arc::clone(&stream));
     let stream_id = stream.id();
+    // Subscribe BEFORE checking `is_closed` — `notify_waiters` retains
+    // no state, so a notify landing between a bare check and a fresh
+    // waiter would strand this handler forever (F04).
+    let died = stream.close_waiter();
+    tokio::pin!(died);
+    let _ = died.as_mut().enable();
     // A stream the session already retired (FIN raced ahead of dispatch)
-    // needs no work arm at all.
+    // needs no work arm at all — the guard still issues its close.
     if !stream.is_closed() {
-        // `enable()` registers the waiter eagerly — a `notify_waiters`
-        // that raced between `notified()` and the select still resolves.
-        let died = stream.close_waiter();
-        tokio::pin!(died);
-        let _ = died.as_mut().enable();
         tokio::select! {
-            _ = died => {
-                debug!("anytls stream {stream_id}: died mid-dispatch");
+            // `biased`: when death and work are BOTH ready, death wins —
+            // dispatch admission must not outrank retirement (F05).
+            biased;
+            _ = &mut died => {
+                if session.is_closed() {
+                    debug!("anytls stream {stream_id}: session teardown");
+                } else {
+                    debug!("anytls stream {stream_id}: died mid-dispatch");
+                }
             }
-            _ = handle_stream_inner(Arc::clone(&stream), session, inner, ctx) => {}
+            _ = handle_stream_inner(Arc::clone(&stream), Arc::clone(&session), inner, ctx) => {}
         }
     }
-    stream.close();
 }
 
 /// The stream's work proper — parse destination, ACK, route. NEVER
@@ -636,4 +684,373 @@ fn build_tls_acceptor(
         anyhow::anyhow!("anytls certificate and private-key do not form a pair: {e}")
     })?;
     Ok(builder.build())
+}
+
+#[cfg(test)]
+mod tests {
+    //! Production-entry coverage (F21): a REAL `run_on` accept loop —
+    //! TCP socket → `allow-insecure` plaintext → auth preface → session
+    //! frames → JoinSet dispatch → `route_inbound_tcp` onto a recording
+    //! proxy. The wire peer is a raw `TcpStream` speaking frames.
+    use super::*;
+    use anytls_rs::hash_password;
+    use anytls_rs::padding::{PaddingFactory, DEFAULT_PADDING_SCHEME};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex as StdMutex;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+
+    /// Recording TCP proxy: every `dial_tcp` notes the metadata and
+    /// answers with an echo conn — bytes the stream writes come back.
+    struct EchoTcpProxy {
+        dials: AtomicUsize,
+        seen: StdMutex<Vec<(String, Option<String>)>>,
+        health: meow_common::ProxyHealth,
+    }
+
+    struct EchoConn(tokio::io::DuplexStream);
+    impl meow_common::ProxyConn for EchoConn {}
+    impl AsyncRead for EchoConn {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_read(cx, buf)
+        }
+    }
+    impl AsyncWrite for EchoConn {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            Pin::new(&mut self.0).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_flush(cx)
+        }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for EchoTcpProxy {
+        fn name(&self) -> &str {
+            "echo-tcp"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            false
+        }
+        async fn dial_tcp(
+            &self,
+            metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            self.dials.fetch_add(1, Ordering::SeqCst);
+            self.seen.lock().unwrap().push((
+                metadata.remote_address().to_string(),
+                metadata.in_user.as_deref().map(str::to_string),
+            ));
+            let (io, mut peer) = tokio::io::duplex(1 << 16);
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match peer.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(n) => {
+                            if peer.write_all(&buf[..n]).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            });
+            Ok(Box::new(EchoConn(io)))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyPacketConn>> {
+            Err(meow_common::MeowError::NotSupported("no udp".into()))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for EchoTcpProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    fn echo_tunnel(proxy: &Arc<EchoTcpProxy>) -> Tunnel {
+        let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        let mut proxies = res.proxies;
+        proxies.insert(
+            "echo-tcp".into(),
+            Arc::clone(proxy) as Arc<dyn meow_common::Proxy>,
+        );
+        tunnel.update_proxies(proxies, res.dialer_registry);
+        tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+            "echo-tcp",
+        ))]);
+        tunnel
+    }
+
+    fn digest(password: &str) -> [u8; 32] {
+        hash_password(password)
+    }
+
+    async fn write_frame(peer: &mut tokio::net::TcpStream, cmd: u8, sid: u32, data: &[u8]) {
+        peer.write_u8(cmd).await.unwrap();
+        peer.write_u32(sid).await.unwrap();
+        peer.write_u16(data.len() as u16).await.unwrap();
+        peer.write_all(data).await.unwrap();
+    }
+
+    async fn read_frame(peer: &mut tokio::net::TcpStream) -> (u8, u32, Vec<u8>) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let mut header = [0u8; 7];
+            peer.read_exact(&mut header).await.unwrap();
+            let len = u16::from_be_bytes([header[5], header[6]]) as usize;
+            let mut data = vec![0u8; len];
+            peer.read_exact(&mut data).await.unwrap();
+            (
+                header[0],
+                u32::from_be_bytes(header[1..5].try_into().unwrap()),
+                data,
+            )
+        })
+        .await
+        .expect("frame read stalled")
+    }
+
+    fn socks_ipv4(ip: [u8; 4], port: u16) -> Vec<u8> {
+        let mut v = vec![0x01];
+        v.extend_from_slice(&ip);
+        v.extend_from_slice(&port.to_be_bytes());
+        v
+    }
+
+    fn socks_domain(host: &str, port: u16) -> Vec<u8> {
+        let mut v = vec![0x03, host.len() as u8];
+        v.extend_from_slice(host.as_bytes());
+        v.extend_from_slice(&port.to_be_bytes());
+        v
+    }
+
+    /// F21: auth → settings → healthy stream (SynAck + echo data) →
+    /// refused stream (bare FIN, no ACK, no dial) → peer FIN echo.
+    #[tokio::test]
+    async fn production_entry_auth_stream_ack_fin_and_refusal() {
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_test_writer()
+            .try_init();
+        tokio::time::timeout(Duration::from_secs(15), async {
+            let proxy = Arc::new(EchoTcpProxy {
+                dials: AtomicUsize::new(0),
+                seen: StdMutex::new(Vec::new()),
+                health: meow_common::ProxyHealth::new(),
+            });
+            let tunnel = echo_tunnel(&proxy);
+            let listener = AnytlsListener::new(
+                tunnel,
+                "in-a".into(),
+                AnytlsListenerSpec {
+                    users: vec![("alice".into(), digest("pw"))],
+                    certificate: None,
+                    private_key: None,
+                    allow_insecure: true,
+                    padding_scheme: None,
+                },
+            )
+            .unwrap();
+            let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = bound.local_addr().unwrap().port();
+            let server = tokio::spawn(async move { Arc::new(listener).run_on(bound).await });
+
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            // Auth preface: SHA256(password) + u16be padLen + padding.
+            client.write_all(&digest("pw")).await.unwrap();
+            client.write_u16(0).await.unwrap();
+            // v2 settings echoing the default scheme's md5 — no
+            // UpdatePaddingScheme, first server frame is ServerSettings.
+            let md5 = PaddingFactory::new(DEFAULT_PADDING_SCHEME.as_bytes())
+                .unwrap()
+                .md5()
+                .to_string();
+            write_frame(
+                &mut client,
+                4, // Settings
+                0,
+                format!("v=2\npadding-md5={md5}").as_bytes(),
+            )
+            .await;
+            let (cmd, _sid, data) = read_frame(&mut client).await;
+            assert_eq!(cmd, 10, "expected ServerSettings, got cmd {cmd}");
+            assert!(data.windows(3).any(|w| w == b"v=2"));
+
+            // Healthy stream: SYN → destination PSH → data PSH.
+            write_frame(&mut client, 1, 7, &[]).await; // SYN
+            write_frame(&mut client, 2, 7, &socks_ipv4([1, 2, 3, 4], 80)).await;
+            write_frame(&mut client, 2, 7, b"ping").await;
+            let (cmd, sid, _) = read_frame(&mut client).await;
+            assert_eq!((cmd, sid), (7, 7), "expected SynAck sid=7");
+            let (cmd, sid, data) = read_frame(&mut client).await;
+            assert_eq!((cmd, sid), (2, 7), "expected PSH echo sid=7");
+            assert_eq!(data, b"ping");
+            // The echo proves route → dial → relay ran through the real
+            // tunnel path — and stamped the authenticated user.
+            assert_eq!(proxy.dials.load(Ordering::SeqCst), 1);
+            {
+                let seen = proxy.seen.lock().unwrap();
+                assert_eq!(seen[0].0, "1.2.3.4:80");
+                assert_eq!(seen[0].1.as_deref(), Some("alice"));
+            }
+
+            // Refused stream: legacy UoT marker → bare FIN, never ACKed,
+            // never dialed.
+            write_frame(&mut client, 1, 8, &[]).await;
+            write_frame(
+                &mut client,
+                2,
+                8,
+                &socks_domain(anytls_rs::uot::UOT_LEGACY_DOMAIN, 0),
+            )
+            .await;
+            let (cmd, sid, _) = read_frame(&mut client).await;
+            assert_eq!(
+                (cmd, sid),
+                (3, 8),
+                "reserved destination must retire with a bare FIN"
+            );
+            assert_eq!(proxy.dials.load(Ordering::SeqCst), 1);
+
+            // Peer FIN on the healthy stream: upstream retires it with
+            // `closeLocally` — NO echo. The session must stay alive and
+            // a NEW stream (recycled work, fresh sid) must still ACK +
+            // relay — proving the retired stream left no stale state.
+            write_frame(&mut client, 3, 7, &[]).await;
+            write_frame(&mut client, 1, 9, &[]).await;
+            write_frame(&mut client, 2, 9, &socks_ipv4([5, 6, 7, 8], 443)).await;
+            write_frame(&mut client, 2, 9, b"ping2").await;
+            let (cmd, sid, _) = read_frame(&mut client).await;
+            assert_eq!((cmd, sid), (7, 9), "post-FIN stream must still ACK");
+            let (cmd, sid, data) = read_frame(&mut client).await;
+            assert_eq!((cmd, sid), (2, 9));
+            assert_eq!(data, b"ping2");
+            assert_eq!(proxy.dials.load(Ordering::SeqCst), 2);
+            // And nothing else arrived for the retired stream — no
+            // spurious FIN/PSH after stream 9's data.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(150), client.read(&mut [0u8; 8]))
+                    .await
+                    .is_err(),
+                "retired stream 7 emitted a late frame"
+            );
+
+            client.shutdown().await.unwrap();
+            drop(client);
+            server.abort();
+            let _ = server.await;
+        })
+        .await
+        .expect("production entry test timed out");
+    }
+
+    /// F21 auth edge: a wrong digest gets NO response bytes — the
+    /// connection just closes (upstream behavior), and the listener
+    /// keeps accepting afterwards.
+    #[tokio::test]
+    async fn production_entry_bad_auth_closes_silently() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let proxy = Arc::new(EchoTcpProxy {
+                dials: AtomicUsize::new(0),
+                seen: StdMutex::new(Vec::new()),
+                health: meow_common::ProxyHealth::new(),
+            });
+            let tunnel = echo_tunnel(&proxy);
+            let listener = AnytlsListener::new(
+                tunnel,
+                "in-a".into(),
+                AnytlsListenerSpec {
+                    users: vec![("alice".into(), digest("pw"))],
+                    certificate: None,
+                    private_key: None,
+                    allow_insecure: true,
+                    padding_scheme: None,
+                },
+            )
+            .unwrap();
+            let bound = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = bound.local_addr().unwrap().port();
+            let server = tokio::spawn(async move { Arc::new(listener).run_on(bound).await });
+
+            let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap();
+            client.write_all(&digest("wrong")).await.unwrap();
+            client.write_u16(0).await.unwrap();
+            // No Alert, no bytes — the socket must simply EOF.
+            let got = tokio::time::timeout(Duration::from_secs(5), async {
+                let mut buf = [0u8; 16];
+                client.read(&mut buf).await
+            })
+            .await
+            .expect("bad-auth close never arrived");
+            // Zero bytes precede the close — EOF or a bare RST both
+            // satisfy "no response bytes" (platform variance in how the
+            // dropped socket reports).
+            match got {
+                Ok(0) => {}
+                Ok(n) => panic!("a rejected auth emitted {n} bytes"),
+                Err(e) => assert_eq!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionReset,
+                    "unexpected close error: {e}"
+                ),
+            }
+            assert_eq!(proxy.dials.load(Ordering::SeqCst), 0);
+            server.abort();
+            let _ = server.await;
+        })
+        .await
+        .expect("bad-auth test timed out");
+    }
 }

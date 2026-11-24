@@ -291,7 +291,7 @@ pub enum ListenerSpec {
 
 /// Per-listener config for the `anytls` inbound (`ListenerSpec::Anytls`).
 ///
-/// Built by [`build_anytls_listener_spec`], the single semantic entry
+/// Built by `build_anytls_listener_spec`, the single semantic entry
 /// point shared by startup, `-t` and `PUT /configs` — no file I/O
 /// happens here; `certificate`/`private_key` stay as-written (PEM
 /// literal or path) for the app's bind-time resolution.
@@ -6241,6 +6241,117 @@ fn build_anytls_listener_spec(
     raw_l: &raw::RawListener,
     default_bind: &str,
 ) -> Result<AnytlsListenerConfig, anyhow::Error> {
+    // Diagnostic order (spec §2.1): the security layer's SHAPE is judged
+    // before any other field can return — `enable`/`udp`/users errors
+    // must not mask a missing or malformed TLS declaration.
+    //
+    // ── certificate/private-key pairing shape — FIRST among the
+    // substantive checks: whether a TLS layer exists at all decides how
+    // every other key reads (`allow-insecure`, front layers, users).
+    let tls_selected = match (raw_l.certificate.as_deref(), raw_l.private_key.as_deref()) {
+        (Some(cert), Some(key)) => {
+            if cert.trim().is_empty() || key.trim().is_empty() {
+                anyhow::bail!(
+                    "listeners[{}]: `certificate`/`private-key` must not be empty",
+                    raw_l.name
+                );
+            }
+            if is_pem_literal(cert) != is_pem_literal(key) {
+                anyhow::bail!(
+                    "listeners[{}]: `certificate`/`private-key` must use the same \
+                     form — both inline PEM or both filesystem paths, not mixed",
+                    raw_l.name
+                );
+            }
+            true
+        }
+        (None, None) => false,
+        _ => anyhow::bail!(
+            "listeners[{}]: `certificate` and `private-key` must be provided \
+             together",
+            raw_l.name
+        ),
+    };
+
+    // ── front-layer opaque blocks (shape + enabled flag type) ──
+    let shadow_tls_on = anytls_front_layer_enabled(raw_l, "shadow-tls", raw_l.shadow_tls.as_ref())?;
+    let res_tls_on = anytls_front_layer_enabled(raw_l, "res-tls", raw_l.res_tls.as_ref())?;
+    let jls_on = anytls_front_layer_enabled(raw_l, "jls-config", raw_l.jls_config.as_ref())?;
+
+    // ── security-mode mutual exclusivity (`allow-insecure` is excluded
+    // from the count, matching upstream's TLS-layer enumeration) ──
+    let mut enabled_layers: Vec<&str> = Vec::new();
+    if tls_selected {
+        enabled_layers.push("certificate/private-key");
+    }
+    if shadow_tls_on {
+        enabled_layers.push("shadow-tls");
+    }
+    if res_tls_on {
+        enabled_layers.push("res-tls");
+    }
+    if jls_on {
+        enabled_layers.push("jls-config");
+    }
+    if enabled_layers.len() > 1 {
+        anyhow::bail!(
+            "listeners[{}]: `type: anytls` accepts at most one TLS/front layer \
+             — enabled together: {}",
+            raw_l.name,
+            enabled_layers.join(", ")
+        );
+    }
+    // A selected front layer is a hard gap, not an ignored key.
+    for (key, on) in [
+        ("shadow-tls", shadow_tls_on),
+        ("res-tls", res_tls_on),
+        ("jls-config", jls_on),
+    ] {
+        if on {
+            anyhow::bail!(
+                "listeners[{}].{key}: `{key}` front layers are not supported by \
+                 meow's `type: anytls` inbound — remove it or terminate it \
+                 upstream",
+                raw_l.name
+            );
+        }
+    }
+
+    // ── mTLS / ECH — any non-empty RAW value is a hard error (never
+    // silently ignored). Whitespace-only counts as a request: the key
+    // carries a value the deployer typed, and meow cannot honour it.
+    for (key, value) in [
+        ("client-auth-type", raw_l.client_auth_type.as_deref()),
+        ("client-auth-cert", raw_l.client_auth_cert.as_deref()),
+        ("ech-key", raw_l.ech_key.as_deref()),
+    ] {
+        if value.is_some_and(|v| !v.is_empty()) {
+            anyhow::bail!(
+                "listeners[{}].{key}: `{key}` is not supported by meow's \
+                 `type: anytls` inbound — remove it",
+                raw_l.name
+            );
+        }
+    }
+
+    // ── the no-security gate ──
+    let allow_insecure = raw_l.allow_insecure.unwrap_or(false);
+    if !tls_selected && !allow_insecure {
+        anyhow::bail!(
+            "listeners[{}]: `type: anytls` requires `certificate` + `private-key` \
+             (TLS), or the explicit `allow-insecure: true` plaintext opt-in",
+            raw_l.name
+        );
+    }
+    if !tls_selected && allow_insecure {
+        warn!(
+            "listeners[{}]: `allow-insecure: true` — the AnyTLS listener accepts \
+             PLAINTEXT connections; credentials are visible to any on-path \
+             observer. Use only on a trusted network or behind a tunnel",
+            raw_l.name
+        );
+    }
+
     // ── `enable` — upstream-accepted but meaningless here: the entry's
     // presence is its enabled state. `false` is a hard error (silent
     // disable would be a dead config line); `true` warns redundant.
@@ -6272,34 +6383,6 @@ fn build_anytls_listener_spec(
         ),
         None => {}
     }
-
-    // ── certificate/private-key pairing shape — FIRST among the
-    // substantive checks: whether a TLS layer exists at all decides how
-    // every other key reads (`allow-insecure`, front layers, users).
-    let tls_selected = match (raw_l.certificate.as_deref(), raw_l.private_key.as_deref()) {
-        (Some(cert), Some(key)) => {
-            if cert.trim().is_empty() || key.trim().is_empty() {
-                anyhow::bail!(
-                    "listeners[{}]: `certificate`/`private-key` must not be empty",
-                    raw_l.name
-                );
-            }
-            if is_pem_literal(cert) != is_pem_literal(key) {
-                anyhow::bail!(
-                    "listeners[{}]: `certificate`/`private-key` must use the same \
-                     form — both inline PEM or both filesystem paths, not mixed",
-                    raw_l.name
-                );
-            }
-            true
-        }
-        (None, None) => false,
-        _ => anyhow::bail!(
-            "listeners[{}]: `certificate` and `private-key` must be provided \
-             together",
-            raw_l.name
-        ),
-    };
 
     // ── `users:` — absent/null/`{}` all mean "authenticate nothing"
     // (upstream's reject-all state): startup proceeds but warns once.
@@ -6357,88 +6440,11 @@ fn build_anytls_listener_spec(
         );
     }
 
-    // ── front-layer opaque blocks (shape + enabled flag type) ──
-    let shadow_tls_on = anytls_front_layer_enabled(raw_l, "shadow-tls", raw_l.shadow_tls.as_ref())?;
-    let res_tls_on = anytls_front_layer_enabled(raw_l, "res-tls", raw_l.res_tls.as_ref())?;
-    let jls_on = anytls_front_layer_enabled(raw_l, "jls-config", raw_l.jls_config.as_ref())?;
-
-    // ── security-mode mutual exclusivity (`allow-insecure` is excluded
-    // from the count, matching upstream's TLS-layer enumeration) ──
-    let mut enabled_layers: Vec<&str> = Vec::new();
-    if tls_selected {
-        enabled_layers.push("certificate/private-key");
-    }
-    if shadow_tls_on {
-        enabled_layers.push("shadow-tls");
-    }
-    if res_tls_on {
-        enabled_layers.push("res-tls");
-    }
-    if jls_on {
-        enabled_layers.push("jls-config");
-    }
-    if enabled_layers.len() > 1 {
-        anyhow::bail!(
-            "listeners[{}]: `type: anytls` accepts at most one TLS/front layer \
-             — enabled together: {}",
-            raw_l.name,
-            enabled_layers.join(", ")
-        );
-    }
-    // A selected front layer is a hard gap, not an ignored key.
-    for (key, on) in [
-        ("shadow-tls", shadow_tls_on),
-        ("res-tls", res_tls_on),
-        ("jls-config", jls_on),
-    ] {
-        if on {
-            anyhow::bail!(
-                "listeners[{}].{key}: `{key}` front layers are not supported by \
-                 meow's `type: anytls` inbound — remove it or terminate it \
-                 upstream",
-                raw_l.name
-            );
-        }
-    }
-
-    // ── mTLS / ECH — non-empty configuration is a hard error (never
-    // silently ignored). Whitespace-only strings count as empty.
-    for (key, value) in [
-        ("client-auth-type", raw_l.client_auth_type.as_deref()),
-        ("client-auth-cert", raw_l.client_auth_cert.as_deref()),
-        ("ech-key", raw_l.ech_key.as_deref()),
-    ] {
-        if value.is_some_and(|v| !v.trim().is_empty()) {
-            anyhow::bail!(
-                "listeners[{}].{key}: `{key}` is not supported by meow's \
-                 `type: anytls` inbound — remove it",
-                raw_l.name
-            );
-        }
-    }
-
-    // ── the no-security gate ──
-    let allow_insecure = raw_l.allow_insecure.unwrap_or(false);
-    if !tls_selected && !allow_insecure {
-        anyhow::bail!(
-            "listeners[{}]: `type: anytls` requires `certificate` + `private-key` \
-             (TLS), or the explicit `allow-insecure: true` plaintext opt-in",
-            raw_l.name
-        );
-    }
-    if !tls_selected && allow_insecure {
-        warn!(
-            "listeners[{}]: `allow-insecure: true` — the AnyTLS listener accepts \
-             PLAINTEXT connections; credentials are visible to any on-path \
-             observer. Use only on a trusted network or behind a tunnel",
-            raw_l.name
-        );
-    }
-
     // ── `padding-scheme` — shared contract with `PaddingFactory::new`;
     // validated here so `-t` and PUT fail fast, and the protocol layer
-    // re-validates (it cannot fail after this gate).
-    if let Some(scheme) = raw_l.padding_scheme.as_deref() {
+    // re-validates (it cannot fail after this gate). `""` is mihomo's
+    // "no scheme" spelling — the listener normalizes it to the default.
+    if let Some(scheme) = raw_l.padding_scheme.as_deref().filter(|s| !s.is_empty()) {
         meow_common::anytls_padding::validate_scheme(scheme.as_bytes())
             .map_err(|e| anyhow::anyhow!("listeners[{}].padding-scheme: {e}", raw_l.name))?;
     }
@@ -6478,16 +6484,28 @@ fn build_anytls_listener_spec(
             .map_err(|e| anyhow::anyhow!("listeners[{}].listen: {e}", raw_l.name))?;
         addresses.push(ListenerBind { listen, port });
     }
-    // Dedup resolved targets — `127.0.0.1:443,localhost:443` or a
-    // wildcard + explicit form can collapse to the same bind; double
-    // binding one addr fails startup (or worse, splits ports on :0).
+    // Reject duplicate resolved targets — `::1` and `0:0:0:0:0:0:0:1`
+    // are the same bind and a second TcpListener::bind on it fails
+    // anyway; fail the config HERE with a clear diagnostic instead of a
+    // partial bind (F11). Comparison goes through `IpAddr`, not the
+    // string, so non-canonical spellings still collide.
     let mut seen = std::collections::HashSet::new();
-    addresses.retain(|b| seen.insert((b.listen.clone(), b.port)));
-    if addresses.is_empty() {
-        anyhow::bail!(
-            "listeners[{}].listen: no bind addresses resolved",
-            raw_l.name
-        );
+    for b in &addresses {
+        let ip = b.listen.parse::<IpAddr>().map_err(|_| {
+            anyhow::anyhow!(
+                "listeners[{}].listen: '{}' is not an IP literal",
+                raw_l.name,
+                b.listen
+            )
+        })?;
+        if !seen.insert((ip, b.port)) {
+            anyhow::bail!(
+                "listeners[{}].listen: duplicate bind address '{}':{}",
+                raw_l.name,
+                b.listen,
+                b.port
+            );
+        }
     }
 
     Ok(AnytlsListenerConfig {
@@ -14660,11 +14678,14 @@ mod listener_surface_tests {
             assert!(err.contains(key), "{err}");
             assert!(err.contains("not supported"), "{err}");
         }
-        // Whitespace-only values are the empty case — the build passes.
-        anytls_named(&format!(
-            "{ANYTLS_USERS}{ANYTLS_CERT}    client-auth-type: \"  \"\n    ech-key: \"\"\n"
-        ))
-        .unwrap();
+        // Emptiness is judged on the RAW value (spec §2.1): a
+        // whitespace-only request is still a request meow cannot honour.
+        let err = anytls_named_err(&format!(
+            "{ANYTLS_USERS}{ANYTLS_CERT}    client-auth-type: \"  \"\n"
+        ));
+        assert!(err.contains("client-auth-type"), "{err}");
+        // Literal "" IS the empty case — the build passes.
+        anytls_named(&format!("{ANYTLS_USERS}{ANYTLS_CERT}    ech-key: \"\"\n")).unwrap();
     }
 
     #[test]

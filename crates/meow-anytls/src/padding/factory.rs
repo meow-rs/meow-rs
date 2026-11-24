@@ -58,9 +58,14 @@ impl PaddingFactory {
         meow_common::anytls_padding::validate_scheme(raw_scheme)?;
         let scheme = StringMap::from_bytes(raw_scheme);
 
+        // Same whitespace tolerance as `validate_scheme` — the two MUST
+        // agree or validation could pass a scheme this parse rejects.
         let stop = scheme
-            .get("stop")
+            .iter()
+            .find(|(k, _)| k.trim() == "stop")
+            .map(|(_, v)| v)
             .ok_or_else(|| "missing 'stop' in padding scheme".to_string())?
+            .trim()
             .parse::<u32>()
             .map_err(|_| "invalid 'stop' value".to_string())?;
 
@@ -233,6 +238,24 @@ mod tests {
         let sizes = ["65535-65535"; 17].join(",");
         let scheme = format!("stop=2\n1={sizes}");
         assert!(PaddingFactory::new(scheme.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn stop_tolerates_surrounding_whitespace() {
+        // Outbound-compat regression (N06): node configs accepted before
+        // the parser unify — `stop` padded by spaces in either half.
+        for scheme in [
+            "stop=8 \n0=30-30",
+            " stop=8\n0=30-30",
+            "stop = 8\n0=30-30",
+            "stop=\t8\n0=30-30",
+        ] {
+            let f = PaddingFactory::new(scheme.as_bytes())
+                .unwrap_or_else(|e| panic!("{scheme:?} rejected: {e}"));
+            assert_eq!(f.stop(), 8, "{scheme:?}");
+        }
+        assert!(PaddingFactory::new(b"stop=\n0=30-30").is_err());
+        assert!(PaddingFactory::new(b"stop= 8 x\n0=30-30").is_err());
     }
 
     #[test]

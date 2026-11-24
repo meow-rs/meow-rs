@@ -52,9 +52,15 @@ pub fn validate_scheme(raw_scheme: &[u8]) -> Result<(), String> {
         }
     }
 
-    match entries.iter().find(|(k, _)| k == "stop") {
+    // `stop` tolerates whitespace around key and value — the pre-unify
+    // config parser trimmed both, and tightening it would reject node
+    // configs meow already accepted (N06). Numeric padding keys stay
+    // verbatim: a padded " 0" is a non-numeric key, ignored like
+    // upstream's StringMap.
+    match entries.iter().find(|(k, _)| k.trim() == "stop") {
         Some((_, stop)) => {
-            stop.parse::<u32>()
+            stop.trim()
+                .parse::<u32>()
                 .map_err(|_| "invalid 'stop' value".to_string())?;
         }
         None => return Err("missing 'stop' in padding scheme".to_string()),

@@ -34,6 +34,19 @@ bind is the only startup-fatal endpoint; the new ones log-and-skip like
 upstream, and a config where every endpoint failed to bind logs that no
 controller is available.
 
+The same holds for named `listeners:` — including `type: anytls`: a PUT
+that changes the effective listener set (its own keys OR an inherited
+default like `max-connections`/`bind-address`/`sniffer:` resolving
+differently) is committed to the in-memory document and reported with a
+restart warning; running sockets, the authenticated user table and TLS
+material are untouched. The committed document is NOT written back to
+the backing config file — `PUT /configs` is a reload, not a save: keep
+the submitted YAML as the file the next boot reads (or run
+`PUT /configs` against the persisted path), otherwise the change is lost
+on restart. A `type: anytls` entry this build cannot serve (no
+`listener-anytls` feature) is rejected with 400 even under `?force=true`,
+so a persisted config can never strand the next boot.
+
 ## Panel runtime API
 
 | Route | Status | Notes |

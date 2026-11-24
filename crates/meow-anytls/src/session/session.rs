@@ -38,6 +38,14 @@ const MAX_STREAM_PENDING_FRAMES: usize = 1024;
 /// Maximum live streams per server session.
 const MAX_STREAMS_PER_SESSION: usize = 128;
 
+/// The shared control-write deadline — upstream's 5 s `writeAndRetry`
+/// bound on every control frame. Applied twice by design: at admission
+/// (`write_control_frame` — queue wait plus completion) and at the
+/// writer's single commit point (the batch wire write in
+/// `process_stream_data`), so no control frame can park either half
+/// of the session on a wedged peer.
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Inbound-budget counters shared between one stream's receive-slot and
 /// every payload it admitted: `session` points at the session-wide byte
 /// counter so a queued item releases both scopes in one Drop. `frames`
@@ -148,6 +156,14 @@ pub struct Session {
     // Session state
     is_closed: Arc<std::sync::atomic::AtomicBool>,
 
+    // Teardown supervision (F07): `is_closed` is the persistent cancel
+    // signal; `close_lock` serializes the destructive half so exactly
+    // one caller runs it — a caller cancelled mid-teardown leaves the
+    // lock for the NEXT `close()` caller, which re-checks
+    // `teardown_done` and finishes the remaining steps itself.
+    close_lock: tokio::sync::Mutex<()>,
+    teardown_done: std::sync::atomic::AtomicBool,
+
     // Padding factory in force for this session. Client sessions share the
     // client's cell, so a server-pushed scheme reaches sessions opened later.
     padding: SharedPaddingFactory,
@@ -249,6 +265,8 @@ impl Session {
             stream_data_rx: Arc::new(tokio::sync::Mutex::new(Some(stream_data_rx))),
             stream_receive_tx: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            close_lock: tokio::sync::Mutex::new(()),
+            teardown_done: std::sync::atomic::AtomicBool::new(false),
             padding,
             is_client: true,
             send_padding: true,
@@ -292,6 +310,8 @@ impl Session {
             stream_data_rx: Arc::new(tokio::sync::Mutex::new(Some(stream_data_rx))),
             stream_receive_tx: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            close_lock: tokio::sync::Mutex::new(()),
+            teardown_done: std::sync::atomic::AtomicBool::new(false),
             padding: padding.into_shared(),
             is_client: false,
             send_padding: false,
@@ -342,18 +362,44 @@ impl Session {
         !self.streams.read().await.is_empty()
     }
 
-    /// Close the session
+    /// Close the session.
+    ///
+    /// Two distinct states: `is_closed` is the persistent CANCEL signal
+    /// every waiter/loop observes, set before any await so a cancelled
+    /// caller still leaves the session stopping. The destructive
+    /// teardown — draining the stream maps, closing stream admission,
+    /// shutting the transport writer — runs under `close_lock`: every
+    /// caller queues for it, and whoever holds it runs whatever steps
+    /// remain, so a `close()` cancelled mid-teardown is RESUMED by the
+    /// next caller instead of leaving the session half-drained (F07).
+    /// `teardown_done` is the separate completion state a second caller
+    /// can trust, not merely "close was initiated".
     pub async fn close(&self) -> Result<()> {
-        let already_closed = self
-            .is_closed
-            .swap(true, std::sync::atomic::Ordering::Relaxed);
-        if already_closed {
-            return Ok(());
-        }
+        self.is_closed
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         self.stream_data_tx.close();
         self.close_notify.notify_waiters();
+        if self
+            .teardown_done
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
+        let _guard = self.close_lock.lock().await;
+        if self
+            .teardown_done
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(());
+        }
 
-        // Close stream data receiver so process_stream_data exits
+        // Drop stream admission — the accept channel's sender hangs
+        // inside this mutex, so a dispatcher parked on `recv` ends when
+        // teardown runs rather than pinning the listener's spawn set.
+        if let Some(callback_guard) = &self.on_new_stream {
+            *callback_guard.lock().await = None;
+        }
+
         // Close all streams and notify pending waiters. The two map
         // writes are the only awaits; `close_with_error`/`notify_synack`
         // are synchronous, so eviction + close + wakeup is one atomic
@@ -390,6 +436,8 @@ impl Session {
             }
         }
 
+        self.teardown_done
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -417,6 +465,12 @@ impl Session {
 
         loop {
             iteration += 1;
+            // Subscribe BEFORE checking the flag: `notify_waiters`
+            // retains no state, so a notify landing between a bare flag
+            // check and a fresh `notified()` would be lost forever.
+            let closed = self.close_notify.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
             if self.is_closed() {
                 tracing::debug!(
                     session_id = session_id,
@@ -440,7 +494,7 @@ impl Session {
             // read half parked on a peer that never speaks again.
             let n = match tokio::select! {
                 n = reader.read_buf(&mut buffer) => Some(n),
-                _ = self.close_notify.notified() => None,
+                _ = &mut closed => None,
             } {
                 Some(Ok(n)) => n,
                 None => {
@@ -585,9 +639,10 @@ impl Session {
                             || pending_frames > MAX_STREAM_PENDING_FRAMES
                         {
                             // A stalled reader must not let one stream
-                            // hold unbounded wire data; evict it (its
-                            // handler fails on next use) and keep serving
-                            // the healthy streams.
+                            // hold unbounded wire data. Tell the peer the
+                            // stream died (bounded control write — never
+                            // an unbounded stall in the recv loop) BEFORE
+                            // retiring it locally (F06).
                             drop(receive_map);
                             tracing::warn!(
                                 session_id = session_id,
@@ -595,6 +650,9 @@ impl Session {
                                 frame.stream_id,
                                 MAX_STREAM_PENDING
                             );
+                            let _ = self
+                                .write_control_frame(Frame::control(Command::Fin, frame.stream_id))
+                                .await;
                             self.evict_stream(frame.stream_id, AnyTlsError::StreamClosed)
                                 .await;
                             return Ok(());
@@ -707,6 +765,9 @@ impl Session {
                         Stream::new(stream_id, reader, self.stream_data_tx.clone());
 
                     let stream = Arc::new(stream);
+                    // Bind BEFORE registration so the instance identity is
+                    // live for every FIN it may later emit.
+                    stream.bind_self();
 
                     // Acquire both locks before mutating either map, in
                     // close()'s order — and recheck `is_closed` inside so a
@@ -951,7 +1012,7 @@ impl Session {
                                 Bytes::copy_from_slice(padding_guard.raw_scheme()),
                             );
                             drop(padding_guard);
-                            self.write_frame(update_frame).await?;
+                            self.write_control_frame(update_frame).await?;
                         }
                     }
 
@@ -982,7 +1043,7 @@ impl Session {
                             0,
                             Bytes::from(server_settings.to_bytes()),
                         );
-                        self.write_frame(server_settings_frame).await?;
+                        self.write_control_frame(server_settings_frame).await?;
                     }
                 }
             }
@@ -1140,6 +1201,7 @@ impl Session {
         let (stream, synack_rx) = Stream::new(stream_id, reader, self.stream_data_tx.clone());
 
         let stream = Arc::new(stream);
+        stream.bind_self();
 
         // Acquire both locks before mutating either map, in close()'s order.
         {
@@ -1290,7 +1352,26 @@ impl Session {
     /// physical write share one deadline so a wedged peer can't park a
     /// SYN/FIN/Alert forever.
     pub async fn write_control_frame(&self, frame: Frame) -> Result<()> {
-        match tokio::time::timeout(Duration::from_secs(5), self.write_frame(frame)).await {
+        match tokio::time::timeout(CONTROL_WRITE_TIMEOUT, self.write_frame(frame)).await {
+            Ok(result) => result,
+            Err(_) => Err(AnyTlsError::Protocol("control write deadline".into())),
+        }
+    }
+
+    /// `write_control_frame` carrying an owner token — the writer's
+    /// commit-time gate strands the frame if its issuing stream retired
+    /// between admission and the wire write (SynAck, F05).
+    async fn write_control_frame_owned(
+        &self,
+        frame: Frame,
+        owner: Option<std::sync::Weak<Stream>>,
+    ) -> Result<()> {
+        match tokio::time::timeout(
+            CONTROL_WRITE_TIMEOUT,
+            self.stream_data_tx.write_frame_owned(frame, owner),
+        )
+        .await
+        {
             Ok(result) => result,
             Err(_) => Err(AnyTlsError::Protocol("control write deadline".into())),
         }
@@ -1739,9 +1820,18 @@ impl Session {
                 // Partial frames may only be abandoned when this entire
                 // session is already closed and will never be pooled again.
                 _ = &mut closed => break,
-                result = self.write_batch(&mut requests, &mut frames, &mut encode_scratch) => result,
+                result = tokio::time::timeout(
+                    CONTROL_WRITE_TIMEOUT,
+                    self.write_batch(&mut requests, &mut frames, &mut encode_scratch),
+                ) => match result {
+                    Ok(r) => r,
+                    Err(_) => Err(AnyTlsError::Protocol("control write deadline".into())),
+                },
             };
             requests.clear();
+            // A deadline expiry can leave classified-but-unwritten frames
+            // behind; they must not resurface in the NEXT batch's image.
+            frames.clear();
             if let Err(error) = &result {
                 tracing::debug!(session_id = self.id(), %error, "AnyTLS session writer failed");
             }
@@ -1772,21 +1862,43 @@ impl Session {
         // header + its owned `Bytes` payload; nothing is copied yet.
         frames.reserve(requests.len());
         let mut flush_waiters: Vec<oneshot::Sender<Result<()>>> = Vec::new();
-        let mut fin_streams: Vec<(u32, Option<u64>)> = Vec::new();
+        let mut fin_streams: Vec<(u32, Option<std::sync::Weak<Stream>>)> = Vec::new();
         for request in requests.drain(..) {
             match request {
                 WriteRequest::Frame {
                     frame,
                     _permit,
                     completion,
-                    fin_owner,
+                    owner,
                 } => {
                     let fin = frame.cmd == Command::Fin;
+                    // Owner gate (F05): a Fin or SynAck issued by a stream
+                    // that has since retired — or been REPLACED under a
+                    // recycled sid — is stranded HERE, at wire-commit
+                    // time, rather than only at the post-write eviction.
+                    // Checking at enqueue would leave the exact window
+                    // the review flagged.
+                    if let Some(owner) = &owner
+                        && matches!(frame.cmd, Command::Fin | Command::SynAck)
+                    {
+                        let streams = self.streams.read().await;
+                        let live = matches!(
+                            (owner.upgrade(), streams.get(&frame.stream_id)),
+                            (Some(o), Some(current)) if Arc::ptr_eq(&o, current)
+                        );
+                        drop(streams);
+                        if !live {
+                            if let Some(completion) = completion {
+                                let _ = completion.send(Err(AnyTlsError::StreamClosed));
+                            }
+                            continue;
+                        }
+                    }
                     if fin {
                         // A cancelled initial dial must not leave its
                         // Settings/SYN/FIN buffered until another dial.
                         self.disable_buffering();
-                        fin_streams.push((frame.stream_id, fin_owner));
+                        fin_streams.push((frame.stream_id, owner));
                     }
                     if frame.data.len() > u16::MAX as usize {
                         // u16::MAX is the PROTOCOL hard limit — the wire
@@ -1911,14 +2023,20 @@ impl Session {
         if !fin_streams.is_empty() {
             let mut streams = self.streams.write().await;
             let mut receive_map = self.stream_receive_tx.write().await;
-            for (stream_id, fin_owner) in fin_streams {
-                // Generation check: only a FIN queued by the CURRENT map
-                // entry may evict it. A stale handler's close on a
-                // recycled SID must leave the new stream live (F05).
-                if let Some(owner) = fin_owner {
-                    match streams.get(&stream_id) {
-                        Some(s) if s.generation() == owner => {}
-                        _ => continue,
+            for (stream_id, owner) in fin_streams {
+                // Owner check: only a FIN whose issuing instance is STILL
+                // the current map entry may evict it — a peer-FIN +
+                // fresh SYN landing between this batch's classify and
+                // its write could have registered a newer generation
+                // under the same sid, which the stale FIN must not
+                // retire (F05).
+                if let Some(owner) = &owner {
+                    let live = matches!(
+                        (owner.upgrade(), streams.get(&stream_id)),
+                        (Some(o), Some(current)) if Arc::ptr_eq(&o, current)
+                    );
+                    if !live {
+                        continue;
                     }
                 }
                 if let Some(stream) = streams.remove(&stream_id) {
@@ -2059,20 +2177,32 @@ impl Session {
     /// the session dies — peer EOF, io error, or a protocol violation
     /// that `handle_frame` already closed it for. The caller still owns
     /// stream dispatch; this is the keepalive.
+    ///
+    /// Both halves are polled IN THIS TASK rather than spawned:
+    /// aborting `run_server` drops them with it, so a listener that
+    /// tears the connection down can never leave a detached reader or
+    /// writer holding the session (F07).
     pub async fn run_server(self: &Arc<Self>) {
-        let recv = {
-            let session = Arc::clone(self);
-            tokio::spawn(async move { session.recv_loop().await })
+        let recv = self.recv_loop();
+        let writer = self.process_stream_data();
+        tokio::pin!(recv);
+        tokio::pin!(writer);
+        let recv_ended = tokio::select! {
+            _ = &mut recv => true,
+            _ = &mut writer => false,
         };
-        let writer = {
-            let session = Arc::clone(self);
-            tokio::spawn(async move { session.process_stream_data().await })
-        };
-        let _ = recv.await;
-        // The read side ending is terminal: flush the writer half out so
-        // nothing outlives the caller's teardown window.
+        // Either half ending is terminal: the cancel signal wakes the
+        // survivor's own select arm, and `teardown_done` keeps this
+        // teardown single-owner even when `close` races in from an
+        // error path or the listener.
         let _ = self.close().await;
-        let _ = writer.await;
+        // Reap ONLY the survivor — a completed future must not be
+        // polled again, and its loop exits on `close_notify`.
+        if recv_ended {
+            let _ = writer.await;
+        } else {
+            let _ = recv.await;
+        }
     }
 
     /// The stream-accept ACK the spec schedules: exactly one empty
@@ -2102,8 +2232,16 @@ impl Session {
             }
         }
         if self.peer_version() >= 2 {
-            self.write_control_frame(Frame::control(Command::SynAck, stream.id()))
-                .await?;
+            // Owner-gated admission: the pre-check above proves the
+            // instance is registered NOW, but the write commits later —
+            // the writer rechecks at commit so a retirement landing in
+            // the gap strands this SynAck instead of blessing a
+            // recycled sid (F05).
+            self.write_control_frame_owned(
+                Frame::control(Command::SynAck, stream.id()),
+                Some(Arc::downgrade(stream)),
+            )
+            .await?;
         }
         Ok(())
     }

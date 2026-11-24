@@ -199,7 +199,7 @@ pub(crate) async fn run_uot_stream(
     // session queue's budget already covers the datagrams themselves).
     // `Bytes` moves the codec's output straight to the writer — no copy.
     let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(SESSION_QUEUE * 2);
-    let mut writer = {
+    let writer = {
         let mut w = io.clone();
         tokio::spawn(async move {
             while let Some(pkt) = out_rx.recv().await {
@@ -228,16 +228,36 @@ pub(crate) async fn run_uot_stream(
                 let idle = idle_ms();
                 let mut table = sessions.lock();
                 table.retain(|_, s| {
-                    let keep = now.wrapping_sub(s.last_activity.load(Ordering::Relaxed)) < idle;
-                    if !keep {
-                        s.dead.store(true, Ordering::Relaxed);
-                        s.task.abort();
+                    // Two reads bracketing the decision (N03): a `now`
+                    // snapshot taken before the activity load can wrap-
+                    // subtract a NEWER stamp into a huge age — evict only
+                    // when a fresh recheck still reports the same stale
+                    // stamp, i.e. nothing was active across the window.
+                    let a1 = s.last_activity.load(Ordering::Relaxed);
+                    if now.wrapping_sub(a1) < idle {
+                        return true;
                     }
-                    keep
+                    let a2 = s.last_activity.load(Ordering::Relaxed);
+                    if a2 != a1 || now_ms().wrapping_sub(a2) < idle {
+                        return true;
+                    }
+                    s.dead.store(true, Ordering::Relaxed);
+                    s.task.abort();
+                    false
                 });
             }
         }
     });
+    // The association OWNS its spawned tasks (N04): dropping this guard
+    // — the normal tail below OR a cancelled `run_uot_stream` — kills
+    // every session task (which in turn drops their in-scope reply arms
+    // and conn guards), the sweeper, and the ordered writer. Nothing
+    // may outlive the association detached.
+    let mut guard = AssociationGuard {
+        sessions: Arc::clone(&sessions),
+        writer,
+        sweeper,
+    };
 
     // Connect format fixes the association's one destination up front —
     // every datagram goes to it; its own request address is the only
@@ -392,18 +412,42 @@ pub(crate) async fn run_uot_stream(
     let _ = read_result;
     // Teardown: kill every session, stop accepting replies, then drain
     // the writer so the last replies still reach the wire before the
-    // stream's FIN.
+    // stream's FIN. The guard's Drop repeats the aborts — cheap and
+    // idempotent — and covers the cancelled/cancel arm with no code path.
     {
-        let mut table = sessions.lock();
+        let mut table = guard.sessions.lock();
         for (_, s) in table.drain() {
             s.dead.store(true, Ordering::Relaxed);
             s.task.abort();
         }
     }
-    sweeper.abort();
+    guard.sweeper.abort();
     drop(out_tx);
-    if let Ok(w) = (&mut writer).await {
+    if let Ok(w) = (&mut guard.writer).await {
         w.close();
+    }
+}
+
+/// The association's owned tasks — ordered writer, idle sweeper and the
+/// session table (N04). `run_uot_stream`'s cleanup tail used to do this
+/// only on the normal path; a cancelled association would detach the
+/// writer and leave the sweeper scanning an emptied table forever.
+/// Dropping the guard aborts every owned task — the session tasks'
+/// in-scope reply arms and conn guards die with them.
+struct AssociationGuard {
+    sessions: Arc<parking_lot::Mutex<HashMap<UotKey, UotSession>>>,
+    writer: tokio::task::JoinHandle<StreamIo>,
+    sweeper: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for AssociationGuard {
+    fn drop(&mut self) {
+        for (_, s) in self.sessions.lock().drain() {
+            s.dead.store(true, Ordering::Relaxed);
+            s.task.abort();
+        }
+        self.sweeper.abort();
+        self.writer.abort();
     }
 }
 
@@ -546,35 +590,34 @@ async fn run_uot_session(
         }
     };
 
-    // Reply reader: `read_packet` → UoT-encode → ordered writer. The
-    // encode carries the real source for Bind and nothing extra for
-    // Connect. A read failure is session death (issue #514's shape).
-    let reply = tokio::spawn({
-        let conn = Arc::clone(&conn);
-        let last_activity = Arc::clone(&last_activity);
-        async move {
-            let mut rbuf = vec![0u8; 65535];
-            while let Ok((m, src)) = conn.read_packet(&mut rbuf).await {
-                let pkt = match reply_form {
-                    ReplyForm::Connect => uot::encode_uot_packet_simple(&rbuf[..m]),
-                    ReplyForm::Bind => uot::encode_uot_packet_from(&rbuf[..m], &src),
-                };
-                let Ok(pkt) = pkt else { break };
-                if out_tx.send(pkt).await.is_err() {
-                    break;
-                }
-                last_activity.store(now_ms(), Ordering::Relaxed);
+    // Reply reader, writer, flush watch and idle deadline — ALL polled
+    // as plain futures inside THIS task (N01/F08): whichever ends first
+    // retires the session, and a task abort drops BOTH arms plus the
+    // conn guard — no JoinHandle survives to double-await or detach
+    // holding the UDP conn (N04).
+    let _conn_guard = ConnGuard(Arc::clone(&conn));
+    let mut rbuf = vec![0u8; 65535];
+    let reply = async {
+        while let Ok((m, src)) = conn.read_packet(&mut rbuf).await {
+            let pkt = match reply_form {
+                ReplyForm::Connect => uot::encode_uot_packet_simple(&rbuf[..m]),
+                ReplyForm::Bind => uot::encode_uot_packet_from(&rbuf[..m], &src),
+            };
+            let Ok(pkt) = pkt else { break };
+            if out_tx.send(pkt).await.is_err() {
+                break;
             }
+            last_activity.store(now_ms(), Ordering::Relaxed);
         }
-    });
-
-    // Writer: queued datagrams → `write_packet` at the resolved dst.
-    // Receive, send and the flush watch sit in ONE cancellation scope:
-    // whichever direction ends first retires the whole session and the
-    // other direction is reaped below — a dead reply reader must not
-    // leave the writer parked on `rx` holding the UDP conn.
+    };
+    tokio::pin!(reply);
     let writer = async {
         loop {
+            // The idle arm derives from the SHARED activity stamp — a
+            // receive-only-but-active target's replies refresh it the
+            // same as sends do (N03).
+            let elapsed = now_ms().wrapping_sub(last_activity.load(Ordering::Relaxed));
+            let idle_left = idle_ms().saturating_sub(elapsed);
             tokio::select! {
                 biased;
                 _ = flush.flushed() => {
@@ -585,7 +628,18 @@ async fn run_uot_session(
                     None => break,
                     Some(packet) => {
                         let payload = &packet.bytes;
-                        match conn.write_packet(payload, &dst_addr).await {
+                        // The write itself races the flush watch — a
+                        // suspended `write_packet` must not starve a
+                        // binding teardown (F08).
+                        let res = tokio::select! {
+                            biased;
+                            _ = flush.flushed() => {
+                                debug!("anytls uot session to {dst_addr}: flushed mid-write; session retires");
+                                break;
+                            }
+                            res = conn.write_packet(payload, &dst_addr) => res,
+                        };
+                        match res {
                             Ok(n) if n == payload.len() => {
                                 last_activity.store(now_ms(), Ordering::Relaxed);
                             }
@@ -603,26 +657,260 @@ async fn run_uot_session(
                         }
                     }
                 },
-                _ = tokio::time::sleep(meow_tunnel::udp::DEFAULT_UDP_IDLE) => {
-                    // Own idle deadline — the sweeper is a backstop;
-                    // sleeping sessions must still retire so the next
-                    // datagram re-dials.
+                _ = tokio::time::sleep(Duration::from_millis(idle_left as u64)) => {
+                    // Re-confirm before retiring: an activity store
+                    // landing between the deadline's derivation and its
+                    // fire must not kill a live target (N03).
+                    if now_ms().wrapping_sub(last_activity.load(Ordering::Relaxed))
+                        < idle_ms()
+                    {
+                        continue;
+                    }
                     break;
                 }
             }
         }
     };
-    let _ = &dead; // read by the dispatcher; this task exits via its own arms
     tokio::pin!(writer);
-    let mut reply = reply;
     tokio::select! {
         _ = &mut reply => {}
         _ = &mut writer => {}
     }
-    // Reap the surviving direction: abort then join so the UDP conn and
-    // its senders drop inside this task's teardown, not at some lazy GC
-    // point.
-    reply.abort();
-    let _ = reply.await;
-    let _ = conn.close();
+    // `_conn_guard` drops here — or earlier on abort — closing the UDP
+    // conn; both direction futures drop with their `rx`/`out_tx` refs.
+}
+
+/// RAII owner for a UoT session's `ProxyPacketConn`: session teardown —
+/// normal return or task abort — closes the conn exactly once, never
+/// leaving a dialed UDP socket parked on a dead task (N04/F08).
+struct ConnGuard(Arc<dyn ProxyPacketConn>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        let _ = self.0.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize as StdAtomicUsize;
+
+    /// Packet conn reporting `close()` through a shared probe; each
+    /// direction's behavior is chosen at construction:
+    ///  - `Dying`: read fails instantly, write parks — the N01 shape.
+    ///    The reply arm terminating FIRST used to leave `run_uot_session`
+    ///    awaiting an already-consumed reply `JoinHandle` (panic, and an
+    ///    abort under `panic = "abort"`).
+    ///  - `Parked`: both directions park — the N04 shape; aborting the
+    ///    session task mid-life must still run `close`.
+    struct ProbeConn {
+        closed: AtomicBool,
+        probe: Arc<AtomicBool>,
+        reply_dies: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyPacketConn for ProbeConn {
+        async fn read_packet(&self, _buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+            if self.reply_dies {
+                return Err(meow_common::MeowError::Proxy("upstream closed".into()));
+            }
+            std::future::pending().await
+        }
+        async fn write_packet(
+            &self,
+            _buf: &[u8],
+            _addr: &SocketAddr,
+        ) -> meow_common::Result<usize> {
+            std::future::pending().await
+        }
+        fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+            Ok("127.0.0.1:0".parse().unwrap())
+        }
+        fn close(&self) -> meow_common::Result<()> {
+            self.closed.store(true, Ordering::SeqCst);
+            self.probe.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// One proxy whose every `dial_udp` hands back a fresh `ProbeConn`.
+    struct ProbeUdpProxy {
+        reply_dies: bool,
+        probe: Arc<AtomicBool>,
+        dials: StdAtomicUsize,
+        health: meow_common::ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::ProxyAdapter for ProbeUdpProxy {
+        fn name(&self) -> &str {
+            "probe-udp"
+        }
+        fn adapter_type(&self) -> meow_common::AdapterType {
+            meow_common::AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+            Err(meow_common::MeowError::NotSupported("no tcp".into()))
+        }
+        async fn dial_udp(
+            &self,
+            _metadata: &Metadata,
+        ) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+            self.dials.fetch_add(1, Ordering::Relaxed);
+            Ok(Box::new(ProbeConn {
+                closed: AtomicBool::new(false),
+                probe: Arc::clone(&self.probe),
+                reply_dies: self.reply_dies,
+            }))
+        }
+        fn health(&self) -> &meow_common::ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl meow_common::Proxy for ProbeUdpProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    fn tunnel_to(proxy: &Arc<ProbeUdpProxy>) -> meow_tunnel::Tunnel {
+        let resolver = std::sync::Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let tunnel = meow_tunnel::Tunnel::new(resolver);
+        let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+        let mut proxies = res.proxies;
+        proxies.insert(
+            "probe-udp".into(),
+            Arc::clone(proxy) as Arc<dyn meow_common::Proxy>,
+        );
+        tunnel.update_proxies(proxies, res.dialer_registry);
+        tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+            "probe-udp",
+        ))]);
+        tunnel
+    }
+
+    fn udp_metadata() -> Metadata {
+        Metadata {
+            network: meow_common::Network::Udp,
+            conn_type: meow_common::ConnType::Anytls,
+            dst_ip: Some(std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4))),
+            dst_port: 443,
+            ..Default::default()
+        }
+    }
+
+    fn harness(reply_dies: bool) -> (Arc<ProbeUdpProxy>, meow_tunnel::Tunnel, Arc<AtomicBool>) {
+        let probe = Arc::new(AtomicBool::new(false));
+        let proxy = Arc::new(ProbeUdpProxy {
+            reply_dies,
+            probe: Arc::clone(&probe),
+            dials: StdAtomicUsize::new(0),
+            health: meow_common::ProxyHealth::new(),
+        });
+        let tunnel = tunnel_to(&proxy);
+        (proxy, tunnel, probe)
+    }
+
+    /// N01 regression: reply-side termination must retire the session
+    /// cleanly — the directions are in-scope futures, so the winner is
+    /// never awaited a second time — and the conn guard must still
+    /// close the upstream socket.
+    #[tokio::test]
+    async fn reply_side_death_retires_session_and_closes_conn() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (_proxy, tunnel, probe) = harness(true);
+            let (_tx, rx) = mpsc::channel::<QueuedPacket>(4);
+            let (out_tx, _out_rx) = mpsc::channel::<Bytes>(4);
+            let dead = Arc::new(AtomicBool::new(false));
+            run_uot_session(
+                Arc::clone(tunnel.inner()),
+                udp_metadata(),
+                None,
+                UotSessionIo {
+                    rx,
+                    out_tx,
+                    reply_form: ReplyForm::Connect,
+                    last_activity: Arc::new(AtomicU::new(now_ms())),
+                    dead: Arc::clone(&dead),
+                },
+            )
+            .await;
+            assert!(dead.load(Ordering::SeqCst), "dead flag not set");
+            assert!(probe.load(Ordering::SeqCst), "conn never closed");
+        })
+        .await
+        .expect("run_uot_session did not retire on reply death");
+    }
+
+    /// N04: a session task aborted mid-life must still close its conn —
+    /// the guard's Drop covers cancellation, not only the normal tail.
+    #[tokio::test]
+    async fn aborted_session_task_still_closes_conn() {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            let (proxy, tunnel, probe) = harness(false);
+            let (_tx, rx) = mpsc::channel::<QueuedPacket>(4);
+            let (out_tx, _out_rx) = mpsc::channel::<Bytes>(4);
+            let dead = Arc::new(AtomicBool::new(false));
+            let task = tokio::spawn(run_uot_session(
+                Arc::clone(tunnel.inner()),
+                udp_metadata(),
+                None,
+                UotSessionIo {
+                    rx,
+                    out_tx,
+                    reply_form: ReplyForm::Connect,
+                    last_activity: Arc::new(AtomicU::new(now_ms())),
+                    dead,
+                },
+            ));
+            // Wait until the session actually dialed (conn exists to
+            // close), then abort mid-life.
+            let dialed = tokio::time::timeout(Duration::from_secs(2), async {
+                while proxy.dials.load(Ordering::Relaxed) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            assert!(dialed.is_ok(), "session never dialed");
+            task.abort();
+            let _ = task.await;
+            assert!(
+                probe.load(Ordering::SeqCst),
+                "aborted session left its conn open"
+            );
+        })
+        .await
+        .expect("abort test timed out");
+    }
 }

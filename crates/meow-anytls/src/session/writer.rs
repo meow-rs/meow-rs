@@ -37,10 +37,13 @@ pub(crate) enum WriteRequest {
         frame: Frame,
         _permit: Option<OwnedSemaphorePermit>,
         completion: Option<oneshot::Sender<Result<()>>>,
-        /// When this is a Fin, the generation of the `Stream` that issued
-        /// it — the drain-time map eviction only retires THAT instance,
-        /// so a stale handler's Fin cannot kill a recycled SID (F05).
-        fin_owner: Option<u64>,
+        /// The `Stream` instance that issued this frame, when the frame
+        /// must not outlive its owner's sid ownership (Fin, SynAck).
+        /// The batch writer commits the frame to the wire only while
+        /// the instance still owns `frame.stream_id` in the session map
+        /// — a retired handler's Fin/SynAck can neither reach the peer
+        /// nor evict a recycled SID's new stream (F05).
+        owner: Option<std::sync::Weak<crate::session::stream::Stream>>,
     },
     /// A pre-encoded contiguous wire image — `[header | payload]` in ONE
     /// `Bytes` — produced by `Stream::poll_write_bytes_data` when the
@@ -83,7 +86,7 @@ impl StreamWriter {
         frame: Frame,
         permit: Option<OwnedSemaphorePermit>,
         completion: Option<oneshot::Sender<Result<()>>>,
-        fin_owner: Option<u64>,
+        owner: Option<std::sync::Weak<crate::session::stream::Stream>>,
     ) -> Result<()> {
         if self.budget.is_closed() {
             return Err(AnyTlsError::SessionClosed);
@@ -93,12 +96,21 @@ impl StreamWriter {
                 frame,
                 _permit: permit,
                 completion,
-                fin_owner,
+                owner,
             })
             .map_err(|_| AnyTlsError::SessionClosed)
     }
 
     pub(crate) async fn write_frame(&self, frame: Frame) -> Result<()> {
+        self.write_frame_owned(frame, None).await
+    }
+
+    /// `write_frame` with an owner token — see [`WriteRequest::Frame::owner`].
+    pub(crate) async fn write_frame_owned(
+        &self,
+        frame: Frame,
+        owner: Option<std::sync::Weak<crate::session::stream::Stream>>,
+    ) -> Result<()> {
         if frame.data.len() > frame_payload_cap(frame.cmd) {
             return Err(AnyTlsError::Protocol(
                 "frame payload exceeds u16 length".into(),
@@ -109,7 +121,7 @@ impl StreamWriter {
             .await
             .map_err(|_| AnyTlsError::SessionClosed)?;
         let (tx, rx) = oneshot::channel();
-        self.enqueue(frame, Some(permit), Some(tx), None)?;
+        self.enqueue(frame, Some(permit), Some(tx), owner)?;
         // Dropping this receiver cannot cancel the physical frame write.
         rx.await.map_err(|_| AnyTlsError::SessionClosed)?
     }
