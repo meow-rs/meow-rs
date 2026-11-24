@@ -11,11 +11,12 @@
 //! - `Classical` — payload is a list of full Clash rule strings; each line
 //!   is parsed as a normal rule (adapter ignored).
 
+use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
 use ipnet::IpNet;
-use meow_common::{Metadata, Rule, RuleMatchHelper};
+use meow_common::{Metadata, Rule, RuleMatchHelper, RuleType};
 use meow_trie::DomainTrie;
 use tracing::warn;
 
@@ -500,11 +501,133 @@ impl RuleSet for IpCidrRuleSet {
 // Classical
 // ---------------------------------------------------------------------------
 
+// A domain pattern in a classical set is literal, including '*' and leading
+// dots. DomainTrie interprets these as wildcards, so it cannot index this run.
+#[derive(Default)]
+struct LiteralDomains {
+    exact: HashSet<Box<[u8]>>,
+    suffix: HashSet<Box<[u8]>>,
+}
+
+impl LiteralDomains {
+    // Cover DNS names without heap-allocating to fold a query. Longer rule
+    // payloads are still accepted and run through their existing matcher.
+    const MAX_KEY: usize = 255;
+
+    fn eligible(rule: &dyn Rule) -> bool {
+        matches!(rule.rule_type(), RuleType::Domain | RuleType::DomainSuffix)
+            && rule.payload().len() <= Self::MAX_KEY
+    }
+
+    fn insert(&mut self, rule: &dyn Rule) {
+        let keys = if rule.rule_type() == RuleType::Domain {
+            &mut self.exact
+        } else {
+            &mut self.suffix
+        };
+        // Both rule constructors have already canonicalized the stored key.
+        keys.insert(rule.payload().as_bytes().into());
+    }
+
+    fn contains(&self, host: &str) -> bool {
+        let bytes = host.as_bytes();
+        let exact = bytes.len() <= Self::MAX_KEY;
+        let mut key = bytes;
+        if !exact {
+            // Only a suffix following a literal dot can still fit this index.
+            let tail = &bytes[bytes.len() - Self::MAX_KEY - 1..];
+            let Some(dot) = tail.iter().position(|&b| b == b'.') else {
+                return false;
+            };
+            key = &tail[dot + 1..];
+        }
+        let mut folded = [0; Self::MAX_KEY];
+        if key.iter().any(u8::is_ascii_uppercase) {
+            let buf = &mut folded[..key.len()];
+            buf.copy_from_slice(key);
+            buf.make_ascii_lowercase();
+            key = buf;
+        }
+        if exact && self.exact.contains(key) {
+            return true;
+        }
+        if !self.suffix.is_empty() {
+            loop {
+                if self.suffix.contains(key) {
+                    return true;
+                }
+                let Some(dot) = key.iter().position(|&b| b == b'.') else {
+                    break;
+                };
+                key = &key[dot + 1..];
+            }
+        }
+        false
+    }
+}
+
+struct IndexedRun {
+    following: Vec<Box<dyn Rule>>,
+    domains: LiteralDomains,
+}
+
 pub struct ClassicalRuleSet {
-    rules: Vec<Box<dyn Rule>>,
+    head: Vec<Box<dyn Rule>>,
+    runs: Vec<IndexedRun>,
+    count: usize,
 }
 
 impl ClassicalRuleSet {
+    fn from_rules(rules: Vec<Box<dyn Rule>>) -> Self {
+        const MIN_RUN: usize = 64;
+        let count = rules.len();
+        let mut runs: Vec<IndexedRun> = Vec::new();
+        if count < MIN_RUN {
+            return Self {
+                runs,
+                head: rules,
+                count,
+            };
+        }
+        let mut head = Vec::new();
+        let mut rules = rules.into_iter();
+        while let Some(rule) = rules.next() {
+            let literal = LiteralDomains::eligible(rule.as_ref());
+            let ordered = runs.last_mut().map_or(&mut head, |run| &mut run.following);
+            ordered.push(rule);
+            if !literal {
+                continue;
+            }
+            // Leave the first literal in place: first-entry hits stay cheap.
+            let following = rules
+                .as_slice()
+                .iter()
+                .take_while(|r| LiteralDomains::eligible(r.as_ref()))
+                .count();
+            let rest = rules.by_ref().take(following);
+            if following < MIN_RUN - 1 {
+                ordered.extend(rest);
+                continue;
+            }
+            let mut domains = LiteralDomains::default();
+            for rule in rest {
+                domains.insert(rule.as_ref());
+            }
+            runs.push(IndexedRun {
+                following: Vec::new(),
+                domains,
+            });
+        }
+        Self { head, runs, count }
+    }
+
+    fn remaining_rules(&self) -> impl Iterator<Item = &dyn Rule> {
+        self.head
+            .iter()
+            .chain(self.runs.iter().flat_map(|run| &run.following))
+            .map(Box::as_ref)
+    }
+
     pub fn from_entries(entries: &[String], ctx: &ParserContext) -> Self {
         let mut builder = ClassicalRuleSetBuilder::new(ctx);
         for entry in entries {
@@ -629,7 +752,7 @@ impl<'a> ClassicalRuleSetBuilder<'a> {
     }
 
     pub fn build(self) -> ClassicalRuleSet {
-        ClassicalRuleSet { rules: self.rules }
+        ClassicalRuleSet::from_rules(self.rules)
     }
 }
 
@@ -639,26 +762,28 @@ impl RuleSet for ClassicalRuleSet {
     }
 
     fn matches(&self, metadata: &Metadata, helper: &RuleMatchHelper) -> bool {
-        self.rules
-            .iter()
-            .any(|r| r.match_metadata(metadata, helper))
+        let matches =
+            |rules: &[Box<dyn Rule>]| rules.iter().any(|r| r.match_metadata(metadata, helper));
+        matches(&self.head)
+            || self
+                .runs
+                .iter()
+                .any(|run| run.domains.contains(metadata.rule_host()) || matches(&run.following))
     }
 
     fn len(&self) -> usize {
-        self.rules.len()
+        self.count
     }
 
     fn should_resolve_ip(&self) -> bool {
         // Dead rules can never fire — their metadata demands must not
         // leak into the aggregate (#625).
-        self.rules
-            .iter()
+        self.remaining_rules()
             .any(|rule| !rule.never_matches() && rule.should_resolve_ip())
     }
 
     fn should_find_process(&self) -> bool {
-        self.rules
-            .iter()
+        self.remaining_rules()
             .any(|rule| !rule.never_matches() && rule.should_find_process())
     }
 
@@ -671,9 +796,7 @@ impl RuleSet for ClassicalRuleSet {
             host: domain.into(),
             ..Default::default()
         };
-        self.rules
-            .iter()
-            .any(|r| r.match_metadata(&metadata, &RuleMatchHelper))
+        self.matches(&metadata, &RuleMatchHelper)
     }
 }
 
@@ -1045,15 +1168,113 @@ mod tests {
         assert!(dead_geoip.never_matches());
         assert!(dead_and.never_matches());
 
-        let set = ClassicalRuleSet {
-            rules: vec![
-                dead_geoip,
-                dead_and,
-                Box::new(DomainSuffixRule::new("example.com", "")),
-            ],
-        };
+        let set = ClassicalRuleSet::from_rules(vec![
+            dead_geoip,
+            dead_and,
+            Box::new(DomainSuffixRule::new("example.com", "")),
+        ]);
         assert!(!set.should_resolve_ip());
         assert!(!set.should_find_process());
+    }
+
+    #[test]
+    fn indexed_classical_runs_match_the_ordered_rules() {
+        let ctx = ParserContext::empty();
+        let mut entries = (0..96)
+            .map(|i| format!("DOMAIN-SUFFIX,s{i}.test"))
+            .collect::<Vec<_>>();
+        entries.extend(
+            [
+                "DOMAIN,Exact.Test",
+                "DOMAIN-SUFFIX,*.literal.test",
+                "DOMAIN,É.test",
+                "DOMAIN-SUFFIX,.odd.test",
+                "OR,((DOMAIN,compound.test),(DOMAIN,x.test))",
+                "DST-PORT,443",
+            ]
+            .map(String::from),
+        );
+        entries.extend((0..96).map(|i| format!("DOMAIN,e{i}.test")));
+        entries.push("DOMAIN,e0.test".into());
+        let mut builder = ClassicalRuleSetBuilder::new(&ctx);
+        for entry in &entries {
+            builder.push_checked(entry).unwrap();
+        }
+        let reference = builder.rules;
+        let set = ClassicalRuleSet::from_entries(&entries, &ctx);
+        assert_eq!(set.len(), entries.len());
+        assert_eq!(set.runs.len(), 2);
+        for host in [
+            "S95.TeSt.",
+            "sub.s95.test",
+            "nots95.test",
+            "Exact.Test",
+            "sub.exact.test",
+            "*.literal.test",
+            "a.literal.test",
+            "a..odd.test",
+            "é.test",
+            "É.test",
+            "compound.test",
+            "e0.test",
+            "e95.test",
+            "miss.test",
+            "",
+            ".",
+        ] {
+            let mut m = Metadata {
+                host: host.into(),
+                ..Default::default()
+            };
+            let expected = |m: &Metadata| {
+                reference
+                    .iter()
+                    .any(|r| r.match_metadata(m, &RuleMatchHelper))
+            };
+            assert_eq!(set.matches_domain(host), expected(&m), "{host}");
+            m.sniff_host = "unknown.test".into();
+            assert_eq!(set.matches(&m, &RuleMatchHelper), expected(&m), "{host}");
+            m.dst_port = 443;
+            assert_eq!(set.matches(&m, &RuleMatchHelper), expected(&m));
+        }
+    }
+
+    #[test]
+    fn indexed_domains_respect_long_names_and_label_boundaries() {
+        let ctx = ParserContext::empty();
+        // Leave the very first exact rule on the ordered fast path.
+        let mut entries: Vec<_> = (0..64).map(|i| format!("DOMAIN,r{i}.example")).collect();
+        let max = "a".repeat(LiteralDomains::MAX_KEY);
+        let long = "x".repeat(LiteralDomains::MAX_KEY + 1);
+        entries.extend([
+            format!("DOMAIN-SUFFIX,{max}"),
+            "DOMAIN,exact.example".into(),
+            "DOMAIN-SUFFIX,bar.example".into(),
+            format!("DOMAIN-SUFFIX,{long}"),
+            "IP-CIDR,192.0.2.0/24".into(),
+        ]);
+        let set = ClassicalRuleSet::from_entries(&entries, &ctx);
+        assert!(set.should_resolve_ip());
+        assert!(!set.should_find_process());
+        for (host, want) in [
+            (
+                format!("{}.{}", "é".repeat(200), max.to_ascii_uppercase()),
+                true,
+            ),
+            (format!("p{max}"), false),
+            (format!("{long}.EXACT.example"), false),
+            (format!("{long}.BAR.example"), true),
+            (format!("deep.{long}"), true),
+            (format!("p{long}"), false),
+        ] {
+            assert_eq!(set.matches_domain(&host), want);
+            let meta = Metadata {
+                host: "ignored.example".into(),
+                sniff_host: host.into(),
+                ..Default::default()
+            };
+            assert_eq!(set.matches(&meta, &RuleMatchHelper), want);
+        }
     }
 
     #[test]

@@ -235,6 +235,9 @@ the canonical, in-repo source a release is cut from.
 
 ### Changed
 
+- Large classical rule-providers index consecutive exact and suffix domain rules
+  for routing and DNS policy lookups. Mixed rules keep their original order.
+
 - **WireGuard received packets are now serviced in the same pump pass
   that polls them**, removing a half-poll scheduling gap that left an
   inbound packet waiting for the next timer wakeup — this was the ~12.7 ms
