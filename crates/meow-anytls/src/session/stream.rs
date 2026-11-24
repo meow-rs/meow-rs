@@ -387,21 +387,25 @@ impl Stream {
     }
 }
 
-impl AsyncRead for Stream {
-    fn poll_read(
-        self: Pin<&mut Self>,
+impl Stream {
+    /// `&self` read entry shared by `AsyncRead for Stream` and
+    /// `AsyncRead for Arc<Stream>` — every state item it touches is
+    /// already behind a mutex, so the only difference is how
+    /// `pending_read` is reached (`lock()` here, `get_mut()` was
+    /// possible on the `&mut` path; the critical section is a bare
+    /// get-or-insert plus one poll either way).
+    fn poll_read_data(
+        &self,
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let this = self.get_mut();
-
         // Fast path — uncontended: `try_lock` borrows the reader and
         // drives `StreamReader::poll_read` straight into `buf`. Zero
         // allocation, no boxed future; the B4 `Bytes` leftover feeds
         // the caller directly. (The old code rebuilt a `Box::pin`d
         // read future + a `vec![0; remaining]` scratch on EVERY poll,
         // Pending included, then dropped both.)
-        if let Ok(mut guard) = this.reader.try_lock() {
+        if let Ok(mut guard) = self.reader.try_lock() {
             return Pin::new(&mut *guard).poll_read(cx, buf);
         }
 
@@ -410,9 +414,9 @@ impl AsyncRead for Stream {
         // `'static`, so the future can live on `self` until the mutex
         // is free, and the waker is registered once with the mutex's
         // wait queue rather than re-armed every poll.
-        let pending = this.pending_read.get_mut().expect("pending_read poisoned");
+        let mut pending = self.pending_read.lock().unwrap();
         let fut = pending.get_or_insert_with(|| {
-            let reader = Arc::clone(&this.reader);
+            let reader = Arc::clone(&self.reader);
             Box::pin(async move { reader.lock_owned().await })
         });
         match fut.as_mut().poll(cx) {
@@ -422,6 +426,59 @@ impl AsyncRead for Stream {
                 Pin::new(&mut *guard).poll_read(cx, buf)
             }
         }
+    }
+}
+
+impl AsyncRead for Stream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.get_mut().poll_read_data(cx, buf)
+    }
+}
+
+/// `Arc<Stream>` as a relay-facing conn: the session's stream-accept
+/// channel hands inbound listeners `Arc<Stream>`s and `Arc` is not a
+/// fundamental type, so `AsyncRead`/`AsyncWrite` can't be implemented on
+/// it directly — this newtype carries them. `Deref<Target = Stream>`
+/// keeps `id()`/`close()`/`reader()` reachable; reads share the same
+/// reader mutex the `Stream` impl drives; writes go through the same
+/// `&self` enqueue path `Stream` itself uses.
+#[derive(Clone)]
+pub struct StreamIo(pub Arc<Stream>);
+
+impl std::ops::Deref for StreamIo {
+    type Target = Stream;
+    fn deref(&self) -> &Stream {
+        &self.0
+    }
+}
+
+impl AsyncRead for StreamIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        self.0.poll_read_data(cx, buf)
+    }
+}
+
+impl AsyncWrite for StreamIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        self.0.poll_write_data(cx, buf)
+    }
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.0.poll_flush_data(cx)
+    }
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.0.poll_shutdown_data(cx)
     }
 }
 
@@ -708,7 +765,7 @@ mod tests {
         let (writer, _rx) = StreamWriter::channel();
         let (reader_tx, reader_rx) = mpsc::unbounded_channel();
         let (mut stream, _) = Stream::new(1, StreamReader::new(1, reader_rx), writer);
-        reader_tx.send(Bytes::from_static(b"world")).unwrap();
+        reader_tx.send(Bytes::from_static(b"world").into()).unwrap();
         let mut buf = [0; 10];
         assert_eq!(stream.read(&mut buf).await.unwrap(), 5);
         assert_eq!(&buf[..5], b"world");

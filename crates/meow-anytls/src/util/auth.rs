@@ -3,6 +3,7 @@
 use crate::padding::PaddingFactory;
 use crate::util::{AnyTlsError, Result};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -11,6 +12,48 @@ pub fn hash_password(password: &str) -> [u8; 32] {
     let mut hasher = Sha256::new();
     hasher.update(password.as_bytes());
     hasher.finalize().into()
+}
+
+/// Multi-user credential table, keyed by `SHA256(password)` like
+/// upstream's `userMap` — the username is what `Metadata.in_user`
+/// stamps on the authenticated flow.
+pub type UserMap = HashMap<[u8; 32], String>;
+
+/// Authenticate a client connection against a multi-user table.
+///
+/// Same wire contract as [`authenticate_client`] — `SHA256(password)`
+/// (32 bytes), `padding0_length` (u16be), `padding0` — but the digest
+/// is looked up in `users` and the matching username returned. An
+/// unknown digest is an [`AnyTlsError::AuthenticationFailed`] so the
+/// caller can distinguish "wrong password → close silently" from
+/// session-protocol errors.
+pub async fn authenticate_user<R: AsyncReadExt + Unpin>(
+    reader: &mut R,
+    users: &UserMap,
+) -> Result<String> {
+    let mut password_hash = [0u8; 32];
+    reader.read_exact(&mut password_hash).await?;
+
+    let Some(user) = users.get(&password_hash) else {
+        return Err(AnyTlsError::AuthenticationFailed);
+    };
+    let user = user.clone();
+
+    let mut padding_len_bytes = [0u8; 2];
+    reader.read_exact(&mut padding_len_bytes).await?;
+    let padding_len = u16::from_be_bytes(padding_len_bytes) as usize;
+    // Discard padding in bounded chunks — a declared 64 KiB must not
+    // become one up-front allocation, and a short read must fail (not be
+    // silently accepted like `take().read_to_end` would).
+    let mut remaining = padding_len;
+    let mut scratch = [0u8; 4096];
+    while remaining > 0 {
+        let chunk = remaining.min(scratch.len());
+        reader.read_exact(&mut scratch[..chunk]).await?;
+        remaining -= chunk;
+    }
+
+    Ok(user)
 }
 
 /// Authenticate a client connection (server side)

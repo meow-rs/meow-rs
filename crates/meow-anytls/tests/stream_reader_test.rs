@@ -17,7 +17,7 @@ async fn large_chunk_drains_exactly_through_smaller_reads() {
     let mut reader = StreamReader::new(7, rx);
 
     let payload: Vec<u8> = (0..128 * 1024u32).map(|i| (i % 251) as u8).collect();
-    tx.send(Bytes::from(payload.clone())).unwrap();
+    tx.send(Bytes::from(payload.clone()).into()).unwrap();
 
     let mut out = Vec::with_capacity(payload.len());
     let mut buf = vec![0u8; 32 * 1024];
@@ -38,8 +38,8 @@ async fn leftover_interleaves_with_new_deliveries_in_fifo_order() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut reader = StreamReader::new(7, rx);
 
-    tx.send(Bytes::from_static(b"AAAA")).unwrap();
-    tx.send(Bytes::from_static(b"BBBB")).unwrap();
+    tx.send(Bytes::from_static(b"AAAA").into()).unwrap();
+    tx.send(Bytes::from_static(b"BBBB").into()).unwrap();
 
     let mut buf = vec![0u8; 3];
     assert_eq!(reader.read(&mut buf).await.unwrap(), 3);
@@ -63,7 +63,7 @@ async fn poll_read_path_matches_read_semantics() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut reader = StreamReader::new(7, rx);
 
-    tx.send(Bytes::from_static(b"chunk")).unwrap();
+    tx.send(Bytes::from_static(b"chunk").into()).unwrap();
     drop(tx); // EOF after the chunk
 
     let mut b = [0u8; 2];
@@ -84,7 +84,7 @@ async fn read_exact_spans_leftover_and_channel() {
     let (tx, rx) = mpsc::unbounded_channel();
     let mut reader = StreamReader::new(7, rx);
 
-    tx.send(Bytes::from_static(b"0123456789")).unwrap();
+    tx.send(Bytes::from_static(b"0123456789").into()).unwrap();
     let mut a = [0u8; 4];
     reader.read_exact(&mut a).await.unwrap();
     assert_eq!(&a, b"0123");

@@ -280,6 +280,92 @@ pub enum ListenerSpec {
     /// most one effective TUN may exist: one named entry, or the
     /// top-level section — never both (spec §3).
     Tun(TunConfig),
+    /// AnyTLS server inbound (`type: anytls`, mihomo-compatible): a
+    /// BoringSSL TLS termination (or an explicitly opted-in plaintext
+    /// mode) carrying authenticated AnyTLS v1/v2 sessions; every SYN'd
+    /// logical stream is routed through the tunnel as a normal inbound
+    /// flow, UoT v2 as UDP. Always parses; servability is gated by the
+    /// `listener-anytls` build feature.
+    Anytls(AnytlsListenerConfig),
+}
+
+/// Per-listener config for the `anytls` inbound (`ListenerSpec::Anytls`).
+///
+/// Built by [`build_anytls_listener_spec`], the single semantic entry
+/// point shared by startup, `-t` and `PUT /configs` — no file I/O
+/// happens here; `certificate`/`private_key` stay as-written (PEM
+/// literal or path) for the app's bind-time resolution.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AnytlsListenerConfig {
+    /// SHA-256-keyed user table in declaration order. EMPTY is a legal
+    /// shape — "authenticate nothing", the upstream reject-all state
+    /// (warned once at build); the listener still serves TLS.
+    pub users: Vec<AnytlsUser>,
+    /// `certificate` — PEM literal or path, `None` only in the
+    /// `allow-insecure` plaintext mode.
+    pub certificate: Option<String>,
+    /// `private-key` — same dual form; `private_key` name because the
+    /// raw field is shared with `type: wireguard`.
+    pub private_key: Option<String>,
+    /// Explicit plaintext opt-in (`allow-insecure: true`); `false` means
+    /// the certificate pair above is mandatory.
+    pub allow_insecure: bool,
+    /// Raw `padding-scheme` bytes as written — already validated by the
+    /// shared `meow_common::anytls_padding` contract, whose MD5 the
+    /// protocol layer computes itself.
+    pub padding_scheme: Option<String>,
+    /// Every normalized bind target in declaration order — `listen` may
+    /// carry a comma-separated list; the listener binds them atomically.
+    /// Always non-empty after a successful build.
+    pub addresses: Vec<ListenerBind>,
+}
+
+/// One normalized `(ip, port)` bind target inside a multi-address
+/// `type: anytls` entry.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListenerBind {
+    pub listen: String,
+    pub port: u16,
+}
+
+/// One `users:` entry: the username verbatim plus its wire credential —
+/// `SHA256(password)`, the key the auth preface looks up (upstream
+/// `userMap` semantics).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AnytlsUser {
+    pub name: String,
+    #[serde(with = "digest_serde")]
+    pub password_sha256: [u8; 32],
+}
+
+/// `[u8; 32]` serde as a lowercase hex string — keeps `PUT /configs`
+/// round-trips and API diagnostics readable without ever carrying the
+/// plaintext password.
+mod digest_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(digest: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        hex.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        let s = String::deserialize(d)?;
+        if s.len() != 64 {
+            return Err(serde::de::Error::custom(
+                "sha256 digest must be 64 hex chars",
+            ));
+        }
+        let mut out = [0u8; 32];
+        for (i, b) in out.iter_mut().enumerate() {
+            *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(serde::de::Error::custom)?;
+        }
+        Ok(out)
+    }
 }
 
 /// Per-listener config for the `shadowsocks` inbound (`ListenerSpec::Shadowsocks`).
@@ -440,6 +526,7 @@ impl ListenerSpec {
             Self::Shadowsocks(_) => "shadowsocks",
             Self::WireGuard(_) => "wireguard",
             Self::Tun(_) => "tun",
+            Self::Anytls(_) => "anytls",
         }
     }
 }
@@ -5739,8 +5826,12 @@ fn parse_listener_spec(
             simple_obfs: None,
         })),
         "wireguard" => Ok(ListenerSpec::WireGuard(build_wg_listener_spec(raw_l)?)),
+        // Placeholder like `Shadowsocks` — `build_named_listeners` fills
+        // the real spec via `build_anytls_listener_spec`, which needs the
+        // (possibly comma-listed) `listen` context.
+        "anytls" => Ok(ListenerSpec::Anytls(AnytlsListenerConfig::default())),
         other => anyhow::bail!(
-            "unknown listener type '{other}'; expected mixed, http, socks, socks5, tproxy, redir, shadowsocks, wireguard, or tun"
+            "unknown listener type '{other}'; expected mixed, http, socks, socks5, tproxy, redir, shadowsocks, wireguard, anytls, or tun"
         ),
     }
 }
@@ -6078,6 +6169,319 @@ fn build_wg_listener_spec(raw_l: &raw::RawListener) -> Result<WgListenerConfig, 
         mtu,
         udp: raw_l.udp.unwrap_or_else(default_wg_udp),
         udp_timeout,
+    })
+}
+
+/// Whether a `certificate`/`private-key` value is the inline-PEM form
+/// (vs. a filesystem path) — the two halves must use the SAME form.
+fn is_pem_literal(value: &str) -> bool {
+    value.contains("-----BEGIN")
+}
+
+/// `shadow-tls`/`res-tls`/`jls-config` opaque-block handling for
+/// `type: anytls`: present-and-enabled is a front layer (counted for
+/// mutual exclusivity); present-but-disabled warns and ignores. A value
+/// that is not a mapping, or whose `enable` is not a boolean, is a
+/// shape error.
+fn anytls_front_layer_enabled(
+    raw_l: &raw::RawListener,
+    key: &str,
+    value: Option<&serde_json::Value>,
+) -> Result<bool, anyhow::Error> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    if value.is_null() {
+        return Ok(false);
+    }
+    let Some(obj) = value.as_object() else {
+        anyhow::bail!("listeners[{}].{key}: must be a mapping", raw_l.name);
+    };
+    match obj.get("enable") {
+        None => {
+            warn!(
+                "listeners[{}].{key}: present but `enable` unset — ignored \
+                 (no front layer is selected)",
+                raw_l.name
+            );
+            Ok(false)
+        }
+        Some(serde_json::Value::Bool(enabled)) => {
+            if !enabled {
+                warn!(
+                    "listeners[{}].{key}: `enable: false` selects no front layer — ignored",
+                    raw_l.name
+                );
+            }
+            Ok(*enabled)
+        }
+        Some(_) => anyhow::bail!("listeners[{}].{key}.enable: must be a boolean", raw_l.name),
+    }
+}
+
+/// Build a validated [`AnytlsListenerConfig`] from a raw `listeners:`
+/// entry — the single semantic entry point for `type: anytls`, reached
+/// identically by startup, `-t` and `PUT /configs` via
+/// `build_named_listeners`. Performs NO file I/O: certificate material
+/// stays as-written for bind-time resolution by the app.
+///
+/// `listen` may be ONE YAML string carrying comma-separated addresses;
+/// each segment resolves through `resolve_listener_bind` in declaration
+/// order (`port`/`listen:port` merge rules identical to single-address
+/// listeners). `default_bind` fills an absent `listen`.
+fn build_anytls_listener_spec(
+    raw_l: &raw::RawListener,
+    default_bind: &str,
+) -> Result<AnytlsListenerConfig, anyhow::Error> {
+    // ── `enable` — upstream-accepted but meaningless here: the entry's
+    // presence is its enabled state. `false` is a hard error (silent
+    // disable would be a dead config line); `true` warns redundant.
+    match raw_l.enable {
+        Some(false) => anyhow::bail!(
+            "listeners[{}].enable: `false` is invalid — an AnyTLS listener entry \
+             is enabled by existing; remove the entry to disable it",
+            raw_l.name
+        ),
+        Some(true) => warn!(
+            "listeners[{}].enable: `true` is redundant — the entry's presence \
+             already enables the listener",
+            raw_l.name
+        ),
+        None => {}
+    }
+
+    // ── `udp` — always supported, so `false` would be a lie; warn `true`.
+    match raw_l.udp {
+        Some(false) => anyhow::bail!(
+            "listeners[{}].udp: `false` is invalid — AnyTLS inbound always \
+             supports UoT v2; remove the key or set `true`",
+            raw_l.name
+        ),
+        Some(true) => warn!(
+            "listeners[{}].udp: `true` is redundant — AnyTLS inbound always \
+             supports UoT v2",
+            raw_l.name
+        ),
+        None => {}
+    }
+
+    // ── `users:` — absent/null/`{}` all mean "authenticate nothing"
+    // (upstream's reject-all state): startup proceeds but warns once.
+    // Usernames and passwords stay verbatim — no trimming, no
+    // normalization — and empty values, duplicate keys and duplicate
+    // password digests are hard errors.
+    let mut digest_seen: std::collections::HashMap<[u8; 32], String> =
+        std::collections::HashMap::new();
+    let mut name_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    let mut users: Vec<AnytlsUser> = Vec::new();
+    for (user, password) in raw_l.users.as_deref().unwrap_or(&[]) {
+        if user.is_empty() {
+            anyhow::bail!(
+                "listeners[{}].users: empty username is not allowed",
+                raw_l.name
+            );
+        }
+        if password.is_empty() {
+            anyhow::bail!(
+                "listeners[{}].users: empty password for user '{user}' is not allowed",
+                raw_l.name
+            );
+        }
+        if !name_seen.insert(user.as_str()) {
+            anyhow::bail!(
+                "listeners[{}].users: duplicate username '{user}'",
+                raw_l.name
+            );
+        }
+        let digest = {
+            use sha2::Digest as _;
+            let mut h = sha2::Sha256::new();
+            h.update(password.as_bytes());
+            let out: [u8; 32] = h.finalize().into();
+            out
+        };
+        if let Some(existing) = digest_seen.insert(digest, user.clone()) {
+            anyhow::bail!(
+                "listeners[{}].users: '{user}' shares a password (SHA-256 digest) \
+                 with earlier user '{existing}' — users must have distinct passwords",
+                raw_l.name
+            );
+        }
+        users.push(AnytlsUser {
+            name: user.clone(),
+            password_sha256: digest,
+        });
+    }
+    if users.is_empty() {
+        warn!(
+            "listeners[{}].users: empty/absent — the AnyTLS listener will \
+             REJECT every authentication (upstream reject-all); add at \
+             least one user to admit clients",
+            raw_l.name
+        );
+    }
+
+    // ── certificate/private-key pairing shape ──
+    let tls_selected = match (raw_l.certificate.as_deref(), raw_l.private_key.as_deref()) {
+        (Some(cert), Some(key)) => {
+            if cert.trim().is_empty() || key.trim().is_empty() {
+                anyhow::bail!(
+                    "listeners[{}]: `certificate`/`private-key` must not be empty",
+                    raw_l.name
+                );
+            }
+            if is_pem_literal(cert) != is_pem_literal(key) {
+                anyhow::bail!(
+                    "listeners[{}]: `certificate`/`private-key` must use the same \
+                     form — both inline PEM or both filesystem paths, not mixed",
+                    raw_l.name
+                );
+            }
+            true
+        }
+        (None, None) => false,
+        _ => anyhow::bail!(
+            "listeners[{}]: `certificate` and `private-key` must be provided \
+             together",
+            raw_l.name
+        ),
+    };
+
+    // ── front-layer opaque blocks (shape + enabled flag type) ──
+    let shadow_tls_on = anytls_front_layer_enabled(raw_l, "shadow-tls", raw_l.shadow_tls.as_ref())?;
+    let res_tls_on = anytls_front_layer_enabled(raw_l, "res-tls", raw_l.res_tls.as_ref())?;
+    let jls_on = anytls_front_layer_enabled(raw_l, "jls-config", raw_l.jls_config.as_ref())?;
+
+    // ── security-mode mutual exclusivity (`allow-insecure` is excluded
+    // from the count, matching upstream's TLS-layer enumeration) ──
+    let mut enabled_layers: Vec<&str> = Vec::new();
+    if tls_selected {
+        enabled_layers.push("certificate/private-key");
+    }
+    if shadow_tls_on {
+        enabled_layers.push("shadow-tls");
+    }
+    if res_tls_on {
+        enabled_layers.push("res-tls");
+    }
+    if jls_on {
+        enabled_layers.push("jls-config");
+    }
+    if enabled_layers.len() > 1 {
+        anyhow::bail!(
+            "listeners[{}]: `type: anytls` accepts at most one TLS/front layer \
+             — enabled together: {}",
+            raw_l.name,
+            enabled_layers.join(", ")
+        );
+    }
+    // A selected front layer is a hard gap, not an ignored key.
+    for (key, on) in [
+        ("shadow-tls", shadow_tls_on),
+        ("res-tls", res_tls_on),
+        ("jls-config", jls_on),
+    ] {
+        if on {
+            anyhow::bail!(
+                "listeners[{}].{key}: `{key}` front layers are not supported by \
+                 meow's `type: anytls` inbound — remove it or terminate it \
+                 upstream",
+                raw_l.name
+            );
+        }
+    }
+
+    // ── mTLS / ECH — non-empty configuration is a hard error (never
+    // silently ignored). Whitespace-only strings count as empty.
+    for (key, value) in [
+        ("client-auth-type", raw_l.client_auth_type.as_deref()),
+        ("client-auth-cert", raw_l.client_auth_cert.as_deref()),
+        ("ech-key", raw_l.ech_key.as_deref()),
+    ] {
+        if value.is_some_and(|v| !v.trim().is_empty()) {
+            anyhow::bail!(
+                "listeners[{}].{key}: `{key}` is not supported by meow's \
+                 `type: anytls` inbound — remove it",
+                raw_l.name
+            );
+        }
+    }
+
+    // ── the no-security gate ──
+    let allow_insecure = raw_l.allow_insecure.unwrap_or(false);
+    if !tls_selected && !allow_insecure {
+        anyhow::bail!(
+            "listeners[{}]: `type: anytls` requires `certificate` + `private-key` \
+             (TLS), or the explicit `allow-insecure: true` plaintext opt-in",
+            raw_l.name
+        );
+    }
+    if !tls_selected && allow_insecure {
+        warn!(
+            "listeners[{}]: `allow-insecure: true` — the AnyTLS listener accepts \
+             PLAINTEXT connections; credentials are visible to any on-path \
+             observer. Use only on a trusted network or behind a tunnel",
+            raw_l.name
+        );
+    }
+
+    // ── `padding-scheme` — shared contract with `PaddingFactory::new`;
+    // validated here so `-t` and PUT fail fast, and the protocol layer
+    // re-validates (it cannot fail after this gate).
+    if let Some(scheme) = raw_l.padding_scheme.as_deref() {
+        meow_common::anytls_padding::validate_scheme(scheme.as_bytes())
+            .map_err(|e| anyhow::anyhow!("listeners[{}].padding-scheme: {e}", raw_l.name))?;
+    }
+
+    // ── `kcp-tun`/`mux-option` — present but never consumed: warn like
+    // the shadowsocks arm does. Shadowsocks-only keys get the same.
+    for (key, set) in [
+        ("kcp-tun", raw_l.kcp_tun.is_some()),
+        ("mux-option", raw_l.mux_option.is_some()),
+        ("cipher", raw_l.cipher.is_some()),
+        ("password", raw_l.password.is_some()),
+        ("simple-obfs", raw_l.simple_obfs.is_some()),
+    ] {
+        if set {
+            warn!(
+                "listeners[{}].{key}: `{key}` is not supported on `type: anytls`, \
+                 ignored; remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+    }
+
+    // ── `listen` — one YAML string, possibly comma-separated; each
+    // segment normalizes in declaration order via the shared bind
+    // resolver. An empty segment between commas is a shape error.
+    let listen_raw = raw_l.listen.as_deref().unwrap_or(default_bind);
+    let mut addresses: Vec<ListenerBind> = Vec::new();
+    for segment in listen_raw.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            anyhow::bail!(
+                "listeners[{}].listen: empty address in comma-separated list '{listen_raw}'",
+                raw_l.name
+            );
+        }
+        let (listen, port) = resolve_listener_bind(segment, raw_l.port)
+            .map_err(|e| anyhow::anyhow!("listeners[{}].listen: {e}", raw_l.name))?;
+        addresses.push(ListenerBind { listen, port });
+    }
+    if addresses.is_empty() {
+        anyhow::bail!(
+            "listeners[{}].listen: no bind addresses resolved",
+            raw_l.name
+        );
+    }
+
+    Ok(AnytlsListenerConfig {
+        users,
+        certificate: raw_l.certificate.clone(),
+        private_key: raw_l.private_key.clone(),
+        allow_insecure,
+        padding_scheme: raw_l.padding_scheme.clone(),
+        addresses,
     })
 }
 
@@ -6971,19 +7375,25 @@ fn build_named_listeners(
                    listen: &str,
                    max_connections: usize,
                    route_override: Option<meow_common::InboundRouteOverride>,
-                   routing_mark: Option<u32>|
+                   routing_mark: Option<u32>,
+                   extra_ports: &[u16]|
      -> Result<(), anyhow::Error> {
         validate_connection_limit(max_connections)
             .map_err(|e| anyhow::anyhow!("listener '{name}': {e}"))?;
         // Port 0 is "OS assigns an ephemeral port" — each such listener binds
         // a distinct port at runtime, so they are not duplicates of each other.
-        if port != 0 {
-            if let Some(existing) = used_ports.get(&port) {
-                anyhow::bail!(
-                    "port {port} already used by listener '{existing}' (duplicate port, Class A per ADR-0002)"
-                );
+        // `seen` dedupes candidates within one listener: an anytls entry may
+        // legitimately bind the same port on several addresses.
+        let mut seen = std::collections::HashSet::new();
+        for candidate in std::iter::once(port).chain(extra_ports.iter().copied()) {
+            if candidate != 0 && seen.insert(candidate) {
+                if let Some(existing) = used_ports.get(&candidate) {
+                    anyhow::bail!(
+                        "port {candidate} already used by listener '{existing}' (duplicate port, Class A per ADR-0002)"
+                    );
+                }
+                used_ports.insert(candidate, name.to_string());
             }
-            used_ports.insert(port, name.to_string());
         }
         if !used_names.insert(name.to_string()) {
             anyhow::bail!(
@@ -7015,6 +7425,7 @@ fn build_named_listeners(
             global_max_conns,
             None,
             None,
+            &[],
         )?;
     }
     if let Some(port) = raw.socks_port.filter(|p| *p != 0) {
@@ -7026,6 +7437,7 @@ fn build_named_listeners(
             global_max_conns,
             None,
             None,
+            &[],
         )?;
     }
     if let Some(port) = raw.port.filter(|p| *p != 0) {
@@ -7037,6 +7449,7 @@ fn build_named_listeners(
             global_max_conns,
             None,
             None,
+            &[],
         )?;
     }
     if raw.firewall.is_some() {
@@ -7076,6 +7489,7 @@ fn build_named_listeners(
             global_max_conns,
             None,
             None,
+            &[],
         )?;
     }
     if let Some(port) = raw.tproxy_port.filter(|p| *p != 0) {
@@ -7098,6 +7512,7 @@ fn build_named_listeners(
             global_max_conns,
             None,
             None,
+            &[],
         )?;
     }
 
@@ -7137,7 +7552,7 @@ fn build_named_listeners(
                 );
             }
             for (key, present) in [
-                ("enable", raw_l.extra.contains_key("enable")),
+                ("enable", raw_l.enable.is_some()),
                 ("tun", raw_l.extra.contains_key("tun")),
                 ("listen", raw_l.listen.is_some()),
                 ("port", raw_l.port.is_some()),
@@ -7201,6 +7616,7 @@ fn build_named_listeners(
                 raw_l.max_connections.unwrap_or(global_max_conns),
                 route_override,
                 None,
+                &[],
             )?;
             continue;
         }
@@ -7252,13 +7668,16 @@ fn build_named_listeners(
             ),
         }
         // `udp` is meaningful on tproxy (issue #564), shadowsocks and
-        // wireguard; any other listener type ignoring it is warned about.
+        // wireguard; `type: anytls` diagnoses the key itself inside
+        // `build_anytls_listener_spec` (`true` redundant, `false` a hard
+        // error). Any other listener type ignoring it is warned about.
         if raw_l.udp.is_some()
             && !matches!(
                 spec,
                 ListenerSpec::TProxy { .. }
                     | ListenerSpec::Shadowsocks(_)
                     | ListenerSpec::WireGuard(_)
+                    | ListenerSpec::Anytls(_)
             )
         {
             warn!(
@@ -7271,8 +7690,18 @@ fn build_named_listeners(
         // the same shape as the `firewall`/`tproxy-sni` checks above
         // (`type: tun` consumed them in its own arm above and never
         // reaches here).
+        // `private-key` is shared with `type: anytls` (TLS material) —
+        // `mtu`/`peers` remain WG/TUN-only and warn there too.
+        if raw_l.private_key.is_some()
+            && !matches!(spec, ListenerSpec::WireGuard(_) | ListenerSpec::Anytls(_))
+        {
+            warn!(
+                "listeners[{}].private-key: only meaningful on `type: wireguard`/`anytls`, ignored; \
+                 remove it to suppress this warning",
+                raw_l.name
+            );
+        }
         for (key, set) in [
-            ("private-key", raw_l.private_key.is_some()),
             ("mtu", raw_l.mtu.is_some()),
             ("peers", raw_l.peers.is_some()),
         ] {
@@ -7283,6 +7712,36 @@ fn build_named_listeners(
                     raw_l.name
                 );
             }
+        }
+        // AnyTLS-only fields set on another listener type warn — same
+        // shape as the wireguard check above (`enable` is also consumed
+        // by `type: tun`... its arm errors before reaching here).
+        for (key, set) in [
+            ("users", raw_l.users.is_some()),
+            ("certificate", raw_l.certificate.is_some()),
+            ("client-auth-type", raw_l.client_auth_type.is_some()),
+            ("client-auth-cert", raw_l.client_auth_cert.is_some()),
+            ("ech-key", raw_l.ech_key.is_some()),
+            ("allow-insecure", raw_l.allow_insecure.is_some()),
+            ("padding-scheme", raw_l.padding_scheme.is_some()),
+        ] {
+            if set && !matches!(spec, ListenerSpec::Anytls(_)) {
+                warn!(
+                    "listeners[{}].{key}: only meaningful on `type: anytls`, ignored; \
+                     remove it to suppress this warning",
+                    raw_l.name
+                );
+            }
+        }
+        // `enable` is meaningful on `type: anytls` (diagnosed inside its
+        // builder) and hard-errors on `type: tun` above; elsewhere it is
+        // a silently-dead key unless warned about here.
+        if raw_l.enable.is_some() && !matches!(spec, ListenerSpec::Anytls(_)) {
+            warn!(
+                "listeners[{}].enable: only meaningful on `type: anytls`, ignored; \
+                 remove it to suppress this warning",
+                raw_l.name
+            );
         }
         // Named-TUN-only fields set on another listener type warn —
         // same shape as the wireguard-field check above.
@@ -7360,15 +7819,26 @@ fn build_named_listeners(
                 "127.0.0.1"
             }
         });
-        let (listen, port) = resolve_listener_bind(listen_raw, raw_l.port)?;
-        // `parse_listener_spec` returns a placeholder for `Shadowsocks`; fold
-        // the real cipher/password/udp/simple-obfs fields in here. TProxy's
+        // `parse_listener_spec` returns a placeholder for `Shadowsocks` and
+        // `Anytls`; fold the real per-type fields in here BEFORE the bind
+        // resolve — `type: anytls` may carry a comma-separated `listen`
+        // list, which `resolve_listener_bind` cannot split. TProxy's
         // `sni` is already resolved inside `parse_listener_spec`.
         let spec = match spec {
             ListenerSpec::Shadowsocks(_) => {
                 ListenerSpec::Shadowsocks(build_ss_listener_spec(raw_l)?)
             }
+            ListenerSpec::Anytls(_) => {
+                ListenerSpec::Anytls(build_anytls_listener_spec(raw_l, default_bind)?)
+            }
             other => other,
+        };
+        // The anytls builder already normalized every bind target; its
+        // first address plays `NamedListener.listen`/`port` while the
+        // full `addresses` list stays on the spec.
+        let (listen, port) = match &spec {
+            ListenerSpec::Anytls(cfg) => (cfg.addresses[0].listen.clone(), cfg.addresses[0].port),
+            _ => resolve_listener_bind(listen_raw, raw_l.port)?,
         };
         // UDP TPROXY is IPv4-only in this release (issue #564): `::` is
         // dual-stack on Linux and would silently accept v6 datagrams, so
@@ -7442,6 +7912,12 @@ fn build_named_listeners(
             );
         }
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
+        // Every port a multi-address `type: anytls` binds must join the
+        // duplicate-port registry, not just the primary one.
+        let extra_ports: Vec<u16> = match &spec {
+            ListenerSpec::Anytls(cfg) => cfg.addresses[1..].iter().map(|a| a.port).collect(),
+            _ => Vec::new(),
+        };
         add(
             &raw_l.name,
             spec,
@@ -7450,6 +7926,7 @@ fn build_named_listeners(
             max_connections,
             route_override,
             routing_mark,
+            &extra_ports,
         )?;
     }
 
@@ -14027,5 +14504,281 @@ mod listener_surface_tests {
                 "{decl}"
             );
         }
+    }
+
+    // ── `type: anytls` listener spec ─────────────────────────────────
+    //
+    // The C1/W1 config matrix of the inbound spec: user table, security
+    // modes, opaque front layers, `enable`/`udp`, padding, multi-address
+    // `listen`, and the duplicate-port registry's reach into extra
+    // addresses.
+
+    fn anytls_named(extra: &str) -> Result<Vec<NamedListener>, anyhow::Error> {
+        let yaml = format!("listeners:\n  - name: a\n    type: anytls\n    port: 0\n{extra}");
+        let raw: raw::RawConfig = crate::parse_raw_yaml(&yaml).unwrap();
+        build_named_listeners(&raw, "127.0.0.1", false)
+    }
+
+    fn anytls_named_err(extra: &str) -> String {
+        anytls_named(extra)
+            .map(|l| format!("BUILT {l:?}"))
+            .unwrap_err()
+            .to_string()
+    }
+
+    const ANYTLS_USERS: &str = "    users: {alice: pw1, bob: pw2}\n";
+    const ANYTLS_INSECURE: &str = "    allow-insecure: true\n";
+    const ANYTLS_CERT: &str =
+        "    certificate: \"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\"\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nMIIB\\n-----END PRIVATE KEY-----\"\n";
+
+    #[test]
+    fn anytls_users_multi_in_declaration_order() {
+        let listeners = anytls_named(&format!("{ANYTLS_USERS}{ANYTLS_INSECURE}")).unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert_eq!(
+            cfg.users
+                .iter()
+                .map(|u| u.name.as_str())
+                .collect::<Vec<_>>(),
+            ["alice", "bob"]
+        );
+        assert_ne!(cfg.users[0].password_sha256, cfg.users[1].password_sha256);
+        assert_eq!(cfg.users[0].password_sha256.len(), 32);
+        assert!(cfg.allow_insecure);
+        assert_eq!(cfg.addresses.len(), 1);
+        assert_eq!(cfg.addresses[0].listen, "127.0.0.1");
+    }
+
+    #[test]
+    fn anytls_users_empty_is_reject_all_not_an_error() {
+        // Upstream's `userMap` empty state: the listener still serves
+        // and every authentication fails — warn-only at build.
+        let listeners = anytls_named(ANYTLS_INSECURE).unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert!(cfg.users.is_empty());
+    }
+
+    #[test]
+    fn anytls_users_empty_name_and_password_error() {
+        let err = anytls_named_err(&format!("    users: {{\"\": x}}\n{ANYTLS_INSECURE}"));
+        assert!(err.contains("empty username"), "{err}");
+        let err = anytls_named_err(&format!("    users: {{a: \"\"}}\n{ANYTLS_INSECURE}"));
+        assert!(err.contains("empty password"), "{err}");
+    }
+
+    #[test]
+    fn anytls_users_duplicate_name_and_password_error() {
+        // serde-saphyr's duplicate-key policy rejects a repeated
+        // `users:` key at parse time, before the builder runs.
+        let err = crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 0\n    allow-insecure: true\n    users:\n      alice: one\n      alice: two\n",
+        )
+        .map(|_: raw::RawConfig| "PARSED".to_string())
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("alice"), "{err}");
+
+        let err = anytls_named_err(&format!(
+            "    users: {{alice: same, bob: same}}\n{ANYTLS_INSECURE}"
+        ));
+        assert!(err.contains("distinct passwords"), "{err}");
+    }
+
+    #[test]
+    fn anytls_users_nonstring_password_is_parse_error() {
+        assert!(crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 0\n    users: {a: 5}\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn anytls_security_mode_matrix() {
+        // Nothing at all → hard error naming both escapes.
+        let err = anytls_named_err(ANYTLS_USERS);
+        assert!(err.contains("certificate"), "{err}");
+        assert!(err.contains("allow-insecure"), "{err}");
+
+        // Full pair → TLS; `allow-insecure` is not counted into the
+        // mode exclusivity (upstream's TLS-layer enumeration).
+        let listeners =
+            anytls_named(&format!("{ANYTLS_USERS}{ANYTLS_CERT}{ANYTLS_INSECURE}")).unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert!(cfg.certificate.is_some() && cfg.private_key.is_some());
+
+        // Half pairs → hard error either way.
+        let err = anytls_named_err(
+            "    users: {a: x}\n    certificate: \"-----BEGIN CERTIFICATE-----\\nM\\n-----END CERTIFICATE-----\"\n",
+        );
+        assert!(err.contains("provided together"), "{err}");
+        let err = anytls_named_err(
+            "    users: {a: x}\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nM\\n-----END PRIVATE KEY-----\"\n",
+        );
+        assert!(err.contains("provided together"), "{err}");
+
+        // PEM literal in one half, path in the other → mixed forms.
+        let err = anytls_named_err(
+            "    users: {a: x}\n    certificate: /etc/cert.pem\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nM\\n-----END PRIVATE KEY-----\"\n",
+        );
+        assert!(err.contains("same"), "{err}");
+    }
+
+    #[test]
+    fn anytls_mtls_and_ech_hard_error_only_when_non_empty() {
+        for key in ["client-auth-type", "client-auth-cert", "ech-key"] {
+            let err = anytls_named_err(&format!("{ANYTLS_USERS}{ANYTLS_CERT}    {key}: present\n"));
+            assert!(err.contains(key), "{err}");
+            assert!(err.contains("not supported"), "{err}");
+        }
+        // Whitespace-only values are the empty case — the build passes.
+        anytls_named(&format!(
+            "{ANYTLS_USERS}{ANYTLS_CERT}    client-auth-type: \"  \"\n    ech-key: \"\"\n"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn anytls_front_layers_enabled_error_disabled_warn() {
+        // Enabled front layer alone → exclusivity gate, then the
+        // unsupported-layer hard error.
+        for key in ["shadow-tls", "res-tls", "jls-config"] {
+            let err = anytls_named_err(&format!(
+                "{ANYTLS_USERS}{ANYTLS_CERT}    {key}: {{enable: true}}\n"
+            ));
+            assert!(err.contains("at most one"), "{err}");
+            let err = anytls_named_err(&format!("{ANYTLS_USERS}    {key}: {{enable: true}}\n"));
+            assert!(err.contains("not supported"), "{err}");
+            // Disabled → warn-ignore, TLS still required.
+            anytls_named(&format!(
+                "{ANYTLS_USERS}{ANYTLS_CERT}    {key}: {{enable: false}}\n"
+            ))
+            .unwrap();
+            // Non-mapping shape errors.
+            let err = anytls_named_err(&format!("{ANYTLS_USERS}{ANYTLS_CERT}    {key}: 5\n"));
+            assert!(err.contains("mapping"), "{err}");
+        }
+    }
+
+    #[test]
+    fn anytls_enable_and_udp_flags() {
+        let err = anytls_named_err(&format!(
+            "{ANYTLS_USERS}{ANYTLS_INSECURE}    enable: false\n"
+        ));
+        assert!(err.contains("enable"), "{err}");
+        let err = anytls_named_err(&format!("{ANYTLS_USERS}{ANYTLS_INSECURE}    udp: false\n"));
+        assert!(err.contains("udp"), "{err}");
+        // `true` spellings pass with a redundancy warn.
+        anytls_named(&format!(
+            "{ANYTLS_USERS}{ANYTLS_INSECURE}    enable: true\n    udp: true\n"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn anytls_padding_scheme_validated_by_shared_contract() {
+        let listeners = anytls_named(&format!(
+            "{ANYTLS_USERS}{ANYTLS_INSECURE}    padding-scheme: \"stop=9\\n0=30-30\"\n"
+        ))
+        .unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert_eq!(cfg.padding_scheme.as_deref(), Some("stop=9\n0=30-30"));
+
+        for bad in ["stop=abc", "0=30-30", "stop=1\\n0=0-30"] {
+            let err = anytls_named_err(&format!(
+                "{ANYTLS_USERS}{ANYTLS_INSECURE}    padding-scheme: \"{bad}\"\n"
+            ));
+            assert!(err.contains("padding-scheme"), "{err}");
+        }
+    }
+
+    #[test]
+    fn anytls_multi_address_listen_and_port_registry() {
+        // Comma-separated `listen` — each segment resolves with the
+        // entry's `port` like a single address does.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 1080\n    allow-insecure: true\n    users: {a: x}\n    listen: \"127.0.0.1,::1\"\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert_eq!(cfg.addresses.len(), 2);
+        assert_eq!(cfg.addresses[0].listen, "127.0.0.1");
+        assert_eq!(cfg.addresses[1].listen, "::1");
+        assert!(cfg.addresses.iter().all(|a| a.port == 1080));
+        // NamedListener keeps the first address as its endpoint pair.
+        assert_eq!(listeners[0].listen, "127.0.0.1");
+        assert_eq!(listeners[0].port, 1080);
+
+        // Different ports per segment need `port` unset — a segment's
+        // explicit `listen:port` merges exactly like the single-address
+        // case, and a mismatching entry `port` is a conflict error.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 0\n    allow-insecure: true\n    users: {a: x}\n    listen: \"127.0.0.1:2080,0.0.0.0:3080\"\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        let ListenerSpec::Anytls(cfg) = &listeners[0].spec else {
+            panic!("expected anytls spec");
+        };
+        assert_eq!(cfg.addresses[0].port, 2080);
+        assert_eq!(cfg.addresses[1].port, 3080);
+
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 1080\n    allow-insecure: true\n    users: {a: x}\n    listen: \"127.0.0.1:2080\"\n",
+        )
+        .unwrap();
+        let err = build_named_listeners(&raw, "127.0.0.1", false)
+            .map(|l| format!("BUILT {l:?}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("conflicts with port"), "{err}");
+
+        // A secondary address's port joins the duplicate-port registry:
+        // another listener on it must conflict like the primary does.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: a\n    type: anytls\n    port: 0\n    allow-insecure: true\n    users: {a: x}\n    listen: \"127.0.0.1:2080,0.0.0.0:3080\"\n  - name: m\n    type: mixed\n    port: 3080\n",
+        )
+        .unwrap();
+        let err = build_named_listeners(&raw, "127.0.0.1", false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("3080"), "{err}");
+
+        // An empty segment between commas is a shape error.
+        let err = anytls_named_err(&format!(
+            "{ANYTLS_USERS}{ANYTLS_INSECURE}    listen: \"127.0.0.1:1,,0.0.0.0:2\"\n"
+        ));
+        assert!(err.contains("empty address"), "{err}");
+    }
+
+    #[test]
+    fn anytls_foreign_keys_and_type_name() {
+        assert_eq!(
+            anytls_named(&format!("{ANYTLS_USERS}{ANYTLS_INSECURE}")).unwrap()[0]
+                .spec
+                .type_name(),
+            "anytls"
+        );
+        // `users:`/`certificate:` on a non-anytls type warn, not error.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    users: {a: x}\n    allow-insecure: true\n    enable: true\n",
+        )
+        .unwrap();
+        build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        // `cipher:`/`kcp-tun:` on anytls warn, not error.
+        anytls_named(&format!(
+            "{ANYTLS_USERS}{ANYTLS_INSECURE}    cipher: aes-256-gcm\n    kcp-tun: {{}}\n"
+        ))
+        .unwrap();
     }
 }

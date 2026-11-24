@@ -48,7 +48,8 @@ Upstream lives in `adapter/outbound/`. Current Rust adapters live in `crates/meo
 | SSH             | Yes      | No        | **Gap** | Niche |
 | HTTP (outbound) | Yes      | No        | **Gap** | HTTP CONNECT outbound |
 | SOCKS5 (outbound)| Yes     | No        | **Gap** | SOCKS5 outbound |
-| anytls / mieru / trusttunnel / sudoku / masque | Yes | No | Low | Niche/new protocols — defer |
+| anytls          | Yes      | Yes       | OK      | Outbound (`anytls` feature) + `listeners: type: anytls` server inbound (`listener-anytls`, `full` not `minimal`) — v1/v2 sessions, multi-user, multi-address, UoT v2; see [specs/listener-anytls.md](specs/listener-anytls.md) |
+| mieru / trusttunnel / sudoku / masque | Yes | No | Low | Niche/new protocols — defer |
 | Reality (transport) | Yes  | Yes       | OK      | In-tree REALITY client; the ClientHello is shaped by `client-fingerprint` (chrome / firefox / safari / ios / edge / random) |
 | ECH (TLS)       | Yes      | No        | Gap     | Encrypted Client Hello — defer |
 
@@ -118,6 +119,7 @@ Upstream lives in `listener/`. Rust listeners live in `crates/meow-listener/src/
 | VLESS (inbound)       | Yes | No | Gap |
 | Hysteria2 (inbound)   | Yes | No | Gap |
 | TUIC (inbound)        | Yes | No | Gap |
+| AnyTLS (inbound)      | Yes | Yes | OK — BoringSSL/plaintext modes, multi-user, multi-address atomic bind, TCP + UoT v2 routing; see [specs/listener-anytls.md](specs/listener-anytls.md) |
 | Inner / Inbound auth  | Yes | Partial | Auth framework not yet exposed |
 | TUN inbound           | Yes | **Excluded** | Non-goal |
 | sing-* variants       | Yes | **Excluded** | Depend on sing-box; not a port priority |

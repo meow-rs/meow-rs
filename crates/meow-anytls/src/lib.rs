@@ -23,6 +23,9 @@ pub mod protocol;
 pub mod server;
 /// Session layer: Session and stream management
 pub mod session;
+/// Wire helpers: SOCKS destination parse and the UoT v2 codec shared by
+/// the dev `server` fixture and the production inbound listener.
+pub mod uot;
 /// Utility modules (error, auth, TLS, etc.)
 pub mod util;
 
@@ -33,5 +36,7 @@ pub use session::*;
 pub use util::*;
 
 // Re-export commonly used types
-pub use util::auth::{authenticate_client, hash_password, send_authentication};
+pub use util::auth::{
+    UserMap, authenticate_client, authenticate_user, hash_password, send_authentication,
+};
 pub use util::error::{AnyTlsError, Result};

@@ -50,8 +50,12 @@ static DEFAULT_FACTORY: std::sync::OnceLock<Arc<PaddingFactory>> = std::sync::On
 pub type SharedPaddingFactory = Arc<RwLock<Arc<PaddingFactory>>>;
 
 impl PaddingFactory {
-    /// Create a new PaddingFactory from raw scheme bytes
+    /// Create a new PaddingFactory from raw scheme bytes. The validity
+    /// contract is `meow_common::anytls_padding::validate_scheme` — the
+    /// same no-IO check `meow-config` runs on `padding-scheme:` — so the
+    /// parse below cannot fail once it passes.
     pub fn new(raw_scheme: &[u8]) -> Result<Self, String> {
+        meow_common::anytls_padding::validate_scheme(raw_scheme)?;
         let scheme = StringMap::from_bytes(raw_scheme);
 
         let stop = scheme

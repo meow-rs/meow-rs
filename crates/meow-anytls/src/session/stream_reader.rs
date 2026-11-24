@@ -3,7 +3,7 @@
 //! 负责从 Session 接收数据并提供给上层读取
 //! 与 Stream 的写入操作完全分离
 
-use bytes::Bytes;
+use crate::session::session::PendingBytes;
 use std::io;
 use tokio::sync::mpsc;
 
@@ -19,7 +19,7 @@ pub struct StreamReader {
 
     /// 从 Session 接收数据的 channel
     /// 注意：recv() 是 async 方法，需要 &mut self
-    reader_rx: mpsc::UnboundedReceiver<Bytes>,
+    reader_rx: mpsc::UnboundedReceiver<PendingBytes>,
 
     /// 缓冲不完整的数据 — the unread remainder of the last `Bytes`
     /// chunk, kept as the chunk itself plus a read offset. Compared to
@@ -27,7 +27,7 @@ pub struct StreamReader {
     /// shares the channel item's allocation instead of
     /// `extend_from_slice` copying it) and O(1) per read (an offset bump
     /// instead of a `drain(..n)` memmove).
-    reader_buffer: Option<(Bytes, usize)>,
+    reader_buffer: Option<(PendingBytes, usize)>,
 
     /// EOF 标志
     eof: bool,
@@ -35,7 +35,7 @@ pub struct StreamReader {
 
 impl StreamReader {
     /// 创建新的 StreamReader
-    pub fn new(id: u32, reader_rx: mpsc::UnboundedReceiver<Bytes>) -> Self {
+    pub fn new(id: u32, reader_rx: mpsc::UnboundedReceiver<PendingBytes>) -> Self {
         Self {
             id,
             reader_rx,
@@ -196,6 +196,7 @@ impl tokio::io::AsyncRead for StreamReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bytes::Bytes;
 
     #[tokio::test]
     async fn test_stream_reader_basic() {
@@ -203,7 +204,7 @@ mod tests {
         let mut reader = StreamReader::new(1, rx);
 
         // 发送数据
-        tx.send(Bytes::from("hello")).unwrap();
+        tx.send(Bytes::from("hello").into()).unwrap();
 
         // 读取数据
         let mut buf = vec![0u8; 10];
@@ -219,7 +220,7 @@ mod tests {
         let mut reader = StreamReader::new(1, rx);
 
         // 发送较大的数据
-        tx.send(Bytes::from("hello world")).unwrap();
+        tx.send(Bytes::from("hello world").into()).unwrap();
 
         // 分两次读取
         let mut buf = vec![0u8; 5];
@@ -262,7 +263,7 @@ mod tests {
 
         let sent = Bytes::from(vec![0xEEu8; 1024]);
         let sent_ptr = sent.as_ptr();
-        tx.send(sent).unwrap();
+        tx.send(sent.into()).unwrap();
 
         // Read less than the chunk — the rest must stay in the SAME
         // allocation the channel delivered.
@@ -296,7 +297,7 @@ mod tests {
     async fn eof_drains_leftover_before_zero() {
         let (tx, rx) = mpsc::unbounded_channel();
         let mut reader = StreamReader::new(1, rx);
-        tx.send(Bytes::from_static(b"abcdef")).unwrap();
+        tx.send(Bytes::from_static(b"abcdef").into()).unwrap();
         drop(tx);
 
         let mut buf = vec![0u8; 2];
@@ -317,9 +318,9 @@ mod tests {
         let mut reader = StreamReader::new(1, rx);
 
         // 发送多个数据块
-        tx.send(Bytes::from("chunk1")).unwrap();
-        tx.send(Bytes::from("chunk2")).unwrap();
-        tx.send(Bytes::from("chunk3")).unwrap();
+        tx.send(Bytes::from("chunk1").into()).unwrap();
+        tx.send(Bytes::from("chunk2").into()).unwrap();
+        tx.send(Bytes::from("chunk3").into()).unwrap();
 
         // 关闭 channel 以触发 EOF
         drop(tx);

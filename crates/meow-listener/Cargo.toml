@@ -62,6 +62,16 @@ listener-wireguard = [
     "dep:meow-dns",
     "dep:rand",
 ]
+# AnyTLS server inbound (`listeners: - type: anytls`) — BoringSSL TLS
+# termination (never the vendored crate's rustls `server` fixture),
+# multi-user auth, v1/v2 sessions routed through the tunnel (TCP +
+# UoT v2). Opt-in; `full` carries it, `minimal` does not.
+listener-anytls = [
+    "dep:meow-anytls",
+    "dep:tokio-boring",
+    "dep:boring",
+    "dep:meow-config",
+]
 
 [dependencies]
 meow-common = { workspace = true }
@@ -93,11 +103,22 @@ bytes = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
 # listener-shadowsocks
 shadowsocks = { workspace = true, optional = true }
-# listener-tun: QUIC Initial decryption for the QUIC sniffer (the same
-# BoringSSL every TLS path links).
+# listener-tun/listener-anytls: QUIC Initial decryption for the QUIC
+# sniffer / the AnyTLS inbound's TLS acceptor (the same BoringSSL every
+# TLS path links).
 boring = { workspace = true, optional = true }
+# listener-anytls: BoringSSL's tokio accept driver.
+tokio-boring = { workspace = true, optional = true }
+# listener-anytls: the vendored AnyTLS session/padding/UoT codec (its
+# `server` feature stays off — that fixture is rustls-based).
+meow-anytls = { workspace = true, optional = true }
+# listener-anytls: `resolve_home_contained` for `certificate`/
+# `private-key` path resolution (same contract the API TLS endpoint
+# keeps).
+meow-config = { workspace = true, optional = true }
 meow-transport = { workspace = true, optional = true }
 parking_lot.workspace = true
+anyhow = { workspace = true }
 
 [dev-dependencies]
 meow-config = { workspace = true }

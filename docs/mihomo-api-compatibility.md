@@ -122,7 +122,12 @@ The following routes are retained and do not collide with the mihomo surface:
   (`{"rule": "<line>"}`: one line after the config's rules; a line that
   fails to parse answers 400 naming it rather than a silent 204)
 - `GET /dns/results` and `POST /dns/query`
-- `GET /listeners`
+- `GET /listeners`: active listeners (`name`, `type`, `port`, `listen`);
+  tproxy entries also report `firewall`/`udp`/`udp-timeout`, and a
+  `type: anytls` entry with several `listen` addresses reports them all
+  under `addresses` (`port`/`listen` stay the first address). Credentials
+  — the `users` digests, certificate and private key — are never in the
+  output
 - `GET /statistics`: `uploadTotal` / `downloadTotal` (the `/traffic`
   totals) and `proxies`, the bytes each proxy carried since start, TCP and
   UDP: `{"DIRECT": {"upload": N, "download": N}, ...}`. A group's traffic

@@ -835,6 +835,7 @@ fn listener_feature_gate(spec: &meow_config::ListenerSpec) -> Option<&'static st
         }
         S::WireGuard(_) => (!cfg!(feature = "listener-wireguard")).then_some("listener-wireguard"),
         S::Tun(_) => (!cfg!(feature = "listener-tun")).then_some("listener-tun"),
+        S::Anytls(_) => (!cfg!(feature = "listener-anytls")).then_some("listener-anytls"),
     }
 }
 
@@ -2074,6 +2075,108 @@ async fn run(
                     );
                 }
             }
+            ListenerSpec::Anytls(cfg) => {
+                #[cfg(feature = "listener-anytls")]
+                {
+                    // Bind every configured address eagerly and
+                    // atomically: any bind failure fails the whole
+                    // listener (upstream iterates all listen addresses;
+                    // partial binds release on drop here).
+                    let mut sockets = Vec::with_capacity(cfg.addresses.len());
+                    let mut bound_first = None;
+                    let mut bind_failed = false;
+                    for a in &cfg.addresses {
+                        let addr = match bind_socket_addr(&a.listen, a.port) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                listener_failed(
+                                    &nl.name,
+                                    &format!("invalid listen address '{}': {e}", a.listen),
+                                );
+                                bind_failed = true;
+                                break;
+                            }
+                        };
+                        match tokio::net::TcpListener::bind(addr).await {
+                            Ok(s) => {
+                                if bound_first.is_none() {
+                                    bound_first = Some(s.local_addr().unwrap_or(addr));
+                                }
+                                sockets.push(s);
+                            }
+                            Err(e) => {
+                                listener_failed(&nl.name, &format!("bind {addr} failed: {e}"));
+                                bind_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if bind_failed {
+                        continue;
+                    }
+                    // `listeners[].routing-mark` applies to every socket
+                    // this listener binds — the same `apply_listener_mark`
+                    // contract the other socket listeners keep.
+                    let mut mark_failed = false;
+                    for s in &sockets {
+                        if !apply_listener_mark(&nl.name, s, nl.routing_mark) {
+                            mark_failed = true;
+                            break;
+                        }
+                    }
+                    if mark_failed {
+                        continue;
+                    }
+                    // The primary address's resolved port is the
+                    // `GET /listeners` snapshot port (`port: 0` case) —
+                    // every bound address stays in `cfg.addresses`.
+                    if let Some(first) = bound_first {
+                        nl.port = first.port();
+                    }
+                    let spec = meow_listener::AnytlsListenerSpec {
+                        users: cfg
+                            .users
+                            .iter()
+                            .map(|u| (u.name.clone(), u.password_sha256))
+                            .collect(),
+                        certificate: cfg.certificate.clone(),
+                        private_key: cfg.private_key.clone(),
+                        allow_insecure: cfg.allow_insecure,
+                        padding_scheme: cfg.padding_scheme.clone(),
+                    };
+                    let listener = match meow_listener::AnytlsListener::new(
+                        tunnel.clone(),
+                        nl.name.clone(),
+                        spec,
+                    ) {
+                        Ok(l) => std::sync::Arc::new(
+                            l.with_max_connections(nl.max_connections)
+                                .with_tcp_keepalive(config.listeners.tcp_keepalive)
+                                .with_route_override(nl.route_override.clone()),
+                        ),
+                        Err(e) => {
+                            listener_failed(&nl.name, &format!("invalid anytls config: {e}"));
+                            continue;
+                        }
+                    };
+                    for socket in sockets {
+                        let listener = std::sync::Arc::clone(&listener);
+                        tokio::spawn(async move {
+                            if let Err(e) = listener.run_on(socket).await {
+                                error!("AnyTLS listener error: {}", e);
+                            }
+                        });
+                    }
+                }
+                #[cfg(not(feature = "listener-anytls"))]
+                {
+                    let _ = cfg;
+                    tracing::warn!(
+                        "listener '{}': anytls requires feature 'listener-anytls'",
+                        nl.name
+                    );
+                }
+            }
             // Spawned above the bind (a TUN owns no socket) — this arm
             // is unreachable, kept only for exhaustiveness.
             ListenerSpec::Tun(_) => {}
@@ -3099,6 +3202,17 @@ mod tests {
         })
     }
 
+    fn anytls_spec() -> meow_config::ListenerSpec {
+        meow_config::ListenerSpec::Anytls(meow_config::AnytlsListenerConfig {
+            allow_insecure: true,
+            addresses: vec![meow_config::ListenerBind {
+                listen: "0.0.0.0".into(),
+                port: 23301,
+            }],
+            ..Default::default()
+        })
+    }
+
     /// The spawn-loop feature mapping is `listener-mixed` for
     /// mixed/http/socks5, `listener-tproxy` for tproxy, and
     /// `listener-shadowsocks` for shadowsocks (in `full`, not `minimal`).
@@ -3145,6 +3259,10 @@ mod tests {
             })),
             (!cfg!(feature = "listener-wireguard")).then_some("listener-wireguard")
         );
+        assert_eq!(
+            gate(&anytls_spec()),
+            (!cfg!(feature = "listener-anytls")).then_some("listener-anytls")
+        );
     }
 
     /// `tun:` rides its own gate — disabled is always servable, enabled
@@ -3184,6 +3302,32 @@ mod tests {
         assert_eq!(
             meow_api::ensure_listeners_supported(&named, super::listener_feature_gate).is_ok(),
             cfg!(feature = "listener-shadowsocks")
+        );
+    }
+
+    /// Same contract for `type: anytls`: on a build without
+    /// `listener-anytls` the config must fail `ensure_inbounds_supported`
+    /// (and therefore `-t`), not warn-and-skip into a dead port.
+    #[test]
+    fn ensure_rejects_uncompiled_anytls_listener() {
+        fn without_anytls(spec: &meow_config::ListenerSpec) -> Option<&'static str> {
+            matches!(spec, meow_config::ListenerSpec::Anytls(_)).then_some("listener-anytls")
+        }
+        let named = [meow_config::NamedListener {
+            name: "anytls-in".into(),
+            spec: anytls_spec(),
+            port: 23301,
+            listen: "0.0.0.0".into(),
+            max_connections: 256,
+            route_override: None,
+            routing_mark: None,
+        }];
+        let err = meow_api::ensure_listeners_supported(&named, without_anytls)
+            .expect_err("anytls listener must fail on a feature-less build");
+        assert!(err.to_string().contains("listener-anytls"), "{err}");
+        assert_eq!(
+            meow_api::ensure_listeners_supported(&named, super::listener_feature_gate).is_ok(),
+            cfg!(feature = "listener-anytls")
         );
     }
 

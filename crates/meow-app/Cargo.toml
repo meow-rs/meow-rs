@@ -130,6 +130,10 @@ listener-shadowsocks = ["meow-listener/listener-shadowsocks"]
 # and the outbound adapter with it — the inbound needs the same vendored
 # noise crate either way).
 listener-wireguard = ["meow-listener/listener-wireguard", "wireguard"]
+# AnyTLS server inbound (`listeners: - type: anytls`): BoringSSL TLS
+# termination, multi-user auth, v1/v2 session routing through the tunnel
+# (TCP + UoT v2 UDP). In `full`; `minimal` leaves it out (ADR-0007).
+listener-anytls = ["meow-listener/listener-anytls"]
 
 # Convenience bundles
 minimal = ["ss", "ss-obfs", "trojan", "dns-server", "listener-mixed"]
@@ -138,7 +142,7 @@ full = [
     "shadow-tls", "restls", "jls", "gost-plugin",
     "dns-server", "dns-encrypted", "dns-doh-h2", "dns-quic",
     "listener-http", "listener-socks5", "listener-tproxy", "listener-mixed", "listener-tun",
-    "listener-shadowsocks", "listener-wireguard",
+    "listener-shadowsocks", "listener-wireguard", "listener-anytls",
     "api-tls",
     "logbook",
     "traffic-ledger",

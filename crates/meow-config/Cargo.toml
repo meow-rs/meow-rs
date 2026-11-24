@@ -82,6 +82,7 @@ meow-transport = { workspace = true, features = ["tls", "ws", "grpc", "h2", "htt
 tokio = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 serde-saphyr = { workspace = true }
 indexmap = { workspace = true }
 tracing = { workspace = true }
