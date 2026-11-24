@@ -70,6 +70,17 @@ impl RulesDialer {
     }
 }
 
+/// Fill `cell` with a dialer bound to `tunnel`.
+///
+/// Called by the two install sites — `meow` startup and
+/// `meow_api::routes::install_resolver_everywhere` — so the construction
+/// contract lives in one place. Publish *before* the resolver generation
+/// becomes reachable (`Tunnel::set_resolver`): a query that lands on the new
+/// generation while its cell is still empty fails its rule-routed dial.
+pub fn publish(cell: &meow_dns::RespectRulesCell, tunnel: &crate::Tunnel) {
+    *cell.write() = Some(Arc::new(RulesDialer::new(tunnel.weak_inner())));
+}
+
 #[async_trait::async_trait]
 impl ProxyAdapter for RulesDialer {
     fn name(&self) -> &str {
@@ -95,20 +106,21 @@ impl ProxyAdapter for RulesDialer {
     }
 
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-        let target = self.resolve(metadata).await?;
-        // Keep the route generation alive for the whole dial.
-        let route = Arc::clone(&target.route);
-        let result = target.adapter.dial_tcp(metadata).await;
-        drop(route);
-        result
+        // `target` owns the pinned route generation (see `ResolvedTarget`)
+        // and stays in scope for the whole dial.
+        self.resolve(metadata)
+            .await?
+            .adapter
+            .dial_tcp(metadata)
+            .await
     }
 
     async fn dial_udp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-        let target = self.resolve(metadata).await?;
-        let route = Arc::clone(&target.route);
-        let result = target.adapter.dial_udp(metadata).await;
-        drop(route);
-        result
+        self.resolve(metadata)
+            .await?
+            .adapter
+            .dial_udp(metadata)
+            .await
     }
 }
 
@@ -189,7 +201,7 @@ mod tests {
         }
     }
 
-    fn tunnel_with(rules: &[&str]) -> crate::Tunnel {
+    fn recording_proxies() -> HashMap<smol_str::SmolStr, Arc<dyn Proxy>> {
         let mut proxies: HashMap<smol_str::SmolStr, Arc<dyn Proxy>> = HashMap::new();
         for name in ["HIT", "MISS"] {
             proxies.insert(
@@ -200,12 +212,19 @@ mod tests {
                 }) as Arc<dyn Proxy>,
             );
         }
-        let rules: Vec<Box<dyn meow_common::Rule>> = rules
+        proxies
+    }
+
+    fn rules(lines: &[&str]) -> Vec<Box<dyn meow_common::Rule>> {
+        lines
             .iter()
             .map(|line| {
                 meow_rules::parse_rule(line, &meow_rules::ParserContext::default()).unwrap()
             })
-            .collect();
+            .collect()
+    }
+
+    fn tunnel_with(lines: &[&str]) -> crate::Tunnel {
         let resolver = Arc::new(meow_dns::Resolver::new(
             vec![],
             vec![],
@@ -215,7 +234,12 @@ mod tests {
             false,
         ));
         let tunnel = crate::Tunnel::new(resolver);
-        tunnel.update_routing(proxies, rules, Default::default(), Default::default());
+        tunnel.update_routing(
+            recording_proxies(),
+            rules(lines),
+            Default::default(),
+            Default::default(),
+        );
         tunnel
     }
 
@@ -249,6 +273,43 @@ mod tests {
             panic!("the recording proxy always fails the dial");
         };
         assert!(err.to_string().contains("MISS dialed"), "{err}");
+    }
+
+    /// The design promise: a `rules:` swap is seen by the *next* dial with
+    /// no republish and no pinned generation.
+    #[tokio::test]
+    async fn rules_swap_is_seen_by_the_next_dial() {
+        let tunnel = tunnel_with(&["MATCH,MISS"]);
+        let dialer = RulesDialer::new(tunnel.weak_inner());
+        let Err(err) = dialer.dial_tcp(&upstream_meta("192.0.2.53")).await else {
+            panic!("the recording proxy always fails the dial");
+        };
+        assert!(err.to_string().contains("MISS dialed"), "{err}");
+
+        tunnel.update_routing(
+            recording_proxies(),
+            rules(&["MATCH,HIT"]),
+            Default::default(),
+            Default::default(),
+        );
+        let Err(err) = dialer.dial_tcp(&upstream_meta("192.0.2.53")).await else {
+            panic!("the recording proxy always fails the dial");
+        };
+        assert!(err.to_string().contains("HIT dialed"), "{err}");
+    }
+
+    /// A UDP upstream goes through `dial_udp` and must honour the same rule
+    /// decision.
+    #[tokio::test]
+    async fn udp_dials_follow_the_same_decision() {
+        let tunnel = tunnel_with(&["IP-CIDR,192.0.2.0/24,HIT", "MATCH,MISS"]);
+        let dialer = RulesDialer::new(tunnel.weak_inner());
+        let mut meta = upstream_meta("192.0.2.53");
+        meta.network = Network::Udp;
+        let Err(err) = dialer.dial_udp(&meta).await else {
+            panic!("the recording proxy always fails the dial");
+        };
+        assert!(err.to_string().contains("HIT dialed"), "{err}");
     }
 
     /// A dial after the tunnel is gone must fail loudly instead of falling

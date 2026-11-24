@@ -67,9 +67,11 @@ rules:
   dial from re-entering the resolver it serves. `proxy-server-nameserver` and
   `direct-nameserver` are themselves never rule-routed.
 - Hostname upstreams (`https://dns.google/dns-query`) are resolved once at
-  config build through `default-nameserver`, so rule matching always sees a
-  stable IP; mihomo resolves them per dial. An unresolvable hostname is a hard
-  load error — use an IP-literal upstream.
+  config build through `default-nameserver` (falling back to the platform
+  resolvers when the config has no IP-literal bootstrap), so rule matching
+  normally sees a stable IP; mihomo resolves them per dial. An unresolvable
+  name is not a load error: the entry stays rule-routed and the dial resolves
+  it per query, which means IP/GEOIP rules will not match that upstream.
 - The decision is made per dial against the live route table, so `rules:` /
   `proxies:` edits apply to the next query without rebuilding the resolver.
   (`PUT /configs` still rebuilds it, like any other `#PROXY` reference.)

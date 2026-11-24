@@ -436,7 +436,10 @@ fn clamp_ttl(raw: Duration) -> Duration {
 /// unconfigured environment. This mirrors mihomo's behaviour and the helper of
 /// the same name in `meow-config::ech_dns`; the logic is duplicated rather than
 /// shared because `meow-config` depends on `meow-dns`, not the reverse.
-async fn system_nameservers() -> Vec<SocketAddr> {
+///
+/// Public so `meow-config` can reuse it for the `dns.respect-rules` bootstrap
+/// of hostname upstreams in a config that carries no IP-literal nameserver.
+pub async fn system_nameservers() -> Vec<SocketAddr> {
     let mut out = Vec::new();
     #[cfg(unix)]
     {

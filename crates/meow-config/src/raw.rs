@@ -1420,8 +1420,11 @@ pub struct RawDns {
     /// is the resolver used for proxy-server hostnames, so it is what keeps a
     /// rule-routed DNS dial from re-entering itself. Hostname nameserver URLs
     /// under `respect-rules` are resolved at build time through
-    /// `default-nameserver` (mihomo resolves them per dial) so rule matching
-    /// always sees a stable IP.
+    /// `default-nameserver` (falling back to the system resolvers when the
+    /// config has no IP-literal bootstrap), so rule matching normally sees a
+    /// stable IP. An unresolvable name is not fatal: the entry stays
+    /// rule-routed and the dial resolves it per query — mihomo's own
+    /// behaviour — so IP/GEOIP rules will not match that upstream.
     pub respect_rules: Option<bool>,
     pub fake_ip_filter: Option<Vec<String>>,
     /// If false, the hosts trie lookup is skipped entirely at query time.

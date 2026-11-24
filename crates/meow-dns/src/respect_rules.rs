@@ -45,7 +45,7 @@ pub type RespectRulesCell = Arc<RwLock<Option<Arc<dyn Proxy>>>>;
 
 /// A fresh, empty cell — the DNS build hands one to every rule-routed
 /// upstream of one resolver generation.
-pub fn new_cell() -> RespectRulesCell {
+pub fn new_respect_rules_cell() -> RespectRulesCell {
     Arc::new(RwLock::new(None))
 }
 
@@ -91,6 +91,9 @@ impl ProxyAdapter for RespectRulesProxy {
         ""
     }
 
+    /// Inert by design (see the `health` field): writes are discarded, and
+    /// the forwarding read paths are `Proxy::alive` / `last_delay*` /
+    /// `delay_history`.
     fn health(&self) -> &ProxyHealth {
         &self.health
     }
@@ -154,12 +157,14 @@ mod tests {
     use super::*;
 
     struct Stub {
+        label: &'static str,
         health: ProxyHealth,
     }
 
     impl Stub {
-        fn new() -> Self {
+        fn new(label: &'static str) -> Self {
             Self {
+                label,
                 health: ProxyHealth::new(),
             }
         }
@@ -183,10 +188,10 @@ mod tests {
             true
         }
         async fn dial_tcp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
-            Err(MeowError::Proxy("stub reached".into()))
+            Err(MeowError::Proxy(format!("{} reached", self.label)))
         }
         async fn dial_udp(&self, _metadata: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-            Err(MeowError::Proxy("stub reached".into()))
+            Err(MeowError::Proxy(format!("{} reached", self.label)))
         }
     }
 
@@ -210,9 +215,19 @@ mod tests {
 
     #[tokio::test]
     async fn empty_cell_fails_the_dial_loudly() {
-        let cell: RespectRulesCell = Arc::new(RwLock::new(None));
-        let proxy = RespectRulesProxy::new(cell);
+        let proxy = RespectRulesProxy::new(new_respect_rules_cell());
         let Err(err) = proxy.dial_tcp(&Metadata::default()).await else {
+            panic!("an unpublished dialer must not dial");
+        };
+        assert!(err.to_string().contains("respect-rules"), "{err}");
+    }
+
+    /// A plain UDP upstream reaches the adapter through `dial_udp`, which
+    /// must fail on an unpublished cell just like the TCP path.
+    #[tokio::test]
+    async fn empty_cell_fails_the_udp_dial_loudly() {
+        let proxy = RespectRulesProxy::new(new_respect_rules_cell());
+        let Err(err) = proxy.dial_udp(&Metadata::default()).await else {
             panic!("an unpublished dialer must not dial");
         };
         assert!(err.to_string().contains("respect-rules"), "{err}");
@@ -220,13 +235,31 @@ mod tests {
 
     #[tokio::test]
     async fn published_dialer_is_forwarded() {
-        let cell: RespectRulesCell = Arc::new(RwLock::new(None));
+        let cell = new_respect_rules_cell();
         let proxy = RespectRulesProxy::new(Arc::clone(&cell));
-        *cell.write() = Some(Arc::new(Stub::new()));
+        *cell.write() = Some(Arc::new(Stub::new("first")));
         assert_eq!(proxy.last_delay(), 42);
         let Err(err) = proxy.dial_tcp(&Metadata::default()).await else {
             panic!("the stub dial fails");
         };
-        assert!(err.to_string().contains("stub reached"), "{err}");
+        assert!(err.to_string().contains("first reached"), "{err}");
+    }
+
+    /// The documented reload contract: a second publication is observed by
+    /// the next dial (no cached resolve).
+    #[tokio::test]
+    async fn republish_is_observed_by_the_next_dial() {
+        let cell = new_respect_rules_cell();
+        let proxy = RespectRulesProxy::new(Arc::clone(&cell));
+        *cell.write() = Some(Arc::new(Stub::new("first")));
+        let Err(err) = proxy.dial_tcp(&Metadata::default()).await else {
+            panic!("the stub dial fails");
+        };
+        assert!(err.to_string().contains("first reached"), "{err}");
+        *cell.write() = Some(Arc::new(Stub::new("second")));
+        let Err(err) = proxy.dial_tcp(&Metadata::default()).await else {
+            panic!("the stub dial fails");
+        };
+        assert!(err.to_string().contains("second reached"), "{err}");
     }
 }

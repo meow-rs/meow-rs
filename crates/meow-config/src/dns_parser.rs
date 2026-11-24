@@ -99,60 +99,6 @@ pub async fn parse_dns(
         prefer_h3,
     ))?;
 
-    // mihomo `respect-rules`: route each untagged upstream's *own dial*
-    // through the tunnel's rule engine (see `RawDns::respect_rules`). The
-    // rule engine lives in the tunnel, which does not exist yet at this
-    // point, so the resolver carries a forwarding cell and the owning
-    // application publishes the real dialer afterwards.
-    //
-    // `proxy-server-nameserver` is mandatory: it is the resolver that
-    // resolves proxy-server hostnames, so it is what stops a rule-routed DNS
-    // dial from re-entering itself. Upstream parsed with `respectRules=false`
-    // here — proxy bootstrapping must never depend on the rules it serves.
-    let respect_rules = dns.respect_rules.unwrap_or(false);
-    if respect_rules && proxy_ns_urls.is_empty() {
-        anyhow::bail!(
-            "dns.respect-rules is on but 'proxy-server-nameserver' is empty; mihomo requires a \
-             bootstrap resolver for proxy server hostnames — add e.g. \
-             'proxy-server-nameserver: [223.5.5.5]'"
-        );
-    }
-    if respect_rules && proxy_registry.contains_key(meow_dns::RESPECT_RULES_PROXY) {
-        anyhow::bail!(
-            "a proxy is named '{}', which collides with the reserved dns.respect-rules routing \
-             entry; rename the proxy",
-            meow_dns::RESPECT_RULES_PROXY
-        );
-    }
-    let respect_rules_cell: Option<meow_dns::RespectRulesCell> = if respect_rules {
-        Some(meow_dns::respect_rules::new_cell())
-    } else {
-        None
-    };
-    // Built before any tagging: a rule-routed upstream carries a proxy tag,
-    // and `build_policy_bootstrap_clients` only takes untagged, IP-literal
-    // entries — computing it later would silently shrink the bootstrap pool.
-    let policy_bootstrap_clients = build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
-    let respect_registry = respect_rules_cell.as_ref().map(|cell| {
-        let mut registry = proxy_registry.clone();
-        registry.insert(
-            smol_str::SmolStr::new(meow_dns::RESPECT_RULES_PROXY),
-            Arc::new(meow_dns::RespectRulesProxy::new(Arc::clone(cell)))
-                as Arc<dyn meow_common::Proxy>,
-        );
-        registry
-    });
-    let proxy_registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> =
-        respect_registry.as_ref().unwrap_or(proxy_registry);
-    let (main_urls, fallback_urls) = if respect_rules {
-        (
-            apply_respect_rules(main_urls, "dns.nameserver", &policy_bootstrap_clients).await?,
-            apply_respect_rules(fallback_urls, "dns.fallback", &policy_bootstrap_clients).await?,
-        )
-    } else {
-        (main_urls, fallback_urls)
-    };
-
     // The same `prefer-h3` rewrite for `nameserver-policy` values, which are
     // URL strings until the policy builder parses them. Computed *before* the
     // capability guard below: a policy-only config (`prefer-h3` with every DoH
@@ -224,6 +170,89 @@ pub async fn parse_dns(
             }
         }
     }
+
+    // mihomo `respect-rules`: route each untagged upstream's *own dial*
+    // through the tunnel's rule engine (see `RawDns::respect_rules`). The
+    // rule engine lives in the tunnel, which does not exist yet at this
+    // point, so the resolver carries a forwarding cell and the owning
+    // application publishes the real dialer afterwards.
+    //
+    // Computed below the HTTP/3 capability guard on purpose:
+    // `build_policy_bootstrap_clients` builds real clients, and
+    // `Resolver::build_single_resolver` panics on an H3 entry when the build
+    // lacks `quic-dns` — the guard above exists to turn exactly that into a
+    // config error.
+    let respect_rules = dns.respect_rules.unwrap_or(false);
+    let respect_rules_cell: Option<meow_dns::RespectRulesCell> = if respect_rules {
+        // mihomo parity: the bootstrap resolver for proxy server hostnames is
+        // mandatory — it is what stops a rule-routed DNS dial from re-entering
+        // itself. Everything below it (`proxy-server-nameserver`,
+        // `direct-nameserver`, the node policy) stays outside the rule-routed
+        // set for the same reason.
+        if proxy_ns_urls.is_empty() {
+            anyhow::bail!(
+                "dns.respect-rules is on but 'proxy-server-nameserver' is empty; mihomo requires \
+                 a bootstrap resolver for proxy server hostnames — add e.g. \
+                 'proxy-server-nameserver: [223.5.5.5]'"
+            );
+        }
+        if proxy_registry.contains_key(meow_dns::RESPECT_RULES_PROXY) {
+            anyhow::bail!(
+                "a proxy is named '{}', which collides with the reserved dns.respect-rules \
+                 routing entry; rename the proxy",
+                meow_dns::RESPECT_RULES_PROXY
+            );
+        }
+        // A nameserver *tag* naming the sentinel would pull a bootstrap
+        // resolver into the rule engine — the recursion the key must not
+        // have — and `circular_proxy_tags` cannot see it (the sentinel is not
+        // a real node). Reject it wherever a tag can appear.
+        for (entries, key) in [
+            (&main_urls, "dns.nameserver"),
+            (&fallback_urls, "dns.fallback"),
+            (&default_ns_urls, "dns.default-nameserver"),
+            (&proxy_ns_urls, "dns.proxy-server-nameserver"),
+            (&direct_ns_urls, "dns.direct-nameserver"),
+        ] {
+            reject_reserved_proxy_tag(entries, key)?;
+        }
+        for map in effective_policy.iter().chain(effective_proxy_policy.iter()) {
+            for value in map.values() {
+                for raw in value.as_urls() {
+                    // Unparseable entries fail the build elsewhere.
+                    if let Ok(entry) = NameServerEntry::parse(raw) {
+                        reject_reserved_proxy_tag(&[entry], "dns.nameserver-policy")?;
+                    }
+                }
+            }
+        }
+        Some(meow_dns::new_respect_rules_cell())
+    } else {
+        None
+    };
+    // Built before any tagging: a rule-routed upstream carries a proxy tag,
+    // and `build_policy_bootstrap_clients` only takes untagged, IP-literal
+    // entries — computing it later would silently shrink the bootstrap pool.
+    let policy_bootstrap_clients = build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
+    let respect_registry = respect_rules_cell.as_ref().map(|cell| {
+        let mut registry = proxy_registry.clone();
+        registry.insert(
+            smol_str::SmolStr::new(meow_dns::RESPECT_RULES_PROXY),
+            Arc::new(meow_dns::RespectRulesProxy::new(Arc::clone(cell)))
+                as Arc<dyn meow_common::Proxy>,
+        );
+        registry
+    });
+    let proxy_registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> =
+        respect_registry.as_ref().unwrap_or(proxy_registry);
+    let (main_urls, fallback_urls) = if respect_rules {
+        (
+            apply_respect_rules(main_urls, "dns.nameserver", &policy_bootstrap_clients).await?,
+            apply_respect_rules(fallback_urls, "dns.fallback", &policy_bootstrap_clients).await?,
+        )
+    } else {
+        (main_urls, fallback_urls)
+    };
 
     let mode = match dns.enhanced_mode.as_deref() {
         Some("fake-ip") => DnsMode::FakeIp,
@@ -1279,9 +1308,21 @@ async fn build_policy_resolvers(
                 let tagged_route = proxy.is_some();
                 let proxy = match proxy {
                     Some(handle) => Some(handle),
-                    None if respect_rules => {
-                        proxy_registry.get(meow_dns::RESPECT_RULES_PROXY).cloned()
-                    }
+                    // Fail closed: an unproxied client here would silently
+                    // dial a `respect-rules` upstream direct, which is the
+                    // one thing the flag must never do.
+                    None if respect_rules => Some(
+                        proxy_registry
+                            .get(meow_dns::RESPECT_RULES_PROXY)
+                            .cloned()
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "nameserver-policy entry '{key}': dns.respect-rules is on \
+                                     but the rule-routed entry is missing from the proxy \
+                                     registry"
+                                )
+                            })?,
+                    ),
                     None => None,
                 };
                 let url = if tagged_route {
@@ -1327,44 +1368,83 @@ async fn build_policy_resolvers(
 /// sentinel so the built client dials through the resolver's cell.
 ///
 /// mihomo resolves the nameserver hostname per dial (`DNSDialer.DialContext`
-/// → `ResolveIPWithResolver`); meow-rs resolves it once, at build time, for
-/// the same reason every other upstream hostname is resolved here — the rule
-/// match then sees a stable address, and the dial never re-enters the
-/// resolver it is serving.
+/// → `ResolveIPWithResolver`); meow-rs resolves it once here so the rule scan
+/// sees an address without re-entering the resolver it is serving. An
+/// unresolvable name is *not* fatal — the entry stays rule-routed with its
+/// hostname, and the dial degrades to per-dial resolution (mihomo's own
+/// behaviour, and the same degradation a `#DIRECT` + domain upstream already
+/// has). Untagging it instead would silently bypass the rule engine.
 async fn apply_respect_rules(
     entries: Vec<NameServerEntry>,
     key: &str,
     bootstrap_clients: &[Arc<DnsClient>],
 ) -> Result<Vec<NameServerEntry>, anyhow::Error> {
     let mut out = Vec::with_capacity(entries.len());
+    // `default-nameserver`/`nameserver` may hold no IP-literal entry at all
+    // (a pure-DoH config); mihomo bootstraps such a hostname through the
+    // system resolvers, so do the same rather than dropping rule routing.
+    let mut clients = bootstrap_clients.to_vec();
+    if clients.is_empty()
+        && entries
+            .iter()
+            .any(|entry| nameserver_hostname(&entry.url).is_some())
+    {
+        clients = system_bootstrap_clients().await;
+    }
     for mut entry in entries {
         // An explicit tag is the operator's own route decision; `rcode://`
         // entries never dial at all.
         if entry.proxy.is_none() && !matches!(entry.url, NameServerUrl::RCode { .. }) {
             if let Some(host) = nameserver_hostname(&entry.url) {
                 let url_str = entry.url.to_string();
-                let resolved = resolve_policy_hostname_url(
-                    entry.url.clone(),
-                    key,
-                    &url_str,
-                    bootstrap_clients,
-                )
-                .await;
-                let Some(url) = resolved else {
-                    anyhow::bail!(
-                        "{key}: 'respect-rules' needs the upstream address at build time, but \
-                         hostname '{host}' in '{url_str}' did not resolve (no IP-literal \
-                         default-nameserver/nameserver to bootstrap it, or the lookup failed); \
-                         use an IP-literal upstream or fix default-nameserver"
-                    );
-                };
-                entry.url = url;
+                match resolve_policy_hostname_url(entry.url.clone(), key, &url_str, &clients).await
+                {
+                    Some(url) => entry.url = url,
+                    None => warn!(
+                        "{key}: 'respect-rules' could not resolve upstream hostname '{host}' in \
+                         '{url_str}' at build time; keeping the name — the rule-routed dial \
+                         resolves it per query, so IP/GEOIP rules will not match it"
+                    ),
+                }
             }
             entry.proxy = Some(meow_dns::RESPECT_RULES_PROXY.to_string());
         }
         out.push(entry);
     }
     Ok(out)
+}
+
+/// Bootstrap clients built from the platform resolvers, for a config whose
+/// `default-nameserver`/`nameserver` holds only hostname entries
+/// (`Resolver::system_nameservers` mirrors mihomo's system-DNS bootstrap).
+async fn system_bootstrap_clients() -> Vec<Arc<DnsClient>> {
+    let resolved = HashMap::new();
+    meow_dns::system_nameservers()
+        .await
+        .into_iter()
+        .map(|addr| {
+            Resolver::build_single_resolver(
+                &NameServerUrl::Udp {
+                    addr: HostOrIp::Ip(addr.ip()),
+                    port: addr.port(),
+                },
+                &resolved,
+            )
+        })
+        .collect()
+}
+
+/// Reject a nameserver tag that names the reserved rule-routing sentinel.
+fn reject_reserved_proxy_tag(entries: &[NameServerEntry], key: &str) -> Result<(), anyhow::Error> {
+    for entry in entries {
+        if entry.proxy.as_deref() == Some(meow_dns::RESPECT_RULES_PROXY) {
+            anyhow::bail!(
+                "{key}: proxy tag '{}' is reserved for dns.respect-rules; rename the tag",
+                meow_dns::RESPECT_RULES_PROXY
+            );
+        }
+    }
+    Ok(())
 }
 
 /// The hostname an entry dials, when it has one.
@@ -4811,7 +4891,7 @@ mod tests {
         registry.insert(
             smol_str::SmolStr::new(meow_dns::RESPECT_RULES_PROXY),
             Arc::new(meow_dns::RespectRulesProxy::new(
-                meow_dns::respect_rules::new_cell(),
+                meow_dns::new_respect_rules_cell(),
             )),
         );
         let value = crate::raw::RawNspValue::One("192.0.2.53".to_string());
@@ -4823,6 +4903,52 @@ mod tests {
             resolvers[0].proxy().map(|proxy| proxy.name()),
             Some(meow_dns::RESPECT_RULES_PROXY)
         );
+    }
+
+    /// The tagging rules themselves: an untagged IP upstream joins the
+    /// rule-routed set (for `fallback` too — the helper is called per list),
+    /// an explicit tag wins, and `rcode://` never dials so it is left alone.
+    #[tokio::test]
+    async fn apply_respect_rules_tags_ip_entries_and_keeps_explicit_tags() {
+        let entries = parse_nameserver_entries(&[
+            "9.9.9.9".to_string(),
+            "8.8.4.4#Proxy".to_string(),
+            "rcode://success".to_string(),
+        ])
+        .unwrap();
+        let out = apply_respect_rules(entries, "dns.fallback", &[])
+            .await
+            .unwrap();
+        assert_eq!(out[0].proxy.as_deref(), Some(meow_dns::RESPECT_RULES_PROXY));
+        assert_eq!(out[1].proxy.as_deref(), Some("Proxy"));
+        assert!(matches!(out[2].url, NameServerUrl::RCode { .. }));
+        assert!(out[2].proxy.is_none());
+    }
+
+    /// A bootstrap nameserver tagged with the sentinel would be pulled into
+    /// the rule engine — the recursion the key must not have.
+    #[tokio::test]
+    async fn respect_rules_rejects_a_reserved_nameserver_tag() {
+        let raw: RawConfig = serde_saphyr::from_str(&format!(
+            "dns:\n  enable: true\n  respect-rules: true\n  nameserver: [1.1.1.1]\n  \
+             proxy-server-nameserver: ['223.5.5.5#{}']\n",
+            meow_dns::RESPECT_RULES_PROXY
+        ))
+        .unwrap();
+        let Err(err) = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        else {
+            panic!("a nameserver tag naming the sentinel must be rejected");
+        };
+        assert!(err.to_string().contains("reserved"), "{err}");
     }
 
     async fn node_policy_config(yaml: &str) -> DnsConfig {

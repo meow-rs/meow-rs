@@ -23,10 +23,13 @@ pub use client::{
 };
 pub use fakeip::{FileStore, MemoryStore, Pool, PoolError, Skipper, SkipperMode, Store};
 pub use host_resolver_hook::ResolverHostHook;
+pub use resolver::system_nameservers;
 pub use resolver::{
     BootstrapError, FallbackFilter, HostEntry, NameserverPolicy, PolicyEntry, Resolver,
 };
-pub use respect_rules::{RespectRulesCell, RespectRulesProxy, RESPECT_RULES_PROXY};
+pub use respect_rules::{
+    new_respect_rules_cell, RespectRulesCell, RespectRulesProxy, RESPECT_RULES_PROXY,
+};
 pub use server::{
     new_dns_outbound_cell, new_resolver_slot, new_resolver_slot_state, BoundDnsServer,
     DnsOutboundCell, DnsServer, LocalAnswer, ResolverGen, ResolverSlot,

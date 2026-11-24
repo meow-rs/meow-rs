@@ -1615,9 +1615,7 @@ async fn run(
     // (`install_resolver_everywhere` republishes only when the DNS build
     // hands out a fresh cell).
     if let Some(cell) = &config.dns.respect_rules_cell {
-        *cell.write() = Some(Arc::new(meow_tunnel::rules_dialer::RulesDialer::new(
-            tunnel.weak_inner(),
-        )));
+        meow_tunnel::rules_dialer::publish(cell, &tunnel);
     }
 
     // Spawn periodic health checks for fallback / url-test proxy groups.
