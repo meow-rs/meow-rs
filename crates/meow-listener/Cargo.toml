@@ -71,6 +71,7 @@ listener-anytls = [
     "dep:tokio-boring",
     "dep:boring",
     "dep:meow-config",
+    "dep:bytes",
 ]
 
 [dependencies]
