@@ -1609,6 +1609,17 @@ async fn run(
     );
     tunnel.spawn_background_tasks();
 
+    // `dns.respect-rules`: hand the resolver generation its rule-routed
+    // dialer. The dialer keeps a weak tunnel handle and consults the live
+    // route table on every upstream dial, so later commits need no republish
+    // (`install_resolver_everywhere` republishes only when the DNS build
+    // hands out a fresh cell).
+    if let Some(cell) = &config.dns.respect_rules_cell {
+        *cell.write() = Some(Arc::new(meow_tunnel::rules_dialer::RulesDialer::new(
+            tunnel.weak_inner(),
+        )));
+    }
+
     // Spawn periodic health checks for fallback / url-test proxy groups.
     // The supervisor lives on the tunnel so config reloads can reconcile
     // the task set (issue #514).

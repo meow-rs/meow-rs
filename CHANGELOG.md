@@ -10,6 +10,17 @@ the canonical, in-repo source a release is cut from.
 
 ### Added
 
+- `dns.respect-rules` — mihomo's key, now honoured: every nameserver entry
+  without an explicit `?proxy=`/`#PROXY` tag dials through the tunnel's rule
+  engine, with the rules matched against the upstream DNS server itself
+  (`metadata.type = inner`), exactly as mihomo's `DNSDialer` does.
+  `proxy-server-nameserver` is required (mihomo parity) and is the resolver
+  that keeps a rule-routed DNS dial from re-entering itself; the node policy
+  and `direct-nameserver` never use it. An explicit tag still wins, and
+  hostname upstreams are bootstrapped at build time so rule matching sees a
+  stable address. The resolver holds a forwarding cell that the application
+  fills with a weak-handle dialer, so rule/proxy edits apply per dial while a
+  `PUT /configs` rebuild keeps its usual semantics.
 - `global-client-fingerprint` and `global-ua` — mihomo's two top-level
   globals (issue #974). `global-client-fingerprint` is the default uTLS
   ClientHello profile for `proxies:`/`proxy-providers:` nodes omitting

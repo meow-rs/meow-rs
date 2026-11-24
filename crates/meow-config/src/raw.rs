@@ -1406,6 +1406,23 @@ pub struct RawDns {
     /// If true, `nameserver-policy` also applies to `direct-nameserver`
     /// lookups (mihomo `direct-nameserver-follow-policy`, default false).
     pub direct_nameserver_follow_policy: Option<bool>,
+    /// mihomo `respect-rules`: dial every nameserver entry that carries no
+    /// explicit `?proxy=`/`#PROXY` tag through the tunnel's rule engine.
+    ///
+    /// The rules are matched against the **upstream DNS server** (its address
+    /// and port, `metadata.type = inner`), not the queried domain — the same
+    /// decision mihomo's `DNSDialer` makes. An entry whose tag names a proxy
+    /// keeps that proxy; `proxy-server-nameserver` and `direct-nameserver` are
+    /// never rule-routed (they are the bootstrap path that would otherwise
+    /// recurse).
+    ///
+    /// Requires `proxy-server-nameserver` to be non-empty (mihomo parity): it
+    /// is the resolver used for proxy-server hostnames, so it is what keeps a
+    /// rule-routed DNS dial from re-entering itself. Hostname nameserver URLs
+    /// under `respect-rules` are resolved at build time through
+    /// `default-nameserver` (mihomo resolves them per dial) so rule matching
+    /// always sees a stable IP.
+    pub respect_rules: Option<bool>,
     pub fake_ip_filter: Option<Vec<String>>,
     /// If false, the hosts trie lookup is skipped entirely at query time.
     pub use_hosts: Option<bool>,

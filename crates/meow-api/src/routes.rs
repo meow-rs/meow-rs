@@ -2878,6 +2878,13 @@ fn dns_uses_proxy_refs(raw: &RawConfig) -> bool {
     let Some(dns) = raw.dns.as_ref() else {
         return false;
     };
+    // `respect-rules` captures adapters by a different route (the rule engine
+    // at dial time), but it is the same class of runtime ref: the resolver
+    // must be rebuilt whenever the route generation is replaced so the
+    // published dialer belongs to the new one.
+    if dns.respect_rules.unwrap_or(false) {
+        return true;
+    }
     // Decide from the parsed entry, not a raw `#`: on `tls://` / `https://`
     // the fragment is SNI (`tls://1.1.1.1#dns.google`), not a proxy tag. An
     // unparseable entry fails the DNS build itself, so it is no ref here.
@@ -3105,6 +3112,16 @@ pub fn install_resolver_everywhere(
     // `dns:` section still binds: the leaves SERVFAIL on `enabled`, not
     // on an unbound cell.
     *tunnel.dns_outbound_cell().write() = Some(tunnel.resolver_slot());
+
+    // `dns.respect-rules`: publish the rule-routed dialer into this resolver
+    // generation's cell. The dialer holds a *weak* tunnel handle and re-reads
+    // the route table per dial, so a later `rules:`/`proxies:` swap needs no
+    // republish; a DNS rebuild gets a fresh cell (below) and republishes here.
+    if let Some(cell) = &dns.respect_rules_cell {
+        *cell.write() = Some(Arc::new(meow_tunnel::rules_dialer::RulesDialer::new(
+            tunnel.weak_inner(),
+        )));
+    }
 
     // Same host-resolver policy as `main.rs` startup: installed whenever
     // DNS is enabled, unconditionally on VPN platforms where it is the
@@ -7161,6 +7178,26 @@ mod tests {
         // `len` differs, so this is the `ma.len() == mb.len()` guard's pin.
         assert!(!dns_inputs_equal(&raw_ab, &raw_a));
         assert!(!dns_inputs_equal(&raw_a, &raw_ab));
+    }
+
+    /// `dns.respect-rules` binds the resolver to the route generation at dial
+    /// time, so `dns_uses_proxy_refs` must report it: a commit that swaps the
+    /// generation has to rebuild the resolver, and flipping the key itself is
+    /// a DNS-input change.
+    #[test]
+    fn dns_inputs_equal_sees_respect_rules() {
+        let off: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n  proxy-server-nameserver: [223.5.5.5]\n",
+        )
+        .unwrap();
+        let on: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  respect-rules: true\n  nameserver: [1.1.1.1]\n  proxy-server-nameserver: [223.5.5.5]\n",
+        )
+        .unwrap();
+        assert!(!dns_inputs_equal(&off, &on));
+        assert!(!dns_inputs_equal(&on, &off));
+        assert!(!dns_uses_proxy_refs(&off));
+        assert!(dns_uses_proxy_refs(&on));
     }
 
     /// Issue #533 review: `swap_config_and_reconcile_tun` compares the TUN

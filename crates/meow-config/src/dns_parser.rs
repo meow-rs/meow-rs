@@ -67,6 +67,7 @@ pub async fn parse_dns(
                 listen_addr: None,
                 enabled: false,
                 proxy_resolver: None,
+                respect_rules_cell: None,
             });
         }
     };
@@ -97,6 +98,60 @@ pub async fn parse_dns(
         dns.direct_nameserver.as_deref().unwrap_or(&[]),
         prefer_h3,
     ))?;
+
+    // mihomo `respect-rules`: route each untagged upstream's *own dial*
+    // through the tunnel's rule engine (see `RawDns::respect_rules`). The
+    // rule engine lives in the tunnel, which does not exist yet at this
+    // point, so the resolver carries a forwarding cell and the owning
+    // application publishes the real dialer afterwards.
+    //
+    // `proxy-server-nameserver` is mandatory: it is the resolver that
+    // resolves proxy-server hostnames, so it is what stops a rule-routed DNS
+    // dial from re-entering itself. Upstream parsed with `respectRules=false`
+    // here — proxy bootstrapping must never depend on the rules it serves.
+    let respect_rules = dns.respect_rules.unwrap_or(false);
+    if respect_rules && proxy_ns_urls.is_empty() {
+        anyhow::bail!(
+            "dns.respect-rules is on but 'proxy-server-nameserver' is empty; mihomo requires a \
+             bootstrap resolver for proxy server hostnames — add e.g. \
+             'proxy-server-nameserver: [223.5.5.5]'"
+        );
+    }
+    if respect_rules && proxy_registry.contains_key(meow_dns::RESPECT_RULES_PROXY) {
+        anyhow::bail!(
+            "a proxy is named '{}', which collides with the reserved dns.respect-rules routing \
+             entry; rename the proxy",
+            meow_dns::RESPECT_RULES_PROXY
+        );
+    }
+    let respect_rules_cell: Option<meow_dns::RespectRulesCell> = if respect_rules {
+        Some(meow_dns::respect_rules::new_cell())
+    } else {
+        None
+    };
+    // Built before any tagging: a rule-routed upstream carries a proxy tag,
+    // and `build_policy_bootstrap_clients` only takes untagged, IP-literal
+    // entries — computing it later would silently shrink the bootstrap pool.
+    let policy_bootstrap_clients = build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
+    let respect_registry = respect_rules_cell.as_ref().map(|cell| {
+        let mut registry = proxy_registry.clone();
+        registry.insert(
+            smol_str::SmolStr::new(meow_dns::RESPECT_RULES_PROXY),
+            Arc::new(meow_dns::RespectRulesProxy::new(Arc::clone(cell)))
+                as Arc<dyn meow_common::Proxy>,
+        );
+        registry
+    });
+    let proxy_registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> =
+        respect_registry.as_ref().unwrap_or(proxy_registry);
+    let (main_urls, fallback_urls) = if respect_rules {
+        (
+            apply_respect_rules(main_urls, "dns.nameserver", &policy_bootstrap_clients).await?,
+            apply_respect_rules(fallback_urls, "dns.fallback", &policy_bootstrap_clients).await?,
+        )
+    } else {
+        (main_urls, fallback_urls)
+    };
 
     // The same `prefer-h3` rewrite for `nameserver-policy` values, which are
     // URL strings until the policy builder parses them. Computed *before* the
@@ -213,7 +268,7 @@ pub async fn parse_dns(
         }
         let proxy_policy = if let Some(map) = &effective_proxy_policy {
             validate_node_policy_proxy_tags(map, proxy_registry)?;
-            let bootstrap = build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
+            let bootstrap = policy_bootstrap_clients.clone();
             Some(
                 build_nameserver_policy(
                     map,
@@ -222,6 +277,7 @@ pub async fn parse_dns(
                     proxy_registry,
                     rule_providers,
                     strict,
+                    false,
                 )
                 .await?
                 // Same exclusive flag as the main policy: it is a
@@ -262,7 +318,7 @@ pub async fn parse_dns(
         if nsp_map.is_empty() {
             None
         } else {
-            let bootstrap_clients = build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
+            let bootstrap_clients = policy_bootstrap_clients.clone();
             let mut policy = build_nameserver_policy(
                 nsp_map,
                 geosite.as_ref(),
@@ -270,6 +326,7 @@ pub async fn parse_dns(
                 proxy_registry,
                 rule_providers,
                 strict,
+                respect_rules,
             )
             .await?;
             if let Some(exclusive) = dns.nameserver_policy_exclusive {
@@ -295,8 +352,7 @@ pub async fn parse_dns(
             Some(nsp_map)
                 if !nsp_map.is_empty() && dns.direct_nameserver_follow_policy.unwrap_or(false) =>
             {
-                let bootstrap_clients =
-                    build_policy_bootstrap_clients(&default_ns_urls, &main_urls);
+                let bootstrap_clients = policy_bootstrap_clients.clone();
                 let mut policy = build_nameserver_policy(
                     nsp_map,
                     geosite.as_ref(),
@@ -304,6 +360,7 @@ pub async fn parse_dns(
                     proxy_registry,
                     rule_providers,
                     strict,
+                    false,
                 )
                 .await?;
                 if let Some(exclusive) = dns.nameserver_policy_exclusive {
@@ -423,6 +480,7 @@ pub async fn parse_dns(
         listen_addr,
         enabled: true,
         proxy_resolver,
+        respect_rules_cell,
     })
 }
 
@@ -862,6 +920,9 @@ async fn build_nameserver_policy(
     // Resolution-dependent skips (bootstrap lookup failed, no addresses)
     // stay lenient: those are transient, not config defects.
     strict: bool,
+    // `dns.respect-rules`: untagged policy upstreams join the rule-routed
+    // set instead of dialling direct (see `RawDns::respect_rules`).
+    respect_rules: bool,
 ) -> Result<NameserverPolicy, anyhow::Error> {
     let mut policy = NameserverPolicy::new();
     let mut warned_unsupported_prefix = false;
@@ -1011,8 +1072,15 @@ async fn build_nameserver_policy(
             continue;
         }
 
-        let resolvers =
-            build_policy_resolvers(key, value, bootstrap_clients, proxy_registry, strict).await?;
+        let resolvers = build_policy_resolvers(
+            key,
+            value,
+            bootstrap_clients,
+            proxy_registry,
+            strict,
+            respect_rules,
+        )
+        .await?;
 
         let entry = PolicyEntry {
             nameservers: resolvers,
@@ -1129,12 +1197,14 @@ fn build_policy_bootstrap_clients(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn build_policy_resolvers(
     key: &str,
     value: &crate::raw::RawNspValue,
     bootstrap_clients: &[Arc<DnsClient>],
     proxy_registry: &HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>>,
     strict: bool,
+    respect_rules: bool,
 ) -> Result<Vec<Arc<meow_dns::DnsClient>>, anyhow::Error> {
     let url_strs = value.as_urls();
     let empty_resolved = HashMap::new();
@@ -1200,7 +1270,21 @@ async fn build_policy_resolvers(
                 // actually resolved to a handle: an unknown name degrades
                 // to the untagged path above, so its hostname still goes
                 // through bootstrap exactly like an untagged entry.
-                let url = if proxy.is_some() {
+                //
+                // `dns.respect-rules`: an untagged entry joins the
+                // rule-routed set (`RawDns::respect_rules`). It is still
+                // bootstrapped — a rule-routed upstream must reach the
+                // engine as an address so IP/GEOIP rules can match it, and
+                // so the dial never re-enters the resolver serving it.
+                let tagged_route = proxy.is_some();
+                let proxy = match proxy {
+                    Some(handle) => Some(handle),
+                    None if respect_rules => {
+                        proxy_registry.get(meow_dns::RESPECT_RULES_PROXY).cloned()
+                    }
+                    None => None,
+                };
+                let url = if tagged_route {
                     Some(entry.url)
                 } else {
                     resolve_policy_hostname_url(entry.url, key, url_str, bootstrap_clients).await
@@ -1236,6 +1320,70 @@ async fn build_policy_resolvers(
     }
 
     Ok(resolvers)
+}
+
+/// mihomo `respect-rules`, per entry: resolve a hostname upstream to the IP
+/// the bootstrap resolvers return, then tag the entry with the rule-routed
+/// sentinel so the built client dials through the resolver's cell.
+///
+/// mihomo resolves the nameserver hostname per dial (`DNSDialer.DialContext`
+/// → `ResolveIPWithResolver`); meow-rs resolves it once, at build time, for
+/// the same reason every other upstream hostname is resolved here — the rule
+/// match then sees a stable address, and the dial never re-enters the
+/// resolver it is serving.
+async fn apply_respect_rules(
+    entries: Vec<NameServerEntry>,
+    key: &str,
+    bootstrap_clients: &[Arc<DnsClient>],
+) -> Result<Vec<NameServerEntry>, anyhow::Error> {
+    let mut out = Vec::with_capacity(entries.len());
+    for mut entry in entries {
+        // An explicit tag is the operator's own route decision; `rcode://`
+        // entries never dial at all.
+        if entry.proxy.is_none() && !matches!(entry.url, NameServerUrl::RCode { .. }) {
+            if let Some(host) = nameserver_hostname(&entry.url) {
+                let url_str = entry.url.to_string();
+                let resolved = resolve_policy_hostname_url(
+                    entry.url.clone(),
+                    key,
+                    &url_str,
+                    bootstrap_clients,
+                )
+                .await;
+                let Some(url) = resolved else {
+                    anyhow::bail!(
+                        "{key}: 'respect-rules' needs the upstream address at build time, but \
+                         hostname '{host}' in '{url_str}' did not resolve (no IP-literal \
+                         default-nameserver/nameserver to bootstrap it, or the lookup failed); \
+                         use an IP-literal upstream or fix default-nameserver"
+                    );
+                };
+                entry.url = url;
+            }
+            entry.proxy = Some(meow_dns::RESPECT_RULES_PROXY.to_string());
+        }
+        out.push(entry);
+    }
+    Ok(out)
+}
+
+/// The hostname an entry dials, when it has one.
+fn nameserver_hostname(url: &NameServerUrl) -> Option<&str> {
+    let (NameServerUrl::Udp { addr, .. }
+    | NameServerUrl::Tcp { addr, .. }
+    | NameServerUrl::Tls { addr, .. }
+    | NameServerUrl::Https { addr, .. }
+    | NameServerUrl::Quic { addr, .. }) = url
+    else {
+        // `rcode://` never dials, and `NameServerUrl` is `#[non_exhaustive]`:
+        // a future transport that dials a hostname must be added above, or it
+        // would skip the build-time resolution and reach the dial as a name.
+        return None;
+    };
+    match addr {
+        HostOrIp::Host(host) => Some(host.as_str()),
+        HostOrIp::Ip(_) => None,
+    }
 }
 
 async fn resolve_policy_hostname_url(
@@ -1317,7 +1465,7 @@ async fn resolve_policy_host(
     // nameservers" verdict, not green-light a config that cannot start.
     if bootstrap_clients.is_empty() {
         warn!(
-            "nameserver-policy entry '{}': URL '{}' uses hostname '{}' but no IP-literal \
+            "{}: URL '{}' uses hostname '{}' but no IP-literal \
             nameserver/default-nameserver is available for policy bootstrap; skipping",
             key, url_str, host
         );
@@ -1343,13 +1491,13 @@ async fn resolve_policy_host(
             }
             Ok(Err(e)) => {
                 warn!(
-                    "nameserver-policy entry '{}': bootstrap lookup for '{}' via '{}' failed: {}",
+                    "{}: bootstrap lookup for '{}' via '{}' failed: {}",
                     key, host, url_str, e
                 );
             }
             Err(_) => {
                 warn!(
-                    "nameserver-policy entry '{}': bootstrap lookup for '{}' timed out; \
+                    "{}: bootstrap lookup for '{}' timed out; \
                     trying next bootstrap nameserver",
                     key, host
                 );
@@ -1357,7 +1505,7 @@ async fn resolve_policy_host(
         }
     }
     warn!(
-        "nameserver-policy entry '{}': URL '{}' hostname '{}' resolved to no addresses; skipping",
+        "{}: URL '{}' hostname '{}' resolved to no addresses; skipping",
         key, url_str, host
     );
     None
@@ -3013,8 +3161,16 @@ mod tests {
             "geosite:cn",
             RawNspValue::One("rcode://success".to_string()),
         )]);
-        let result =
-            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false).await;
+        let result = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await;
         assert!(result.is_ok(), "geosite: prefix must not hard-error");
         let pol = result.unwrap();
         assert!(
@@ -3031,9 +3187,17 @@ mod tests {
         use crate::raw::RawNspValue;
         let map = nsp_map(&[("a..b", RawNspValue::One("rcode://success".to_string()))]);
         let cap = WarnCapture::start();
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
-            .await
-            .expect("empty-label key must stay lenient");
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await
+        .expect("empty-label key must stay lenient");
         let warns = cap.take();
         assert!(
             warns.contains("a..b") && warns.contains("empty label"),
@@ -3043,8 +3207,16 @@ mod tests {
             pol.lookup("a.b").is_none(),
             "the dead node must not leak to a.b"
         );
-        let result =
-            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), true).await;
+        let result = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            false,
+        )
+        .await;
         let Err(err) = result else {
             panic!("strict must hard-error on an empty-label key")
         };
@@ -3070,6 +3242,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3088,8 +3261,16 @@ mod tests {
             "corp.example",
             RawNspValue::Many(vec!["quic://bad.example".to_string()]),
         )]);
-        let result =
-            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false).await;
+        let result = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await;
         assert!(
             result.is_err(),
             "policy entry with no valid servers must be a hard error"
@@ -3104,9 +3285,17 @@ mod tests {
             "+.corp.internal",
             RawNspValue::One("192.168.1.53".to_string()),
         )]);
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(pol.lookup("foo.corp.internal").is_some());
         assert!(pol.lookup("corp.internal").is_some());
         assert!(pol.lookup("other.example").is_none());
@@ -3121,9 +3310,17 @@ mod tests {
             "*.corp.internal",
             RawNspValue::One("192.168.1.53".to_string()),
         )]);
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             pol.lookup("foo.corp.internal").is_some(),
             "single-label subdomain of *.corp.internal must hit"
@@ -3150,9 +3347,17 @@ mod tests {
             ".corp.internal",
             RawNspValue::One("192.168.1.53".to_string()),
         )]);
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(pol.lookup("foo.corp.internal").is_some());
         assert!(
             pol.lookup("a.b.corp.internal").is_some(),
@@ -3172,9 +3377,17 @@ mod tests {
             "corp.internal",
             RawNspValue::One("192.168.1.53".to_string()),
         )]);
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         assert!(pol.lookup("corp.internal").is_some());
         assert!(pol.lookup("a.corp.internal").is_none());
         assert!(pol.lookup("a.b.corp.internal").is_none());
@@ -3221,9 +3434,10 @@ mod tests {
             "rule-set:cn",
             RawNspValue::One("rcode://success".to_string()),
         )]);
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
-            .await
-            .unwrap();
+        let pol =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false, false)
+                .await
+                .unwrap();
         assert!(pol.lookup("example.cn").is_some());
         assert!(pol.lookup("foo.cn").is_some());
         assert!(pol.lookup("example.com").is_none());
@@ -3239,7 +3453,8 @@ mod tests {
             RawNspValue::One("rcode://success".to_string()),
         )]);
         let result =
-            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false).await;
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false, false)
+                .await;
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("not found rule-set"), "msg was: {msg}");
@@ -3255,7 +3470,8 @@ mod tests {
             RawNspValue::One("rcode://success".to_string()),
         )]);
         let result =
-            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false).await;
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false, false)
+                .await;
         assert!(result.is_err());
         let msg = result.err().unwrap().to_string();
         assert!(msg.contains("IpCidr"), "msg was: {msg}");
@@ -3274,9 +3490,10 @@ mod tests {
             "rule-set:cls",
             RawNspValue::One("rcode://success".to_string()),
         )]);
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
-            .await
-            .unwrap();
+        let pol =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false, false)
+                .await
+                .unwrap();
         assert!(pol.lookup("mail.google.com").is_some());
         assert!(pol.lookup("example.org").is_none());
     }
@@ -3293,9 +3510,10 @@ mod tests {
             "rule-set:a,b",
             RawNspValue::One("rcode://success".to_string()),
         )]);
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
-            .await
-            .unwrap();
+        let pol =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false, false)
+                .await
+                .unwrap();
         assert!(pol.lookup("a.example").is_some());
         assert!(pol.lookup("b.example").is_some());
         assert!(pol.lookup("c.example").is_none());
@@ -3310,9 +3528,10 @@ mod tests {
             "rule-set:CN",
             RawNspValue::One("rcode://success".to_string()),
         )]);
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
-            .await
-            .unwrap();
+        let pol =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false, false)
+                .await
+                .unwrap();
         assert!(pol.lookup("example.cn").is_some());
     }
 
@@ -3342,9 +3561,10 @@ mod tests {
             ),
         ]);
         for _ in 0..2 {
-            let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
-                .await
-                .unwrap();
+            let pol =
+                build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false, false)
+                    .await
+                    .unwrap();
             let hit = pol.lookup("x.shared.example").expect("must match");
             assert_eq!(
                 hit.nameservers.len(),
@@ -3368,9 +3588,17 @@ mod tests {
                 RawNspValue::One("rcode://success".to_string()),
             ),
         ]);
-        let pol = build_nameserver_policy(&reversed, None, &[], &HashMap::new(), &providers, false)
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &reversed,
+            None,
+            &[],
+            &HashMap::new(),
+            &providers,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         let hit = pol.lookup("x.shared.example").expect("must match");
         assert_eq!(
             hit.nameservers.len(),
@@ -3402,9 +3630,10 @@ mod tests {
                 ]),
             ),
         ]);
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
-            .await
-            .unwrap();
+        let pol =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false, false)
+                .await
+                .unwrap();
         let hit = pol.lookup("x.shadow.example").expect("must match");
         assert_eq!(
             hit.nameservers.len(),
@@ -3434,9 +3663,17 @@ mod tests {
                 RawNspValue::One("rcode://success".to_string()),
             ),
         ]);
-        let pol = build_nameserver_policy(&reversed, None, &[], &HashMap::new(), &providers, false)
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &reversed,
+            None,
+            &[],
+            &HashMap::new(),
+            &providers,
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         let hit = pol.lookup("x.shadow.example").expect("must match");
         assert_eq!(
             hit.nameservers.len(),
@@ -3460,7 +3697,7 @@ mod tests {
                 RawNspValue::One("rcode://success".to_string()),
             ),
         ]);
-        build_nameserver_policy(&same, None, &[], &HashMap::new(), &providers, false)
+        build_nameserver_policy(&same, None, &[], &HashMap::new(), &providers, false, false)
             .await
             .unwrap();
         let logs = warns.take();
@@ -3490,9 +3727,17 @@ mod tests {
                 ]),
             ),
         ]);
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             pol.lookup("x.example")
                 .expect("must match")
@@ -3531,9 +3776,10 @@ mod tests {
                 ]),
             ),
         ]);
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false)
-            .await
-            .unwrap();
+        let pol =
+            build_nameserver_policy(&map, None, &[], &HashMap::new(), &providers, false, false)
+                .await
+                .unwrap();
         // `q.a.example` hits the first key's domain arm.
         assert_eq!(pol.lookup("q.a.example").unwrap().nameservers.len(), 1);
         // `q.b.example`: the Domains arm holding `+.a.example` misses, the
@@ -3573,9 +3819,17 @@ mod tests {
             "the last value must win"
         );
         // The folded entry still builds a working policy.
-        let pol = build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
-            .await
-            .unwrap();
+        let pol = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
         assert_eq!(pol.lookup("x.dup.example").unwrap().nameservers.len(), 2);
     }
 
@@ -3848,7 +4102,7 @@ mod tests {
             }),
         );
         let value = crate::raw::RawNspValue::One("tcp://8.8.8.8#Proxy".to_string());
-        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false)
+        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false, false)
             .await
             .expect("proxy-tagged policy entry builds");
         assert_eq!(resolvers.len(), 1);
@@ -3865,7 +4119,7 @@ mod tests {
             "tcp://8.8.8.8#NoSuchProxy".to_string(),
             "1.1.1.1#NoSuchProxy".to_string(),
         ]);
-        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false)
+        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false, false)
             .await
             .expect("unknown proxy name must not fail the policy build");
         assert_eq!(resolvers.len(), 2);
@@ -3877,7 +4131,8 @@ mod tests {
         // Strict: the same silent direct-dial downgrade is a hard error —
         // the upstream was proxied precisely because direct is untrusted
         // (issue #533 review).
-        let Err(err) = build_policy_resolvers("geosite:gfw", &value, &[], &registry, true).await
+        let Err(err) =
+            build_policy_resolvers("geosite:gfw", &value, &[], &registry, true, false).await
         else {
             panic!("strict must reject an unknown #proxy reference");
         };
@@ -3892,13 +4147,14 @@ mod tests {
             "bogus://8.8.8.8".to_string(),
             "1.1.1.1".to_string(),
         ]);
-        let resolvers = build_policy_resolvers("example.com", &value, &[], &registry, false)
+        let resolvers = build_policy_resolvers("example.com", &value, &[], &registry, false, false)
             .await
             .expect("lenient keeps the valid entries");
         assert_eq!(resolvers.len(), 1);
 
         // …but under strict the unparseable entry is a config defect.
-        let Err(err) = build_policy_resolvers("example.com", &value, &[], &registry, true).await
+        let Err(err) =
+            build_policy_resolvers("example.com", &value, &[], &registry, true, false).await
         else {
             panic!("strict must reject an invalid policy URL");
         };
@@ -3915,12 +4171,28 @@ mod tests {
             crate::raw::RawNspValue::One("8.8.8.8".to_string()),
         )]);
         // Lenient: warn + entry skipped.
-        build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
-            .await
-            .expect("lenient drops geosite keys without a DB");
+        build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await
+        .expect("lenient drops geosite keys without a DB");
         // Strict: hard error naming the key.
-        let Err(err) =
-            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), true).await
+        let Err(err) = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            false,
+        )
+        .await
         else {
             panic!("strict must reject geosite: policy with no DB");
         };
@@ -3935,11 +4207,27 @@ mod tests {
             "geoip:cn",
             crate::raw::RawNspValue::One("8.8.8.8".to_string()),
         )]);
-        build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), false)
-            .await
-            .expect("lenient skips unknown prefixes");
-        let Err(err) =
-            build_nameserver_policy(&map, None, &[], &HashMap::new(), &HashMap::new(), true).await
+        build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            false,
+            false,
+        )
+        .await
+        .expect("lenient skips unknown prefixes");
+        let Err(err) = build_nameserver_policy(
+            &map,
+            None,
+            &[],
+            &HashMap::new(),
+            &HashMap::new(),
+            true,
+            false,
+        )
+        .await
         else {
             panic!("strict must reject an unsupported policy prefix");
         };
@@ -3962,6 +4250,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             true,
+            false,
         )
         .await
         else {
@@ -3979,6 +4268,7 @@ mod tests {
             &HashMap::new(),
             &HashMap::new(),
             true,
+            false,
         )
         .await
         else {
@@ -4022,7 +4312,7 @@ mod tests {
         // parsing as before and never consult the registry.
         let registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
         let value = crate::raw::RawNspValue::One("tls://8.8.4.4#dns.google".to_string());
-        let resolvers = build_policy_resolvers("example.com", &value, &[], &registry, false)
+        let resolvers = build_policy_resolvers("example.com", &value, &[], &registry, false, false)
             .await
             .expect("tls entry with SNI fragment builds");
         assert_eq!(resolvers.len(), 1);
@@ -4042,7 +4332,7 @@ mod tests {
             }),
         );
         let value = crate::raw::RawNspValue::One("tls://8.8.4.4?proxy=Proxy".to_string());
-        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false)
+        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false, false)
             .await
             .expect("`?proxy=` policy entry builds");
         assert_eq!(resolvers.len(), 1);
@@ -4068,7 +4358,7 @@ mod tests {
         );
         let value =
             crate::raw::RawNspValue::One("tls://policy-stub.invalid?proxy=Proxy".to_string());
-        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false)
+        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false, false)
             .await
             .expect("proxied hostname policy entry builds with no bootstrap clients");
         assert_eq!(resolvers.len(), 1);
@@ -4082,13 +4372,14 @@ mod tests {
     async fn policy_resolver_unknown_query_proxy_lenient_and_strict() {
         let registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
         let value = crate::raw::RawNspValue::One("tls://8.8.4.4?proxy=NoSuchProxy".to_string());
-        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false)
+        let resolvers = build_policy_resolvers("geosite:gfw", &value, &[], &registry, false, false)
             .await
             .expect("lenient keeps the entry as a direct client");
         assert_eq!(resolvers.len(), 1);
         assert!(!resolvers[0].is_proxied());
 
-        let Err(err) = build_policy_resolvers("geosite:gfw", &value, &[], &registry, true).await
+        let Err(err) =
+            build_policy_resolvers("geosite:gfw", &value, &[], &registry, true, false).await
         else {
             panic!("strict must reject an unknown ?proxy= reference");
         };
@@ -4183,12 +4474,16 @@ mod tests {
                     "tcp://policy-host.test#NoSuchProxy",
                 ] {
                     let value = crate::raw::RawNspValue::One(url.to_string());
-                    let clients =
-                        build_policy_resolvers("geosite:gfw", &value, &bootstrap, &registry, false)
-                            .await
-                            .unwrap_or_else(|e| {
-                                panic!("'{url}' must build under lenient policy: {e}")
-                            });
+                    let clients = build_policy_resolvers(
+                        "geosite:gfw",
+                        &value,
+                        &bootstrap,
+                        &registry,
+                        false,
+                        false,
+                    )
+                    .await
+                    .unwrap_or_else(|e| panic!("'{url}' must build under lenient policy: {e}"));
                     assert_eq!(clients.len(), 1, "{url}");
                     assert!(
                         !clients[0].is_proxied(),
@@ -4262,6 +4557,7 @@ mod tests {
                 &value,
                 &[],
                 &registry,
+                false,
                 false,
             ))
             .expect("SNI-fragment entry builds (fragment is SNI, not a proxy tag)");
@@ -4421,6 +4717,114 @@ mod tests {
         let registry = stub_registry(&[("JP", "node.example:443")]);
         assert!(circular_proxy_tags(&entries, &registry).is_empty());
     }
+    /// mihomo parity: `respect-rules` cannot work without a bootstrap
+    /// resolver for proxy server hostnames — it is what keeps a rule-routed
+    /// DNS dial from re-entering itself.
+    #[tokio::test]
+    async fn respect_rules_requires_proxy_server_nameserver() {
+        let raw: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  respect-rules: true\n  nameserver: [1.1.1.1]\n",
+        )
+        .unwrap();
+        let Err(err) = parse_dns(
+            &raw,
+            None,
+            None,
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            None,
+        )
+        .await
+        else {
+            panic!("respect-rules without proxy-server-nameserver must fail the load");
+        };
+        assert!(err.to_string().contains("proxy-server-nameserver"), "{err}");
+    }
+
+    /// Every untagged `nameserver` / `fallback` upstream is bound to the
+    /// rule-routed sentinel; an explicit `?proxy=` keeps its own adapter, and
+    /// `proxy-server-nameserver` is never rule-routed (it is the bootstrap
+    /// path that would otherwise recurse).
+    #[tokio::test]
+    async fn respect_rules_tags_untagged_upstreams_and_leaves_bootstrap_alone() {
+        let raw: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  respect-rules: true\n  \
+             nameserver: ['1.1.1.1', '8.8.8.8#Proxy']\n  \
+             fallback: [9.9.9.9]\n  \
+             proxy-server-nameserver: [223.5.5.5]\n",
+        )
+        .unwrap();
+        let registry = stub_registry(&[("Proxy", "node.example:443")]);
+        let cfg = parse_dns(&raw, None, None, &registry, None, &HashMap::new(), None)
+            .await
+            .unwrap();
+
+        assert!(
+            cfg.respect_rules_cell.is_some(),
+            "the build must hand out a cell for the application to fill"
+        );
+        let main = cfg.resolver.main_nameservers();
+        assert_eq!(
+            main[0].proxy().map(|proxy| proxy.name()),
+            Some(meow_dns::RESPECT_RULES_PROXY),
+            "an untagged upstream must join the rule-routed set"
+        );
+        assert_eq!(
+            main[1].proxy().map(|proxy| proxy.name()),
+            Some("Proxy"),
+            "an explicit ?proxy= tag must win over respect-rules"
+        );
+        let proxy_resolver = cfg.proxy_resolver.expect("proxy resolver built");
+        assert!(
+            proxy_resolver
+                .main_nameservers()
+                .iter()
+                .all(|client| !client.is_proxied()),
+            "proxy-server-nameserver must never be rule-routed"
+        );
+    }
+
+    /// The sentinel lives in the same registry namespace as real proxy names,
+    /// so a user node spelled exactly like it would silently steal every
+    /// rule-routed upstream. Reject the config instead.
+    #[tokio::test]
+    async fn respect_rules_rejects_a_reserved_proxy_name() {
+        let raw: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  respect-rules: true\n  nameserver: [1.1.1.1]\n  \
+             proxy-server-nameserver: [223.5.5.5]\n",
+        )
+        .unwrap();
+        let registry = stub_registry(&[(meow_dns::RESPECT_RULES_PROXY, "node.example:443")]);
+        let Err(err) = parse_dns(&raw, None, None, &registry, None, &HashMap::new(), None).await
+        else {
+            panic!("a proxy named like the sentinel must be rejected");
+        };
+        assert!(err.to_string().contains("reserved"), "{err}");
+    }
+
+    /// Policy entries follow the main list: an untagged one is rule-routed,
+    /// and its hostname is still bootstrapped so rule matching sees an IP.
+    #[tokio::test]
+    async fn respect_rules_tags_untagged_policy_entries() {
+        let mut registry: HashMap<smol_str::SmolStr, Arc<dyn meow_common::Proxy>> = HashMap::new();
+        registry.insert(
+            smol_str::SmolStr::new(meow_dns::RESPECT_RULES_PROXY),
+            Arc::new(meow_dns::RespectRulesProxy::new(
+                meow_dns::respect_rules::new_cell(),
+            )),
+        );
+        let value = crate::raw::RawNspValue::One("192.0.2.53".to_string());
+        let resolvers = build_policy_resolvers("corp.test", &value, &[], &registry, false, true)
+            .await
+            .unwrap();
+        assert_eq!(resolvers.len(), 1);
+        assert_eq!(
+            resolvers[0].proxy().map(|proxy| proxy.name()),
+            Some(meow_dns::RESPECT_RULES_PROXY)
+        );
+    }
+
     async fn node_policy_config(yaml: &str) -> DnsConfig {
         let raw: RawConfig = serde_saphyr::from_str(yaml).unwrap();
         parse_dns(

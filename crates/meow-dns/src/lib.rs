@@ -9,6 +9,7 @@ pub mod client;
 pub mod fakeip;
 pub mod host_resolver_hook;
 pub mod resolver;
+pub mod respect_rules;
 pub mod response_policy;
 pub mod server;
 pub mod upstream;
@@ -25,6 +26,7 @@ pub use host_resolver_hook::ResolverHostHook;
 pub use resolver::{
     BootstrapError, FallbackFilter, HostEntry, NameserverPolicy, PolicyEntry, Resolver,
 };
+pub use respect_rules::{RespectRulesCell, RespectRulesProxy, RESPECT_RULES_PROXY};
 pub use server::{
     new_dns_outbound_cell, new_resolver_slot, new_resolver_slot_state, BoundDnsServer,
     DnsOutboundCell, DnsServer, LocalAnswer, ResolverGen, ResolverSlot,
