@@ -1,6 +1,6 @@
 //! Cancellation-safe admission to the session's single wire writer.
 
-use crate::protocol::{Frame, HEADER_OVERHEAD_SIZE};
+use crate::protocol::{Command, Frame, HEADER_OVERHEAD_SIZE};
 use crate::util::{AnyTlsError, Result};
 use bytes::Bytes;
 use std::sync::Arc;
@@ -20,11 +20,27 @@ const _: () = assert!(MAX_FRAME_PAYLOAD <= u16::MAX as usize);
 // FIN and flush markers bypass the budget so Drop never needs to spawn a task.
 pub(crate) const QUEUED_FRAMES: usize = 64;
 
+/// Payload cap per command kind: data frames use the batching bound so
+/// a relay-sized fill + header fits 64 KiB; control frames ride the
+/// protocol's u16 ceiling — an UpdatePaddingScheme can legitimately be
+/// larger than the batching target and must still send.
+fn frame_payload_cap(cmd: Command) -> usize {
+    if cmd == Command::Push {
+        MAX_FRAME_PAYLOAD
+    } else {
+        u16::MAX as usize
+    }
+}
+
 pub(crate) enum WriteRequest {
     Frame {
         frame: Frame,
         _permit: Option<OwnedSemaphorePermit>,
         completion: Option<oneshot::Sender<Result<()>>>,
+        /// When this is a Fin, the generation of the `Stream` that issued
+        /// it — the drain-time map eviction only retires THAT instance,
+        /// so a stale handler's Fin cannot kill a recycled SID (F05).
+        fin_owner: Option<u64>,
     },
     /// A pre-encoded contiguous wire image — `[header | payload]` in ONE
     /// `Bytes` — produced by `Stream::poll_write_bytes_data` when the
@@ -67,6 +83,7 @@ impl StreamWriter {
         frame: Frame,
         permit: Option<OwnedSemaphorePermit>,
         completion: Option<oneshot::Sender<Result<()>>>,
+        fin_owner: Option<u64>,
     ) -> Result<()> {
         if self.budget.is_closed() {
             return Err(AnyTlsError::SessionClosed);
@@ -76,12 +93,13 @@ impl StreamWriter {
                 frame,
                 _permit: permit,
                 completion,
+                fin_owner,
             })
             .map_err(|_| AnyTlsError::SessionClosed)
     }
 
     pub(crate) async fn write_frame(&self, frame: Frame) -> Result<()> {
-        if frame.data.len() > MAX_FRAME_PAYLOAD {
+        if frame.data.len() > frame_payload_cap(frame.cmd) {
             return Err(AnyTlsError::Protocol(
                 "frame payload exceeds u16 length".into(),
             ));
@@ -91,7 +109,7 @@ impl StreamWriter {
             .await
             .map_err(|_| AnyTlsError::SessionClosed)?;
         let (tx, rx) = oneshot::channel();
-        self.enqueue(frame, Some(permit), Some(tx))?;
+        self.enqueue(frame, Some(permit), Some(tx), None)?;
         // Dropping this receiver cannot cancel the physical frame write.
         rx.await.map_err(|_| AnyTlsError::SessionClosed)?
     }
@@ -104,7 +122,7 @@ impl StreamWriter {
     /// matching anytls-go's enqueue semantics). A closed session still
     /// fails fast through the budget check.
     pub(crate) async fn enqueue_frame(&self, frame: Frame) -> Result<()> {
-        if frame.data.len() > MAX_FRAME_PAYLOAD {
+        if frame.data.len() > frame_payload_cap(frame.cmd) {
             return Err(AnyTlsError::Protocol(
                 "frame payload exceeds u16 length".into(),
             ));
@@ -113,7 +131,7 @@ impl StreamWriter {
             .acquire_owned()
             .await
             .map_err(|_| AnyTlsError::SessionClosed)?;
-        self.enqueue(frame, Some(permit), None)
+        self.enqueue(frame, Some(permit), None, None)
     }
 
     /// Fire-and-forget admission of a contiguous wire image — the

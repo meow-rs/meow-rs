@@ -46,9 +46,16 @@ impl Drop for OpeningStreamGuard {
 type PendingReadLock =
     Pin<Box<dyn Future<Output = tokio::sync::OwnedMutexGuard<StreamReader>> + Send>>;
 
+/// Unique per-process identity of a stream instance — stream *ids* are
+/// peer-assigned and can be recycled after a FIN, so the session tags
+/// outbound FINs with this and evicts only the matching generation
+/// (F05: a retired handler must not kill the recycled SID's new stream).
+static STREAM_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// Stream represents a single data stream within a Session.
 pub struct Stream {
     id: u32,
+    generation: u64,
     reader: Arc<tokio::sync::Mutex<StreamReader>>,
     writer: StreamWriter,
     // Only synchronous admission and close operations run under this lock.
@@ -84,6 +91,7 @@ impl Stream {
         (
             Self {
                 id,
+                generation: STREAM_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
                 reader: Arc::new(tokio::sync::Mutex::new(reader)),
                 writer,
                 write_state: Mutex::new(WriteState {
@@ -118,6 +126,11 @@ impl Stream {
         self.id
     }
 
+    /// This instance's unique identity — see [`STREAM_GENERATION`].
+    pub(crate) fn generation(&self) -> u64 {
+        self.generation
+    }
+
     /// Mark the stream closed locally without emitting a `Fin` —
     /// upstream `closeLocally` semantics: the peer already ended the
     /// stream, so no reply is owed. Synchronous for the same reason as
@@ -133,17 +146,24 @@ impl Stream {
 
     fn mark_closed(&self, send_fin: bool) {
         let mut state = self.write_state.lock().unwrap();
+        // Upstream `dieOnce` parity: once the stream is dead — locally or
+        // by peer FIN — a later `close()` emits no FIN at all (a recycled
+        // SID's new stream must not see a stale close's frame).
+        let was_closed = state.closed;
         state.closed = true;
         // Drop a pending semaphore acquisition, releasing its reserved permits.
         state.permits = PollSemaphore::new(Arc::clone(&self.writer.budget));
-        if send_fin && !state.fin_sent {
+        if send_fin && !state.fin_sent && !was_closed {
             state.fin_sent = true;
             // A pending flush may precede FIN. Shutdown must acknowledge a
             // fresh barrier after it, even if an earlier flush was cancelled.
             state.flush = None;
-            let _ = self
-                .writer
-                .enqueue(Frame::control(Command::Fin, self.id), None, None);
+            let _ = self.writer.enqueue(
+                Frame::control(Command::Fin, self.id),
+                None,
+                None,
+                Some(self.generation),
+            );
         }
         let waker = state.waker.take();
         drop(state);
@@ -156,6 +176,14 @@ impl Stream {
     /// Queue exactly one FIN after all accepted writes, including from Drop.
     pub fn close(&self) {
         self.mark_closed(true);
+    }
+
+    /// A future resolving when the stream dies — local close, peer FIN,
+    /// eviction, or session teardown. Listeners race a stream's work
+    /// against it so a retired instance stops dispatching immediately
+    /// instead of finishing a dial on the session's behalf.
+    pub fn close_waiter(&self) -> tokio::sync::futures::Notified<'_> {
+        self.close_notify.notified()
     }
 
     pub fn reader(&self) -> &Arc<tokio::sync::Mutex<StreamReader>> {
@@ -190,7 +218,7 @@ impl Stream {
             return Err(AnyTlsError::StreamClosed);
         }
         self.writer
-            .enqueue(Frame::data(self.id, data), Some(permit), None)
+            .enqueue(Frame::data(self.id, data), Some(permit), None, None)
     }
 
     fn poll_pending_flush(
@@ -237,6 +265,7 @@ impl Stream {
             .enqueue(
                 Frame::data(self.id, Bytes::copy_from_slice(&buf[..len])),
                 Some(permit),
+                None,
                 None,
             )
             .map_err(std::io::Error::other)?;
@@ -352,7 +381,7 @@ impl Stream {
                 let take = rest.len().min(MAX_FRAME_PAYLOAD);
                 let chunk = rest.split_to(take);
                 self.writer
-                    .enqueue(Frame::data(self.id, chunk.freeze()), Some(one), None)
+                    .enqueue(Frame::data(self.id, chunk.freeze()), Some(one), None, None)
                     .map_err(std::io::Error::other)?;
             }
         }
@@ -479,6 +508,32 @@ impl AsyncWrite for StreamIo {
     }
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
         self.0.poll_shutdown_data(cx)
+    }
+}
+
+/// The owned-`Bytes` write path the tunnel relay probes for: forwards to
+/// [`Stream::poll_write_bytes_data`] so a relay fill becomes one frame
+/// with the header overlaid in the caller's reserved headroom — no
+/// per-frame `copy_from_slice`.
+impl meow_common::WriteBytes for StreamIo {
+    fn poll_write_bytes(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bytes: &mut Option<BytesMut>,
+    ) -> Poll<std::io::Result<()>> {
+        self.0.poll_write_bytes_data(cx, bytes)
+    }
+    fn want_write_headroom(&self) -> usize {
+        self.0.want_write_headroom()
+    }
+}
+
+/// `ProxyConn` for the frame-multiplexed stream: NO `tcp_stream` (the
+/// relay must never splice a muxed logical flow), `write_bytes` exposes
+/// the headroom path above so inbound TCP relays batch zero-copy.
+impl meow_common::ProxyConn for StreamIo {
+    fn write_bytes(&mut self) -> Option<&mut dyn meow_common::WriteBytes> {
+        Some(self)
     }
 }
 

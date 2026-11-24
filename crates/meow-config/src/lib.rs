@@ -361,8 +361,16 @@ mod digest_serde {
             ));
         }
         let mut out = [0u8; 32];
-        for (i, b) in out.iter_mut().enumerate() {
-            *b = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).map_err(serde::de::Error::custom)?;
+        // Slice BYTES, not `&str` — a 64-byte non-ASCII string would
+        // panic splitting a multi-byte char boundary.
+        let (pairs, _rest) = s.as_bytes().as_chunks::<2>();
+        for (b, pair) in out.iter_mut().zip(pairs) {
+            let hi = (pair[0] as char).to_digit(16);
+            let lo = (pair[1] as char).to_digit(16);
+            let (Some(hi), Some(lo)) = (hi, lo) else {
+                return Err(serde::de::Error::custom("sha256 digest must be hex"));
+            };
+            *b = (hi * 16 + lo) as u8;
         }
         Ok(out)
     }
@@ -6265,6 +6273,34 @@ fn build_anytls_listener_spec(
         None => {}
     }
 
+    // ── certificate/private-key pairing shape — FIRST among the
+    // substantive checks: whether a TLS layer exists at all decides how
+    // every other key reads (`allow-insecure`, front layers, users).
+    let tls_selected = match (raw_l.certificate.as_deref(), raw_l.private_key.as_deref()) {
+        (Some(cert), Some(key)) => {
+            if cert.trim().is_empty() || key.trim().is_empty() {
+                anyhow::bail!(
+                    "listeners[{}]: `certificate`/`private-key` must not be empty",
+                    raw_l.name
+                );
+            }
+            if is_pem_literal(cert) != is_pem_literal(key) {
+                anyhow::bail!(
+                    "listeners[{}]: `certificate`/`private-key` must use the same \
+                     form — both inline PEM or both filesystem paths, not mixed",
+                    raw_l.name
+                );
+            }
+            true
+        }
+        (None, None) => false,
+        _ => anyhow::bail!(
+            "listeners[{}]: `certificate` and `private-key` must be provided \
+             together",
+            raw_l.name
+        ),
+    };
+
     // ── `users:` — absent/null/`{}` all mean "authenticate nothing"
     // (upstream's reject-all state): startup proceeds but warns once.
     // Usernames and passwords stay verbatim — no trimming, no
@@ -6320,32 +6356,6 @@ fn build_anytls_listener_spec(
             raw_l.name
         );
     }
-
-    // ── certificate/private-key pairing shape ──
-    let tls_selected = match (raw_l.certificate.as_deref(), raw_l.private_key.as_deref()) {
-        (Some(cert), Some(key)) => {
-            if cert.trim().is_empty() || key.trim().is_empty() {
-                anyhow::bail!(
-                    "listeners[{}]: `certificate`/`private-key` must not be empty",
-                    raw_l.name
-                );
-            }
-            if is_pem_literal(cert) != is_pem_literal(key) {
-                anyhow::bail!(
-                    "listeners[{}]: `certificate`/`private-key` must use the same \
-                     form — both inline PEM or both filesystem paths, not mixed",
-                    raw_l.name
-                );
-            }
-            true
-        }
-        (None, None) => false,
-        _ => anyhow::bail!(
-            "listeners[{}]: `certificate` and `private-key` must be provided \
-             together",
-            raw_l.name
-        ),
-    };
 
     // ── front-layer opaque blocks (shape + enabled flag type) ──
     let shadow_tls_on = anytls_front_layer_enabled(raw_l, "shadow-tls", raw_l.shadow_tls.as_ref())?;
@@ -6468,6 +6478,11 @@ fn build_anytls_listener_spec(
             .map_err(|e| anyhow::anyhow!("listeners[{}].listen: {e}", raw_l.name))?;
         addresses.push(ListenerBind { listen, port });
     }
+    // Dedup resolved targets — `127.0.0.1:443,localhost:443` or a
+    // wildcard + explicit form can collapse to the same bind; double
+    // binding one addr fails startup (or worse, splits ports on :0).
+    let mut seen = std::collections::HashSet::new();
+    addresses.retain(|b| seen.insert((b.listen.clone(), b.port)));
     if addresses.is_empty() {
         anyhow::bail!(
             "listeners[{}].listen: no bind addresses resolved",
@@ -7568,7 +7583,9 @@ fn build_named_listeners(
                 }
             }
             validation::warn_extra(&format!("listener '{}'", raw_l.name), &raw_l.extra);
-            // Keys meaningful only on socket listener types.
+            // Keys meaningful only on socket listener types — including
+            // the anytls-only set the shared diagnostics would warn
+            // about below, which this early-`continue` arm never reaches.
             for (key, set) in [
                 ("firewall", raw_l.firewall.is_some()),
                 ("tproxy-sni", raw_l.tproxy_sni.is_some()),
@@ -7581,6 +7598,13 @@ fn build_named_listeners(
                 // No inbound socket exists to mark — the ingress
                 // `routing-mark` contract does not reach a TUN device.
                 ("routing-mark", raw_l.routing_mark.is_some()),
+                ("users", raw_l.users.is_some()),
+                ("certificate", raw_l.certificate.is_some()),
+                ("client-auth-type", raw_l.client_auth_type.is_some()),
+                ("client-auth-cert", raw_l.client_auth_cert.is_some()),
+                ("ech-key", raw_l.ech_key.is_some()),
+                ("allow-insecure", raw_l.allow_insecure.is_some()),
+                ("padding-scheme", raw_l.padding_scheme.is_some()),
             ] {
                 if set {
                     warn!(

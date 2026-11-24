@@ -20,20 +20,31 @@ const MAX_PACKET_PADDING: usize = 1024 * 1024;
 /// declared size may additionally emit one Waste frame of this overhead.
 const FRAME_OVERHEAD: usize = 7;
 
+/// The whole scheme travels as ONE `UpdatePaddingScheme` frame payload —
+/// the u16 length field is the protocol's hard ceiling. A scheme that
+/// validates here must remain sendable, so the cap lives in the shared
+/// contract rather than in either caller.
+const MAX_SCHEME_BYTES: usize = u16::MAX as usize;
+
 /// Validate `raw_scheme` exactly as `anytls_rs::PaddingFactory::new`
 /// accepts it. Returns `Err` with a human-readable message on any
-/// malformed `stop`, bad range endpoint, or a packet whose total
-/// potential padding exceeds the protocol bound.
+/// malformed `stop`, bad range endpoint, a packet whose total potential
+/// padding exceeds the protocol bound, or a scheme too long to ever
+/// ride the update frame.
 pub fn validate_scheme(raw_scheme: &[u8]) -> Result<(), String> {
+    if raw_scheme.len() > MAX_SCHEME_BYTES {
+        return Err(format!(
+            "padding scheme exceeds {MAX_SCHEME_BYTES} bytes — it must fit one frame"
+        ));
+    }
     let text = String::from_utf8_lossy(raw_scheme);
 
-    // `StringMap::from_bytes` parity: trim both halves of every `k=v`
-    // line into a map, last duplicate key winning.
+    // `StringMap::from_bytes` parity: `k=v` halves are taken VERBATIM
+    // (no trimming — upstream `StringMapFromBytes` does not trim), last
+    // duplicate key winning.
     let mut entries: Vec<(String, String)> = Vec::new();
     for line in text.lines() {
         if let Some((key, value)) = line.split_once('=') {
-            let key = key.trim();
-            let value = value.trim();
             match entries.iter_mut().find(|(k, _)| k == key) {
                 Some(slot) => slot.1 = value.to_string(),
                 None => entries.push((key.to_string(), value.to_string())),

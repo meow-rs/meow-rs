@@ -70,7 +70,15 @@ where
 
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
             let mut v = Vec::new();
-            while let Some((user, value)) = map.next_entry::<String, serde_json::Value>()? {
+            // Keys and values are read as `Value` first: YAML happily
+            // coerces `123: x` or `~: x` scalars; the spec's user table
+            // is string→string, so a non-string key or password is a
+            // hard error, never a coercion.
+            while let Some(key) = map.next_key::<serde_json::Value>()? {
+                let serde_json::Value::String(user) = key else {
+                    return Err(de::Error::custom("users: username must be a string"));
+                };
+                let value = map.next_value::<serde_json::Value>()?;
                 let serde_json::Value::String(password) = value else {
                     return Err(de::Error::custom(format!(
                         "users: password for '{user}' must be a string"
@@ -83,6 +91,27 @@ where
     }
 
     deserializer.deserialize_option(UserMap)
+}
+
+/// Serialize `users` back as the YAML mapping it was read from —
+/// `Vec<(String, String)>`'s derived form is a *sequence* of pairs
+/// (and `Some([])` would emit `[]`), which `deser_user_map` refuses.
+/// Persisted configs (PUT /configs) must round-trip (F03).
+fn ser_user_map<S>(value: &Option<Vec<(String, String)>>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        None => s.serialize_none(),
+        Some(pairs) => {
+            use serde::ser::SerializeMap;
+            let mut map = s.serialize_map(Some(pairs.len()))?;
+            for (user, password) in pairs {
+                map.serialize_entry(user, password)?;
+            }
+            map.end()
+        }
+    }
 }
 
 fn deserialize_string_or_seq<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
@@ -1228,7 +1257,7 @@ pub enum RawAutoRoute {
 }
 
 /// One entry in the `listeners:` array.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawListener {
     pub name: String,
@@ -1344,8 +1373,13 @@ pub struct RawListener {
     /// `users:` — username → password map, decoded as ordered pairs so
     /// duplicate YAML keys stay detectable instead of collapsing into a
     /// map's last-wins. `None`/empty/`{}` all mean "authenticate
-    /// nothing" per the spec (warn once, still serve).
-    #[serde(default, deserialize_with = "deser_user_map")]
+    /// nothing" per the spec (warn once, still serve). Serialized back
+    /// as a mapping so persisted configs round-trip.
+    #[serde(
+        default,
+        deserialize_with = "deser_user_map",
+        serialize_with = "ser_user_map"
+    )]
     pub users: Option<Vec<(String, String)>>,
     /// `certificate` / `private-key` — each is an inline PEM block or a
     /// filesystem path; mixing the two forms is a build error.
@@ -1392,7 +1426,7 @@ pub struct RawListener {
 /// (required `public-key`/`allowed-ips`, base64 → 32-byte keys, CIDR
 /// entries, 3-byte `reserved`) happens in `build_wg_listener_spec` — the
 /// same "raw loose, typed strict" split the rest of `raw.rs` follows.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawWgPeer {
     /// Peer static public key, base64 → exactly 32 bytes (required).
@@ -1416,7 +1450,7 @@ pub struct RawWgPeer {
 }
 
 /// Raw `simple-obfs:` block for a shadowsocks listener.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawSimpleObfs {
     #[serde(default)]

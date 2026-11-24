@@ -31,15 +31,21 @@ const SYN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
 /// the session.
 const MAX_STREAM_PENDING: usize = 256 * 1024;
 const MAX_SESSION_PENDING: usize = 4 * 1024 * 1024;
+/// Per-stream queued-item bound, independent of the byte budget: many
+/// tiny PSH frames must not pile up channel entries without limit —
+/// upstream bounds its pipe by buffers, this bounds ours by count.
+const MAX_STREAM_PENDING_FRAMES: usize = 1024;
 /// Maximum live streams per server session.
 const MAX_STREAMS_PER_SESSION: usize = 128;
 
 /// Inbound-budget counters shared between one stream's receive-slot and
-/// every payload it admitted: `session` points at the session-wide
-/// counter so a queued item releases both scopes in one Drop.
+/// every payload it admitted: `session` points at the session-wide byte
+/// counter so a queued item releases both scopes in one Drop. `frames`
+/// is this stream's own queued-item count, released the same way.
 #[derive(Debug)]
 pub struct PendingBudget {
     stream: std::sync::atomic::AtomicUsize,
+    frames: std::sync::atomic::AtomicUsize,
     session: Arc<std::sync::atomic::AtomicUsize>,
 }
 
@@ -85,6 +91,9 @@ impl Drop for PendingBytes {
                 .stream
                 .fetch_sub(self.bytes.len(), std::sync::atomic::Ordering::Relaxed);
             budget
+                .frames
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            budget
                 .session
                 .fetch_sub(self.bytes.len(), std::sync::atomic::Ordering::Relaxed);
         }
@@ -99,9 +108,10 @@ struct StreamRx {
     budget: Option<Arc<PendingBudget>>,
 }
 
-/// Type alias for new stream callback channel
-type NewStreamCallback =
-    Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Arc<Stream>>>>>;
+/// Type alias for new stream callback channel — BOUNDED: the accept
+/// queue is part of the stream-admission budget, so a stalled
+/// dispatcher can't let SYNs accumulate without limit.
+type NewStreamCallback = Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Sender<Arc<Stream>>>>>;
 
 #[derive(Clone)]
 pub struct SessionHeartbeatConfig {
@@ -306,10 +316,7 @@ impl Session {
     }
 
     /// Set callback for new streams (server side only)
-    pub fn set_stream_callback(
-        &mut self,
-        callback: tokio::sync::mpsc::UnboundedSender<Arc<Stream>>,
-    ) {
+    pub fn set_stream_callback(&mut self, callback: tokio::sync::mpsc::Sender<Arc<Stream>>) {
         if !self.is_client {
             self.on_new_stream = Some(Arc::new(tokio::sync::Mutex::new(Some(callback))));
         }
@@ -428,9 +435,23 @@ impl Session {
                 buffer.reserve(8192);
             }
 
-            let n = match reader.read_buf(&mut buffer).await {
-                Ok(n) => n,
-                Err(e) => {
+            // Race the read against session closure: a writer-side fatal
+            // (backpressure, control-write deadline) must not leave the
+            // read half parked on a peer that never speaks again.
+            let n = match tokio::select! {
+                n = reader.read_buf(&mut buffer) => Some(n),
+                _ = self.close_notify.notified() => None,
+            } {
+                Some(Ok(n)) => n,
+                None => {
+                    tracing::debug!(
+                        session_id = session_id,
+                        "[Session] recv_loop: Session closed while read pending (iteration {})",
+                        iteration
+                    );
+                    break;
+                }
+                Some(Err(e)) => {
                     // Check if this is a "close_notify" error (common and harmless)
                     let error_msg = e.to_string();
                     let is_close_notify_error = error_msg.contains("close_notify")
@@ -522,6 +543,13 @@ impl Session {
         );
         match frame.cmd {
             Command::Push => {
+                // An empty PSH carries nothing — upstream skips it by
+                // `hdr.Length() > 0` before the stream lookup. Enqueueing
+                // it would both bypass the byte budget (0 bytes) and
+                // surface a spurious 0-length read == EOF downstream.
+                if frame.data.is_empty() {
+                    return Ok(());
+                }
                 // Data frame — forward to the stream. `frame.data` MOVES
                 // into the channel (no `Bytes` refcount clone), which is
                 // what lets `StreamReader` hand the caller slices of the
@@ -529,11 +557,12 @@ impl Session {
                 let receive_map = self.stream_receive_tx.read().await;
 
                 if let Some(rx) = receive_map.get(&frame.stream_id) {
-                    // Server-side admission: count the bytes against the
-                    // stream and session budgets BEFORE enqueueing. Only
-                    // recv_loop mutates the counters upward, so the
-                    // check-then-add is race-free; `PendingBytes::Drop`
-                    // gives the counts back on every downstream path.
+                    // Server-side admission: count the bytes AND the
+                    // queue entry against the stream and session budgets
+                    // BEFORE enqueueing. Only recv_loop mutates the
+                    // counters upward, so the check-then-add is
+                    // race-free; `PendingBytes::Drop` gives the counts
+                    // back on every downstream path.
                     let budget = if self.is_client {
                         None
                     } else {
@@ -544,9 +573,17 @@ impl Session {
                             .map(|b| b.stream.load(std::sync::atomic::Ordering::Relaxed))
                             .unwrap_or(0)
                             + len;
+                        let pending_frames = rx
+                            .budget
+                            .as_ref()
+                            .map(|b| b.frames.load(std::sync::atomic::Ordering::Relaxed))
+                            .unwrap_or(0)
+                            + 1;
                         let pending_session =
                             self.pending_in.load(std::sync::atomic::Ordering::Relaxed) + len;
-                        if pending_stream > MAX_STREAM_PENDING {
+                        if pending_stream > MAX_STREAM_PENDING
+                            || pending_frames > MAX_STREAM_PENDING_FRAMES
+                        {
                             // A stalled reader must not let one stream
                             // hold unbounded wire data; evict it (its
                             // handler fails on next use) and keep serving
@@ -578,6 +615,9 @@ impl Session {
                         budget
                             .stream
                             .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                        budget
+                            .frames
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         self.pending_in
                             .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
                         Some(Arc::clone(budget))
@@ -613,6 +653,11 @@ impl Session {
                 // Stream open (server side)
                 if !self.is_client {
                     let stream_id = frame.stream_id;
+                    // A SYN with payload is malformed — the command never
+                    // carries data upstream.
+                    if !frame.data.is_empty() {
+                        return Err(AnyTlsError::Protocol("SYN with payload".into()));
+                    }
                     tracing::debug!(
                         session_id = session_id,
                         "[Session] Received SYN for stream {} (server side)",
@@ -631,19 +676,25 @@ impl Session {
                             "[Session] SYN for stream {} before client Settings",
                             stream_id
                         );
+                        // Upstream `die("client did not send its
+                        // settings")` — the exact Alert text a peer
+                        // surfaces to its operator.
                         let alert = Frame::with_data(
                             Command::Alert,
                             0,
-                            Bytes::from_static(b"SYN before client Settings"),
+                            Bytes::from_static(b"client did not send its settings"),
                         );
                         let _ = self.write_control_frame(alert).await;
                         let _ = self.close().await;
-                        return Err(AnyTlsError::Protocol("SYN before client Settings".into()));
+                        return Err(AnyTlsError::Protocol(
+                            "client did not send its settings".into(),
+                        ));
                     }
 
                     let (receive_tx, receive_rx) = mpsc::unbounded_channel();
                     let budget = Arc::new(PendingBudget {
                         stream: std::sync::atomic::AtomicUsize::new(0),
+                        frames: std::sync::atomic::AtomicUsize::new(0),
                         session: Arc::clone(&self.pending_in),
                     });
 
@@ -667,50 +718,35 @@ impl Session {
                         if self.is_closed() {
                             return Ok(());
                         }
-                        // A duplicate SID must not recreate or overwrite
-                        // the live stream — upstream dies the session on
-                        // it; Alert for parity, then close.
+                        // A duplicate SID on a LIVE stream is ignored
+                        // upstream (`streams.LoadOrStore` keeps the
+                        // existing instance) — it must not recreate the
+                        // stream, overwrite the map, or kill the session.
                         if streams.contains_key(&stream_id) {
+                            tracing::warn!(
+                                session_id = session_id,
+                                "[Session] duplicate SYN for live stream {} — ignored",
+                                stream_id
+                            );
+                            return Ok(());
+                        }
+                        // Stream-count bound: a SYN flood must not grow
+                        // the maps without limit. Refuse ONLY this stream
+                        // — a FIN is the close primitive both versions
+                        // share (upstream `stream.Close()` on refusal);
+                        // no SynAck, which a v2 peer would misread as the
+                        // stream being accepted.
+                        if streams.len() >= MAX_STREAMS_PER_SESSION {
                             drop(receive_map);
                             drop(streams);
                             tracing::warn!(
                                 session_id = session_id,
-                                "[Session] duplicate SYN for live stream {} — closing session",
-                                stream_id
+                                "[Session] refusing stream {} — {} stream limit",
+                                stream_id,
+                                MAX_STREAMS_PER_SESSION
                             );
-                            let alert = Frame::with_data(
-                                Command::Alert,
-                                0,
-                                Bytes::from_static(b"duplicate stream id"),
-                            );
-                            let _ = self.write_control_frame(alert).await;
-                            let _ = self.close().await;
-                            return Err(AnyTlsError::Protocol(format!(
-                                "duplicate stream id {stream_id}"
-                            )));
-                        }
-                        // Stream-count bound: a SYN flood must not grow
-                        // the maps without limit. v2 peers get a SynAck
-                        // error payload (the stream refusal they wait
-                        // on); v1 has no refusal primitive — drop.
-                        if streams.len() >= MAX_STREAMS_PER_SESSION {
-                            drop(receive_map);
-                            drop(streams);
-                            if self.peer_version.load(std::sync::atomic::Ordering::Relaxed) >= 2 {
-                                let refusal = Frame::with_data(
-                                    Command::SynAck,
-                                    stream_id,
-                                    Bytes::from_static(b"session stream limit reached"),
-                                );
-                                self.write_control_frame(refusal).await?;
-                            } else {
-                                tracing::warn!(
-                                    session_id = session_id,
-                                    "[Session] refusing stream {} — {} stream limit",
-                                    stream_id,
-                                    MAX_STREAMS_PER_SESSION
-                                );
-                            }
+                            self.write_control_frame(Frame::control(Command::Fin, stream_id))
+                                .await?;
                             return Ok(());
                         }
                         receive_map.insert(
@@ -729,29 +765,36 @@ impl Session {
                         stream_id
                     );
 
-                    // Notify callback if set
+                    // Notify callback if set — a BOUNDED admission queue:
+                    // a saturated listener must refuse the stream
+                    // (FIN + drop), never let inbound SYNs pile into an
+                    // unbounded channel while handlers stall.
+                    let mut refuse = false;
                     if let Some(callback_guard) = &self.on_new_stream {
                         let callback = callback_guard.lock().await;
                         if let Some(tx) = callback.as_ref() {
-                            tracing::debug!(
-                                session_id = session_id,
-                                "[Session] Sending stream {} to callback",
-                                stream_id
-                            );
-                            let _ = tx.send(stream.clone());
+                            if tx.try_send(stream.clone()).is_err() {
+                                refuse = true;
+                            }
                         } else {
-                            tracing::warn!(
-                                session_id = session_id,
-                                "[Session] No callback set for stream {}",
-                                stream_id
-                            );
+                            refuse = true;
                         }
                     } else {
+                        refuse = true;
+                    }
+                    if refuse {
                         tracing::warn!(
                             session_id = session_id,
-                            "[Session] No callback guard for stream {}",
+                            "[Session] stream {} admission saturated — refusing",
                             stream_id
                         );
+                        // Retire the just-created instance so the maps,
+                        // budget and slot are released, then tell the
+                        // peer the stream died (no SynAck).
+                        self.evict_stream(stream_id, AnyTlsError::StreamClosed)
+                            .await;
+                        self.write_control_frame(Frame::control(Command::Fin, stream_id))
+                            .await?;
                     }
                 } else {
                     tracing::warn!(
@@ -846,6 +889,11 @@ impl Session {
                     "[Session] FIN received for stream {}, closing",
                     frame.stream_id
                 );
+                // A FIN with payload is malformed — the command never
+                // carries data upstream.
+                if !frame.data.is_empty() {
+                    return Err(AnyTlsError::Protocol("FIN with payload".into()));
+                }
                 // Both locks before either mutation — same order as
                 // `open_stream`/`close` — so the two-map eviction is atomic
                 // to observers (issue #621 review).
@@ -872,14 +920,16 @@ impl Session {
                 }
             }
             Command::Settings => {
-                // Client settings (server side). Receipt — even of an
-                // empty map — arms SYN admission; a SYN ahead of this is
-                // a protocol violation.
-                if !self.is_client {
+                // Client settings (server side). Only a NON-EMPTY map
+                // arms SYN admission — an empty Settings frame carries
+                // no `v`/client info and upstream leaves `hasSettings`
+                // unset for it, so it must not unlock SYN.
+                if self.is_client || frame.data.is_empty() {
+                    return Ok(());
+                }
+                {
                     self.client_settings_received
                         .store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-                if !self.is_client && !frame.data.is_empty() {
                     let settings = StringMap::from_bytes(&frame.data);
 
                     // padding-md5 parity with upstream
@@ -905,13 +955,17 @@ impl Session {
                         }
                     }
 
-                    // Check client version
+                    // Check client version — parse wide: `v=999` parses
+                    // upstream (`strconv.Atoi`) and must negotiate v2;
+                    // a u8 parse would reject it as overflow.
                     if let Some(v_str) = settings.get("v")
-                        && let Ok(v) = v_str.parse::<u8>()
+                        && let Ok(v) = v_str.parse::<u32>()
                         && v >= 2
                     {
-                        self.peer_version
-                            .store(v, std::sync::atomic::Ordering::Relaxed);
+                        self.peer_version.store(
+                            v.min(u8::MAX as u32) as u8,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
 
                         // Send ServerSettings — extras merge FIRST so a
                         // custom entry can never shadow the protocol
@@ -937,10 +991,12 @@ impl Session {
                 if self.is_client && !frame.data.is_empty() {
                     let settings = StringMap::from_bytes(&frame.data);
                     if let Some(v_str) = settings.get("v")
-                        && let Ok(v) = v_str.parse::<u8>()
+                        && let Ok(v) = v_str.parse::<u32>()
                     {
-                        self.peer_version
-                            .store(v, std::sync::atomic::Ordering::Relaxed);
+                        self.peer_version.store(
+                            v.min(u8::MAX as u32) as u8,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         tracing::debug!("[Session] Server version: {}", v);
                     }
                 }
@@ -973,12 +1029,13 @@ impl Session {
                 }
             }
             Command::Alert => {
-                // Alert message - fatal error, should close session
-                let alert_msg = if !frame.data.is_empty() {
-                    String::from_utf8_lossy(&frame.data).to_string()
-                } else {
-                    "Unknown alert".to_string()
-                };
+                // Alert message - fatal error, should close session. An
+                // EMPTY alert is ignored upstream (the handler only acts
+                // on a non-empty payload), so it cannot kill the session.
+                if frame.data.is_empty() {
+                    return Ok(());
+                }
+                let alert_msg = String::from_utf8_lossy(&frame.data).to_string();
                 tracing::error!("[Session] Received Alert frame (fatal): {}", alert_msg);
                 // Close admission and wake the writer too, not just the flag:
                 // a blocked physical write must stop with the entire session.
@@ -987,6 +1044,9 @@ impl Session {
             }
             Command::HeartRequest => {
                 // Heartbeat request - respond with HeartResponse
+                if !frame.data.is_empty() {
+                    return Err(AnyTlsError::Protocol("HeartRequest with payload".into()));
+                }
                 tracing::debug!(
                     "[Session] Received HeartRequest (stream_id={})",
                     frame.stream_id
@@ -1007,6 +1067,9 @@ impl Session {
             }
             Command::HeartResponse => {
                 // Heartbeat response - log for now
+                if !frame.data.is_empty() {
+                    return Err(AnyTlsError::Protocol("HeartResponse with payload".into()));
+                }
                 tracing::debug!(
                     "[Session] Received HeartResponse (stream_id={})",
                     frame.stream_id
@@ -1096,6 +1159,7 @@ impl Session {
                     budget: (!self.is_client).then(|| {
                         Arc::new(PendingBudget {
                             stream: std::sync::atomic::AtomicUsize::new(0),
+                            frames: std::sync::atomic::AtomicUsize::new(0),
                             session: Arc::clone(&self.pending_in),
                         })
                     }),
@@ -1221,9 +1285,15 @@ impl Session {
         self.write_frame(frame).await
     }
 
-    /// Write a control frame to connection
+    /// Write a control frame to connection. Upstream bounds every
+    /// control write (`writeAndRetry` in 5s); the queue-wait plus the
+    /// physical write share one deadline so a wedged peer can't park a
+    /// SYN/FIN/Alert forever.
     pub async fn write_control_frame(&self, frame: Frame) -> Result<()> {
-        self.write_frame(frame).await
+        match tokio::time::timeout(Duration::from_secs(5), self.write_frame(frame)).await {
+            Ok(result) => result,
+            Err(_) => Err(AnyTlsError::Protocol("control write deadline".into())),
+        }
     }
 
     /// Write a frame to the connection
@@ -1702,20 +1772,21 @@ impl Session {
         // header + its owned `Bytes` payload; nothing is copied yet.
         frames.reserve(requests.len());
         let mut flush_waiters: Vec<oneshot::Sender<Result<()>>> = Vec::new();
-        let mut fin_streams: Vec<u32> = Vec::new();
+        let mut fin_streams: Vec<(u32, Option<u64>)> = Vec::new();
         for request in requests.drain(..) {
             match request {
                 WriteRequest::Frame {
                     frame,
                     _permit,
                     completion,
+                    fin_owner,
                 } => {
                     let fin = frame.cmd == Command::Fin;
                     if fin {
                         // A cancelled initial dial must not leave its
                         // Settings/SYN/FIN buffered until another dial.
                         self.disable_buffering();
-                        fin_streams.push(frame.stream_id);
+                        fin_streams.push((frame.stream_id, fin_owner));
                     }
                     if frame.data.len() > u16::MAX as usize {
                         // u16::MAX is the PROTOCOL hard limit — the wire
@@ -1840,7 +1911,16 @@ impl Session {
         if !fin_streams.is_empty() {
             let mut streams = self.streams.write().await;
             let mut receive_map = self.stream_receive_tx.write().await;
-            for stream_id in fin_streams {
+            for (stream_id, fin_owner) in fin_streams {
+                // Generation check: only a FIN queued by the CURRENT map
+                // entry may evict it. A stale handler's close on a
+                // recycled SID must leave the new stream live (F05).
+                if let Some(owner) = fin_owner {
+                    match streams.get(&stream_id) {
+                        Some(s) if s.generation() == owner => {}
+                        _ => continue,
+                    }
+                }
                 if let Some(stream) = streams.remove(&stream_id) {
                     receive_map.remove(&stream_id);
                     stream.close_with_error(AnyTlsError::StreamClosed);
@@ -1956,16 +2036,21 @@ impl Session {
     /// the caller owns the outer handshake, the user-table auth preface,
     /// and the combined deadline. `run_server` still has to be spawned —
     /// nothing moves frames until then.
+    /// Streams a SYN may park in the accept queue before the dispatcher
+    /// drains them. Beyond it, admission is refused (FIN) rather than
+    /// growing memory or wedging recv_loop.
+    pub const STREAM_ACCEPT_QUEUE: usize = MAX_STREAMS_PER_SESSION;
+
     pub fn new_inbound<S>(
         io: S,
         padding: Arc<PaddingFactory>,
-    ) -> (Arc<Self>, mpsc::UnboundedReceiver<Arc<Stream>>)
+    ) -> (Arc<Self>, mpsc::Receiver<Arc<Stream>>)
     where
         S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
     {
         let (reader, writer) = tokio::io::split(io);
         let mut session = Self::new_server(reader, writer, padding);
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(Self::STREAM_ACCEPT_QUEUE);
         session.set_stream_callback(tx);
         (Arc::new(session), rx)
     }
@@ -1999,9 +2084,25 @@ impl Session {
     /// Awaiting the queue completion is deliberate: the caller that
     /// then hands the stream to routing can test "ACK precedes first
     /// data" deterministically.
-    pub async fn handshake_success(&self, stream_id: u32) -> Result<()> {
+    ///
+    /// Takes the stream INSTANCE, not a bare sid: if a FIN already
+    /// retired it and the SID has since been recycled, the ACK must
+    /// not bless a different stream living under the same id (F05).
+    pub async fn handshake_success(&self, stream: &Arc<Stream>) -> Result<()> {
+        {
+            let streams = self.streams.read().await;
+            match streams.get(&stream.id()) {
+                Some(current) if Arc::ptr_eq(current, stream) => {}
+                _ => {
+                    return Err(AnyTlsError::Protocol(format!(
+                        "stream {} already retired before SynAck",
+                        stream.id()
+                    )));
+                }
+            }
+        }
         if self.peer_version() >= 2 {
-            self.write_control_frame(Frame::control(Command::SynAck, stream_id))
+            self.write_control_frame(Frame::control(Command::SynAck, stream.id()))
                 .await?;
         }
         Ok(())
@@ -3432,6 +3533,7 @@ mod padding_bounds_tests {
 #[cfg(test)]
 mod server_protocol_tests {
     use super::*;
+    use crate::StreamIo;
     use crate::padding::PaddingFactory;
     use crate::session::writer::MAX_FRAME_PAYLOAD;
     use crate::util::StringMap;
@@ -3446,7 +3548,7 @@ mod server_protocol_tests {
         io: DuplexStream,
     ) -> (
         Arc<Session>,
-        mpsc::UnboundedReceiver<Arc<Stream>>,
+        mpsc::Receiver<Arc<Stream>>,
         tokio::task::JoinHandle<()>,
     ) {
         let (session, rx) = Session::new_inbound(io, test_padding());
@@ -3513,7 +3615,7 @@ mod server_protocol_tests {
             .expect("stream accept stalled")
             .expect("accept channel closed");
         assert_eq!(stream.id(), 1);
-        session.handshake_success(1).await.unwrap();
+        session.handshake_success(&stream).await.unwrap();
         let synack = read_frame(&mut peer).await;
         assert_eq!(synack, Frame::control(Command::SynAck, 1));
 
@@ -3543,7 +3645,7 @@ mod server_protocol_tests {
             .expect("stream accept stalled")
             .expect("accept channel closed");
         assert_eq!(stream.id(), 1);
-        session.handshake_success(1).await.unwrap();
+        session.handshake_success(&stream).await.unwrap();
 
         // The next server→client frame must be the heartbeat answer —
         // proving nothing (settings/SynAck) was emitted ahead of it.
@@ -3564,7 +3666,11 @@ mod server_protocol_tests {
         write_frame(&mut peer, &Frame::control(Command::Syn, 1)).await;
         let alert = read_frame(&mut peer).await;
         assert_eq!(alert.cmd, Command::Alert);
-        assert!(String::from_utf8_lossy(&alert.data).contains("SYN before client Settings"));
+        // Upstream `die` text verbatim — the peer surfaces it.
+        assert_eq!(
+            String::from_utf8_lossy(&alert.data),
+            "client did not send its settings"
+        );
 
         for _ in 0..50 {
             if session.is_closed() {
@@ -3577,10 +3683,10 @@ mod server_protocol_tests {
     }
 
     #[tokio::test]
-    async fn duplicate_stream_id_alerts_and_closes() {
+    async fn duplicate_stream_id_is_ignored() {
         let (io, mut peer) = duplex(1 << 16);
         let padding = test_padding();
-        let (_session, mut accept, task) = spawn_server(io);
+        let (session, mut accept, task) = spawn_server(io);
 
         write_frame(
             &mut peer,
@@ -3594,22 +3700,77 @@ mod server_protocol_tests {
             .expect("accept channel closed");
         assert_eq!(stream.id(), 9);
 
+        // Upstream `LoadOrStore` parity: the second SYN on the live SID
+        // is ignored — NO Alert, no session death, no second stream.
         write_frame(&mut peer, &Frame::control(Command::Syn, 9)).await;
-        let alert = read_frame(&mut peer).await;
-        assert_eq!(alert.cmd, Command::Alert);
-        assert!(String::from_utf8_lossy(&alert.data).contains("duplicate stream id"));
-        // The second SYN must not mint a second stream — either the
-        // accept channel stays silent for the window or it closes.
+        write_frame(&mut peer, &Frame::control(Command::HeartRequest, 0)).await;
+        let response = read_frame(&mut peer).await;
+        assert_eq!(
+            response.cmd,
+            Command::HeartResponse,
+            "the first post-dup frame must be the heartbeat answer — the dup SYN emitted nothing"
+        );
         assert!(matches!(
             time::timeout(Duration::from_millis(500), accept.recv()).await,
             Err(_) | Ok(None)
         ));
+        assert!(!session.is_closed());
+
         drop(peer);
         task.await.unwrap();
     }
 
     #[tokio::test]
-    async fn v2_stream_limit_refuses_with_synack_error() {
+    async fn empty_psh_is_dropped_not_eof() {
+        let (io, mut peer) = duplex(1 << 16);
+        let padding = test_padding();
+        let (_session, mut accept, task) = spawn_server(io);
+
+        write_frame(
+            &mut peer,
+            &settings_frame(&[("v", "1"), ("padding-md5", padding.md5())]),
+        )
+        .await;
+        write_frame(&mut peer, &Frame::control(Command::Syn, 3)).await;
+        let stream = time::timeout(Duration::from_secs(2), accept.recv())
+            .await
+            .expect("stream accept stalled")
+            .expect("accept channel closed");
+
+        // Zero-length PSH: carries no data — must NOT queue (a 0-byte
+        // channel entry reads as a spurious EOF downstream, F02).
+        write_frame(&mut peer, &Frame::control(Command::Push, 3)).await;
+        // Real data after it must arrive intact and ordered.
+        write_frame(
+            &mut peer,
+            &Frame::with_data(Command::Push, 3, Bytes::from_static(b"hello")),
+        )
+        .await;
+
+        use tokio::io::AsyncReadExt as _;
+        let mut io_stream = StreamIo(stream);
+        let mut buf = [0u8; 5];
+        time::timeout(Duration::from_secs(2), io_stream.read_exact(&mut buf))
+            .await
+            .expect("read stalled")
+            .expect("read failed");
+        assert_eq!(&buf, b"hello");
+        // And the stream must not be EOF'd by the empty frame: a further
+        // read pends rather than returning Ok(0).
+        let mut one = [0u8; 1];
+        assert!(
+            time::timeout(Duration::from_millis(200), io_stream.read(&mut one))
+                .await
+                .is_err(),
+            "empty PSH must not surface a 0-byte (EOF) read"
+        );
+
+        drop(peer);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v2_stream_limit_refuses_with_fin() {
         let (io, mut peer) = duplex(1 << 16);
         let padding = test_padding();
         let (session, mut accept, _task) = spawn_server(io);
@@ -3634,13 +3795,11 @@ mod server_protocol_tests {
         let overflow = MAX_STREAMS_PER_SESSION as u32 + 1;
         write_frame(&mut peer, &Frame::control(Command::Syn, overflow)).await;
         let refusal = read_frame(&mut peer).await;
-        assert_eq!(refusal.cmd, Command::SynAck);
+        // Upstream refusal closes ONLY the stream: a bare FIN, and no
+        // SynAck — a v2 client must not read an accept for a refused SID.
+        assert_eq!(refusal.cmd, Command::Fin);
         assert_eq!(refusal.stream_id, overflow);
-        assert!(
-            String::from_utf8_lossy(&refusal.data).contains("stream limit"),
-            "refusal payload: {:?}",
-            refusal.data
-        );
+        assert!(refusal.data.is_empty());
         assert!(
             time::timeout(Duration::from_millis(500), accept.recv())
                 .await

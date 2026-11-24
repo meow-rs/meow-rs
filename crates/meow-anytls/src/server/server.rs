@@ -158,9 +158,10 @@ async fn handle_connection(
     authenticate_client(&mut reader, &password_hash, &padding).await?;
     tracing::debug!("[Server] Client authenticated");
 
-    // Create callback channel for new streams
+    // Create callback channel for new streams — bounded like production
+    // `Session::new_inbound` (SYN admission refuses past the cap).
     let (stream_callback_tx, mut stream_callback_rx) =
-        tokio::sync::mpsc::unbounded_channel::<Arc<crate::session::Stream>>();
+        tokio::sync::mpsc::channel::<Arc<crate::session::Stream>>(Session::STREAM_ACCEPT_QUEUE);
 
     // Create server session
     let mut session = Session::new_server(reader, writer, padding);

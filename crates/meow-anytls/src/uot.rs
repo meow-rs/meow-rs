@@ -73,9 +73,13 @@ impl UotAddr {
     /// True when this stream destination is any *rejected* UoT form:
     /// the legacy domain (any port) or the v2 domain on a port other
     /// than 0. Must not be treated as an ordinary TCP destination.
+    /// Mutually exclusive with [`is_uot_v2`](Self::is_uot_v2) — the
+    /// legal marker `sp.v2.udp-over-tcp.arpa:0` is neither.
     pub fn is_uot_rejected(&self) -> bool {
         match self {
-            UotAddr::Domain(host, _) => host == UOT_LEGACY_DOMAIN || host == UOT_V2_DOMAIN,
+            UotAddr::Domain(host, port) => {
+                host == UOT_LEGACY_DOMAIN || (host == UOT_V2_DOMAIN && *port != 0)
+            }
             UotAddr::Ip(_) => false,
         }
     }
@@ -183,13 +187,51 @@ pub async fn read_uot_addr<R: AsyncRead + Unpin>(reader: &mut R) -> Result<UotAd
 }
 
 /// Read the UoT initial request: `isConnect u8 | <socks addr>`.
-/// Returns `(is_connect, destination)`. The destination is left
-/// unresolved: in Bind format the server never routes on it.
-pub async fn read_uot_request<R: AsyncRead + Unpin>(reader: &mut R) -> Result<(bool, UotAddr)> {
+/// Returns `(is_connect, destination)`.
+///
+/// Connect's address is a parsed/validated [`UotAddr`] — it is the
+/// association's one fixed target. Bind's address is a placeholder the
+/// spec's `uot.Server` only consumes by layout — the same family table
+/// is skipped verbatim, never interpreted, so an unusual placeholder
+/// cannot reject a legal Bind association (`None` returned for it).
+pub async fn read_uot_request<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> Result<(bool, Option<UotAddr>)> {
     let mut is_connect = [0u8; 1];
     read_exact(reader, &mut is_connect).await?;
     // Upstream writes a Go bool: anything non-zero means Connect.
-    Ok((is_connect[0] != 0, read_socks_addr(reader).await?))
+    if is_connect[0] != 0 {
+        Ok((true, Some(read_socks_addr(reader).await?)))
+    } else {
+        skip_socks_addr(reader).await?;
+        Ok((false, None))
+    }
+}
+
+/// Consume a SOCKS5-serialized address by layout only — same family
+/// table and byte counts as [`read_socks_addr`], none of the value
+/// checks (UTF-8, non-empty domain). For positions where the address
+/// must be skipped rather than interpreted (the Bind request slot).
+async fn skip_socks_addr<R: AsyncRead + Unpin>(reader: &mut R) -> Result<()> {
+    let mut atyp = [0u8; 1];
+    read_exact(reader, &mut atyp).await?;
+    let addr_len = match atyp[0] {
+        SOCKS5_ATYP_IPV4 => 4,
+        SOCKS5_ATYP_IPV6 => 16,
+        SOCKS5_ATYP_DOMAIN => {
+            let mut len = [0u8; 1];
+            read_exact(reader, &mut len).await?;
+            len[0] as usize
+        }
+        other => {
+            return Err(AnyTlsError::Protocol(format!(
+                "unknown address type: {other}"
+            )));
+        }
+    };
+    let mut skip = vec![0u8; addr_len + 2];
+    read_exact(reader, &mut skip).await?;
+    Ok(())
 }
 
 /// Read one length-prefixed UoT packet (`len u16be | payload`).
@@ -311,7 +353,10 @@ mod tests {
         let bytes = socks_domain_bytes(UOT_V2_DOMAIN, 0);
         let addr = read_socks_addr(&mut &bytes[..]).await.unwrap();
         assert!(addr.is_uot_v2());
-        assert!(addr.is_uot_rejected()); // still a UoT name, never TCP
+        // The legal marker is neither rejected nor plain TCP — the
+        // predicates are mutually exclusive so either dispatch order is
+        // safe (F01: the rejected check used to swallow the marker).
+        assert!(!addr.is_uot_rejected());
 
         // v2 name on any other port: rejected, not an association.
         let bytes = socks_domain_bytes(UOT_V2_DOMAIN, 53);
@@ -361,11 +406,27 @@ mod tests {
         // non-zero is Connect.
         let mut wire = vec![0x01];
         wire.extend_from_slice(&socks_domain_bytes("203.0.113.9.example", 0));
-        let (is_connect, _dest) = read_uot_request(&mut &wire[..]).await.unwrap();
+        let (is_connect, dest) = read_uot_request(&mut &wire[..]).await.unwrap();
         assert!(is_connect);
+        assert!(matches!(dest, Some(UotAddr::Domain(_, 0))));
         wire[0] = 0x00;
-        let (is_connect, _) = read_uot_request(&mut &wire[..]).await.unwrap();
+        let (is_connect, dest) = read_uot_request(&mut &wire[..]).await.unwrap();
         assert!(!is_connect);
+        assert!(dest.is_none(), "bind request dest is layout-consumed");
+
+        // Bind placeholder addresses are never interpreted: an empty
+        // domain that `read_socks_addr` rejects parses fine as a Bind
+        // request.
+        let mut wire = vec![0x00, 0x03, 0x00, 0x04, 0x00];
+        let (is_connect, dest) = read_uot_request(&mut &wire[..]).await.unwrap();
+        assert!(!is_connect && dest.is_none());
+        // ...but the layout boundary still holds — a following packet
+        // decodes right after the skipped placeholder address.
+        wire.extend_from_slice(&[0x00, 0x01, 0xAA]);
+        assert_eq!(
+            &read_uot_packet(&mut &wire[5..]).await.unwrap()[..],
+            &[0xAA]
+        );
 
         // Connect packets are a bare u16be length + payload; zero length
         // is a real (empty) datagram, not EOF.

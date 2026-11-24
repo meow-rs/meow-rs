@@ -19,7 +19,7 @@ use anytls_rs::padding::PaddingFactory;
 use anytls_rs::session::{Session, StreamIo};
 use anytls_rs::uot;
 use anytls_rs::util::{authenticate_user, AnyTlsError, UserMap};
-use meow_common::{metadata_ip_literal, ConnType, Metadata, Network, TcpKeepaliveConfig};
+use meow_common::{ConnType, Metadata, Network, TcpKeepaliveConfig};
 use meow_tunnel::{route_inbound_tcp, Tunnel};
 use smol_str::SmolStr;
 use std::net::SocketAddr;
@@ -86,7 +86,11 @@ pub struct AnytlsListener {
     /// `SHA256(password)` → username (upstream `userMap` semantics).
     users: Arc<UserMap>,
     padding: Arc<PaddingFactory>,
-    max_connections: usize,
+    /// The concurrent-inbound cap shared across EVERY address this
+    /// listener entry serves — `max_connections` bounds the entry, not
+    /// each `run_on` invocation (one semaphore per socket would
+    /// multiply the real cap by address count).
+    conn_slots: Option<Arc<Semaphore>>,
     /// Keepalive posture applied to every accepted socket (see
     /// [`crate::keepalive`]); `enabled: false` writes no sockopts.
     tcp_keepalive: TcpKeepaliveConfig,
@@ -138,7 +142,8 @@ impl AnytlsListener {
             acceptor,
             users: Arc::new(users),
             padding,
-            max_connections: DEFAULT_MAX_CONNECTIONS,
+            conn_slots: (DEFAULT_MAX_CONNECTIONS > 0)
+                .then(|| Arc::new(Semaphore::new(DEFAULT_MAX_CONNECTIONS))),
             tcp_keepalive: TcpKeepaliveConfig::default(),
             route_override: None,
         })
@@ -154,7 +159,7 @@ impl AnytlsListener {
     /// Override the concurrent-inbound cap (default
     /// [`DEFAULT_MAX_CONNECTIONS`]). `0` disables the cap.
     pub fn with_max_connections(mut self, max: usize) -> Self {
-        self.max_connections = max;
+        self.conn_slots = (max > 0).then(|| Arc::new(Semaphore::new(max)));
         self
     }
 
@@ -181,6 +186,10 @@ impl AnytlsListener {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bound = listener.local_addr()?;
         let in_port = bound.port();
+        let max_connections = self
+            .conn_slots
+            .as_ref()
+            .map_or(0, |s| s.available_permits());
         info!(
             "AnyTLS listener '{}' on {} (tls={}, users={})",
             self.name,
@@ -189,18 +198,32 @@ impl AnytlsListener {
             self.users.len(),
         );
 
-        let sem: Option<Arc<Semaphore>> =
-            (self.max_connections > 0).then(|| Arc::new(Semaphore::new(self.max_connections)));
-
         let mut warned_saturated = false;
         let mut accept_backoff = meow_common::ErrorBackoff::new();
         loop {
-            let permit = if let Some(sem) = &sem {
+            // Acquire AFTER accept(): the cap must bound connections the
+            // kernel actually delivered — pre-accept permits park the
+            // loop while no peer has even connected.
+            let (stream, peer) = match listener.accept().await {
+                Ok(v) => {
+                    accept_backoff.succeeded();
+                    v
+                }
+                Err(e) => {
+                    if accept_backoff.failed(&e).await {
+                        error!("anytls listener '{}' accept error: {}", self.name, e);
+                    } else {
+                        debug!("anytls listener '{}' accept error: {}", self.name, e);
+                    }
+                    continue;
+                }
+            };
+            let permit = if let Some(sem) = &self.conn_slots {
                 let sem = Arc::clone(sem);
                 if sem.available_permits() == 0 && !warned_saturated {
                     warn!(
                         "anytls listener '{}' saturated at {} concurrent connections; new clients will queue",
-                        self.name, self.max_connections
+                        self.name, max_connections
                     );
                     warned_saturated = true;
                 }
@@ -218,21 +241,6 @@ impl AnytlsListener {
                 None
             };
 
-            let (stream, peer) = match listener.accept().await {
-                Ok(v) => {
-                    accept_backoff.succeeded();
-                    v
-                }
-                Err(e) => {
-                    drop(permit);
-                    if accept_backoff.failed(&e).await {
-                        error!("anytls listener '{}' accept error: {}", self.name, e);
-                    } else {
-                        debug!("anytls listener '{}' accept error: {}", self.name, e);
-                    }
-                    continue;
-                }
-            };
             crate::keepalive::apply(&stream, self.tcp_keepalive, &self.name);
 
             let listener = Arc::clone(self);
@@ -245,15 +253,15 @@ impl AnytlsListener {
 
     /// Per-connection pipeline: TLS/plaintext → auth preface → session.
     async fn handle_conn(&self, stream: tokio::net::TcpStream, peer: SocketAddr, in_port: u16) {
-        // TLS termination and the auth preface share one deadline: the
-        // client has `AUTH_PREFACE_TIMEOUT` to present credentials —
-        // upstream admits the connection either way, but a bounded
-        // preface keeps a parked peer from holding a slot.
+        // ONE absolute deadline for TLS accept + auth preface combined:
+        // two independent per-phase timeouts would double the window a
+        // parked peer can hold a concurrency slot.
+        let deadline = tokio::time::Instant::now() + AUTH_PREFACE_TIMEOUT;
         let io: Box<dyn InboundIo> = match &self.acceptor {
             Some(acceptor) => {
                 let acceptor = Arc::clone(acceptor);
-                let tls = match tokio::time::timeout(
-                    AUTH_PREFACE_TIMEOUT,
+                let tls = match tokio::time::timeout_at(
+                    deadline,
                     tokio_boring::accept(&acceptor, stream),
                 )
                 .await
@@ -283,11 +291,8 @@ impl AnytlsListener {
         // SHA256(password) + u16be padding length + padding — in
         // bounded chunks.
         let mut io = io;
-        let user = match tokio::time::timeout(
-            AUTH_PREFACE_TIMEOUT,
-            authenticate_user(&mut io, &self.users),
-        )
-        .await
+        let user = match tokio::time::timeout_at(deadline, authenticate_user(&mut io, &self.users))
+            .await
         {
             Ok(Ok(user)) => user,
             Ok(Err(AnyTlsError::AuthenticationFailed)) => {
@@ -322,16 +327,27 @@ impl AnytlsListener {
         let route_override = self.route_override.clone();
         let user: SmolStr = user.into();
         let dispatch = tokio::spawn(async move {
+            // Every per-stream task the session spawns lives in ONE
+            // supervision set: when the session dies, `JoinSet::abort_all`
+            // retires the handlers (they drop their `Arc<Stream>` and
+            // unblock) instead of leaking dials past connection teardown.
+            let mut children = tokio::task::JoinSet::new();
             while let Some(stream) = stream_rx.recv().await {
                 let session = Arc::clone(&session);
                 let inner = Arc::clone(&inner);
-                let name = in_name.clone();
-                let ov = route_override.clone();
-                let user = user.clone();
-                tokio::spawn(async move {
-                    handle_stream(stream, session, inner, peer, name, in_port, user, ov).await;
+                let ctx = FlowCtx {
+                    peer,
+                    in_name: in_name.clone(),
+                    in_port,
+                    user: user.clone(),
+                    route_override: route_override.clone(),
+                };
+                children.spawn(async move {
+                    handle_stream(stream, session, inner, ctx).await;
                 });
             }
+            children.abort_all();
+            while children.join_next().await.is_some() {}
         });
         // Await the session's death; the dispatch task ends when the
         // stream-accept channel closes with the session maps.
@@ -340,18 +356,63 @@ impl AnytlsListener {
     }
 }
 
-/// Per-stream dispatch: parse the SOCKS destination, ACK at the spec's
-/// ordering point, then route TCP or open the UoT association.
+/// Per-connection context every accepted stream inherits — the peer,
+/// the listener identity it arrived on and the authenticated user.
+/// Grouped so the dispatch chain isn't a positional-argument list.
+pub(crate) struct FlowCtx {
+    pub peer: SocketAddr,
+    pub in_name: String,
+    pub in_port: u16,
+    pub user: SmolStr,
+    pub route_override: Option<meow_common::InboundRouteOverride>,
+}
+
+/// Per-stream dispatch umbrella: race the stream's work against its
+/// death (peer FIN, admission eviction, session teardown), then close
+/// through ONE point. `Stream::close` is dieOnce-guarded, so a
+/// retired-mid-dispatch stream emits no second FIN; the queued FIN's
+/// drain-time eviction retires exactly this generation (F04/F05).
 async fn handle_stream(
     stream: Arc<anytls_rs::session::Stream>,
     session: Arc<Session>,
     inner: Arc<meow_tunnel::TunnelInner>,
-    peer: SocketAddr,
-    in_name: String,
-    in_port: u16,
-    user: SmolStr,
-    route_override: Option<meow_common::InboundRouteOverride>,
+    ctx: FlowCtx,
 ) {
+    let stream_id = stream.id();
+    // A stream the session already retired (FIN raced ahead of dispatch)
+    // needs no work arm at all.
+    if !stream.is_closed() {
+        // `enable()` registers the waiter eagerly — a `notify_waiters`
+        // that raced between `notified()` and the select still resolves.
+        let died = stream.close_waiter();
+        tokio::pin!(died);
+        let _ = died.as_mut().enable();
+        tokio::select! {
+            _ = died => {
+                debug!("anytls stream {stream_id}: died mid-dispatch");
+            }
+            _ = handle_stream_inner(Arc::clone(&stream), session, inner, ctx) => {}
+        }
+    }
+    stream.close();
+}
+
+/// The stream's work proper — parse destination, ACK, route. NEVER
+/// closes the stream itself; the umbrella owns that so a mid-flight
+/// cancellation cannot skip or double the FIN.
+async fn handle_stream_inner(
+    stream: Arc<anytls_rs::session::Stream>,
+    session: Arc<Session>,
+    inner: Arc<meow_tunnel::TunnelInner>,
+    ctx: FlowCtx,
+) {
+    let FlowCtx {
+        peer,
+        in_name,
+        in_port,
+        user,
+        route_override,
+    } = &ctx;
     let stream_id = stream.id();
     let mut io = StreamIo(Arc::clone(&stream));
     let dest = match tokio::time::timeout(DEFAULT_HANDSHAKE_TIMEOUT, uot::read_socks_addr(&mut io))
@@ -362,12 +423,10 @@ async fn handle_stream(
             if !uot::is_eof(&e) {
                 debug!("anytls stream {stream_id}: bad destination: {e}");
             }
-            stream.close();
             return;
         }
         Err(_) => {
             debug!("anytls stream {stream_id}: destination read timed out");
-            stream.close();
             return;
         }
     };
@@ -382,7 +441,6 @@ async fn handle_stream(
         if let uot::UotAddr::Domain(host, _) = &dest {
             if !meow_common::is_valid_host(host) {
                 debug!("anytls stream {stream_id}: target {host:?} is not a hostname");
-                stream.close();
                 return;
             }
         }
@@ -391,18 +449,17 @@ async fn handle_stream(
 
     if matches!(kind, StreamTarget::Reject) {
         debug!("anytls stream {stream_id}: reserved UoT destination {dest} refused");
-        stream.close();
         return;
     }
 
     // SynAck ordering (spec §4): exactly one empty SynAck to a v2+ peer,
     // queued after destination validation and BEFORE any rule lookup or
     // dial — a blocked route must never reorder it behind stream data.
-    // `handshake_success` awaits the queue admission so the invariant is
-    // deterministic. No frame is sent to v1.
-    if let Err(e) = session.handshake_success(stream_id).await {
+    // `handshake_success` checks the stream instance is still live so a
+    // recycled SID can't be ACK'd under a stale handler, and awaits the
+    // queue admission so the invariant is deterministic. No frame to v1.
+    if let Err(e) = session.handshake_success(&stream).await {
         debug!("anytls stream {stream_id}: synack: {e}");
-        stream.close();
         return;
     }
 
@@ -410,29 +467,24 @@ async fn handle_stream(
         StreamTarget::Tcp => {
             let metadata = build_tcp_metadata(
                 &dest,
-                peer,
-                &in_name,
-                in_port,
-                &user,
+                *peer,
+                in_name,
+                *in_port,
+                user,
                 route_override.as_ref(),
             );
             debug!(
                 "anytls stream {stream_id}: {peer} -> {}",
                 metadata.remote_address()
             );
-            route_inbound_tcp(&inner, &mut io, metadata, &[]).await;
+            // `Box<dyn ProxyConn>`: the tunnel's downcast finds the
+            // stream's `WriteBytes` path, so relay bulk moves into a
+            // frame slot without a per-frame copy (F14).
+            let mut conn: Box<dyn meow_common::ProxyConn> = Box::new(io);
+            route_inbound_tcp(&inner, &mut conn, metadata, &[]).await;
         }
         StreamTarget::Uot => {
-            crate::anytls_uot::run_uot_stream(
-                io,
-                inner,
-                peer,
-                &in_name,
-                in_port,
-                &user,
-                route_override,
-            )
-            .await;
+            crate::anytls_uot::run_uot_stream(io, inner, &ctx).await;
         }
         StreamTarget::Reject => unreachable!("rejected destinations returned above"),
     }
@@ -470,40 +522,6 @@ fn build_tcp_metadata(
         ov.apply(&mut metadata);
     }
     metadata
-}
-
-/// `Metadata` for one UoT target — `Network::Udp`, the authenticated
-/// user and the route override stamped exactly like the TCP path.
-pub(crate) fn build_udp_metadata(
-    dst_ip: Option<std::net::IpAddr>,
-    host: SmolStr,
-    dst_port: u16,
-    peer: SocketAddr,
-    in_name: &str,
-    in_port: u16,
-    user: &SmolStr,
-    route_override: Option<&meow_common::InboundRouteOverride>,
-) -> (Metadata, Option<SocketAddr>) {
-    let claimed = dst_ip
-        .or_else(|| metadata_ip_literal(&host))
-        .map(|ip| SocketAddr::new(ip.to_canonical(), dst_port));
-    let mut metadata = Metadata {
-        network: Network::Udp,
-        conn_type: ConnType::Anytls,
-        src_ip: Some(peer.ip()),
-        src_port: peer.port(),
-        dst_ip,
-        dst_port,
-        host,
-        in_name: in_name.into(),
-        in_port,
-        in_user: Some(user.clone()),
-        ..Default::default()
-    };
-    if let Some(ov) = route_override {
-        ov.apply(&mut metadata);
-    }
-    (metadata, claimed)
 }
 
 /// The conn half a `type: anytls` preamble authenticates — BoringSSL's

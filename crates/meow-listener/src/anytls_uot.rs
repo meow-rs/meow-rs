@@ -19,12 +19,14 @@
 
 use anytls_rs::session::StreamIo;
 use anytls_rs::uot::{self, UotAddr};
+use bytes::Bytes;
+use meow_common::atomic::{AtomicU, Uint};
 use meow_common::{Metadata, ProxyPacketConn};
 use meow_tunnel::{MatchedRule, ResolvedTarget, TunnelInner, UsingProxy};
 use smol_str::SmolStr;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
@@ -40,7 +42,14 @@ const MAX_UOT_SESSIONS: usize = 128;
 /// establishing (resolve + route + `dial_udp`); overflow drops the
 /// datagram — the same `SESSION_QUEUE` bound SOCKS5-UDP uses.
 const SESSION_QUEUE: usize = 64;
-/// Session-idle sweep period (the SOCKS5 sweeper's cadence).
+/// Shared byte ceiling across every session's ingress queue on one UoT
+/// stream. The per-queue count alone bounds 128 × 64 datagrams of up to
+/// 64 KiB — ~512 MiB parked against a stalled writer; the byte meter
+/// keeps the association's whole backlog proportional.
+const SESSION_QUEUE_BYTES: usize = 4 * 1024 * 1024;
+/// Session-idle sweep period (the SOCKS5 sweeper's cadence). Idle
+/// eviction runs ONLY on this timer — an O(table) scan per packet is
+/// needless work on every datagram (F14).
 const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Session-table key: canonicalized `ip:port` for address-form targets,
@@ -70,16 +79,80 @@ enum ReplyForm {
     Bind,
 }
 
+/// One queued datagram: the payload plus its share of the association's
+/// byte meter, released on Drop whatever path consumed it.
+struct QueuedPacket {
+    bytes: Bytes,
+    meter: Arc<AtomicUsize>,
+}
+
+impl Drop for QueuedPacket {
+    fn drop(&mut self) {
+        self.meter.fetch_sub(self.bytes.len(), Ordering::Relaxed);
+    }
+}
+
+/// Millisecond timestamps stored in the platform atomic — truncates to
+/// `Uint`'s width, and every comparison uses `wrapping_sub` so the 32-bit
+/// fallback's ~49.7-day wrap stays correct (see `meow_common::atomic`).
+fn now_ms() -> Uint {
+    crate::monotonic_ms() as Uint
+}
+
+fn idle_ms() -> Uint {
+    meow_tunnel::udp::DEFAULT_UDP_IDLE.as_millis() as Uint
+}
+
 /// One live outbound UDP session: the bounded ingress queue plus the
 /// activity/deadness bookkeeping the sweeper and teardown need.
 struct UotSession {
-    tx: mpsc::Sender<Vec<u8>>,
-    last_activity: Arc<AtomicU64>,
+    tx: mpsc::Sender<QueuedPacket>,
+    last_activity: Arc<AtomicU>,
     /// Set by eviction/teardown so the session task's flush-watch
     /// select exits even between datagrams.
     dead: Arc<AtomicBool>,
     /// Session task abort — teardown must not wait for the idle bound.
     task: tokio::task::AbortHandle,
+}
+
+/// The listener-side context stamped onto every session's `Metadata` —
+/// grouped so the spawn path isn't a positional-argument list (F15).
+struct UotFlowCtx<'a> {
+    peer: SocketAddr,
+    in_name: &'a str,
+    in_port: u16,
+    user: &'a SmolStr,
+    route_override: Option<&'a meow_common::InboundRouteOverride>,
+}
+
+/// `Metadata` for one UoT target — `Network::Udp`, the authenticated
+/// user and the route override stamped exactly like the TCP path.
+fn build_udp_metadata(
+    dst_ip: Option<std::net::IpAddr>,
+    host: SmolStr,
+    dst_port: u16,
+    ctx: &UotFlowCtx<'_>,
+) -> (Metadata, Option<SocketAddr>) {
+    let claimed = dst_ip
+        .or_else(|| meow_common::metadata_ip_literal(&host))
+        .map(|ip| SocketAddr::new(ip.to_canonical(), dst_port));
+    let mut metadata = Metadata {
+        network: meow_common::Network::Udp,
+        conn_type: meow_common::ConnType::Anytls,
+        src_ip: Some(ctx.peer.ip()),
+        src_port: ctx.peer.port(),
+        dst_ip,
+        dst_port,
+        host,
+        in_name: ctx.in_name.into(),
+        in_port: ctx.in_port,
+        in_user: Some(ctx.user.clone()),
+        ..Default::default()
+    };
+    if let Some(ov) = ctx.route_override {
+        ov.apply(&mut metadata);
+    }
+    (metadata, claimed)
 }
 
 /// Drive one UoT v2 association until the stream ends. `io` has already
@@ -88,12 +161,9 @@ struct UotSession {
 pub(crate) async fn run_uot_stream(
     mut io: StreamIo,
     inner: Arc<TunnelInner>,
-    peer: SocketAddr,
-    in_name: &str,
-    in_port: u16,
-    user: &SmolStr,
-    route_override: Option<meow_common::InboundRouteOverride>,
+    flow: &crate::anytls::FlowCtx,
 ) {
+    let peer = flow.peer;
     let (is_connect, request_dest) = match tokio::time::timeout(
         crate::DEFAULT_HANDSHAKE_TIMEOUT,
         uot::read_uot_request(&mut io),
@@ -127,7 +197,8 @@ pub(crate) async fn run_uot_stream(
     // packets here so frame interleaving is impossible. Bounded — a
     // stalled stream must not let replies pile up unbounded (the
     // session queue's budget already covers the datagrams themselves).
-    let (out_tx, mut out_rx) = mpsc::channel::<Vec<u8>>(SESSION_QUEUE * 2);
+    // `Bytes` moves the codec's output straight to the writer — no copy.
+    let (out_tx, mut out_rx) = mpsc::channel::<Bytes>(SESSION_QUEUE * 2);
     let mut writer = {
         let mut w = io.clone();
         tokio::spawn(async move {
@@ -143,6 +214,9 @@ pub(crate) async fn run_uot_stream(
 
     let sessions: Arc<parking_lot::Mutex<HashMap<UotKey, UotSession>>> =
         Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    // Association-wide datagram-byte meter — every session ingress
+    // queue's `QueuedPacket` charges and releases here.
+    let pending_bytes = Arc::new(AtomicUsize::new(0));
     let sweeper = tokio::spawn({
         let sessions = Arc::clone(&sessions);
         async move {
@@ -150,11 +224,11 @@ pub(crate) async fn run_uot_stream(
             tick.tick().await; // first tick fires immediately — skip it
             loop {
                 tick.tick().await;
-                let now = crate::monotonic_ms();
-                let idle = meow_tunnel::udp::DEFAULT_UDP_IDLE.as_millis() as u64;
+                let now = now_ms();
+                let idle = idle_ms();
                 let mut table = sessions.lock();
                 table.retain(|_, s| {
-                    let keep = now.saturating_sub(s.last_activity.load(Ordering::Relaxed)) < idle;
+                    let keep = now.wrapping_sub(s.last_activity.load(Ordering::Relaxed)) < idle;
                     if !keep {
                         s.dead.store(true, Ordering::Relaxed);
                         s.task.abort();
@@ -167,34 +241,26 @@ pub(crate) async fn run_uot_stream(
 
     // Connect format fixes the association's one destination up front —
     // every datagram goes to it; its own request address is the only
-    // target ever created.
-    let mut connect_key = None;
-    if is_connect {
-        connect_key = Some(UotKey::of(&request_dest));
-    }
+    // target ever created. Bind's request address is a layout-only
+    // placeholder (already consumed) — no destination exists to key.
+    let connect_key = if is_connect {
+        request_dest.as_ref().map(UotKey::of)
+    } else {
+        None
+    };
+    let ctx = UotFlowCtx {
+        peer: flow.peer,
+        in_name: &flow.in_name,
+        in_port: flow.in_port,
+        user: &flow.user,
+        route_override: flow.route_override.as_ref(),
+    };
 
     // Per-association read loop: decode packets, dispatch to (possibly
     // new) per-target sessions. `sessions` is only mutated here plus the
     // sweeper — the lock hand-off is momentary both ways.
     let read_result: Result<(), ()> = async {
         loop {
-            // Evict-idle on activity too — a burst of fresh targets must
-            // not sit on a full table of dead entries until the next
-            // sweeper tick.
-            let now = crate::monotonic_ms();
-            let idle = meow_tunnel::udp::DEFAULT_UDP_IDLE.as_millis() as u64;
-            {
-                let mut table = sessions.lock();
-                table.retain(|_, s| {
-                    let keep = now.saturating_sub(s.last_activity.load(Ordering::Relaxed)) < idle;
-                    if !keep {
-                        s.dead.store(true, Ordering::Relaxed);
-                        s.task.abort();
-                    }
-                    keep
-                });
-            }
-
             let (key, payload) = if is_connect {
                 let payload = match uot::read_uot_packet(&mut io).await {
                     Ok(p) => p,
@@ -234,7 +300,7 @@ pub(crate) async fn run_uot_stream(
             // wire address; domain targets resolve inside the session
             // task so a slow lookup cannot stall this read loop.
             let dest_for_new = if is_connect {
-                request_dest.clone()
+                request_dest.clone().expect("connect carries a destination")
             } else {
                 match &key {
                     UotKey::Addr(sa) => UotAddr::Ip(*sa),
@@ -246,8 +312,7 @@ pub(crate) async fn run_uot_stream(
             let deliver = {
                 let table = sessions.lock();
                 table.get(&key).map(|s| {
-                    s.last_activity
-                        .store(crate::monotonic_ms(), Ordering::Relaxed);
+                    s.last_activity.store(now_ms(), Ordering::Relaxed);
                     s.tx.clone()
                 })
             };
@@ -275,12 +340,8 @@ pub(crate) async fn run_uot_stream(
                     }
                     let session = spawn_uot_session(
                         Arc::clone(&inner),
-                        dest_for_new,
-                        peer,
-                        in_name,
-                        in_port,
-                        user,
-                        route_override.as_ref(),
+                        &dest_for_new,
+                        &ctx,
                         out_tx.clone(),
                         reply_form,
                     );
@@ -290,20 +351,37 @@ pub(crate) async fn run_uot_stream(
                 }
             };
 
-            let payload_vec = payload.to_vec();
-            match tx.try_send(payload_vec) {
+            // Charge the shared byte meter BEFORE enqueueing. Only this
+            // read loop mutates it upward, so check-then-add is
+            // race-free; `QueuedPacket::Drop` releases it on pop,
+            // eviction, or teardown.
+            let new_pending = pending_bytes.load(Ordering::Relaxed) + payload.len();
+            if new_pending > SESSION_QUEUE_BYTES {
+                debug!(
+                    "anytls uot stream {}: queued byte budget exhausted, dropping datagram",
+                    io.id()
+                );
+                continue;
+            }
+            pending_bytes.fetch_add(payload.len(), Ordering::Relaxed);
+            match tx.try_send(QueuedPacket {
+                bytes: payload,
+                meter: Arc::clone(&pending_bytes),
+            }) {
                 Ok(()) => {}
-                Err(mpsc::error::TrySendError::Full(_)) => {
+                Err(mpsc::error::TrySendError::Full(queued)) => {
                     // Queue saturated — drop this datagram (UDP semantics:
                     // never block the stream for one target's backlog).
+                    drop(queued);
                     debug!(
                         "anytls uot stream {}: session queue full, dropping datagram",
                         io.id()
                     );
                 }
-                Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(mpsc::error::TrySendError::Closed(queued)) => {
                     // Session died between lookup and send — remove the
                     // corpse so the next packet respawns it.
+                    drop(queued);
                     sessions.lock().remove(&key);
                 }
             }
@@ -333,46 +411,34 @@ pub(crate) async fn run_uot_stream(
 /// `dial_udp`, then the packet writer and the reply reader. Mirrors
 /// `socks5_udp::run_session` — same metadata pipeline, same flush watch,
 /// same `dial_udp` counting path.
-#[allow(clippy::too_many_arguments)]
 fn spawn_uot_session(
     inner: Arc<TunnelInner>,
-    dest: UotAddr,
-    peer: SocketAddr,
-    in_name: &str,
-    in_port: u16,
-    user: &SmolStr,
-    route_override: Option<&meow_common::InboundRouteOverride>,
-    out_tx: mpsc::Sender<Vec<u8>>,
+    dest: &UotAddr,
+    ctx: &UotFlowCtx<'_>,
+    out_tx: mpsc::Sender<Bytes>,
     reply_form: ReplyForm,
 ) -> UotSession {
-    let (tx, rx) = mpsc::channel::<Vec<u8>>(SESSION_QUEUE);
-    let last_activity = Arc::new(AtomicU64::new(crate::monotonic_ms()));
+    let (tx, rx) = mpsc::channel::<QueuedPacket>(SESSION_QUEUE);
+    let last_activity = Arc::new(AtomicU::new(now_ms()));
     let dead = Arc::new(AtomicBool::new(false));
 
-    let (dst_ip, host, dst_port) = match &dest {
+    let (dst_ip, host, dst_port) = match dest {
         UotAddr::Ip(sa) => (Some(sa.ip()), SmolStr::default(), sa.port()),
         UotAddr::Domain(h, p) => (None, Metadata::lower_host(h), *p),
     };
-    let (metadata, claimed) = crate::anytls::build_udp_metadata(
-        dst_ip,
-        host,
-        dst_port,
-        peer,
-        in_name,
-        in_port,
-        user,
-        route_override,
-    );
+    let (metadata, claimed) = build_udp_metadata(dst_ip, host, dst_port, ctx);
 
     let task = tokio::spawn(run_uot_session(
         inner,
         metadata,
         claimed,
-        rx,
-        out_tx,
-        reply_form,
-        Arc::clone(&last_activity),
-        Arc::clone(&dead),
+        UotSessionIo {
+            rx,
+            out_tx,
+            reply_form,
+            last_activity: Arc::clone(&last_activity),
+            dead: Arc::clone(&dead),
+        },
     ));
 
     UotSession {
@@ -383,6 +449,17 @@ fn spawn_uot_session(
     }
 }
 
+/// The halves a UoT session task owns — its datagram queue, the
+/// association's ordered writer, its liveness stamps — grouped so the
+/// task signature isn't a positional-argument list.
+struct UotSessionIo {
+    rx: mpsc::Receiver<QueuedPacket>,
+    out_tx: mpsc::Sender<Bytes>,
+    reply_form: ReplyForm,
+    last_activity: Arc<AtomicU>,
+    dead: Arc<AtomicBool>,
+}
+
 /// The session task itself: metadata pipeline (pre-handle, pre-resolve,
 /// route) → `dial_udp` → writer + reply loops with the outbound-binding
 /// flush watch — the SOCKS5-UDP session task's shape on a UoT stream.
@@ -390,12 +467,15 @@ async fn run_uot_session(
     inner: Arc<TunnelInner>,
     mut metadata: Metadata,
     claimed: Option<SocketAddr>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
-    out_tx: mpsc::Sender<Vec<u8>>,
-    reply_form: ReplyForm,
-    last_activity: Arc<AtomicU64>,
-    dead: Arc<AtomicBool>,
+    io: UotSessionIo,
 ) {
+    let UotSessionIo {
+        mut rx,
+        out_tx,
+        reply_form,
+        last_activity,
+        dead,
+    } = io;
     struct DeadOnExit(Arc<AtomicBool>);
     impl Drop for DeadOnExit {
         fn drop(&mut self) {
@@ -480,17 +560,19 @@ async fn run_uot_session(
                     ReplyForm::Bind => uot::encode_uot_packet_from(&rbuf[..m], &src),
                 };
                 let Ok(pkt) = pkt else { break };
-                if out_tx.send(pkt.to_vec()).await.is_err() {
+                if out_tx.send(pkt).await.is_err() {
                     break;
                 }
-                last_activity.store(crate::monotonic_ms(), Ordering::Relaxed);
+                last_activity.store(now_ms(), Ordering::Relaxed);
             }
         }
     });
 
     // Writer: queued datagrams → `write_packet` at the resolved dst.
-    // The same cancel-and-retire posture as SOCKS5-UDP: a short write
-    // or flush watch ends the session; the next datagram re-dials.
+    // Receive, send and the flush watch sit in ONE cancellation scope:
+    // whichever direction ends first retires the whole session and the
+    // other direction is reaped below — a dead reply reader must not
+    // leave the writer parked on `rx` holding the UDP conn.
     let writer = async {
         loop {
             tokio::select! {
@@ -501,22 +583,25 @@ async fn run_uot_session(
                 }
                 msg = rx.recv() => match msg {
                     None => break,
-                    Some(payload) => match conn.write_packet(&payload, &dst_addr).await {
-                        Ok(n) if n == payload.len() => {
-                            last_activity.store(crate::monotonic_ms(), Ordering::Relaxed);
+                    Some(packet) => {
+                        let payload = &packet.bytes;
+                        match conn.write_packet(payload, &dst_addr).await {
+                            Ok(n) if n == payload.len() => {
+                                last_activity.store(now_ms(), Ordering::Relaxed);
+                            }
+                            Ok(n) => {
+                                debug!(
+                                    "anytls uot session to {dst_addr}: short upstream write {n}/{}; session retires",
+                                    payload.len()
+                                );
+                                break;
+                            }
+                            Err(e) => {
+                                debug!("anytls uot session to {dst_addr}: upstream write: {e}; session retires");
+                                break;
+                            }
                         }
-                        Ok(n) => {
-                            debug!(
-                                "anytls uot session to {dst_addr}: short upstream write {n}/{}; session retires",
-                                payload.len()
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            debug!("anytls uot session to {dst_addr}: upstream write: {e}; session retires");
-                            break;
-                        }
-                    },
+                    }
                 },
                 _ = tokio::time::sleep(meow_tunnel::udp::DEFAULT_UDP_IDLE) => {
                     // Own idle deadline — the sweeper is a backstop;
@@ -528,7 +613,16 @@ async fn run_uot_session(
         }
     };
     let _ = &dead; // read by the dispatcher; this task exits via its own arms
-    writer.await;
+    tokio::pin!(writer);
+    let mut reply = reply;
+    tokio::select! {
+        _ = &mut reply => {}
+        _ = &mut writer => {}
+    }
+    // Reap the surviving direction: abort then join so the UDP conn and
+    // its senders drop inside this task's teardown, not at some lazy GC
+    // point.
     reply.abort();
+    let _ = reply.await;
     let _ = conn.close();
 }

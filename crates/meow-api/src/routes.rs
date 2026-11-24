@@ -4572,6 +4572,7 @@ async fn swap_config_and_reconcile_tun(
         logbook_enable,
         geo_schedule_changed,
         controller_changed,
+        listeners_changed,
     ) = {
         let guard = state.raw_config.read();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
@@ -4619,6 +4620,12 @@ async fn swap_config_and_reconcile_tun(
             || guard.external_controller_pipe != candidate.external_controller_pipe
             || guard.external_controller_cors != candidate.external_controller_cors
             || guard.tls != candidate.tls;
+        // `listeners:` is likewise a startup snapshot: a committed diff —
+        // any type's keys, including the anytls-only set the raw entry
+        // models — lands on restart only, so flag it exactly like the
+        // controller surface rather than silently stale (F18). Ordinary
+        // and forced PUTs share this commit point, so both warn.
+        let listeners_changed = guard.listeners != candidate.listeners;
         (
             old,
             tun_changed,
@@ -4627,6 +4634,7 @@ async fn swap_config_and_reconcile_tun(
             logbook_enable,
             geo_schedule_changed,
             controller_changed,
+            listeners_changed,
         )
     };
 
@@ -4992,6 +5000,13 @@ async fn swap_config_and_reconcile_tun(
             "external-controller* / external-controller-cors / tls changed: the \
              controller listener surface is a startup snapshot — restart meow to \
              rebind or re-apply it"
+        );
+    }
+    if listeners_changed {
+        warn!(
+            "listeners: changed (mixed/socks5/http/tproxy/shadowsocks/wireguard/\
+             anytls/tun entries): inbounds are a startup snapshot — restart meow \
+             to apply the committed listener set"
         );
     }
     logbook::reconfigure(logbook_enable);

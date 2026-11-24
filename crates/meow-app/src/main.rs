@@ -2078,61 +2078,10 @@ async fn run(
             ListenerSpec::Anytls(cfg) => {
                 #[cfg(feature = "listener-anytls")]
                 {
-                    // Bind every configured address eagerly and
-                    // atomically: any bind failure fails the whole
-                    // listener (upstream iterates all listen addresses;
-                    // partial binds release on drop here).
-                    let mut sockets = Vec::with_capacity(cfg.addresses.len());
-                    let mut bound_first = None;
-                    let mut bind_failed = false;
-                    for a in &cfg.addresses {
-                        let addr = match bind_socket_addr(&a.listen, a.port) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                listener_failed(
-                                    &nl.name,
-                                    &format!("invalid listen address '{}': {e}", a.listen),
-                                );
-                                bind_failed = true;
-                                break;
-                            }
-                        };
-                        match tokio::net::TcpListener::bind(addr).await {
-                            Ok(s) => {
-                                if bound_first.is_none() {
-                                    bound_first = Some(s.local_addr().unwrap_or(addr));
-                                }
-                                sockets.push(s);
-                            }
-                            Err(e) => {
-                                listener_failed(&nl.name, &format!("bind {addr} failed: {e}"));
-                                bind_failed = true;
-                                break;
-                            }
-                        }
-                    }
-                    if bind_failed {
-                        continue;
-                    }
-                    // `listeners[].routing-mark` applies to every socket
-                    // this listener binds — the same `apply_listener_mark`
-                    // contract the other socket listeners keep.
-                    let mut mark_failed = false;
-                    for s in &sockets {
-                        if !apply_listener_mark(&nl.name, s, nl.routing_mark) {
-                            mark_failed = true;
-                            break;
-                        }
-                    }
-                    if mark_failed {
-                        continue;
-                    }
-                    // The primary address's resolved port is the
-                    // `GET /listeners` snapshot port (`port: 0` case) —
-                    // every bound address stays in `cfg.addresses`.
-                    if let Some(first) = bound_first {
-                        nl.port = first.port();
-                    }
+                    // TLS material + padding resolve BEFORE any socket is
+                    // bound: a bad PEM, mixed cert/key form, or broken
+                    // scheme fails the listener outright — never leaves
+                    // bound sockets behind on a "skipped" entry.
                     let spec = meow_listener::AnytlsListenerSpec {
                         users: cfg
                             .users
@@ -2159,6 +2108,71 @@ async fn run(
                             continue;
                         }
                     };
+                    // Bind every configured address eagerly and
+                    // atomically: any bind failure fails the whole
+                    // listener (upstream iterates all listen addresses;
+                    // partial binds release on drop here).
+                    let mut sockets = Vec::with_capacity(cfg.addresses.len());
+                    let mut bind_failed = false;
+                    for a in &cfg.addresses {
+                        let addr = match bind_socket_addr(&a.listen, a.port) {
+                            Ok(v) => v,
+                            Err(e) => {
+                                listener_failed(
+                                    &nl.name,
+                                    &format!("invalid listen address '{}': {e}", a.listen),
+                                );
+                                bind_failed = true;
+                                break;
+                            }
+                        };
+                        match tokio::net::TcpListener::bind(addr).await {
+                            Ok(s) => sockets.push(s),
+                            Err(e) => {
+                                listener_failed(&nl.name, &format!("bind {addr} failed: {e}"));
+                                bind_failed = true;
+                                break;
+                            }
+                        }
+                    }
+                    if bind_failed {
+                        continue;
+                    }
+                    // `listeners[].routing-mark` applies to every socket
+                    // this listener binds — the same `apply_listener_mark`
+                    // contract the other socket listeners keep.
+                    let mut mark_failed = false;
+                    for s in &sockets {
+                        if !apply_listener_mark(&nl.name, s, nl.routing_mark) {
+                            mark_failed = true;
+                            break;
+                        }
+                    }
+                    if mark_failed {
+                        continue;
+                    }
+                    // Publish the REAL bound endpoints: `local_addr()`
+                    // from every socket replaces the configured listen
+                    // string/port in the spec snapshot, and the first
+                    // bound socket's port is the top-level `port` — so
+                    // `port: 0` never reports `0` (F11).
+                    let mut bound_ports: Vec<u16> = Vec::with_capacity(sockets.len());
+                    let mut bound_addrs: Vec<(String, u16)> = Vec::with_capacity(sockets.len());
+                    for s in &sockets {
+                        if let Ok(b) = s.local_addr() {
+                            bound_addrs.push((b.ip().to_string(), b.port()));
+                            bound_ports.push(b.port());
+                        }
+                    }
+                    if let ListenerSpec::Anytls(cfg) = &mut nl.spec {
+                        for (a, (ip, port)) in cfg.addresses.iter_mut().zip(&bound_addrs) {
+                            a.listen = ip.clone();
+                            a.port = *port;
+                        }
+                    }
+                    if let Some(first) = bound_ports.first() {
+                        nl.port = *first;
+                    }
                     for socket in sockets {
                         let listener = std::sync::Arc::clone(&listener);
                         tokio::spawn(async move {
@@ -2171,10 +2185,7 @@ async fn run(
                 #[cfg(not(feature = "listener-anytls"))]
                 {
                     let _ = cfg;
-                    tracing::warn!(
-                        "listener '{}': anytls requires feature 'listener-anytls'",
-                        nl.name
-                    );
+                    listener_failed(&nl.name, "anytls requires feature 'listener-anytls'");
                 }
             }
             // Spawned above the bind (a TUN owns no socket) — this arm
