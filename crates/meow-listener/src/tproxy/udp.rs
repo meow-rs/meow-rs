@@ -621,7 +621,7 @@ mod linux {
         /// Unit-test script used to prove multiplexer fairness without
         /// requiring a kernel TPROXY path; production constructors leave it unset.
         #[cfg(test)]
-        scripted: Option<std::collections::VecDeque<RecvOutcome>>,
+        scripted: Option<ScriptedRecv>,
     }
 
     /// The ingress sockets selected by the configured listen address. At
@@ -889,7 +889,10 @@ mod linux {
     async fn recv_dgram(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<RecvOutcome> {
         let fd = socket.as_raw_fd();
         loop {
-            socket.readable().await?;
+            // Unlike `readable()`, `poll_recv_ready` participates in tokio's
+            // task coop budget, so a continuously-ready datagram flood cannot
+            // pin a runtime worker inside one task poll.
+            std::future::poll_fn(|cx| socket.poll_recv_ready(cx)).await?;
             match socket.try_io(Interest::READABLE, || unsafe {
                 recvmsg_with_orig_dst(fd, buf)
             }) {
@@ -1209,7 +1212,13 @@ mod linux {
         backoff: IngressBackoff,
         mapped_v6_drops: u64,
         #[cfg(test)]
-        scripted: Option<std::collections::VecDeque<RecvOutcome>>,
+        scripted: Option<ScriptedRecv>,
+    }
+
+    #[cfg(test)]
+    enum ScriptedRecv {
+        Queue(std::collections::VecDeque<RecvOutcome>),
+        Repeat(RecvOutcome),
     }
 
     impl IngressState {
@@ -1228,9 +1237,12 @@ mod linux {
         async fn recv_one(&mut self) -> io::Result<RecvOutcome> {
             #[cfg(test)]
             if let Some(scripted) = &mut self.scripted {
-                return match scripted.pop_front() {
-                    Some(outcome) => Ok(outcome),
-                    None => std::future::pending().await,
+                return match scripted {
+                    ScriptedRecv::Queue(queue) => match queue.pop_front() {
+                        Some(outcome) => Ok(outcome),
+                        None => std::future::pending().await,
+                    },
+                    ScriptedRecv::Repeat(outcome) => Ok(*outcome),
                 };
             }
             recv_dgram(&self.socket, &mut self.buf).await
@@ -1251,6 +1263,24 @@ mod linux {
             && client.is_ipv4() == orig_dst.is_ipv4()
     }
 
+    /// A repeated scripted ingress has no real readiness object, so charge
+    /// the same coop budget a real socket would have spent in `recv_dgram`.
+    /// Charging only when the outer receive branch completes keeps the flood
+    /// test discriminating: an implementation that retries filtered drops in
+    /// its inner loop never reaches this point.
+    #[cfg(test)]
+    async fn scripted_repeat_progress(is_repeat: bool) {
+        if !is_repeat {
+            return;
+        }
+        std::future::poll_fn(|cx| {
+            let coop = std::task::ready!(tokio::task::coop::poll_proceed(cx));
+            coop.made_progress();
+            std::task::Poll::Ready(())
+        })
+        .await;
+    }
+
     /// Receive and validate at most one datagram from one ingress. Even a
     /// filtered datagram completes the selectable branch (`None`), so a
     /// malformed-packet flood cannot keep this future permanently ready and
@@ -1268,7 +1298,7 @@ mod linux {
         let ingress_is_v4 = local_addr.is_ipv4();
         let family = if ingress_is_v4 { "ipv4" } else { "ipv6" };
 
-        match state.recv_one().await {
+        let result = match state.recv_one().await {
             Err(e) => {
                 if state.backoff.failed(&e, Instant::now()) {
                     warn!("tproxy UDP '{in_name}' {family} recv error: {e}");
@@ -1310,21 +1340,24 @@ mod linux {
                         "tproxy UDP '{in_name}' {family}: dropping family-inconsistent \
                          datagram {client} -> {orig_dst}"
                     );
-                    return None;
-                }
-                // Sanity-guard the recovered destination before it ever
-                // reaches a flow — see `is_safe_orig_dst`.
-                if !is_safe_orig_dst(orig_dst, local_addr, local_addrs) {
+                    None
+                } else if !is_safe_orig_dst(orig_dst, local_addr, local_addrs) {
+                    // Sanity-guard the recovered destination before it ever
+                    // reaches a flow — see `is_safe_orig_dst`.
                     debug!(
                         "tproxy UDP '{in_name}' {family}: dropping datagram to unsafe orig_dst {orig_dst}"
                     );
-                    return None;
+                    None
+                } else {
+                    // Zero-length datagrams are legal UDP — copied and forwarded
+                    // like any other.
+                    Some((state.buf[..len].to_vec(), client, orig_dst))
                 }
-                // Zero-length datagrams are legal UDP — copied and forwarded
-                // like any other.
-                Some((state.buf[..len].to_vec(), client, orig_dst))
             }
-        }
+        };
+        #[cfg(test)]
+        scripted_repeat_progress(matches!(state.scripted, Some(ScriptedRecv::Repeat(_)))).await;
+        result
     }
 
     async fn wait_retry(deadline: Instant) {
@@ -1485,7 +1518,15 @@ mod linux {
             UdpIngress {
                 socket: dummy_udp_socket(),
                 local_addr,
-                scripted: Some(outcomes.into_iter().collect()),
+                scripted: Some(ScriptedRecv::Queue(outcomes.into_iter().collect())),
+            }
+        }
+
+        fn repeating_drop_ingress(local_addr: SocketAddr, drop: RecvDrop) -> UdpIngress {
+            UdpIngress {
+                socket: dummy_udp_socket(),
+                local_addr,
+                scripted: Some(ScriptedRecv::Repeat(RecvOutcome::Drop(drop))),
             }
         }
 
@@ -1524,14 +1565,123 @@ mod linux {
             .await
             .expect("filtered datagram did not complete the receive branch");
             assert!(received.is_none());
+            let ScriptedRecv::Queue(queue) = state.scripted.as_ref().unwrap() else {
+                panic!("test ingress uses a queue");
+            };
             assert_eq!(
-                state.scripted.as_ref().unwrap().len(),
+                queue.len(),
                 1,
                 "the second queued drop belongs to the next outer poll"
             );
             assert!(
                 state.backoff.waiting_until(Instant::now()).is_none(),
                 "ordinary filter drops must not become socket-error backoff"
+            );
+        }
+
+        /// A continuously-ready UDP flood must spend the task coop budget:
+        /// on a current-thread runtime the probe task can complete even
+        /// while the kernel queue is being refilled.
+        #[test]
+        fn udp_flood_cannot_pin_current_thread_worker() {
+            let receiver = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .unwrap();
+            receiver.set_recv_buffer_size(4 * 1024 * 1024).unwrap();
+            receiver
+                .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+                .unwrap();
+            receiver.set_nonblocking(true).unwrap();
+            let receiver_addr = receiver.local_addr().unwrap().as_socket().unwrap();
+            let receiver: std::net::UdpSocket = receiver.into();
+
+            let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            sender.connect(receiver_addr).unwrap();
+            sender.set_nonblocking(true).unwrap();
+            let mut prefilled = 0usize;
+            for _ in 0..8192 {
+                match sender.send(&[0u8]) {
+                    Ok(_) => prefilled += 1,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => panic!("prefill send: {e}"),
+                }
+            }
+            assert!(
+                prefilled >= 256,
+                "test needs a real initial UDP backlog, got {prefilled}"
+            );
+            sender.set_nonblocking(false).unwrap();
+
+            let stop_flood = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let flood_thread = std::thread::spawn({
+                let stop_flood = Arc::clone(&stop_flood);
+                move || {
+                    while !stop_flood.load(Ordering::Relaxed) {
+                        if sender.send(&[0u8]).is_err() {
+                            std::thread::yield_now();
+                        }
+                    }
+                }
+            });
+
+            let probe_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+            let runtime_thread = std::thread::spawn({
+                let probe_done = Arc::clone(&probe_done);
+                move || {
+                    let runtime = tokio::runtime::Builder::new_current_thread()
+                        .enable_all()
+                        .build()
+                        .unwrap();
+                    runtime.block_on(async move {
+                        let socket = UdpSocket::from_std(receiver).unwrap();
+                        let ingresses = UdpIngresses {
+                            v4: Some(UdpIngress {
+                                socket,
+                                local_addr: receiver_addr,
+                                scripted: None,
+                            }),
+                            v6: None,
+                        };
+                        tokio::spawn(run_udp(
+                            mk_tunnel(None),
+                            ingresses,
+                            Duration::from_secs(60),
+                            0,
+                            "flood-test".into(),
+                            receiver_addr.port(),
+                            None,
+                            None,
+                        ));
+                        tokio::spawn(async move {
+                            tokio::task::yield_now().await;
+                            probe_done.store(true, Ordering::SeqCst);
+                        });
+                        let _ = shutdown_rx.await;
+                    });
+                }
+            });
+
+            let start = std::time::Instant::now();
+            let mut completed_while_flooding = false;
+            while start.elapsed() < Duration::from_secs(2) {
+                if probe_done.load(Ordering::SeqCst) {
+                    completed_while_flooding = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+
+            stop_flood.store(true, Ordering::SeqCst);
+            let _ = shutdown_tx.send(());
+            runtime_thread.join().expect("runtime thread panicked");
+            flood_thread.join().expect("flood thread panicked");
+            assert!(
+                completed_while_flooding,
+                "probe task did not run while the ingress flood was active"
             );
         }
 
@@ -1578,13 +1728,13 @@ mod linux {
         async fn sibling_valid_datagram_progresses_during_drop_flood() {
             let proxy = RecordingProxy::new(false);
             let tunnel = mk_tunnel(Some(Arc::clone(&proxy)));
-            let drops = (0..1024)
-                .map(|_| RecvOutcome::Drop(RecvDrop::MissingOrigDst))
-                .collect();
             let client6 = v6(0x2001, 0xdb8, 0, 7, 41234);
             let dst6 = v6(0x2001, 0xdb8, 0, 53, 53);
             let ingresses = UdpIngresses {
-                v4: Some(scripted_ingress(v4(0, 0, 0, 0, 7893), drops)),
+                v4: Some(repeating_drop_ingress(
+                    v4(0, 0, 0, 0, 7893),
+                    RecvDrop::MissingOrigDst,
+                )),
                 v6: Some(scripted_ingress(
                     SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7893),
                     vec![RecvOutcome::Datagram {
