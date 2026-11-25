@@ -15,8 +15,10 @@ mixed-port: 7890
 # all rule management to an external system (no nft/pfctl calls from meow).
 # The tproxy-port shorthand always stays managed — a top-level `firewall:`
 # key does not exist and is ignored (with a warning). Linux only: `udp: true`
-# enables UDP TPROXY on the same port (requires `firewall: false`, an IPv4
-# listen, and deployer-owned fwmark/policy routing). See docs/tproxy-gateway.md.
+# enables UDP TPROXY on the same port (requires `firewall: false` and
+# deployer-owned per-family fwmark/policy routing). IPv4 or unscoped,
+# non-link-local IPv6 listens are supported; `listen: "::"` covers both
+# families. See docs/tproxy-gateway.md.
 #
 # TUN inbound (the transparent-proxy path on Windows; also Linux/macOS).
 # `enable: true` alone captures all traffic and answers DNS in-process;

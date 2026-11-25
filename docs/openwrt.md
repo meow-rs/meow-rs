@@ -217,7 +217,10 @@ Saving **Settings** synchronizes the selected local YAML before saving UCI:
   proxies and rules remain intact. Disabling DNS hijacking stops the firewall
   redirect but leaves the resolver configured for meow's own use.
 - IPv6 capture uses a dual-stack TCP listener in REDIRECT mode. IPv6 with
-  UDP TPROXY is rejected because that listener supports only IPv4.
+  UDP TPROXY remains rejected by the current OpenWrt/LuCI automatic
+  configuration: the core Linux listener is dual-stack capable, but this
+  wrapper's scripts, UI validation, dual-stack policy routing, socket-divert
+  behaviour and DNS scope have not been reworked and device-tested for it.
 
 The candidate YAML is checked with `meow -t` before replacement. Validation
 and upload errors prevent the UCI save; a subsequent UCI save failure restores
