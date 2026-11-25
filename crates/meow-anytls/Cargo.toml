@@ -84,6 +84,7 @@ anyhow = "1.0"
 
 notify = { version = "8.2", optional = true }
 x509-parser = { version = "0.18", optional = true }
+# (meow-rs RUSTSEC-2026-0543) `time` replaces upstream chrono for cert display.
 time = { workspace = true, optional = true }
 
 # libc is only used by the Android / OpenHarmony socket-protect helper (EINPROGRESS check on

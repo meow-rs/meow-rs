@@ -243,9 +243,12 @@ fn format_system_time(time: SystemTime) -> String {
             let Ok(secs) = i64::try_from(duration.as_secs()) else {
                 return "Invalid time".to_string();
             };
-            // `OffsetDateTime` ends at year 9999. Use the existing invalid-time
-            // marker for anything outside it rather than displaying the epoch
-            // fallback as a false date.
+            // (meow-rs RUSTSEC-2026-0543) The x509-parser prelude shadows
+            // the external crate with its own `time` module, so `::time`
+            // must stay absolute; the parameter is also named `time`.
+            // `OffsetDateTime` ends at year 9999; use the existing
+            // invalid-time marker outside it rather than displaying the
+            // epoch fallback as a false date.
             let Ok(datetime) = ::time::OffsetDateTime::from_unix_timestamp(secs) else {
                 return "Invalid time".to_string();
             };
@@ -300,6 +303,7 @@ mod tests {
         );
     }
 
+    // (meow-rs RUSTSEC-2026-0543) Boundary coverage for the `time` migration.
     #[test]
     fn test_format_system_time_epoch() {
         assert_eq!(format_system_time(UNIX_EPOCH), "1970-01-01 00:00:00 UTC");
