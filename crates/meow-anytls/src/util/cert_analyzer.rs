@@ -243,9 +243,9 @@ fn format_system_time(time: SystemTime) -> String {
             let Ok(secs) = i64::try_from(duration.as_secs()) else {
                 return "Invalid time".to_string();
             };
-            // (meow-rs RUSTSEC-2026-0543) The x509-parser prelude shadows
-            // the external crate with its own `time` module, so `::time`
-            // must stay absolute; the parameter is also named `time`.
+            // (meow-rs RUSTSEC-2026-0543) The x509-parser prelude glob-imports
+            // that crate's own `time` module, shadowing the external crate in
+            // type-namespace path resolution, so `::time` must stay absolute.
             // `OffsetDateTime` ends at year 9999; use the existing
             // invalid-time marker outside it rather than displaying the
             // epoch fallback as a false date.

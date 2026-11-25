@@ -74,9 +74,9 @@ D6 — Certificate-time formatting uses workspace `time` (RUSTSEC-2026-0543)
     `chrono` when replaying upstream manifest changes.
   - `src/util/cert_analyzer.rs`: `format_system_time` is rewritten around
     `::time::OffsetDateTime::from_unix_timestamp` and manual UTC formatting.
-    The leading `::` is required because `x509_parser::prelude::*` shadows the
-    external crate with x509-parser's own `time` module; the function's
-    parameter is also named `time`, so never shorten the path when replaying.
+    The leading `::` is required because the x509-parser prelude glob-imports
+    that crate's own `time` module, which shadows the external crate in
+    type-namespace path resolution; never shorten the path when replaying.
     Returning "Invalid time" for a timestamp outside `OffsetDateTime`'s
     range is intentional — do not reintroduce upstream's epoch fallback,
     which would display a false date.
