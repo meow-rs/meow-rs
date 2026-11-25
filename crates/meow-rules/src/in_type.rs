@@ -25,6 +25,7 @@ pub struct InTypeRule {
     match_socks5: bool,
     match_tproxy: bool,
     match_inner: bool,
+    match_anytls: bool,
 }
 
 impl InTypeRule {
@@ -40,6 +41,7 @@ impl InTypeRule {
             match_socks5: false,
             match_tproxy: false,
             match_inner: false,
+            match_anytls: false,
         };
         match type_str.to_uppercase().as_str() {
             "HTTP" => {
@@ -50,9 +52,10 @@ impl InTypeRule {
             "SOCKS5" => r.match_socks5 = true,
             "TPROXY" => r.match_tproxy = true,
             "INNER" => r.match_inner = true,
+            "ANYTLS" => r.match_anytls = true,
             other => {
                 return Err(format!(
-                "unknown IN-TYPE value '{other}'; expected HTTP, HTTPS, SOCKS5, TPROXY, or INNER \
+                "unknown IN-TYPE value '{other}'; expected HTTP, HTTPS, SOCKS5, TPROXY, INNER, or ANYTLS \
                      (Class A per ADR-0002, upstream: rules/common/inbound.go)"
             ))
             }
@@ -73,6 +76,7 @@ impl Rule for InTypeRule {
             ConnType::Socks5 => self.match_socks5,
             ConnType::TProxy => self.match_tproxy,
             ConnType::Inner => self.match_inner,
+            ConnType::Anytls => self.match_anytls,
             _ => false,
         }
     }
@@ -128,6 +132,24 @@ mod tests {
         let r = InTypeRule::new("TPROXY", "DIRECT").unwrap();
         assert!(r.match_metadata(&meta_with_conn(ConnType::TProxy), &helper()));
         assert!(!r.match_metadata(&meta_with_conn(ConnType::Http), &helper()));
+    }
+
+    #[test]
+    fn in_type_anytls_matches_only_anytls() {
+        let r = InTypeRule::new("ANYTLS", "DIRECT").unwrap();
+        assert!(r.match_metadata(&meta_with_conn(ConnType::Anytls), &helper()));
+        for other in [
+            ConnType::Http,
+            ConnType::Https,
+            ConnType::Socks5,
+            ConnType::TProxy,
+            ConnType::Inner,
+        ] {
+            assert!(
+                !r.match_metadata(&meta_with_conn(other), &helper()),
+                "{other:?}"
+            );
+        }
     }
 
     #[test]

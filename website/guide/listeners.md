@@ -48,9 +48,9 @@ listeners:
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `name` | string | ✓ | — | Unique; appears in logs, the API, and `IN-NAME` rules |
-| `type` | string | ✓ | — | `mixed` · `http` · `socks5` · `tproxy` · `redir` · `shadowsocks` |
+| `type` | string | ✓ | — | `mixed` · `http` · `socks5` · `tproxy` · `redir` · `shadowsocks` · `anytls` |
 | `port` | u16 | | — | Unique across listeners; omit or `0` to let the OS assign an ephemeral port |
-| `listen` | string | | per type | Bind IP literal, or `host:port` (e.g. `127.0.0.1:0`) |
+| `listen` | string | | per type | Bind IP literal, or `host:port` (e.g. `127.0.0.1:0`); `anytls` also accepts a comma-separated list of them |
 | `tproxy-sni` | bool | | global | (tproxy) deprecated SNI shorthand — prefer [`sniffer`](./sniffer) |
 | `firewall` | bool | | `true` | (tproxy) `false` = external firewall management — no nft/pfctl calls, no cleanup; see [Transparent Proxy](./transparent-proxy) |
 | `udp` | bool | | `false` | (tproxy, Linux/IPv4 only) UDP TPROXY on the same port; requires `firewall: false`; see [Transparent Proxy](./transparent-proxy) |
@@ -96,6 +96,39 @@ own OS-assigned port.
   [ss-listener.md](https://github.com/meow-rs/meow-rs/blob/main/docs/ss-listener.md));
   a build without it fails `-t`/startup rather than silently skipping the
   port.
+- **`anytls`** — AnyTLS server inbound (mihomo/Clash Meta compatible), TLS
+  via BoringSSL or an explicit `allow-insecure: true` plaintext opt-in.
+  Sessions multiplex TCP streams and udp-over-tcp (UoT v2) datagrams, all
+  routed through the normal rules engine — the authenticated `users:` name
+  is available to `IN-USER`, and `IN-TYPE,ANYTLS` matches the inbound.
+  Behind the `listener-anytls` cargo feature (`full`, not `minimal`); a
+  build without it fails `-t`/startup rather than silently skipping the
+  port.
+
+  ```yaml
+  listeners:
+    - name: anytls-in
+      type: anytls
+      listen: 0.0.0.0           # or "127.0.0.1:8443, [::1]:8443"
+      port: 8443
+      users:
+        alice: her-password
+        bob: his-password
+      certificate: /path/to/cert.pem   # both files or both inline PEM
+      private-key: /path/to/key.pem
+      # padding-scheme: "stop=8\n0=30-30\n100=400-400"
+      # allow-insecure: true           # plaintext mode — no TLS material
+  ```
+
+  `listen` may carry several comma-separated addresses — all of them bind
+  atomically (one failure releases every socket) and share the
+  `max-connections` quota; `GET /listeners` reports them under
+  `addresses`. `enable: false` and `udp: false` are hard errors (an
+  anytls entry is always enabled and always UDP-capable); unsupported
+  `client-auth-*`/`ech-key`/`shadow-tls`/`res-tls`/`jls-config` settings
+  are rejected rather than silently ignored. See
+  [docs/specs/listener-anytls.md](https://github.com/meow-rs/meow-rs/blob/main/docs/specs/listener-anytls.md)
+  for the full contract.
 - **`tun:`** (top-level, not in this array) — L3 TUN inbound. On Windows this is a
   Wintun adapter and is the transparent-proxy path. See [Transparent Proxy](./transparent-proxy).
 
@@ -122,7 +155,7 @@ Three rule types let you route based on *where a connection came in*:
 
 - `IN-PORT` — the listener port.
 - `IN-NAME` — the listener `name`.
-- `IN-TYPE` — `HTTP` / `HTTPS` / `SOCKS5` / `TPROXY` / `INNER`.
+- `IN-TYPE` — `HTTP` / `HTTPS` / `SOCKS5` / `TPROXY` / `INNER` / `ANYTLS`.
 
 ```yaml
 rules:

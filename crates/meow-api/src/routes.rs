@@ -4572,6 +4572,7 @@ async fn swap_config_and_reconcile_tun(
         logbook_enable,
         geo_schedule_changed,
         controller_changed,
+        listeners_changed,
     ) = {
         let guard = state.raw_config.read();
         let old = guard.tun.as_ref().is_some_and(|t| t.enable);
@@ -4619,6 +4620,53 @@ async fn swap_config_and_reconcile_tun(
             || guard.external_controller_pipe != candidate.external_controller_pipe
             || guard.external_controller_cors != candidate.external_controller_cors
             || guard.tls != candidate.tls;
+        // `listeners:` is likewise a startup snapshot — but the EFFECTIVE
+        // set is what `resolve_named_listeners` produces, and a raw
+        // `listeners:` array that did not change can still resolve
+        // differently when shared inputs move: the `allow-lan`/bind
+        // default, global `max-connections`, `sniffer:` (which deadens
+        // `tproxy-sni` synthesis), proxy names behind `listeners[].proxy`,
+        // `rule:` overrides, `routing-mark` — none live under the
+        // `listeners:` key (F18). Compare the resolved lists both ways:
+        // a raw diff that resolves identically is a respelling (no warn),
+        // an inherited change still warns. A failed old-side resolve
+        // counts as "changed" — conservative, since the committed doc
+        // already built once.
+        let listeners_changed = {
+            let effective_keepalive = |raw: &meow_config::raw::RawConfig| {
+                raw.tcp_keepalive.unwrap_or(true).then(|| {
+                    (
+                        raw.tcp_keepalive_idle
+                            .unwrap_or(meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_IDLE_SECS),
+                        raw.tcp_keepalive_interval
+                            .unwrap_or(meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_INTERVAL_SECS),
+                        raw.tcp_keepalive_probes
+                            .unwrap_or(meow_common::tcp_opts::DEFAULT_TCP_KEEPALIVE_PROBES),
+                    )
+                })
+            };
+            let has_top_level_tcp_inbound = |raw: &meow_config::raw::RawConfig| {
+                raw.port.unwrap_or(0) != 0
+                    || raw.socks_port.unwrap_or(0) != 0
+                    || raw.mixed_port.unwrap_or(0) != 0
+                    || raw.redir_port.unwrap_or(0) != 0
+                    || raw.tproxy_port.unwrap_or(0) != 0
+            };
+            let projection = |raw: &meow_config::raw::RawConfig| {
+                let list = meow_config::resolve_named_listeners(raw).ok()?;
+                let has_tcp_listener = has_top_level_tcp_inbound(raw)
+                    || list.iter().any(|l| {
+                        !matches!(
+                            l.spec,
+                            meow_config::ListenerSpec::WireGuard(_)
+                                | meow_config::ListenerSpec::Tun(_)
+                        )
+                    });
+                let keepalive = has_tcp_listener.then(|| effective_keepalive(raw));
+                serde_json::to_value((list, keepalive)).ok()
+            };
+            projection(&guard) != projection(&candidate)
+        };
         (
             old,
             tun_changed,
@@ -4627,6 +4675,7 @@ async fn swap_config_and_reconcile_tun(
             logbook_enable,
             geo_schedule_changed,
             controller_changed,
+            listeners_changed,
         )
     };
 
@@ -4994,6 +5043,13 @@ async fn swap_config_and_reconcile_tun(
              rebind or re-apply it"
         );
     }
+    if listeners_changed {
+        warn!(
+            "listeners: changed (mixed/socks5/http/tproxy/shadowsocks/wireguard/\
+             anytls/tun entries): inbounds are a startup snapshot — restart meow \
+             to apply the committed listener set"
+        );
+    }
     logbook::reconfigure(logbook_enable);
 
     if let Some(new_log_level) = new_log_level {
@@ -5212,6 +5268,27 @@ async fn put_configs(
             )
         }
     };
+    // The `type: anytls` feature gate is unbypassable, unlike the
+    // degradable gate below: a persisted entry this build cannot serve
+    // fails the NEXT boot's `ensure_inbounds_supported` hard-check, so
+    // committing it is a Class-A defect like malformed shape — reject it
+    // identically even under `?force`.
+    let gate = crate::listener_gate();
+    if let Some(l) = named_listeners
+        .iter()
+        .find(|l| matches!(l.spec, meow_config::ListenerSpec::Anytls(_)) && gate(&l.spec).is_some())
+    {
+        let feature = gate(&l.spec).expect("find() already selected a missing feature");
+        return reload_rejected(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "listener '{}' (type anytls) requires cargo feature '{feature}', \
+                 which this build lacks — refusing to persist a config the next \
+                 startup could not serve",
+                l.name
+            ),
+        );
+    }
     // A `listeners[].proxy` target the document itself never declares —
     // not a `proxies:`/`proxy-groups:` name or a built-in — is a
     // document-shape defect too: provider members are not registry keys,
@@ -6867,6 +6944,23 @@ async fn get_listeners(State(state): State<Arc<AppState>>) -> Json<serde_json::V
                 item["port"] = serde_json::json!(l.port);
                 item["listen"] = serde_json::json!(l.listen);
             }
+            // A multi-address `type: anytls` reports every bound target
+            // in declaration order — `listen`/`port` above stay the
+            // first entry for single-address parity. Only `listen`/
+            // `port` is emitted: user digests, certificate material and
+            // the private key never appear in API output.
+            if let meow_config::ListenerSpec::Anytls(cfg) = &l.spec {
+                if cfg.addresses.len() > 1 {
+                    item["addresses"] = serde_json::json!(cfg
+                        .addresses
+                        .iter()
+                        .map(|a| serde_json::json!({
+                            "listen": a.listen,
+                            "port": a.port,
+                        }))
+                        .collect::<Vec<_>>());
+                }
+            }
             // TProxy listeners disclose who owns the redirect rules — a
             // deployer checking whether the table/anchor they installed is
             // supposed to coexist with a meow-managed one reads this field
@@ -8330,5 +8424,132 @@ mod listener_deps_tests {
         blocks.insert("blk".to_string(), std::sync::Arc::new(vec![]));
         listener_route_deps_guard(&running, &raw, &proxies(), &blocks, &HashMap::new())
             .expect("all dependencies resolve");
+    }
+}
+
+/// `GET /listeners` for `type: anytls` — every bound address surfaces,
+/// user digests and TLS material never do.
+#[cfg(test)]
+mod anytls_listeners_api_tests {
+    use super::*;
+    use meow_config::{AnytlsListenerConfig, ListenerBind, ListenerSpec, NamedListener};
+
+    fn test_state(listeners: Vec<NamedListener>) -> Arc<AppState> {
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        let tunnel = Tunnel::new(resolver);
+        let raw = meow_config::parse_raw_yaml("mode: rule\nrules:\n  - MATCH,DIRECT\n").unwrap();
+        let meow_config::RebuildResult {
+            proxies,
+            rules,
+            sub_rules,
+            dialer_registry,
+            ..
+        } = meow_config::rebuild_from_raw(&raw).unwrap();
+        tunnel.update_routing(proxies, rules, sub_rules, dialer_registry);
+        Arc::new(AppState {
+            tunnel,
+            secret: None,
+            config_path: None,
+            raw_config: Arc::new(RwLock::new(raw)),
+            log_tx: broadcast::channel(16).0,
+            proxy_providers: Arc::new(DashMap::new()),
+            provider_dialer_registry: Default::default(),
+            ntp_reconcile: None,
+            rule_providers: Arc::new(RwLock::new(HashMap::new())),
+            rule_provider_refresh: Default::default(),
+            proxy_provider_refresh: Default::default(),
+            listeners,
+            external_ui: None,
+            traffic_feed: TrafficFeed::default(),
+            dns_server: Default::default(),
+            ui_storage: Default::default(),
+            cors: Default::default(),
+        })
+    }
+
+    fn anytls_listener(addresses: &[(&str, u16)]) -> NamedListener {
+        let (listen, port) = addresses[0];
+        NamedListener {
+            name: "at".into(),
+            spec: ListenerSpec::Anytls(AnytlsListenerConfig {
+                users: vec![meow_config::AnytlsUser {
+                    name: "alice".into(),
+                    password_sha256: [0xAB; 32],
+                }],
+                certificate: Some("-----BEGIN CERTIFICATE-----".into()),
+                private_key: Some("-----BEGIN PRIVATE KEY-----".into()),
+                allow_insecure: false,
+                padding_scheme: None,
+                addresses: addresses
+                    .iter()
+                    .map(|(l, p)| ListenerBind {
+                        listen: (*l).to_string(),
+                        port: *p,
+                    })
+                    .collect(),
+            }),
+            port,
+            listen: listen.into(),
+            max_connections: 256,
+            route_override: None,
+            routing_mark: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn listeners_reports_every_anytls_address_and_no_secrets() {
+        let state = test_state(vec![anytls_listener(&[("127.0.0.1", 8443), ("::1", 8443)])]);
+        let Json(body) = get_listeners(State(state)).await;
+        let item = &body[0];
+        assert_eq!(item["name"], "at");
+        assert_eq!(item["type"], "anytls");
+        assert_eq!(item["listen"], "127.0.0.1");
+        assert_eq!(item["port"], 8443);
+        assert_eq!(
+            item["addresses"],
+            serde_json::json!([
+                {"listen": "127.0.0.1", "port": 8443},
+                {"listen": "::1", "port": 8443},
+            ])
+        );
+
+        // Nothing sensitive may appear — the username/password digest,
+        // PEM blocks and the padding scheme are config-only.
+        let serialized = body.to_string();
+        for secret in [
+            "alice",
+            "password",
+            "sha256",
+            "certificate",
+            "private",
+            "BEGIN",
+            "ABABAB",
+            "padding",
+        ] {
+            assert!(
+                !serialized.contains(secret),
+                "GET /listeners leaked '{secret}': {serialized}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn listeners_single_address_anytls_omits_addresses_key() {
+        let state = test_state(vec![anytls_listener(&[("0.0.0.0", 9443)])]);
+        let Json(body) = get_listeners(State(state)).await;
+        let item = &body[0];
+        assert_eq!(item["type"], "anytls");
+        assert_eq!(item["listen"], "0.0.0.0");
+        assert_eq!(item["port"], 9443);
+        // `addresses` only disambiguates multi-address entries — a
+        // single-address item stays byte-identical to other listeners.
+        assert!(item.get("addresses").is_none(), "{item}");
     }
 }

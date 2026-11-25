@@ -33,6 +33,87 @@ pub(crate) fn flatten_header_map(map: &HashMap<String, StringOrList>) -> Vec<(St
     pairs
 }
 
+/// `users:` on `type: anytls` — a YAML mapping of username → password
+/// decoded into ORDERED pairs. Collecting pairs instead of a map keeps
+/// duplicate YAML keys visible (a map silently collapses last-wins);
+/// non-string values hard-error on the spot. `null` is absent; anything
+/// that is not a mapping is a shape error.
+fn deser_user_map<'de, D>(deserializer: D) -> Result<Option<Vec<(String, String)>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{self, MapAccess, Visitor};
+    use std::fmt;
+
+    struct UserMap;
+    impl<'de> Visitor<'de> for UserMap {
+        type Value = Option<Vec<(String, String)>>;
+
+        fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+            f.write_str("a mapping of string usernames to string passwords")
+        }
+
+        fn visit_none<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: serde::Deserializer<'de>>(
+            self,
+            deserializer: D2,
+        ) -> Result<Self::Value, D2::Error> {
+            deserializer.deserialize_map(self)
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            let mut v = Vec::new();
+            // Keys and values are read as `Value` first: YAML happily
+            // coerces `123: x` or `~: x` scalars; the spec's user table
+            // is string→string, so a non-string key or password is a
+            // hard error, never a coercion.
+            while let Some(key) = map.next_key::<serde_json::Value>()? {
+                let serde_json::Value::String(user) = key else {
+                    return Err(de::Error::custom("users: username must be a string"));
+                };
+                let value = map.next_value::<serde_json::Value>()?;
+                let serde_json::Value::String(password) = value else {
+                    return Err(de::Error::custom(format!(
+                        "users: password for '{user}' must be a string"
+                    )));
+                };
+                v.push((user, password));
+            }
+            Ok(Some(v))
+        }
+    }
+
+    deserializer.deserialize_option(UserMap)
+}
+
+/// Serialize `users` back as the YAML mapping it was read from —
+/// `Vec<(String, String)>`'s derived form is a *sequence* of pairs
+/// (and `Some([])` would emit `[]`), which `deser_user_map` refuses.
+/// Persisted configs (PUT /configs) must round-trip (F03).
+fn ser_user_map<S>(value: &Option<Vec<(String, String)>>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    match value {
+        None => s.serialize_none(),
+        Some(pairs) => {
+            use serde::ser::SerializeMap;
+            let mut map = s.serialize_map(Some(pairs.len()))?;
+            for (user, password) in pairs {
+                map.serialize_entry(user, password)?;
+            }
+            map.end()
+        }
+    }
+}
+
 fn deserialize_string_or_seq<'de, D>(deserializer: D) -> Result<Option<Vec<String>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -1176,7 +1257,7 @@ pub enum RawAutoRoute {
 }
 
 /// One entry in the `listeners:` array.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawListener {
     pub name: String,
@@ -1288,6 +1369,40 @@ pub struct RawListener {
     pub gso: Option<serde_json::Value>,
     pub file_descriptor: Option<serde_json::Value>,
 
+    // ── anytls-listener fields (only meaningful when `type: anytls`) ──
+    /// `users:` — username → password map, decoded as ordered pairs so
+    /// duplicate YAML keys stay detectable instead of collapsing into a
+    /// map's last-wins. `None`/empty/`{}` all mean "authenticate
+    /// nothing" per the spec (warn once, still serve). Serialized back
+    /// as a mapping so persisted configs round-trip.
+    #[serde(
+        default,
+        deserialize_with = "deser_user_map",
+        serialize_with = "ser_user_map"
+    )]
+    pub users: Option<Vec<(String, String)>>,
+    /// `certificate` / `private-key` — each is an inline PEM block or a
+    /// filesystem path; mixing the two forms is a build error.
+    /// `private_key` above is shared with `type: wireguard`.
+    pub certificate: Option<String>,
+    /// `client-auth-type`/`client-auth-cert` — mTLS is NOT implemented;
+    /// a non-empty value hard-errors (never silently ignored).
+    pub client_auth_type: Option<String>,
+    pub client_auth_cert: Option<String>,
+    /// `ech-key` — ECH is NOT implemented for the inbound; a non-empty
+    /// value hard-errors.
+    pub ech_key: Option<String>,
+    /// `allow-insecure` — explicit plaintext opt-in, only legal when no
+    /// TLS material exists; warns loudly when it takes effect.
+    pub allow_insecure: Option<bool>,
+    /// `padding-scheme` — validated at build by the shared
+    /// `meow_common::anytls_padding` contract; carried as raw bytes.
+    pub padding_scheme: Option<String>,
+    /// `enable` — upstream accepts it but an entry's presence already is
+    /// its enabled state: `true` warns redundant, `false` hard-errors
+    /// (remove the entry instead).
+    pub enable: Option<bool>,
+
     // ── upstream sub-options not yet supported by meow-rs ──
     // Captured as opaque `Value`s so their mere presence can be warned about
     // (ADR-0002: never silently ignore a mihomo flag) without modelling the
@@ -1311,7 +1426,7 @@ pub struct RawListener {
 /// (required `public-key`/`allowed-ips`, base64 → 32-byte keys, CIDR
 /// entries, 3-byte `reserved`) happens in `build_wg_listener_spec` — the
 /// same "raw loose, typed strict" split the rest of `raw.rs` follows.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawWgPeer {
     /// Peer static public key, base64 → exactly 32 bytes (required).
@@ -1335,7 +1450,7 @@ pub struct RawWgPeer {
 }
 
 /// Raw `simple-obfs:` block for a shadowsocks listener.
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub struct RawSimpleObfs {
     #[serde(default)]

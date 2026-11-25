@@ -2670,6 +2670,7 @@ dependencies = [
  "serde",
  "serde-saphyr",
  "serde_json",
+ "sha2",
  "smol_str",
  "tempfile",
  "tokio",
@@ -2718,6 +2719,7 @@ dependencies = [
 name = "meow-listener"
 version = "0.29.0"
 dependencies = [
+ "anyhow",
  "async-trait",
  "base64 0.22.1",
  "boring",
@@ -2725,6 +2727,7 @@ dependencies = [
  "futures",
  "ipnet",
  "libc",
+ "meow-anytls",
  "meow-common",
  "meow-config",
  "meow-dns",
@@ -2748,6 +2751,7 @@ dependencies = [
  "smoltcp",
  "socket2 0.5.10",
  "tokio",
+ "tokio-boring",
  "tracing",
  "tracing-subscriber",
  "tun-rs",

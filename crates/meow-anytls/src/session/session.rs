@@ -3,7 +3,7 @@
 use crate::padding::{PaddingFactory, SharedPaddingFactory};
 use crate::protocol::{Command, Frame, FrameCodec, HEADER_OVERHEAD_SIZE};
 use crate::session::Stream;
-use crate::session::writer::{StreamWriter, WriteRequest};
+use crate::session::writer::{ControlTicket, StreamWriter, WriteRequest};
 use crate::util::{AnyTlsError, Result, StringMap};
 use bytes::{Bytes, BytesMut};
 use md5;
@@ -25,9 +25,101 @@ use tokio_util::codec::Decoder;
 /// per-stream timeout (issue #625).
 const SYN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(3);
 
-/// Type alias for new stream callback channel
-type NewStreamCallback =
-    Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<Arc<Stream>>>>>;
+/// Server-side admission caps on inbound PSH bytes still unconsumed by
+/// the stream handler — the "stall a stream, starve the session" bound.
+/// Per-stream saturation evicts that stream; session saturation kills
+/// the session.
+const MAX_STREAM_PENDING: usize = 256 * 1024;
+const MAX_SESSION_PENDING: usize = 4 * 1024 * 1024;
+/// Per-stream queued-item bound, independent of the byte budget: many
+/// tiny PSH frames must not pile up channel entries without limit —
+/// upstream bounds its pipe by buffers, this bounds ours by count.
+const MAX_STREAM_PENDING_FRAMES: usize = 1024;
+/// Maximum live streams per server session.
+const MAX_STREAMS_PER_SESSION: usize = 128;
+
+/// The shared control-write deadline — upstream's 5 s `writeAndRetry`
+/// bound on every control frame. Applied twice by design: at admission
+/// (`write_control_frame` — queue wait plus completion) and at the
+/// writer's single commit point (the batch wire write in
+/// `process_stream_data`), so no control frame can park either half
+/// of the session on a wedged peer.
+const CONTROL_WRITE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Inbound-budget counters shared between one stream's receive-slot and
+/// every payload it admitted: `session` points at the session-wide byte
+/// counter so a queued item releases both scopes in one Drop. `frames`
+/// is this stream's own queued-item count, released the same way.
+#[derive(Debug)]
+pub struct PendingBudget {
+    stream: std::sync::atomic::AtomicUsize,
+    frames: std::sync::atomic::AtomicUsize,
+    session: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One inbound PSH payload in a stream's receive channel. Carries its
+/// byte share of the per-stream and per-session budgets; when the item
+/// drops — consumed, evicted, or torn down with the session — the
+/// budget comes back, so every cleanup path releases without extra
+/// bookkeeping. `Deref`s to the payload for the reader's slice ops.
+pub struct PendingBytes {
+    bytes: Bytes,
+    budget: Option<Arc<PendingBudget>>,
+}
+
+impl PendingBytes {
+    /// Unmetered payload — client-side receive paths admit no inbound
+    /// cap, so they carry no budget.
+    fn unmetered(bytes: Bytes) -> Self {
+        Self {
+            bytes,
+            budget: None,
+        }
+    }
+}
+
+impl From<Bytes> for PendingBytes {
+    /// Bare payload → unmetered item (client paths, tests).
+    fn from(bytes: Bytes) -> Self {
+        Self::unmetered(bytes)
+    }
+}
+
+impl std::ops::Deref for PendingBytes {
+    type Target = Bytes;
+    fn deref(&self) -> &Bytes {
+        &self.bytes
+    }
+}
+
+impl Drop for PendingBytes {
+    fn drop(&mut self) {
+        if let Some(budget) = &self.budget {
+            budget
+                .stream
+                .fetch_sub(self.bytes.len(), std::sync::atomic::Ordering::Relaxed);
+            budget
+                .frames
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            budget
+                .session
+                .fetch_sub(self.bytes.len(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// A live stream's receive-slot: the channel plus this stream's budget.
+/// Budget presence distinguishes server sessions (admission-enforced)
+/// from client ones.
+struct StreamRx {
+    tx: mpsc::UnboundedSender<PendingBytes>,
+    budget: Option<Arc<PendingBudget>>,
+}
+
+/// Type alias for new stream callback channel — BOUNDED: the accept
+/// queue is part of the stream-admission budget, so a stalled
+/// dispatcher can't let SYNs accumulate without limit.
+type NewStreamCallback = Arc<tokio::sync::Mutex<Option<tokio::sync::mpsc::Sender<Arc<Stream>>>>>;
 
 #[derive(Clone)]
 pub struct SessionHeartbeatConfig {
@@ -58,11 +150,19 @@ pub struct Session {
     stream_data_tx: StreamWriter,
     stream_data_rx: Arc<tokio::sync::Mutex<Option<StreamDataReceiver>>>,
 
-    // Channel for sending data to streams (stream_id -> sender)
-    stream_receive_tx: Arc<RwLock<HashMap<u32, mpsc::UnboundedSender<Bytes>>>>,
+    // Channel for sending data to streams (stream_id -> receive slot)
+    stream_receive_tx: Arc<RwLock<HashMap<u32, StreamRx>>>,
 
     // Session state
     is_closed: Arc<std::sync::atomic::AtomicBool>,
+
+    // Teardown supervision (F07): `is_closed` is the persistent cancel
+    // signal; `close_lock` serializes the destructive half so exactly
+    // one caller runs it — a caller cancelled mid-teardown leaves the
+    // lock for the NEXT `close()` caller, which re-checks
+    // `teardown_done` and finishes the remaining steps itself.
+    close_lock: tokio::sync::Mutex<()>,
+    teardown_done: std::sync::atomic::AtomicBool,
 
     // Padding factory in force for this session. Client sessions share the
     // client's cell, so a server-pushed scheme reaches sessions opened later.
@@ -98,6 +198,15 @@ pub struct Session {
     // deadline task holding `Weak<Session>` closes the session on expiry.
     // Sync mutex — held only across abort/store, never across an await.
     syn_watchdog: std::sync::Mutex<Option<tokio::task::AbortHandle>>,
+
+    // Server side: total inbound PSH bytes still pending consumption
+    // across every stream (the shared half of each `PendingBudget`).
+    pending_in: Arc<std::sync::atomic::AtomicUsize>,
+
+    // Server side: the client's Settings frame arrived. A SYN ahead of
+    // it is a protocol violation (upstream refuses the session), not a
+    // stream to route.
+    client_settings_received: std::sync::atomic::AtomicBool,
 }
 
 impl Session {
@@ -156,6 +265,8 @@ impl Session {
             stream_data_rx: Arc::new(tokio::sync::Mutex::new(Some(stream_data_rx))),
             stream_receive_tx: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            close_lock: tokio::sync::Mutex::new(()),
+            teardown_done: std::sync::atomic::AtomicBool::new(false),
             padding,
             is_client: true,
             send_padding: true,
@@ -169,6 +280,8 @@ impl Session {
             heartbeat: heartbeat_state,
             close_notify: Arc::new(Notify::new()),
             syn_watchdog: std::sync::Mutex::new(None),
+            pending_in: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            client_settings_received: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -197,6 +310,8 @@ impl Session {
             stream_data_rx: Arc::new(tokio::sync::Mutex::new(Some(stream_data_rx))),
             stream_receive_tx: Arc::new(RwLock::new(HashMap::new())),
             is_closed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            close_lock: tokio::sync::Mutex::new(()),
+            teardown_done: std::sync::atomic::AtomicBool::new(false),
             padding: padding.into_shared(),
             is_client: false,
             send_padding: false,
@@ -210,6 +325,8 @@ impl Session {
             heartbeat: None,
             close_notify: Arc::new(Notify::new()),
             syn_watchdog: std::sync::Mutex::new(None),
+            pending_in: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            client_settings_received: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -219,10 +336,7 @@ impl Session {
     }
 
     /// Set callback for new streams (server side only)
-    pub fn set_stream_callback(
-        &mut self,
-        callback: tokio::sync::mpsc::UnboundedSender<Arc<Stream>>,
-    ) {
+    pub fn set_stream_callback(&mut self, callback: tokio::sync::mpsc::Sender<Arc<Stream>>) {
         if !self.is_client {
             self.on_new_stream = Some(Arc::new(tokio::sync::Mutex::new(Some(callback))));
         }
@@ -235,7 +349,14 @@ impl Session {
 
     /// Check if session is closed
     pub fn is_closed(&self) -> bool {
-        self.is_closed.load(std::sync::atomic::Ordering::Relaxed)
+        self.is_closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn initiate_close(&self) {
+        self.is_closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        self.stream_data_tx.close();
+        self.close_notify.notify_waiters();
     }
 
     /// Whether the session currently carries any open streams.
@@ -248,18 +369,41 @@ impl Session {
         !self.streams.read().await.is_empty()
     }
 
-    /// Close the session
+    /// Close the session.
+    ///
+    /// Two distinct states: `is_closed` is the persistent CANCEL signal
+    /// every waiter/loop observes, set before any await so a cancelled
+    /// caller still leaves the session stopping. The destructive
+    /// teardown — draining the stream maps, closing stream admission,
+    /// shutting the transport writer — runs under `close_lock`: every
+    /// caller queues for it, and whoever holds it runs whatever steps
+    /// remain, so a `close()` cancelled mid-teardown is RESUMED by the
+    /// next caller instead of leaving the session half-drained (F07).
+    /// `teardown_done` is the separate completion state a second caller
+    /// can trust, not merely "close was initiated".
     pub async fn close(&self) -> Result<()> {
-        let already_closed = self
-            .is_closed
-            .swap(true, std::sync::atomic::Ordering::Relaxed);
-        if already_closed {
+        self.initiate_close();
+        if self
+            .teardown_done
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return Ok(());
         }
-        self.stream_data_tx.close();
-        self.close_notify.notify_waiters();
+        let _guard = self.close_lock.lock().await;
+        if self
+            .teardown_done
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
 
-        // Close stream data receiver so process_stream_data exits
+        // Drop stream admission — the accept channel's sender hangs
+        // inside this mutex, so a dispatcher parked on `recv` ends when
+        // teardown runs rather than pinning the listener's spawn set.
+        if let Some(callback_guard) = &self.on_new_stream {
+            *callback_guard.lock().await = None;
+        }
+
         // Close all streams and notify pending waiters. The two map
         // writes are the only awaits; `close_with_error`/`notify_synack`
         // are synchronous, so eviction + close + wakeup is one atomic
@@ -296,6 +440,8 @@ impl Session {
             }
         }
 
+        self.teardown_done
+            .store(true, std::sync::atomic::Ordering::Release);
         Ok(())
     }
 
@@ -305,6 +451,7 @@ impl Session {
     /// `Entered` guard across `.await` leaks this span onto whatever task the
     /// worker thread polls while this loop is parked.
     pub async fn recv_loop(&self) -> Result<()> {
+        const RECV_BUF_CHUNK: usize = 64 * 1024 + HEADER_OVERHEAD_SIZE;
         let session_id = self.id();
         tracing::debug!(
             session_id = session_id,
@@ -312,7 +459,7 @@ impl Session {
             "[Session] recv_loop started"
         );
         let mut codec = FrameCodec;
-        let mut buffer = BytesMut::with_capacity(8192);
+        let mut buffer = BytesMut::with_capacity(RECV_BUF_CHUNK);
         let mut iteration = 0u64;
         let mut total_bytes_in: usize = 0;
 
@@ -323,6 +470,12 @@ impl Session {
 
         loop {
             iteration += 1;
+            // Subscribe BEFORE checking the flag: `notify_waiters`
+            // retains no state, so a notify landing between a bare flag
+            // check and a fresh `notified()` would be lost forever.
+            let closed = self.close_notify.notified();
+            tokio::pin!(closed);
+            closed.as_mut().enable();
             if self.is_closed() {
                 tracing::debug!(
                     session_id = session_id,
@@ -332,18 +485,30 @@ impl Session {
                 break;
             }
 
-            // A `BytesMut` whose spare capacity hits 0 hands `read_buf`
-            // an empty chunk → `Ok(0)` → spurious EOF below. BytesMut
-            // reports `remaining_mut = isize::MAX` (it can always grow),
-            // so `has_remaining_mut` cannot detect this — check the real
-            // spare (`capacity - len`) and reserve ahead of the read.
-            if buffer.len() == buffer.capacity() {
-                buffer.reserve(8192);
+            // Keep enough spare capacity to fit at least a full TLS record
+            // without triggering a per-frame grow-and-copy when `decode`
+            // reserves a max-sized frame.
+            if buffer.capacity() - buffer.len() < 16 * 1024 {
+                buffer.reserve(RECV_BUF_CHUNK);
             }
 
-            let n = match reader.read_buf(&mut buffer).await {
-                Ok(n) => n,
-                Err(e) => {
+            // Race the read against session closure: a writer-side fatal
+            // (backpressure, control-write deadline) must not leave the
+            // read half parked on a peer that never speaks again.
+            let n = match tokio::select! {
+                n = reader.read_buf(&mut buffer) => Some(n),
+                _ = &mut closed => None,
+            } {
+                Some(Ok(n)) => n,
+                None => {
+                    tracing::debug!(
+                        session_id = session_id,
+                        "[Session] recv_loop: Session closed while read pending (iteration {})",
+                        iteration
+                    );
+                    break;
+                }
+                Some(Err(e)) => {
                     // Check if this is a "close_notify" error (common and harmless)
                     let error_msg = e.to_string();
                     let is_close_notify_error = error_msg.contains("close_notify")
@@ -435,14 +600,99 @@ impl Session {
         );
         match frame.cmd {
             Command::Push => {
+                // An empty PSH carries nothing — upstream skips it by
+                // `hdr.Length() > 0` before the stream lookup. Enqueueing
+                // it would both bypass the byte budget (0 bytes) and
+                // surface a spurious 0-length read == EOF downstream.
+                if frame.data.is_empty() {
+                    return Ok(());
+                }
                 // Data frame — forward to the stream. `frame.data` MOVES
                 // into the channel (no `Bytes` refcount clone), which is
                 // what lets `StreamReader` hand the caller slices of the
                 // very allocation the codec decoded.
                 let receive_map = self.stream_receive_tx.read().await;
 
-                if let Some(tx) = receive_map.get(&frame.stream_id) {
-                    if let Err(e) = tx.send(frame.data) {
+                if let Some(rx) = receive_map.get(&frame.stream_id) {
+                    // Server-side admission: count the bytes AND the
+                    // queue entry against the stream and session budgets
+                    // BEFORE enqueueing. Only recv_loop mutates the
+                    // counters upward, so the check-then-add is
+                    // race-free; `PendingBytes::Drop` gives the counts
+                    // back on every downstream path.
+                    let budget = if self.is_client {
+                        None
+                    } else {
+                        let len = frame.data.len();
+                        let pending_stream = rx
+                            .budget
+                            .as_ref()
+                            .map(|b| b.stream.load(std::sync::atomic::Ordering::Relaxed))
+                            .unwrap_or(0)
+                            + len;
+                        let pending_frames = rx
+                            .budget
+                            .as_ref()
+                            .map(|b| b.frames.load(std::sync::atomic::Ordering::Relaxed))
+                            .unwrap_or(0)
+                            + 1;
+                        let pending_session =
+                            self.pending_in.load(std::sync::atomic::Ordering::Relaxed) + len;
+                        if pending_stream > MAX_STREAM_PENDING
+                            || pending_frames > MAX_STREAM_PENDING_FRAMES
+                        {
+                            drop(receive_map);
+                            tracing::warn!(
+                                session_id = session_id,
+                                "[Session] stream {} exceeded {} B pending — evicting",
+                                frame.stream_id,
+                                MAX_STREAM_PENDING
+                            );
+                            let victim = self.streams.read().await.get(&frame.stream_id).cloned();
+                            if let Some(victim) = victim {
+                                let owner = victim.owner();
+                                let _ = self
+                                    .write_control_frame_owned(
+                                        Frame::control(Command::Fin, frame.stream_id),
+                                        owner,
+                                    )
+                                    .await;
+                                self.evict_stream_if_same(
+                                    frame.stream_id,
+                                    &victim,
+                                    AnyTlsError::StreamClosed,
+                                )
+                                .await;
+                            }
+                            return Ok(());
+                        }
+                        if pending_session > MAX_SESSION_PENDING {
+                            drop(receive_map);
+                            tracing::warn!(
+                                session_id = session_id,
+                                "[Session] session pending data exceeded {} B — closing",
+                                MAX_SESSION_PENDING
+                            );
+                            let _ = self.close().await;
+                            return Err(AnyTlsError::Protocol(
+                                "session pending data limit exceeded".into(),
+                            ));
+                        }
+                        let budget = rx.budget.as_ref().expect("server slots are metered");
+                        budget
+                            .stream
+                            .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                        budget
+                            .frames
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.pending_in
+                            .fetch_add(len, std::sync::atomic::Ordering::Relaxed);
+                        Some(Arc::clone(budget))
+                    };
+                    if let Err(e) = rx.tx.send(PendingBytes {
+                        bytes: frame.data,
+                        budget,
+                    }) {
                         tracing::error!(
                             session_id = session_id,
                             "[Session] handle_frame: Failed to send {} bytes to stream {} via channel: {}",
@@ -470,13 +720,50 @@ impl Session {
                 // Stream open (server side)
                 if !self.is_client {
                     let stream_id = frame.stream_id;
+                    // A SYN with payload is malformed — the command never
+                    // carries data upstream.
+                    if !frame.data.is_empty() {
+                        return Err(AnyTlsError::Protocol("SYN with payload".into()));
+                    }
                     tracing::debug!(
                         session_id = session_id,
                         "[Session] Received SYN for stream {} (server side)",
                         stream_id
                     );
 
+                    // A SYN ahead of the client's Settings is a protocol
+                    // violation, not a routeable stream: Alert like
+                    // upstream `die` then close the session.
+                    if !self
+                        .client_settings_received
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                    {
+                        tracing::warn!(
+                            session_id = session_id,
+                            "[Session] SYN for stream {} before client Settings",
+                            stream_id
+                        );
+                        // Upstream `die("client did not send its
+                        // settings")` — the exact Alert text a peer
+                        // surfaces to its operator.
+                        let alert = Frame::with_data(
+                            Command::Alert,
+                            0,
+                            Bytes::from_static(b"client did not send its settings"),
+                        );
+                        let _ = self.write_control_frame(alert).await;
+                        let _ = self.close().await;
+                        return Err(AnyTlsError::Protocol(
+                            "client did not send its settings".into(),
+                        ));
+                    }
+
                     let (receive_tx, receive_rx) = mpsc::unbounded_channel();
+                    let budget = Arc::new(PendingBudget {
+                        stream: std::sync::atomic::AtomicUsize::new(0),
+                        frames: std::sync::atomic::AtomicUsize::new(0),
+                        session: Arc::clone(&self.pending_in),
+                    });
 
                     // 创建 StreamReader
                     let reader = crate::session::StreamReader::new(stream_id, receive_rx);
@@ -487,6 +774,9 @@ impl Session {
                         Stream::new(stream_id, reader, self.stream_data_tx.clone());
 
                     let stream = Arc::new(stream);
+                    // Bind BEFORE registration so the instance identity is
+                    // live for every FIN it may later emit.
+                    stream.bind_self();
 
                     // Acquire both locks before mutating either map, in
                     // close()'s order — and recheck `is_closed` inside so a
@@ -498,7 +788,44 @@ impl Session {
                         if self.is_closed() {
                             return Ok(());
                         }
-                        receive_map.insert(stream_id, receive_tx);
+                        // A duplicate SID on a LIVE stream is ignored
+                        // upstream (`streams.LoadOrStore` keeps the
+                        // existing instance) — it must not recreate the
+                        // stream, overwrite the map, or kill the session.
+                        if streams.contains_key(&stream_id) {
+                            tracing::warn!(
+                                session_id = session_id,
+                                "[Session] duplicate SYN for live stream {} — ignored",
+                                stream_id
+                            );
+                            return Ok(());
+                        }
+                        // Stream-count bound: a SYN flood must not grow
+                        // the maps without limit. Refuse ONLY this stream
+                        // — a FIN is the close primitive both versions
+                        // share (upstream `stream.Close()` on refusal);
+                        // no SynAck, which a v2 peer would misread as the
+                        // stream being accepted.
+                        if streams.len() >= MAX_STREAMS_PER_SESSION {
+                            drop(receive_map);
+                            drop(streams);
+                            tracing::warn!(
+                                session_id = session_id,
+                                "[Session] refusing stream {} — {} stream limit",
+                                stream_id,
+                                MAX_STREAMS_PER_SESSION
+                            );
+                            self.write_control_frame(Frame::control(Command::Fin, stream_id))
+                                .await?;
+                            return Ok(());
+                        }
+                        receive_map.insert(
+                            stream_id,
+                            StreamRx {
+                                tx: receive_tx,
+                                budget: Some(budget),
+                            },
+                        );
                         streams.insert(stream_id, stream.clone());
                     }
 
@@ -508,29 +835,39 @@ impl Session {
                         stream_id
                     );
 
-                    // Notify callback if set
+                    // Notify callback if set — a BOUNDED admission queue:
+                    // a saturated listener must refuse the stream
+                    // (FIN + drop), never let inbound SYNs pile into an
+                    // unbounded channel while handlers stall.
+                    let mut refuse = false;
                     if let Some(callback_guard) = &self.on_new_stream {
                         let callback = callback_guard.lock().await;
                         if let Some(tx) = callback.as_ref() {
-                            tracing::debug!(
-                                session_id = session_id,
-                                "[Session] Sending stream {} to callback",
-                                stream_id
-                            );
-                            let _ = tx.send(stream.clone());
+                            if tx.try_send(stream.clone()).is_err() {
+                                refuse = true;
+                            }
                         } else {
-                            tracing::warn!(
-                                session_id = session_id,
-                                "[Session] No callback set for stream {}",
-                                stream_id
-                            );
+                            refuse = true;
                         }
                     } else {
+                        refuse = true;
+                    }
+                    if refuse {
                         tracing::warn!(
                             session_id = session_id,
-                            "[Session] No callback guard for stream {}",
+                            "[Session] stream {} admission saturated — refusing",
                             stream_id
                         );
+                        let owner = stream.owner();
+                        let res = self
+                            .write_control_frame_owned(
+                                Frame::control(Command::Fin, stream_id),
+                                owner,
+                            )
+                            .await;
+                        self.evict_stream_if_same(stream_id, &stream, AnyTlsError::StreamClosed)
+                            .await;
+                        res?;
                     }
                 } else {
                     tracing::warn!(
@@ -625,6 +962,11 @@ impl Session {
                     "[Session] FIN received for stream {}, closing",
                     frame.stream_id
                 );
+                // A FIN with payload is malformed — the command never
+                // carries data upstream.
+                if !frame.data.is_empty() {
+                    return Err(AnyTlsError::Protocol("FIN with payload".into()));
+                }
                 // Both locks before either mutation — same order as
                 // `open_stream`/`close` — so the two-map eviction is atomic
                 // to observers (issue #621 review).
@@ -651,51 +993,69 @@ impl Session {
                 }
             }
             Command::Settings => {
-                // Client settings (server side)
-                if !self.is_client && !frame.data.is_empty() {
+                // Client settings (server side). Only a NON-EMPTY map
+                // arms SYN admission — an empty Settings frame carries
+                // no `v`/client info and upstream leaves `hasSettings`
+                // unset for it, so it must not unlock SYN.
+                if self.is_client || frame.data.is_empty() {
+                    return Ok(());
+                }
+                {
+                    self.client_settings_received
+                        .store(true, std::sync::atomic::Ordering::Relaxed);
                     let settings = StringMap::from_bytes(&frame.data);
 
-                    // Check padding-md5
-                    if let Some(client_md5) = settings.get("padding-md5") {
+                    // padding-md5 parity with upstream
+                    // (`m["padding-md5"] != paddingF.Md5`): a missing key
+                    // compares as "" — different from any real md5 — so a
+                    // client that omits the fingerprint gets the raw
+                    // scheme pushed exactly like a mismatched one.
+                    {
                         let padding_guard = self.padding.read().await;
-                        let server_md5 = padding_guard.md5();
-                        if client_md5 != server_md5 {
-                            // Send UpdatePaddingScheme
+                        if settings.get("padding-md5").map(String::as_str)
+                            != Some(padding_guard.md5())
+                        {
                             tracing::debug!(
-                                "[Session] Client padding-md5 mismatch, sending update"
+                                "[Session] Client padding-md5 missing/mismatch, sending update"
                             );
-                            let raw_scheme = padding_guard.raw_scheme();
                             let update_frame = Frame::with_data(
                                 Command::UpdatePaddingScheme,
                                 0,
-                                Bytes::copy_from_slice(raw_scheme),
+                                Bytes::copy_from_slice(padding_guard.raw_scheme()),
                             );
-                            self.write_frame(update_frame).await?;
+                            drop(padding_guard);
+                            self.write_control_frame(update_frame).await?;
                         }
                     }
 
-                    // Check client version
+                    // Check client version — parse wide: `v=999` parses
+                    // upstream (`strconv.Atoi`) and must negotiate v2;
+                    // a u8 parse would reject it as overflow.
                     if let Some(v_str) = settings.get("v")
-                        && let Ok(v) = v_str.parse::<u8>()
+                        && let Ok(v) = v_str.parse::<u32>()
                         && v >= 2
                     {
-                        self.peer_version
-                            .store(v, std::sync::atomic::Ordering::Relaxed);
+                        self.peer_version.store(
+                            v.min(u8::MAX as u32) as u8,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
 
-                        // Send ServerSettings
+                        // Send ServerSettings — extras merge FIRST so a
+                        // custom entry can never shadow the protocol
+                        // version: `v=2` is the server's own statement.
                         let mut server_settings = StringMap::new();
-                        server_settings.insert("v", "2");
                         if let Some(extra) = &self.server_settings {
                             for (k, v) in extra.clone().into_vec() {
                                 server_settings.insert(k, v);
                             }
                         }
+                        server_settings.insert("v", "2");
                         let server_settings_frame = Frame::with_data(
                             Command::ServerSettings,
                             0,
                             Bytes::from(server_settings.to_bytes()),
                         );
-                        self.write_frame(server_settings_frame).await?;
+                        self.write_control_frame(server_settings_frame).await?;
                     }
                 }
             }
@@ -704,10 +1064,12 @@ impl Session {
                 if self.is_client && !frame.data.is_empty() {
                     let settings = StringMap::from_bytes(&frame.data);
                     if let Some(v_str) = settings.get("v")
-                        && let Ok(v) = v_str.parse::<u8>()
+                        && let Ok(v) = v_str.parse::<u32>()
                     {
-                        self.peer_version
-                            .store(v, std::sync::atomic::Ordering::Relaxed);
+                        self.peer_version.store(
+                            v.min(u8::MAX as u32) as u8,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
                         tracing::debug!("[Session] Server version: {}", v);
                     }
                 }
@@ -740,12 +1102,13 @@ impl Session {
                 }
             }
             Command::Alert => {
-                // Alert message - fatal error, should close session
-                let alert_msg = if !frame.data.is_empty() {
-                    String::from_utf8_lossy(&frame.data).to_string()
-                } else {
-                    "Unknown alert".to_string()
-                };
+                // Alert message - fatal error, should close session. An
+                // EMPTY alert is ignored upstream (the handler only acts
+                // on a non-empty payload), so it cannot kill the session.
+                if frame.data.is_empty() {
+                    return Ok(());
+                }
+                let alert_msg = String::from_utf8_lossy(&frame.data).to_string();
                 tracing::error!("[Session] Received Alert frame (fatal): {}", alert_msg);
                 // Close admission and wake the writer too, not just the flag:
                 // a blocked physical write must stop with the entire session.
@@ -754,6 +1117,9 @@ impl Session {
             }
             Command::HeartRequest => {
                 // Heartbeat request - respond with HeartResponse
+                if !frame.data.is_empty() {
+                    return Err(AnyTlsError::Protocol("HeartRequest with payload".into()));
+                }
                 tracing::debug!(
                     "[Session] Received HeartRequest (stream_id={})",
                     frame.stream_id
@@ -774,6 +1140,9 @@ impl Session {
             }
             Command::HeartResponse => {
                 // Heartbeat response - log for now
+                if !frame.data.is_empty() {
+                    return Err(AnyTlsError::Protocol("HeartResponse with payload".into()));
+                }
                 tracing::debug!(
                     "[Session] Received HeartResponse (stream_id={})",
                     frame.stream_id
@@ -784,16 +1153,36 @@ impl Session {
                     *last = Instant::now();
                 }
             }
-            _ => {
-                // Unhandled command - log and ignore
-                tracing::debug!(
-                    "[Session] Unhandled command: {:?} (stream_id={})",
-                    frame.cmd,
-                    frame.stream_id
-                );
+            Command::Waste => {
+                // Padding bytes — expected on every padded write; the
+                // scheme already spent them, so discard without a log.
             }
         }
         Ok(())
+    }
+
+    /// Evict a specific `Stream` generation from both maps (two-lock order
+    /// like `close`), then mark it locally-closed and resolve its
+    /// synack-waiter. Leaves a newer stream that recycled `stream_id`
+    /// untouched (F05/F06).
+    async fn evict_stream_if_same(&self, stream_id: u32, expected: &Arc<Stream>, err: AnyTlsError) {
+        let removed = {
+            let mut streams = self.streams.write().await;
+            let mut receive_map = self.stream_receive_tx.write().await;
+            let matches = streams
+                .get(&stream_id)
+                .is_some_and(|cur| Arc::ptr_eq(cur, expected));
+            if matches {
+                receive_map.remove(&stream_id);
+                streams.remove(&stream_id)
+            } else {
+                None
+            }
+        };
+        if let Some(stream) = removed {
+            stream.close_with_error(AnyTlsError::StreamClosed);
+            stream.notify_synack(Err(err));
+        }
     }
 
     /// Create a new stream (client side).
@@ -830,6 +1219,7 @@ impl Session {
         let (stream, synack_rx) = Stream::new(stream_id, reader, self.stream_data_tx.clone());
 
         let stream = Arc::new(stream);
+        stream.bind_self();
 
         // Acquire both locks before mutating either map, in close()'s order.
         {
@@ -838,7 +1228,23 @@ impl Session {
             if self.is_closed() {
                 return Err(AnyTlsError::SessionClosed);
             }
-            receive_map.insert(stream_id, receive_tx);
+            receive_map.insert(
+                stream_id,
+                StreamRx {
+                    tx: receive_tx,
+                    // A server session that opens streams itself (the dev
+                    // fixture does) must meter inbound data on them too —
+                    // the Push path's `expect` assumes every server slot
+                    // carries a budget. Client sessions stay unmetered.
+                    budget: (!self.is_client).then(|| {
+                        Arc::new(PendingBudget {
+                            stream: std::sync::atomic::AtomicUsize::new(0),
+                            frames: std::sync::atomic::AtomicUsize::new(0),
+                            session: Arc::clone(&self.pending_in),
+                        })
+                    }),
+                },
+            );
             streams.insert(stream_id, stream.clone());
         }
         let mut guard = crate::session::stream::OpeningStreamGuard::new(Arc::clone(&stream));
@@ -959,9 +1365,47 @@ impl Session {
         self.write_frame(frame).await
     }
 
-    /// Write a control frame to connection
+    /// Write a control frame to connection. Upstream bounds every
+    /// control write (`writeAndRetry` in 5s); the queue-wait plus the
+    /// physical write share one deadline so a wedged peer can't park a
+    /// SYN/FIN/Alert forever.
     pub async fn write_control_frame(&self, frame: Frame) -> Result<()> {
-        self.write_frame(frame).await
+        self.write_control_frame_owned(frame, None).await
+    }
+
+    /// `write_control_frame` carrying an owner token — checked under the
+    /// physical writer lock right before bytes enter the transport, and
+    /// marked abandoned if the caller's deadline expires or is cancelled
+    /// before commit (F05/F06).
+    async fn write_control_frame_owned(
+        &self,
+        frame: Frame,
+        owner: Option<std::sync::Weak<Stream>>,
+    ) -> Result<()> {
+        struct AbandonOnDrop(Option<Arc<std::sync::atomic::AtomicBool>>);
+        impl Drop for AbandonOnDrop {
+            fn drop(&mut self) {
+                if let Some(flag) = self.0.take() {
+                    flag.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+
+        let abandoned = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut guard = AbandonOnDrop(Some(Arc::clone(&abandoned)));
+        match tokio::time::timeout(
+            CONTROL_WRITE_TIMEOUT,
+            self.stream_data_tx
+                .write_frame_cancellable(frame, owner, Some(abandoned)),
+        )
+        .await
+        {
+            Ok(result) => {
+                guard.0 = None;
+                result
+            }
+            Err(_) => Err(AnyTlsError::Protocol("control write deadline".into())),
+        }
     }
 
     /// Write a frame to the connection
@@ -1049,30 +1493,81 @@ impl Session {
         self.write_with_padding(buffer).await
     }
 
+    /// Drive one transport write/flush step without ever dropping a
+    /// partially-polled future mid-session (required by `SslStream` write
+    /// retry semantics). Enforces `CONTROL_WRITE_TIMEOUT` only while a
+    /// control frame is pending (`force_deadline` or queued `ControlTicket`),
+    /// so data-only backpressure never kills a session and slow-but-progressing
+    /// writes reset the timer on every forward step (NEW-02).
+    async fn drive_io<F, T>(&self, fut: F, force_deadline: bool) -> Result<T>
+    where
+        F: std::future::Future<Output = std::io::Result<T>>,
+    {
+        tokio::pin!(fut);
+        loop {
+            let notified = self.stream_data_tx.control_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if force_deadline || self.stream_data_tx.has_pending_controls() {
+                return match time::timeout(CONTROL_WRITE_TIMEOUT, &mut fut).await {
+                    Ok(Ok(v)) => Ok(v),
+                    Ok(Err(e)) => Err(AnyTlsError::Io(e)),
+                    Err(_) => Err(AnyTlsError::Protocol("control write deadline".into())),
+                };
+            }
+            tokio::select! {
+                res = &mut fut => return res.map_err(AnyTlsError::Io),
+                _ = &mut notified => {}
+            }
+        }
+    }
+
+    async fn write_all_progress(
+        &self,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        mut buf: &[u8],
+        force_deadline: bool,
+    ) -> Result<()> {
+        while !buf.is_empty() {
+            let n = self.drive_io(writer.write(buf), force_deadline).await?;
+            if n == 0 {
+                return Err(AnyTlsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "anytls session writer accepted zero bytes",
+                )));
+            }
+            buf = &buf[n..];
+        }
+        Ok(())
+    }
+
     /// Write buffer to connection with padding applied
-    async fn write_with_padding(&self, mut buffer: BytesMut) -> Result<()> {
+    async fn write_with_padding(&self, buffer: BytesMut) -> Result<()> {
+        let padding_factory = if self.send_padding {
+            Some(self.padding.read().await.clone())
+        } else {
+            None
+        };
+        let mut writer = self.writer.lock().await;
+        self.write_with_padding_locked(&mut **writer, padding_factory.as_deref(), buffer, false)
+            .await
+    }
+
+    async fn write_with_padding_locked(
+        &self,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
+        padding_factory: Option<&PaddingFactory>,
+        mut buffer: BytesMut,
+        force_deadline: bool,
+    ) -> Result<()> {
         use crate::padding::CHECK_MARK;
         use bytes::BufMut;
 
-        if !self.send_padding {
-            // No padding, write directly
-            tracing::trace!(
-                "[Session] write_with_padding: Writing {} bytes without padding",
-                buffer.len()
-            );
-            let mut writer = self.writer.lock().await;
-            if let Err(e) = writer.write_all(&buffer).await {
-                return Err(AnyTlsError::Io(e));
-            }
-            if let Err(e) = writer.flush().await {
-                return Err(AnyTlsError::Io(e));
-            }
-            tracing::trace!(
-                "[Session] write_with_padding: Successfully wrote {} bytes to connection",
-                buffer.len()
-            );
-            return Ok(());
-        }
+        let Some(padding_factory) = padding_factory.filter(|_| self.send_padding) else {
+            self.write_all_progress(writer, &buffer, force_deadline)
+                .await?;
+            return self.drive_io(writer.flush(), force_deadline).await;
+        };
 
         // Increment packet counter. The authentication packet already
         // consumed scheme index 0 (`send_authentication` calls
@@ -1083,134 +1578,71 @@ impl Session {
             .pkt_counter
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
             + 1;
-        let padding_factory = {
-            let padding_guard = self.padding.read().await;
-            padding_guard.clone()
-        };
         let stop = padding_factory.stop();
 
         if pkt >= stop {
-            // Stop padding after stop packets
-            // Note: We should probably disable send_padding, but that requires mutable access
-            // For now, just write directly
-            let mut writer = self.writer.lock().await;
-            if let Err(e) = writer.write_all(&buffer).await {
-                return Err(AnyTlsError::Io(e));
-            }
-            if let Err(e) = writer.flush().await {
-                return Err(AnyTlsError::Io(e));
-            }
-            return Ok(());
+            self.write_all_progress(writer, &buffer, force_deadline)
+                .await?;
+            return self.drive_io(writer.flush(), force_deadline).await;
         }
 
-        // Get padding sizes for this packet
         let pkt_sizes = padding_factory.generate_record_payload_sizes(pkt);
-
-        // If no sizes defined, write directly
         if pkt_sizes.is_empty() {
-            let mut writer = self.writer.lock().await;
-            if let Err(e) = writer.write_all(&buffer).await {
-                return Err(AnyTlsError::Io(e));
-            }
-            if let Err(e) = writer.flush().await {
-                return Err(AnyTlsError::Io(e));
-            }
-            return Ok(());
+            self.write_all_progress(writer, &buffer, force_deadline)
+                .await?;
+            return self.drive_io(writer.flush(), force_deadline).await;
         }
-
-        let mut writer = self.writer.lock().await;
 
         for size in pkt_sizes {
             let remain_payload_len = buffer.len();
 
             if size == CHECK_MARK {
-                // Check mark: if no remaining payload, return early
                 if remain_payload_len == 0 {
                     break;
                 }
-                // Otherwise continue to next size
                 continue;
             }
 
             let size = size as usize;
 
-            tracing::trace!(
-                "[Session] write_with_padding: Processing size={}, remain_payload_len={}",
-                size,
-                remain_payload_len
-            );
-
             if remain_payload_len > size {
-                // This packet is all payload - send exactly size bytes
-                // Note: This may split a frame in the middle, but that's okay for TLS records
-                // The receiver will reassemble frames from the stream
-                tracing::trace!(
-                    "[Session] write_with_padding: Splitting payload: sending {} bytes (remain={})",
-                    size,
-                    remain_payload_len
-                );
-                if size >= 7 {
-                    tracing::trace!(
-                        "[Session] write_with_padding: First 7 bytes being sent: {:?}",
-                        &buffer[..7]
-                    );
-                }
-                if let Err(e) = writer.write_all(&buffer[..size]).await {
-                    return Err(AnyTlsError::Io(e));
-                }
+                self.write_all_progress(writer, &buffer[..size], force_deadline)
+                    .await?;
                 buffer = buffer.split_off(size);
             } else if remain_payload_len > 0 {
-                // This packet contains payload + padding
                 let padding_len = size.saturating_sub(remain_payload_len + HEADER_OVERHEAD_SIZE);
 
                 if padding_len > 0 {
-                    // Create padding frame (cmdWaste)
                     let mut padding_frame =
                         BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + padding_len);
                     padding_frame.put_u8(Command::Waste as u8);
-                    padding_frame.put_u32(0); // stream_id = 0
+                    padding_frame.put_u32(0);
                     padding_frame.put_u16(padding_len as u16);
-                    padding_frame.put_slice(&vec![0u8; padding_len]); // padding data (zeros)
-
-                    // Combine payload and padding
+                    padding_frame.put_bytes(0, padding_len);
                     buffer.put_slice(&padding_frame);
                 }
 
-                if let Err(e) = writer.write_all(&buffer).await {
-                    return Err(AnyTlsError::Io(e));
-                }
+                self.write_all_progress(writer, &buffer, force_deadline)
+                    .await?;
                 buffer.clear();
             } else {
-                // This packet is all padding
                 let mut padding_frame = BytesMut::with_capacity(HEADER_OVERHEAD_SIZE + size);
                 padding_frame.put_u8(Command::Waste as u8);
-                padding_frame.put_u32(0); // stream_id = 0
+                padding_frame.put_u32(0);
                 padding_frame.put_u16(size as u16);
-                padding_frame.put_slice(&vec![0u8; size]); // padding data (zeros)
+                padding_frame.put_bytes(0, size);
 
-                if let Err(e) = writer.write_all(&padding_frame).await {
-                    return Err(AnyTlsError::Io(e));
-                }
+                self.write_all_progress(writer, &padding_frame, force_deadline)
+                    .await?;
             }
         }
 
-        // Write any remaining payload
         if !buffer.is_empty() {
-            tracing::trace!(
-                "[Session] write_with_padding: Writing {} remaining payload bytes",
-                buffer.len()
-            );
-            if let Err(e) = writer.write_all(&buffer).await {
-                return Err(AnyTlsError::Io(e));
-            }
+            self.write_all_progress(writer, &buffer, force_deadline)
+                .await?;
         }
 
-        tracing::trace!("[Session] write_with_padding: Flushing writer");
-        if let Err(e) = writer.flush().await {
-            return Err(AnyTlsError::Io(e));
-        }
-        tracing::trace!("[Session] write_with_padding: Successfully wrote and flushed data");
-        Ok(())
+        self.drive_io(writer.flush(), force_deadline).await
     }
 
     /// Start the client session (send settings and start recv loop)
@@ -1410,6 +1842,7 @@ impl Session {
                 result = self.write_batch(&mut requests, &mut frames, &mut encode_scratch) => result,
             };
             requests.clear();
+            frames.clear();
             if let Err(error) = &result {
                 tracing::debug!(session_id = self.id(), %error, "AnyTLS session writer failed");
             }
@@ -1436,33 +1869,24 @@ impl Session {
         frames: &mut Vec<WireFrame>,
         encode_scratch: &mut BytesMut,
     ) -> Result<()> {
-        // Phase 1 — classify. Each queued frame becomes a pre-encoded
-        // header + its owned `Bytes` payload; nothing is copied yet.
         frames.reserve(requests.len());
         let mut flush_waiters: Vec<oneshot::Sender<Result<()>>> = Vec::new();
-        let mut fin_streams: Vec<u32> = Vec::new();
         for request in requests.drain(..) {
             match request {
                 WriteRequest::Frame {
                     frame,
                     _permit,
+                    _control,
                     completion,
+                    owner,
+                    abandoned,
                 } => {
-                    let fin = frame.cmd == Command::Fin;
-                    if fin {
+                    if frame.cmd == Command::Fin {
                         // A cancelled initial dial must not leave its
                         // Settings/SYN/FIN buffered until another dial.
                         self.disable_buffering();
-                        fin_streams.push(frame.stream_id);
                     }
                     if frame.data.len() > u16::MAX as usize {
-                        // u16::MAX is the PROTOCOL hard limit — the wire
-                        // length field itself — not `writer::MAX_FRAME_PAYLOAD`,
-                        // the batching bound beneath it that admission
-                        // (`write_frame`/`enqueue_frame`) enforces; a bare
-                        // `enqueue` caller could still oversize — fail like
-                        // the codec's encode error did (the write, and so
-                        // the session, dies).
                         return Err(AnyTlsError::Io(std::io::Error::new(
                             std::io::ErrorKind::InvalidInput,
                             "AnyTLS frame payload exceeds u16 length",
@@ -1473,6 +1897,17 @@ impl Session {
                     header[1..5].copy_from_slice(&frame.stream_id.to_be_bytes());
                     header[5..7].copy_from_slice(&(frame.data.len() as u16).to_be_bytes());
                     if self.buffering.load(std::sync::atomic::Ordering::Relaxed) {
+                        if abandoned
+                            .as_ref()
+                            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
+                        {
+                            if let Some(completion) = completion {
+                                let _ = completion.send(Err(AnyTlsError::Protocol(
+                                    "control write deadline".into(),
+                                )));
+                            }
+                            continue;
+                        }
                         let mut buffer = self.buffer.lock().await;
                         buffer.extend_from_slice(&header);
                         buffer.extend_from_slice(&frame.data);
@@ -1482,10 +1917,15 @@ impl Session {
                         }
                     } else {
                         frames.push(WireFrame::Split {
+                            cmd: frame.cmd,
+                            stream_id: frame.stream_id,
                             header,
                             data: frame.data,
                             _permit,
+                            _control,
                             completion,
+                            owner,
+                            abandoned,
                         });
                     }
                 }
@@ -1494,9 +1934,6 @@ impl Session {
                     _permit,
                     completion,
                 } => {
-                    // Already `[header | payload]` contiguous — opaque
-                    // bytes to this layer. Buffering folds the image
-                    // verbatim, exactly like a split frame's image.
                     if self.buffering.load(std::sync::atomic::Ordering::Relaxed) {
                         self.buffer.lock().await.extend_from_slice(&wire);
                         if let Some(completion) = completion {
@@ -1511,74 +1948,165 @@ impl Session {
                     }
                 }
                 WriteRequest::Flush(completion) => {
-                    // Flush barriers resolve when the batch they rode in
-                    // on is written + flushed — everything queued before
-                    // the marker precedes it on the wire.
                     self.disable_buffering();
                     flush_waiters.push(completion);
                 }
             }
         }
 
-        // Phase 2 — the wire write. Padding (client sessions, first
-        // `stop` packets only) still needs a contiguous image; otherwise
-        // the batch goes out under a single lock + write + flush.
-        //
-        // While `buffering` still holds the buffer must NOT be drained:
-        // upstream `writeConn` appends to `s.buffer` until the client
-        // clears the flag, so the accumulated image — [Settings+SYN+addr]
-        // on a successful dial — reaches the wire as ONE atomic packet.
-        // Draining here mid-window is what scattered it across 1-3
-        // nondeterministic packet groupings. The FIFO Flush marker the
-        // client enqueues after the address (and the existing FIN marker
-        // for a cancelled dial) clears `buffering` inside this batch's
-        // classification pass, so the flag is false by the time we get
-        // here whenever the flush was owed.
         let buffered = if self.buffering.load(std::sync::atomic::Ordering::Relaxed) {
             Vec::new()
         } else {
             std::mem::take(&mut *self.buffer.lock().await)
         };
-        let padding_active = self.send_padding
-            && self.pkt_counter.load(std::sync::atomic::Ordering::Relaxed)
-                < self.padding.read().await.stop();
-        let result: Result<()> = if buffered.is_empty() && frames.is_empty() {
-            if flush_waiters.is_empty() {
-                Ok(())
-            } else {
-                // A lone Flush barrier still owes the transport a bare
-                // flush — the old `flush_inner` ran `writer.flush()`
-                // unconditionally (transports can buffer internally).
-                self.writer
-                    .lock()
-                    .await
-                    .flush()
-                    .await
-                    .map_err(AnyTlsError::Io)
-            }
-        } else if padding_active {
-            encode_scratch.clear();
-            encode_scratch
-                .reserve(buffered.len() + frames.iter().map(WireFrame::wire_len).sum::<usize>());
-            encode_scratch.extend_from_slice(&buffered);
-            for frame in frames.iter() {
-                frame.encode_into(encode_scratch);
-            }
-            self.write_with_padding(encode_scratch.split()).await
+        if buffered.is_empty() && frames.is_empty() && flush_waiters.is_empty() {
+            return Ok(());
+        }
+        let padding_factory = if self.send_padding {
+            let pf = self.padding.read().await.clone();
+            (self.pkt_counter.load(std::sync::atomic::Ordering::Relaxed) < pf.stop()).then_some(pf)
         } else {
-            self.write_wire(&buffered, frames, encode_scratch).await
+            None
+        };
+        let force_deadline = !buffered.is_empty();
+
+        // Acquire the physical writer lock BEFORE checking owner/abandon
+        // state so no frame can retire or recycle a SID between validation
+        // and the wire write (F05/F06).
+        let mut fin_streams: Vec<(u32, Option<std::sync::Weak<Stream>>)> = Vec::new();
+        let result: Result<()> = {
+            let mut writer = self.writer.lock().await;
+            let needs_commit_check = frames.iter().any(|f| {
+                matches!(
+                    f,
+                    WireFrame::Split {
+                        abandoned: Some(_),
+                        ..
+                    } | WireFrame::Split {
+                        owner: Some(_),
+                        cmd: Command::Fin | Command::SynAck,
+                        ..
+                    }
+                )
+            });
+            if needs_commit_check {
+                let streams = self.streams.read().await;
+                let mut kept = Vec::with_capacity(frames.len());
+                for frame in frames.drain(..) {
+                    match frame {
+                        WireFrame::Split {
+                            cmd,
+                            stream_id,
+                            header,
+                            data,
+                            _permit,
+                            _control,
+                            completion,
+                            owner,
+                            abandoned,
+                        } => {
+                            if abandoned
+                                .as_ref()
+                                .is_some_and(|f| f.load(std::sync::atomic::Ordering::Acquire))
+                            {
+                                if let Some(completion) = completion {
+                                    let _ = completion.send(Err(AnyTlsError::Protocol(
+                                        "control write deadline".into(),
+                                    )));
+                                }
+                                continue;
+                            }
+                            if let Some(owner_ref) = &owner
+                                && matches!(cmd, Command::Fin | Command::SynAck)
+                            {
+                                let live = matches!(
+                                    (owner_ref.upgrade(), streams.get(&stream_id)),
+                                    (Some(o), Some(current)) if Arc::ptr_eq(&o, current)
+                                );
+                                if !live {
+                                    if let Some(completion) = completion {
+                                        let _ = completion.send(Err(AnyTlsError::StreamClosed));
+                                    }
+                                    continue;
+                                }
+                            }
+                            kept.push(WireFrame::Split {
+                                cmd,
+                                stream_id,
+                                header,
+                                data,
+                                _permit,
+                                _control,
+                                completion,
+                                owner,
+                                abandoned,
+                            });
+                        }
+                        other => kept.push(other),
+                    }
+                }
+                drop(streams);
+                *frames = kept;
+            }
+            for frame in frames.iter() {
+                if let WireFrame::Split {
+                    cmd: Command::Fin,
+                    stream_id,
+                    owner,
+                    ..
+                } = frame
+                {
+                    fin_streams.push((*stream_id, owner.clone()));
+                }
+            }
+
+            if buffered.is_empty() && frames.is_empty() {
+                if flush_waiters.is_empty() {
+                    Ok(())
+                } else {
+                    self.drive_io(writer.flush(), force_deadline).await
+                }
+            } else if padding_factory.is_some() {
+                encode_scratch.clear();
+                encode_scratch.reserve(
+                    buffered.len() + frames.iter().map(WireFrame::wire_len).sum::<usize>(),
+                );
+                encode_scratch.extend_from_slice(&buffered);
+                for frame in frames.iter() {
+                    frame.encode_into(encode_scratch);
+                }
+                self.write_with_padding_locked(
+                    &mut **writer,
+                    padding_factory.as_deref(),
+                    encode_scratch.split(),
+                    force_deadline,
+                )
+                .await
+            } else {
+                self.write_wire_locked(
+                    &mut **writer,
+                    &buffered,
+                    frames,
+                    encode_scratch,
+                    force_deadline,
+                )
+                .await
+            }
         };
 
-        // FIN eviction runs AFTER the write — the same point in the
-        // sequence the per-request loop used, and on any write outcome.
-        // Acquiring both locks once for the whole batch keeps removal +
-        // close + wakeup an uninterruptible step per stream (issue #621):
-        // `open_stream` is pub, so an out-of-tree caller can hold a live
-        // synack-waiter across a local close.
         if !fin_streams.is_empty() {
             let mut streams = self.streams.write().await;
             let mut receive_map = self.stream_receive_tx.write().await;
-            for stream_id in fin_streams {
+            for (stream_id, owner) in fin_streams {
+                if let Some(owner) = &owner {
+                    let live = matches!(
+                        (owner.upgrade(), streams.get(&stream_id)),
+                        (Some(o), Some(current)) if Arc::ptr_eq(&o, current)
+                    );
+                    if !live {
+                        continue;
+                    }
+                }
                 if let Some(stream) = streams.remove(&stream_id) {
                     receive_map.remove(&stream_id);
                     stream.close_with_error(AnyTlsError::StreamClosed);
@@ -1587,9 +2115,6 @@ impl Session {
             }
         }
 
-        // Every waiter of the drain resolves with the batch's outcome.
-        // Permits drop with `frames` — after the physical write, matching
-        // the old "hold capacity through write/flush" rule.
         for mut frame in frames.drain(..) {
             if let Some(completion) = frame.completion().take() {
                 let _ = completion.send(clone_result(&result));
@@ -1601,22 +2126,16 @@ impl Session {
         result
     }
 
-    /// Unpadded batch write under one writer lock + one flush.
-    ///
-    /// Vectored-capable transports take `[buffered][header, payload]*`
-    /// straight from the frames' `Bytes` — zero copies. The rest get one
-    /// contiguous image assembled in the reused scratch: `SslStream` (and
-    /// any `write_vectored`-less writer) seals each `write` call into its
-    /// own record, so feeding it per-frame iovecs would split every
-    /// 7-byte header into its own TLS record.
-    async fn write_wire(
+    /// Unpadded batch write under an already-held writer lock + one flush.
+    async fn write_wire_locked(
         &self,
+        writer: &mut (dyn AsyncWrite + Send + Unpin),
         buffered: &[u8],
         frames: &[WireFrame],
         encode_scratch: &mut BytesMut,
+        force_deadline: bool,
     ) -> Result<()> {
         use std::io::IoSlice;
-        let mut writer = self.writer.lock().await;
         if writer.is_write_vectored() {
             let mut slices: Vec<IoSlice<'_>> = Vec::with_capacity(1 + frames.len() * 2);
             if !buffered.is_empty() {
@@ -1624,9 +2143,6 @@ impl Session {
             }
             for frame in frames {
                 match frame {
-                    // One iovec per contiguous frame — the headroom
-                    // path's whole point: header and payload share one
-                    // `Bytes`, so a vectored write needs no assembly.
                     WireFrame::Wire { wire, .. } => slices.push(IoSlice::new(wire)),
                     WireFrame::Split { header, data, .. } => {
                         slices.push(IoSlice::new(header));
@@ -1638,16 +2154,16 @@ impl Session {
             }
             let mut pending = slices.as_mut_slice();
             while !pending.is_empty() {
-                match writer.write_vectored(pending).await {
-                    Ok(0) => {
-                        return Err(AnyTlsError::Io(std::io::Error::new(
-                            std::io::ErrorKind::WriteZero,
-                            "anytls session writer accepted zero bytes",
-                        )));
-                    }
-                    Ok(n) => IoSlice::advance_slices(&mut pending, n),
-                    Err(e) => return Err(AnyTlsError::Io(e)),
+                let n = self
+                    .drive_io(writer.write_vectored(pending), force_deadline)
+                    .await?;
+                if n == 0 {
+                    return Err(AnyTlsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "anytls session writer accepted zero bytes",
+                    )));
                 }
+                IoSlice::advance_slices(&mut pending, n);
             }
         } else {
             encode_scratch.clear();
@@ -1657,12 +2173,10 @@ impl Session {
             for frame in frames {
                 frame.encode_into(encode_scratch);
             }
-            writer
-                .write_all(&encode_scratch[..])
-                .await
-                .map_err(AnyTlsError::Io)?;
+            self.write_all_progress(writer, &encode_scratch[..], force_deadline)
+                .await?;
         }
-        writer.flush().await.map_err(AnyTlsError::Io)
+        self.drive_io(writer.flush(), force_deadline).await
     }
 
     /// Get session sequence number
@@ -1688,6 +2202,98 @@ impl Session {
     pub fn peer_version(&self) -> u8 {
         self.peer_version.load(std::sync::atomic::Ordering::Relaxed)
     }
+
+    /// Split an already-authenticated transport into a server `Session`
+    /// plus the stream-accept channel the dispatcher drains. TLS-free:
+    /// the caller owns the outer handshake, the user-table auth preface,
+    /// and the combined deadline. `run_server` still has to be spawned —
+    /// nothing moves frames until then.
+    /// Streams a SYN may park in the accept queue before the dispatcher
+    /// drains them. Beyond it, admission is refused (FIN) rather than
+    /// growing memory or wedging recv_loop.
+    pub const STREAM_ACCEPT_QUEUE: usize = MAX_STREAMS_PER_SESSION;
+
+    pub fn new_inbound<S>(
+        io: S,
+        padding: Arc<PaddingFactory>,
+    ) -> (Arc<Self>, mpsc::Receiver<Arc<Stream>>)
+    where
+        S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+    {
+        let (reader, writer) = tokio::io::split(io);
+        let mut session = Self::new_server(reader, writer, padding);
+        let (tx, rx) = mpsc::channel(Self::STREAM_ACCEPT_QUEUE);
+        session.set_stream_callback(tx);
+        (Arc::new(session), rx)
+    }
+
+    /// Drive the session's read loop and its single writer task until
+    /// the session dies — peer EOF, io error, or a protocol violation
+    /// that `handle_frame` already closed it for. The caller still owns
+    /// stream dispatch; this is the keepalive.
+    ///
+    /// Both halves are polled IN THIS TASK rather than spawned:
+    /// aborting `run_server` drops them with it, and once either half
+    /// finishes the survivor is polled concurrently with `close()` so a
+    /// half holding `writer` or `close_lock` can release it instead of
+    /// deadlocking teardown (NEW-01 / F07).
+    pub async fn run_server(self: &Arc<Self>) {
+        let recv = self.recv_loop();
+        let writer = self.process_stream_data();
+        tokio::pin!(recv);
+        tokio::pin!(writer);
+        let recv_ended = tokio::select! {
+            _ = &mut recv => true,
+            _ = &mut writer => false,
+        };
+        self.initiate_close();
+        if recv_ended {
+            let _ = tokio::join!(writer, self.close());
+        } else {
+            let _ = tokio::join!(recv, self.close());
+        }
+    }
+
+    /// The stream-accept ACK the spec schedules: exactly one empty
+    /// SynAck for a v2+ peer, none for v1. The production listener calls
+    /// this after a TCP destination parses and validates, and right
+    /// after the UoT marker is recognized — before any dial — so a
+    /// blocked rule lookup cannot reorder it behind stream data.
+    ///
+    /// Awaiting the queue completion is deliberate: the caller that
+    /// then hands the stream to routing can test "ACK precedes first
+    /// data" deterministically.
+    ///
+    /// Takes the stream INSTANCE, not a bare sid: if a FIN already
+    /// retired it and the SID has since been recycled, the ACK must
+    /// not bless a different stream living under the same id (F05).
+    pub async fn handshake_success(&self, stream: &Arc<Stream>) -> Result<()> {
+        {
+            let streams = self.streams.read().await;
+            match streams.get(&stream.id()) {
+                Some(current) if Arc::ptr_eq(current, stream) => {}
+                _ => {
+                    return Err(AnyTlsError::Protocol(format!(
+                        "stream {} already retired before SynAck",
+                        stream.id()
+                    )));
+                }
+            }
+        }
+        if self.peer_version() >= 2 {
+            // Owner-gated admission: the pre-check above proves the
+            // instance is registered NOW, but the write commits later —
+            // the writer rechecks at commit so a retirement landing in
+            // the gap strands this SynAck instead of blessing a
+            // recycled sid (F05).
+            self.write_control_frame_owned(
+                Frame::control(Command::SynAck, stream.id()),
+                Some(Arc::downgrade(stream)),
+            )
+            .await?;
+        }
+        Ok(())
+    }
 }
 
 /// A queued frame mid-drain. The budget permit rides inside so it is
@@ -1696,10 +2302,15 @@ enum WireFrame {
     /// Pre-encoded wire header + the owned `Bytes` payload (which moves
     /// to the wire unmodified — no copy).
     Split {
+        cmd: Command,
+        stream_id: u32,
         header: [u8; HEADER_OVERHEAD_SIZE],
         data: Bytes,
         _permit: Option<OwnedSemaphorePermit>,
+        _control: Option<ControlTicket>,
         completion: Option<oneshot::Sender<Result<()>>>,
+        owner: Option<std::sync::Weak<Stream>>,
+        abandoned: Option<Arc<std::sync::atomic::AtomicBool>>,
     },
     /// `[header | payload]` already contiguous in one `Bytes` — the
     /// headroom path from `Stream::poll_write_bytes_data`. The wire
@@ -3105,5 +3716,479 @@ mod padding_bounds_tests {
         time::advance(SYN_WATCHDOG_TIMEOUT * 2).await;
         tokio::task::yield_now().await;
         assert!(!session.is_closed());
+    }
+}
+
+/// Server-side wire contract tests: the frames a real client sends over
+/// `new_inbound`'s transport and the exact frames it must see back —
+/// W1 (v1 silence) / W2 (v2 ordering) / W3 (violation + budget paths).
+#[cfg(test)]
+mod server_protocol_tests {
+    use super::*;
+    use crate::StreamIo;
+    use crate::padding::PaddingFactory;
+    use crate::session::writer::MAX_FRAME_PAYLOAD;
+    use crate::util::StringMap;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex};
+    use tokio::time;
+
+    fn test_padding() -> Arc<PaddingFactory> {
+        Arc::new(PaddingFactory::new(crate::padding::DEFAULT_PADDING_SCHEME.as_bytes()).unwrap())
+    }
+
+    fn spawn_server(
+        io: DuplexStream,
+    ) -> (
+        Arc<Session>,
+        mpsc::Receiver<Arc<Stream>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (session, rx) = Session::new_inbound(io, test_padding());
+        let worker = Arc::clone(&session);
+        let task = tokio::spawn(async move { worker.run_server().await });
+        (session, rx, task)
+    }
+
+    fn settings_frame(pairs: &[(&str, &str)]) -> Frame {
+        let mut map = StringMap::new();
+        for (k, v) in pairs {
+            map.insert(*k, *v);
+        }
+        Frame::with_data(Command::Settings, 0, Bytes::from(map.to_bytes()))
+    }
+
+    async fn write_frame(peer: &mut DuplexStream, frame: &Frame) {
+        peer.write_u8(u8::from(frame.cmd)).await.unwrap();
+        peer.write_u32(frame.stream_id).await.unwrap();
+        peer.write_u16(frame.data.len() as u16).await.unwrap();
+        peer.write_all(&frame.data).await.unwrap();
+    }
+
+    async fn read_frame(peer: &mut DuplexStream) -> Frame {
+        time::timeout(Duration::from_secs(2), async {
+            let mut header = [0; 7];
+            peer.read_exact(&mut header).await.unwrap();
+            let mut data = vec![0; u16::from_be_bytes([header[5], header[6]]) as usize];
+            peer.read_exact(&mut data).await.unwrap();
+            Frame::with_data(
+                Command::from(header[0]),
+                u32::from_be_bytes(header[1..5].try_into().unwrap()),
+                Bytes::from(data),
+            )
+        })
+        .await
+        .expect("frame writer stalled")
+    }
+
+    #[tokio::test]
+    async fn v2_settings_then_synack_in_wire_order() {
+        let (io, mut peer) = duplex(1 << 16);
+        let (session, mut accept, task) = spawn_server(io);
+
+        // v2 client that does not echo the server's padding md5: the
+        // scheme push must precede the version handshake, exactly the
+        // upstream ordering.
+        write_frame(
+            &mut peer,
+            &settings_frame(&[("v", "2"), ("client", "meow-test")]),
+        )
+        .await;
+        let update = read_frame(&mut peer).await;
+        assert_eq!(update.cmd, Command::UpdatePaddingScheme);
+        assert!(!update.data.is_empty());
+        let server_settings = read_frame(&mut peer).await;
+        assert_eq!(server_settings.cmd, Command::ServerSettings);
+        let map = StringMap::from_bytes(&server_settings.data);
+        assert_eq!(map.get("v").map(String::as_str), Some("2"));
+
+        write_frame(&mut peer, &Frame::control(Command::Syn, 1)).await;
+        let stream = time::timeout(Duration::from_secs(2), accept.recv())
+            .await
+            .expect("stream accept stalled")
+            .expect("accept channel closed");
+        assert_eq!(stream.id(), 1);
+        session.handshake_success(&stream).await.unwrap();
+        let synack = read_frame(&mut peer).await;
+        assert_eq!(synack, Frame::control(Command::SynAck, 1));
+
+        // `run_server` ends when the transport EOFs or the session dies —
+        // close the client half to let the task drain deterministically.
+        drop(peer);
+        session.close().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v1_peer_gets_no_server_settings_or_synack() {
+        let (io, mut peer) = duplex(1 << 16);
+        let padding = test_padding();
+        let (session, mut accept, task) = spawn_server(io);
+
+        // v1 client echoing the scheme md5 — no UpdatePaddingScheme,
+        // no ServerSettings, no SynAck ever reach the wire.
+        write_frame(
+            &mut peer,
+            &settings_frame(&[("v", "1"), ("padding-md5", padding.md5())]),
+        )
+        .await;
+        write_frame(&mut peer, &Frame::control(Command::Syn, 1)).await;
+        let stream = time::timeout(Duration::from_secs(2), accept.recv())
+            .await
+            .expect("stream accept stalled")
+            .expect("accept channel closed");
+        assert_eq!(stream.id(), 1);
+        session.handshake_success(&stream).await.unwrap();
+
+        // The next server→client frame must be the heartbeat answer —
+        // proving nothing (settings/SynAck) was emitted ahead of it.
+        write_frame(&mut peer, &Frame::control(Command::HeartRequest, 0)).await;
+        let response = read_frame(&mut peer).await;
+        assert_eq!(response.cmd, Command::HeartResponse);
+
+        drop(peer);
+        session.close().await.unwrap();
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn syn_before_settings_alerts_and_closes() {
+        let (io, mut peer) = duplex(1 << 16);
+        let (session, _accept, task) = spawn_server(io);
+
+        write_frame(&mut peer, &Frame::control(Command::Syn, 1)).await;
+        let alert = read_frame(&mut peer).await;
+        assert_eq!(alert.cmd, Command::Alert);
+        // Upstream `die` text verbatim — the peer surfaces it.
+        assert_eq!(
+            String::from_utf8_lossy(&alert.data),
+            "client did not send its settings"
+        );
+
+        for _ in 0..50 {
+            if session.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(session.is_closed());
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn duplicate_stream_id_is_ignored() {
+        let (io, mut peer) = duplex(1 << 16);
+        let padding = test_padding();
+        let (session, mut accept, task) = spawn_server(io);
+
+        write_frame(
+            &mut peer,
+            &settings_frame(&[("v", "1"), ("padding-md5", padding.md5())]),
+        )
+        .await;
+        write_frame(&mut peer, &Frame::control(Command::Syn, 9)).await;
+        let stream = time::timeout(Duration::from_secs(2), accept.recv())
+            .await
+            .expect("stream accept stalled")
+            .expect("accept channel closed");
+        assert_eq!(stream.id(), 9);
+
+        // Upstream `LoadOrStore` parity: the second SYN on the live SID
+        // is ignored — NO Alert, no session death, no second stream.
+        write_frame(&mut peer, &Frame::control(Command::Syn, 9)).await;
+        write_frame(&mut peer, &Frame::control(Command::HeartRequest, 0)).await;
+        let response = read_frame(&mut peer).await;
+        assert_eq!(
+            response.cmd,
+            Command::HeartResponse,
+            "the first post-dup frame must be the heartbeat answer — the dup SYN emitted nothing"
+        );
+        assert!(matches!(
+            time::timeout(Duration::from_millis(500), accept.recv()).await,
+            Err(_) | Ok(None)
+        ));
+        assert!(!session.is_closed());
+
+        drop(peer);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn empty_psh_is_dropped_not_eof() {
+        let (io, mut peer) = duplex(1 << 16);
+        let padding = test_padding();
+        let (_session, mut accept, task) = spawn_server(io);
+
+        write_frame(
+            &mut peer,
+            &settings_frame(&[("v", "1"), ("padding-md5", padding.md5())]),
+        )
+        .await;
+        write_frame(&mut peer, &Frame::control(Command::Syn, 3)).await;
+        let stream = time::timeout(Duration::from_secs(2), accept.recv())
+            .await
+            .expect("stream accept stalled")
+            .expect("accept channel closed");
+
+        // Zero-length PSH: carries no data — must NOT queue (a 0-byte
+        // channel entry reads as a spurious EOF downstream, F02).
+        write_frame(&mut peer, &Frame::control(Command::Push, 3)).await;
+        // Real data after it must arrive intact and ordered.
+        write_frame(
+            &mut peer,
+            &Frame::with_data(Command::Push, 3, Bytes::from_static(b"hello")),
+        )
+        .await;
+
+        use tokio::io::AsyncReadExt as _;
+        let mut io_stream = StreamIo(stream);
+        let mut buf = [0u8; 5];
+        time::timeout(Duration::from_secs(2), io_stream.read_exact(&mut buf))
+            .await
+            .expect("read stalled")
+            .expect("read failed");
+        assert_eq!(&buf, b"hello");
+        // And the stream must not be EOF'd by the empty frame: a further
+        // read pends rather than returning Ok(0).
+        let mut one = [0u8; 1];
+        assert!(
+            time::timeout(Duration::from_millis(200), io_stream.read(&mut one))
+                .await
+                .is_err(),
+            "empty PSH must not surface a 0-byte (EOF) read"
+        );
+
+        drop(peer);
+        task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn v2_stream_limit_refuses_with_fin() {
+        let (io, mut peer) = duplex(1 << 16);
+        let padding = test_padding();
+        let (session, mut accept, _task) = spawn_server(io);
+
+        write_frame(
+            &mut peer,
+            &settings_frame(&[("v", "2"), ("padding-md5", padding.md5())]),
+        )
+        .await;
+        let server_settings = read_frame(&mut peer).await;
+        assert_eq!(server_settings.cmd, Command::ServerSettings);
+
+        for sid in 1..=MAX_STREAMS_PER_SESSION as u32 {
+            write_frame(&mut peer, &Frame::control(Command::Syn, sid)).await;
+            let stream = time::timeout(Duration::from_secs(2), accept.recv())
+                .await
+                .expect("stream accept stalled")
+                .expect("accept channel closed");
+            assert_eq!(stream.id(), sid);
+        }
+
+        let overflow = MAX_STREAMS_PER_SESSION as u32 + 1;
+        write_frame(&mut peer, &Frame::control(Command::Syn, overflow)).await;
+        let refusal = read_frame(&mut peer).await;
+        // Upstream refusal closes ONLY the stream: a bare FIN, and no
+        // SynAck — a v2 client must not read an accept for a refused SID.
+        assert_eq!(refusal.cmd, Command::Fin);
+        assert_eq!(refusal.stream_id, overflow);
+        assert!(refusal.data.is_empty());
+        assert!(
+            time::timeout(Duration::from_millis(500), accept.recv())
+                .await
+                .is_err(),
+            "refused stream must not reach the accept channel"
+        );
+        assert!(!session.is_closed());
+    }
+
+    #[tokio::test]
+    async fn per_stream_pending_overflow_evicts_only_that_stream() {
+        let (io, mut peer) = duplex(1 << 16);
+        let padding = test_padding();
+        let (session, mut accept, _task) = spawn_server(io);
+
+        write_frame(
+            &mut peer,
+            &settings_frame(&[("v", "1"), ("padding-md5", padding.md5())]),
+        )
+        .await;
+        for sid in [1u32, 2] {
+            write_frame(&mut peer, &Frame::control(Command::Syn, sid)).await;
+            accept.recv().await.unwrap();
+        }
+
+        // Nobody drains stream 1: flood it past the 256 KiB per-stream
+        // pending bound. MAX_FRAME_PAYLOAD-sized PSH frames reach it in
+        // five sends.
+        let chunk = vec![0xAA; MAX_FRAME_PAYLOAD];
+        let mut sent = 0usize;
+        while sent <= MAX_STREAM_PENDING {
+            write_frame(&mut peer, &Frame::data(1, Bytes::copy_from_slice(&chunk))).await;
+            sent += chunk.len();
+        }
+
+        // Stream 1 is evicted; the session and stream 2 stay healthy —
+        // prove it by pushing one PSH to stream 2 and reading it back
+        // through the stream API.
+        write_frame(&mut peer, &Frame::data(2, Bytes::from_static(b"ok"))).await;
+        // The eviction is synchronous inside the read loop that just
+        // consumed the flood, so by the time a new frame lands the map
+        // already reflects it.
+        for _ in 0..50 {
+            if !session.has_active_streams().await || session.is_closed() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(!session.is_closed());
+        assert!(session.has_active_streams().await, "stream 2 must survive");
+    }
+
+    #[tokio::test]
+    async fn teardown_completes_when_recv_fails_while_writer_holds_lock() {
+        // Small duplex so one data frame stalls `writer` inside `write_batch`
+        // while holding `self.writer`. A protocol error on `recv_loop` then
+        // ends `recv` first; `run_server` must wake and join `writer` rather
+        // than deadlocking on `self.writer` inside `close()` (NEW-01).
+        let (io, mut peer) = duplex(64);
+        let padding = test_padding();
+        let (session, mut accept, task) = spawn_server(io);
+
+        write_frame(
+            &mut peer,
+            &settings_frame(&[("v", "1"), ("padding-md5", padding.md5())]),
+        )
+        .await;
+        write_frame(&mut peer, &Frame::control(Command::Syn, 1)).await;
+        let stream = accept.recv().await.unwrap();
+        stream
+            .send_data(Bytes::from(vec![0xAB; 4096]))
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Malformed SYN with payload makes `recv_loop` return `Err` directly.
+        write_frame(
+            &mut peer,
+            &Frame::with_data(Command::Syn, 2, Bytes::from_static(b"bad")),
+        )
+        .await;
+
+        time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("run_server deadlocked on writer lock")
+            .unwrap();
+        assert!(
+            session
+                .teardown_done
+                .load(std::sync::atomic::Ordering::Acquire)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn data_only_backpressure_survives_control_deadline() {
+        let (io, mut peer) = duplex(64);
+        let padding = test_padding();
+        let (session, mut accept, task) = spawn_server(io);
+
+        write_frame(
+            &mut peer,
+            &settings_frame(&[("v", "1"), ("padding-md5", padding.md5())]),
+        )
+        .await;
+        write_frame(&mut peer, &Frame::control(Command::Syn, 1)).await;
+        let stream = accept.recv().await.unwrap();
+        stream
+            .send_data(Bytes::from(vec![0xCD; 1024]))
+            .await
+            .unwrap();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Peer pauses reading past CONTROL_WRITE_TIMEOUT; pure PSH backpressure
+        // must not kill the session (NEW-02).
+        time::advance(CONTROL_WRITE_TIMEOUT * 2).await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        assert!(!session.is_closed());
+
+        let got = read_frame(&mut peer).await;
+        assert_eq!(got.cmd, Command::Push);
+        assert_eq!(got.data.len(), 1024);
+
+        drop(peer);
+        task.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn commit_gate_strands_stale_frames_when_sid_recycles_under_backpressure() {
+        // Fill the server->client pipe so `writer` holds `self.writer` on a
+        // PSH batch. Queue a SynAck and an overflow FIN for generation 1 of
+        // SID 7, let the overflow FIN time out (F06), retire generation 1 via
+        // peer FIN and open generation 2 on the SAME SID 7 (F05), then drain
+        // the pipe: neither the stale SynAck nor the abandoned FIN may reach
+        // the peer or evict generation 2.
+        let (io, mut peer) = duplex(128);
+        let padding = test_padding();
+        let (session, mut accept, task) = spawn_server(io);
+
+        write_frame(
+            &mut peer,
+            &settings_frame(&[("v", "2"), ("padding-md5", padding.md5())]),
+        )
+        .await;
+        let _ = read_frame(&mut peer).await; // ServerSettings
+
+        // Stream 1 clogs the server->client pipe with pure PSH data.
+        write_frame(&mut peer, &Frame::control(Command::Syn, 1)).await;
+        let s1 = accept.recv().await.unwrap();
+        s1.send_data(Bytes::from(vec![0x11; 4096])).await.unwrap();
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Open SID 7 (gen 1) and queue its SynAck behind the stalled PSH.
+        write_frame(&mut peer, &Frame::control(Command::Syn, 7)).await;
+        let s7_gen1 = accept.recv().await.unwrap();
+        let ack_session = Arc::clone(&session);
+        let s7_for_ack = Arc::clone(&s7_gen1);
+        let ack_handle =
+            tokio::spawn(async move { ack_session.handshake_success(&s7_for_ack).await });
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+
+        // Peer retires SID 7 (gen 1) and immediately reopens SID 7 (gen 2)
+        // BEFORE the server pipe drains.
+        write_frame(&mut peer, &Frame::control(Command::Fin, 7)).await;
+        write_frame(&mut peer, &Frame::control(Command::Syn, 7)).await;
+        let s7_gen2 = accept.recv().await.unwrap();
+        assert!(!Arc::ptr_eq(&s7_gen1, &s7_gen2));
+
+        // Drain the stalled PSH on stream 1, then send a heartbeat to flush
+        // any frame the writer committed behind it.
+        let clogged = read_frame(&mut peer).await;
+        assert_eq!((clogged.cmd, clogged.stream_id), (Command::Push, 1));
+        assert!(ack_handle.await.unwrap().is_err());
+
+        write_frame(&mut peer, &Frame::control(Command::HeartRequest, 0)).await;
+        let next = read_frame(&mut peer).await;
+        assert_eq!(
+            next.cmd,
+            Command::HeartResponse,
+            "stale gen-1 SynAck must not reach the wire for gen-2 SID 7"
+        );
+
+        // Gen 2 is still registered and can now legitimately ACK and carry data.
+        session.handshake_success(&s7_gen2).await.unwrap();
+        let gen2_ack = read_frame(&mut peer).await;
+        assert_eq!(gen2_ack, Frame::control(Command::SynAck, 7));
+
+        drop(peer);
+        task.await.unwrap();
     }
 }

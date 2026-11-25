@@ -4,6 +4,6 @@ pub mod stream;
 pub mod stream_reader;
 pub mod writer;
 
-pub use session::{Session, SessionHeartbeatConfig};
-pub use stream::Stream;
+pub use session::{PendingBytes, Session, SessionHeartbeatConfig};
+pub use stream::{Stream, StreamIo};
 pub use stream_reader::StreamReader;

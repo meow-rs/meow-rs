@@ -50,13 +50,19 @@ impl StringMap {
     }
 
     /// Parse from bytes in format: "key=value\nkey2=value2\n..."
+    ///
+    /// Upstream `StringMapFromBytes` parity: split each line on the
+    /// FIRST `=` and take both halves verbatim — no trimming. A peer's
+    /// `padding-md5` fingerprint or `v` version must compare exactly as
+    /// it arrived; surrounding whitespace is part of the value and
+    /// simply fails the downstream parse, matching upstream.
     pub fn from_bytes(data: &[u8]) -> Self {
         let mut map = HashMap::new();
         let text = String::from_utf8_lossy(data);
 
         for line in text.lines() {
             if let Some((key, value)) = line.split_once('=') {
-                map.insert(key.trim().to_string(), value.trim().to_string());
+                map.insert(key.to_string(), value.to_string());
             }
         }
 

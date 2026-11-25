@@ -99,6 +99,9 @@ pub enum ConnType {
     /// spelling readable on deserialize.
     #[serde(rename = "wireguard", alias = "WireGuard")]
     WireGuard,
+    /// AnyTLS inbound listener (`type: anytls`): a per-SYN logical flow
+    /// demuxed out of an authenticated AnyTLS session.
+    Anytls,
 }
 
 impl fmt::Display for ConnType {
@@ -120,6 +123,7 @@ impl fmt::Display for ConnType {
             ConnType::Hysteria2 => write!(f, "Hysteria2"),
             ConnType::Inner => write!(f, "Inner"),
             ConnType::WireGuard => write!(f, "WireGuard"),
+            ConnType::Anytls => write!(f, "AnyTLS"),
         }
     }
 }

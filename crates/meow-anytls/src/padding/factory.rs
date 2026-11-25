@@ -50,15 +50,13 @@ static DEFAULT_FACTORY: std::sync::OnceLock<Arc<PaddingFactory>> = std::sync::On
 pub type SharedPaddingFactory = Arc<RwLock<Arc<PaddingFactory>>>;
 
 impl PaddingFactory {
-    /// Create a new PaddingFactory from raw scheme bytes
+    /// Create a new PaddingFactory from raw scheme bytes. The validity
+    /// contract is `meow_common::anytls_padding::validate_scheme` — the
+    /// same no-IO check `meow-config` runs on `padding-scheme:` — so the
+    /// parse below cannot fail once it passes.
     pub fn new(raw_scheme: &[u8]) -> Result<Self, String> {
+        let stop = meow_common::anytls_padding::parse_and_validate_scheme(raw_scheme)?;
         let scheme = StringMap::from_bytes(raw_scheme);
-
-        let stop = scheme
-            .get("stop")
-            .ok_or_else(|| "missing 'stop' in padding scheme".to_string())?
-            .parse::<u32>()
-            .map_err(|_| "invalid 'stop' value".to_string())?;
 
         let mut sizes = HashMap::new();
         for (key, spec) in scheme.iter() {
@@ -229,6 +227,27 @@ mod tests {
         let sizes = ["65535-65535"; 17].join(",");
         let scheme = format!("stop=2\n1={sizes}");
         assert!(PaddingFactory::new(scheme.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn stop_tolerates_surrounding_whitespace() {
+        // Outbound-compat regression (N06): node configs accepted before
+        // the parser unify — `stop` padded by spaces in either half.
+        for scheme in [
+            "stop=8 \n0=30-30",
+            " stop=8\n0=30-30",
+            "stop = 8\n0=30-30",
+            "stop=\t8\n0=30-30",
+        ] {
+            let f = PaddingFactory::new(scheme.as_bytes())
+                .unwrap_or_else(|e| panic!("{scheme:?} rejected: {e}"));
+            assert_eq!(f.stop(), 8, "{scheme:?}");
+        }
+        assert!(PaddingFactory::new(b"stop=\n0=30-30").is_err());
+        assert!(PaddingFactory::new(b"stop= 8 x\n0=30-30").is_err());
+        assert!(PaddingFactory::new(b"stop=8\n stop=bad\n0=30-30").is_err());
+        let dup = PaddingFactory::new(b"stop=8\n stop = 12 \n0=30-30").unwrap();
+        assert_eq!(dup.stop(), 12);
     }
 
     #[test]

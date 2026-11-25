@@ -26,7 +26,7 @@ meow-rs is the engine of the meow apps:
 - **HTTP** -- HTTP CONNECT outbound proxy with optional TLS and basic auth
 - **SOCKS5** -- SOCKS5 outbound proxy with optional TLS and auth
 - **Snell** -- v3/v4/v5/v6 TCP, UDP-over-TCP, optional HTTP/TLS obfs (v3–v5); v4–v6 connection reuse; v6 `default` / `unshaped` / `unsafe-raw` modes
-- **AnyTLS** -- AnyTLS outbound (`anytls` feature; in the `full` bundle, so the release binaries include it)
+- **AnyTLS** -- AnyTLS outbound plus `listeners: type: anytls` server inbound (v1/v2 sessions, multi-user, multi-address bind, UDP-over-TCP v2; `anytls`/`listener-anytls` features, both in the `full` bundle, so the release binaries include them)
 - **Direct** -- Direct connection to destination
 - **Reject** -- Drop connections (with configurable behavior)
 
@@ -135,6 +135,7 @@ Logic composition rules (AND, OR, NOT) are also supported for combining conditio
 - **HTTP Proxy** -- HTTP CONNECT and plain HTTP forwarding
 - **SOCKS5** -- SOCKS5 with optional authentication
 - **Transparent Proxy (TProxy)** -- Kernel-level traffic interception via nftables (Linux) or pf (macOS)
+- **AnyTLS** -- mihomo-compatible `type: anytls` server inbound (TLS via BoringSSL or explicit `allow-insecure` plaintext opt-in, multi-user `users:`, comma-separated multi-address `listen`, UDP-over-TCP v2 through the rules engine). See [docs/specs/listener-anytls.md](docs/specs/listener-anytls.md)
 - **TUN / Wintun** -- L3 inbound (`tun:`). On Windows this is a [Wintun](https://www.wintun.net/) adapter and is the transparent-proxy path; official Windows zips ship `wintun.dll` beside `meow.exe`, and the binary also embeds a copy to extract if the sidecar is missing
 
 ### Transparent Proxy
@@ -242,7 +243,7 @@ The [#746 throughput follow-up](docs/benchmarks/tcp-throughput-746.md) fixes tra
 
 ```mermaid
 flowchart TD
-    inbound["Inbound listeners<br/>Mixed / HTTP / SOCKS5 / TProxy"] --> tunnel["Tunnel<br/>routing, relay, connection stats"]
+    inbound["Inbound listeners<br/>Mixed / HTTP / SOCKS5 / TProxy / AnyTLS"] --> tunnel["Tunnel<br/>routing, relay, connection stats"]
     api["REST API + Web UI<br/>Axum"] --> tunnel
     api --> runtime["Runtime state<br/>config, subscriptions, proxy groups, rules"]
     runtime --> tunnel
@@ -263,7 +264,7 @@ flowchart TD
 | `meow-rules` | Rule matching engine and parser |
 | `meow-dns` | DNS resolver, cache, DNS snooping, server |
 | `meow-tunnel` | Core routing, TCP/UDP relay, statistics |
-| `meow-listener` | Inbound protocol handlers (Mixed/HTTP/SOCKS5/TProxy) |
+| `meow-listener` | Inbound protocol handlers (Mixed/HTTP/SOCKS5/TProxy/AnyTLS) |
 | `meow-config` | YAML configuration parsing, subscription fetcher, config persistence |
 | `meow-api` | REST API (Axum) + embedded web UI |
 | `meow-app` | CLI entry point |

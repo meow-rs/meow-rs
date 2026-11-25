@@ -245,6 +245,7 @@ struct InTypeMask {
     socks5: bool,
     tproxy: bool,
     inner: bool,
+    anytls: bool,
 }
 
 struct MatchInput<'a> {
@@ -1322,12 +1323,13 @@ fn dedup_fingerprint(payload: &str, op: &RuleOp) -> Option<String> {
         RuleOp::Uid(uid) => Some(uid.to_string()),
         RuleOp::Network(network) => Some(format!("{network:?}")),
         RuleOp::InType(mask) => Some(format!(
-            "{}{}{}{}{}",
+            "{}{}{}{}{}{}",
             u8::from(mask.http),
             u8::from(mask.https),
             u8::from(mask.socks5),
             u8::from(mask.tproxy),
-            u8::from(mask.inner)
+            u8::from(mask.inner),
+            u8::from(mask.anytls)
         )),
         // Shared-state handles: pointer identity means the same immutable
         // trie/set, so the predicates are interchangeable. GEOSITE also keys
@@ -2203,6 +2205,7 @@ fn compile_in_type(payload: &str) -> Option<InTypeMask> {
         socks5: false,
         tproxy: false,
         inner: false,
+        anytls: false,
     };
     match payload.to_ascii_uppercase().as_str() {
         "HTTP" => {
@@ -2213,6 +2216,7 @@ fn compile_in_type(payload: &str) -> Option<InTypeMask> {
         "SOCKS5" => mask.socks5 = true,
         "TPROXY" => mask.tproxy = true,
         "INNER" => mask.inner = true,
+        "ANYTLS" => mask.anytls = true,
         _ => return None,
     }
     Some(mask)
@@ -2225,6 +2229,7 @@ fn in_type_matches(mask: InTypeMask, conn_type: ConnType) -> bool {
         ConnType::Socks5 => mask.socks5,
         ConnType::TProxy => mask.tproxy,
         ConnType::Inner => mask.inner,
+        ConnType::Anytls => mask.anytls,
         _ => false,
     }
 }
