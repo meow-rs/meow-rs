@@ -77,9 +77,9 @@ D6 — Certificate-time formatting uses workspace `time` (RUSTSEC-2026-0543)
     The leading `::` is required because the x509-parser prelude glob-imports
     that crate's own `time` module, which shadows the external crate in
     type-namespace path resolution; never shorten the path when replaying.
-    Returning "Invalid time" for a timestamp outside `OffsetDateTime`'s
-    range is intentional — do not reintroduce upstream's epoch fallback,
-    which would display a false date.
+    Returning "Invalid time" outside X.509's four-digit year range is
+    intentional and enforced independently of `time/large-dates` — do not
+    reintroduce upstream's epoch fallback, which would display a false date.
   - The same test module carries the migration boundary coverage (epoch,
     midnight/year boundaries, leap years, subsecond truncation, and the
     year-9999/10000 cutoff).

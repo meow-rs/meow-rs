@@ -246,12 +246,17 @@ fn format_system_time(time: SystemTime) -> String {
             // (meow-rs RUSTSEC-2026-0543) The x509-parser prelude glob-imports
             // that crate's own `time` module, shadowing the external crate in
             // type-namespace path resolution, so `::time` must stay absolute.
-            // `OffsetDateTime` ends at year 9999; use the existing
-            // invalid-time marker outside it rather than displaying the
-            // epoch fallback as a false date.
+            // X.509 years are four digits; cap them explicitly because
+            // `time/large-dates` feature unification can widen
+            // `OffsetDateTime`'s range. Use the existing invalid-time marker
+            // outside the cap rather than displaying the epoch fallback as a
+            // false date.
             let Ok(datetime) = ::time::OffsetDateTime::from_unix_timestamp(secs) else {
                 return "Invalid time".to_string();
             };
+            if datetime.year() > 9999 {
+                return "Invalid time".to_string();
+            }
             format!(
                 "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
                 datetime.year(),

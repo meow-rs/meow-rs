@@ -46,8 +46,9 @@
 #   (`lib.rs:344-350`) before the discarded `replaced` tuple can be dropped by
 #   the capture filter (`lib.rs:352`). The advisory's drop-key-before-detach
 #   path is therefore structurally unreachable. Re-evaluate if
-#   reed-solomon-erasure changes version or LruCache usage, or if another
-#   reverse dependency edge to lru 0.7 appears.
+#   reed-solomon-erasure changes version or LruCache usage, if any lru
+#   version below 0.18.2 other than 0.7.8 enters the lockfile, or if any new
+#   reverse dependency edge to lru appears.
 
 [advisories]
 ignore = [
