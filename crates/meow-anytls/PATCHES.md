@@ -64,6 +64,26 @@ D5 — Pluggable dialers (meow-rs `dialer-proxy`)
   Caller contract (meow-proxy `anytls_adapter.rs`): a front-dial
   failure fails the session loudly — the dialer never silently
   falls back to a direct connection.
+
+D6 — Certificate-time formatting uses workspace `time` (RUSTSEC-2026-0543)
+  Upstream formats certificate validity timestamps through chrono, which is
+  unmaintained. meow-rs removes that dependency edge rather than carrying an
+  advisory exception:
+  - `Cargo.toml`: the optional cert-analysis dependency is the workspace
+    `time` crate and the `server` feature enables `dep:time`; do not restore
+    `chrono` when replaying upstream manifest changes.
+  - `src/util/cert_analyzer.rs`: `format_system_time` is rewritten around
+    `::time::OffsetDateTime::from_unix_timestamp` and manual UTC formatting.
+    The leading `::` is required because the x509-parser prelude glob-imports
+    that crate's own `time` module, which shadows the external crate in
+    type-namespace path resolution; never shorten the path when replaying.
+    Returning "Invalid time" outside X.509's four-digit year range is
+    intentional and enforced independently of `time/large-dates` — do not
+    reintroduce upstream's epoch fallback, which would display a false date.
+  - The same test module carries the migration boundary coverage (epoch,
+    midnight/year boundaries, leap years, subsecond truncation, and the
+    year-9999/10000 cutoff).
+  Files: Cargo.toml, src/util/cert_analyzer.rs
 ```
 
 Invariants every refresh must keep:

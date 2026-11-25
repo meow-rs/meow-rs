@@ -240,10 +240,32 @@ fn asn1_time_to_system_time(asn1_time: &ASN1Time) -> Result<SystemTime> {
 fn format_system_time(time: SystemTime) -> String {
     match time.duration_since(UNIX_EPOCH) {
         Ok(duration) => {
-            let secs = duration.as_secs();
-            let datetime = chrono::DateTime::from_timestamp(secs as i64, 0)
-                .unwrap_or(chrono::DateTime::UNIX_EPOCH);
-            datetime.format("%Y-%m-%d %H:%M:%S UTC").to_string()
+            let Ok(secs) = i64::try_from(duration.as_secs()) else {
+                return "Invalid time".to_string();
+            };
+            // (meow-rs RUSTSEC-2026-0543) The x509-parser prelude glob-imports
+            // that crate's own `time` module, shadowing the external crate in
+            // type-namespace path resolution, so `::time` must stay absolute.
+            // X.509 years are four digits; cap them explicitly because
+            // `time/large-dates` feature unification can widen
+            // `OffsetDateTime`'s range. Use the existing invalid-time marker
+            // outside the cap rather than displaying the epoch fallback as a
+            // false date.
+            let Ok(datetime) = ::time::OffsetDateTime::from_unix_timestamp(secs) else {
+                return "Invalid time".to_string();
+            };
+            if datetime.year() > 9999 {
+                return "Invalid time".to_string();
+            }
+            format!(
+                "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+                datetime.year(),
+                u8::from(datetime.month()),
+                datetime.day(),
+                datetime.hour(),
+                datetime.minute(),
+                datetime.second()
+            )
         }
         Err(_) => "Invalid time".to_string(),
     }
@@ -283,6 +305,82 @@ mod tests {
         assert_eq!(
             extract_cn("O=Test , CN=example.com , C=US"),
             Some("example.com")
+        );
+    }
+
+    // (meow-rs RUSTSEC-2026-0543) Boundary coverage for the `time` migration.
+    #[test]
+    fn test_format_system_time_epoch() {
+        assert_eq!(format_system_time(UNIX_EPOCH), "1970-01-01 00:00:00 UTC");
+    }
+
+    #[test]
+    fn test_format_system_time_crosses_midnight() {
+        for (secs, expected) in [
+            (1_696_118_399, "2023-09-30 23:59:59 UTC"),
+            (1_696_118_400, "2023-10-01 00:00:00 UTC"),
+        ] {
+            assert_eq!(
+                format_system_time(UNIX_EPOCH + Duration::from_secs(secs)),
+                expected,
+                "timestamp {secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_system_time_crosses_year_boundary() {
+        for (secs, expected) in [
+            (1_672_531_199, "2022-12-31 23:59:59 UTC"),
+            (1_672_531_200, "2023-01-01 00:00:00 UTC"),
+        ] {
+            assert_eq!(
+                format_system_time(UNIX_EPOCH + Duration::from_secs(secs)),
+                expected,
+                "timestamp {secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_system_time_leap_years() {
+        assert_eq!(
+            format_system_time(UNIX_EPOCH + Duration::from_secs(951_827_696)),
+            "2000-02-29 12:34:56 UTC"
+        );
+        for (secs, expected) in [
+            (4_107_542_399, "2100-02-28 23:59:59 UTC"),
+            (4_107_542_400, "2100-03-01 00:00:00 UTC"),
+        ] {
+            assert_eq!(
+                format_system_time(UNIX_EPOCH + Duration::from_secs(secs)),
+                expected,
+                "timestamp {secs}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_format_system_time_truncates_subseconds() {
+        assert_eq!(
+            format_system_time(UNIX_EPOCH + Duration::new(1_696_118_400, 999_999_999)),
+            "2023-10-01 00:00:00 UTC"
+        );
+    }
+
+    #[test]
+    fn test_format_system_time_invalid_time() {
+        assert_eq!(
+            format_system_time(UNIX_EPOCH - Duration::from_secs(1)),
+            "Invalid time"
+        );
+        assert_eq!(
+            format_system_time(UNIX_EPOCH + Duration::from_secs(253_402_300_799)),
+            "9999-12-31 23:59:59 UTC"
+        );
+        assert_eq!(
+            format_system_time(UNIX_EPOCH + Duration::from_secs(253_402_300_800)),
+            "Invalid time"
         );
     }
 

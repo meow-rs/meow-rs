@@ -1,16 +1,21 @@
 # cargo-audit configuration.
 #
-# Four advisories are ignored, none applicable to this workspace.
+# Five advisories are ignored, none applicable to this workspace.
 #
-# Three are pulled transitively via the `anytls-rs` fork's
+# Two are pulled transitively via the `anytls-rs` fork's
 # `trust-dns-resolver 0.23` dep:
 #
 # * RUSTSEC-2024-0421 (`idna` 0.4 — privilege escalation via URL hostname
 #   comparison). Our use is DNS resolution, not URL/origin comparison.
 # * RUSTSEC-2025-0017 (`trust-dns-proto` rebrand to `hickory-proto`). Cosmetic,
 #   pending upstream `anytls-rs` migration.
-# * RUSTSEC-2025-0134 (`rustls-pemfile` rolled into `rustls-pki-types`). Same,
-#   pending upstream `anytls-rs` migration.
+#
+# `rustls-pemfile` is a direct optional dependency of the vendored anytls
+# `server` feature:
+#
+# * RUSTSEC-2025-0134 (`rustls-pemfile` rolled into `rustls-pki-types`).
+#   Cosmetic; the vendored server-side certificate tooling still uses the
+#   pemfile API.
 #
 # One is pulled transitively via the TUN inbound's Linux netlink stack
 # (`tun-rs`/`route_manager` → `netlink-packet-core`):
@@ -21,6 +26,29 @@
 #   git main as of 2026-07) still depends on `paste`, so there is no upstream
 #   fix to take. Re-evaluate when rust-netlink migrates (e.g. to `pastey`).
 #   Tracked in issue #349.
+#
+# One is pulled transitively through the kcptun FEC path (`meow-transport`'s
+# `kcptun` feature, in the `full` release bundle → `reed-solomon-erasure
+# 6.0.0` → `lru 0.7.8`):
+#
+# * RUSTSEC-2026-0253 (`lru` 0.7.8 — panic-unsafe `LruCache::pop()`).
+#   reed-solomon-erasure 6.0.0 is the latest crates.io release and hard-requires
+#   `lru ^0.7.8`, so there is no upgrade path. Its only cache is
+#   `LruCache<Vec<usize>, Arc<Matrix<F>>>` (`core.rs:349`), and its complete
+#   LruCache call set is `new` (`core.rs:465`), `get` (`core.rs:704`), and `put`
+#   (`core.rs:728`): no `pop`, `pop_lru`, or `resize`. The key is `Vec<usize>`;
+#   the value destructor chain is `Arc → Matrix → SmallVec<F::Elem>`,
+#   `F::Elem: Copy`, and kcptun uses `galois_8` whose element is `u8`, so no
+#   user-defined `Drop` exists and destruction cannot panic. A full-capacity
+#   `put` does not enter `pop`/`pop_lru`: lru 0.7.8 removes the tail node from
+#   the map, moves the old key/value into `replaced`, rewrites and detaches the
+#   node (`lib.rs:359-376`); `capturing_put` reattaches and reinserts it
+#   (`lib.rs:344-350`) before the discarded `replaced` tuple can be dropped by
+#   the capture filter (`lib.rs:352`). The advisory's drop-key-before-detach
+#   path is therefore structurally unreachable. Re-evaluate if
+#   reed-solomon-erasure changes version or LruCache usage, if any lru
+#   version below 0.18.2 other than 0.7.8 enters the lockfile, or if any new
+#   reverse dependency edge to lru appears.
 
 [advisories]
 ignore = [
@@ -28,4 +56,5 @@ ignore = [
     "RUSTSEC-2025-0017",
     "RUSTSEC-2025-0134",
     "RUSTSEC-2024-0436",
+    "RUSTSEC-2026-0253",
 ]
