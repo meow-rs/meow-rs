@@ -618,6 +618,10 @@ mod linux {
     pub(super) struct UdpIngress {
         socket: UdpSocket,
         local_addr: SocketAddr,
+        /// Unit-test script used to prove multiplexer fairness without
+        /// requiring a kernel TPROXY path; production constructors leave it unset.
+        #[cfg(test)]
+        scripted: Option<std::collections::VecDeque<RecvOutcome>>,
     }
 
     /// The ingress sockets selected by the configured listen address. At
@@ -639,6 +643,9 @@ mod linux {
     /// Transparency requires `CAP_NET_ADMIN`/`CAP_NET_RAW` — a failure here
     /// is the explicit permission diagnostic the issue asks for.
     pub fn bind_transparent(addr: SocketAddr) -> io::Result<UdpIngresses> {
+        // Validate before any branch rebuilds the address: `SocketAddr::new`
+        // drops a v6 scope id, and the programmatic contract must reject it.
+        validate_udp_socket_addr(addr)?;
         match addr.ip() {
             IpAddr::V4(ip) => Ok(UdpIngresses {
                 v4: Some(bind_ingress(SocketAddr::new(IpAddr::V4(ip), addr.port()))?),
@@ -680,7 +687,12 @@ mod linux {
             )
         })?;
         let socket = UdpSocket::from_std(std_sock)?;
-        Ok(UdpIngress { socket, local_addr })
+        Ok(UdpIngress {
+            socket,
+            local_addr,
+            #[cfg(test)]
+            scripted: None,
+        })
     }
 
     /// Bind the client-facing reply socket to `orig_dst` so replies leave
@@ -1196,6 +1208,8 @@ mod linux {
         buf: Vec<u8>,
         backoff: IngressBackoff,
         mapped_v6_drops: u64,
+        #[cfg(test)]
+        scripted: Option<std::collections::VecDeque<RecvOutcome>>,
     }
 
     impl IngressState {
@@ -1206,7 +1220,20 @@ mod linux {
                 buf: vec![0u8; DATAGRAM_BUF],
                 backoff: IngressBackoff::new(),
                 mapped_v6_drops: 0,
+                #[cfg(test)]
+                scripted: ingress.scripted,
             }
+        }
+
+        async fn recv_one(&mut self) -> io::Result<RecvOutcome> {
+            #[cfg(test)]
+            if let Some(scripted) = &mut self.scripted {
+                return match scripted.pop_front() {
+                    Some(outcome) => Ok(outcome),
+                    None => std::future::pending().await,
+                };
+            }
+            recv_dgram(&self.socket, &mut self.buf).await
         }
     }
 
@@ -1224,95 +1251,123 @@ mod linux {
             && client.is_ipv4() == orig_dst.is_ipv4()
     }
 
-    /// Receive and validate datagrams from one ingress until one is fit for
-    /// the shared flow table. The payload copy happens here so the selectable
-    /// future owns the result and no sibling branch ever borrows the flow
-    /// dispatcher; it is the same one-copy-per-datagram contract the v4 loop
-    /// already had. `None` means a socket-level error was recorded in the
-    /// ingress backoff — the outer loop then leaves this ingress dormant
-    /// until its absolute retry deadline without affecting the sibling.
+    /// Receive and validate at most one datagram from one ingress. Even a
+    /// filtered datagram completes the selectable branch (`None`), so a
+    /// malformed-packet flood cannot keep this future permanently ready and
+    /// starve the sibling family; the outer loop may immediately poll this
+    /// ingress again after giving the sibling its chance. Error `None` has
+    /// already been classified by the socket-error backoff helper; ordinary
+    /// filter drops never touch that backoff.
     async fn recv_ingress(
         state: Option<&mut IngressState>,
         in_name: &str,
         local_addrs: Option<&HashSet<IpAddr>>,
     ) -> Option<(Vec<u8>, SocketAddr, SocketAddr)> {
         let state = state.expect("recv branch polled while disabled");
-        let IngressState {
-            socket,
-            local_addr,
-            buf,
-            backoff,
-            mapped_v6_drops,
-        } = state;
-        let local_addr = *local_addr;
+        let local_addr = state.local_addr;
         let ingress_is_v4 = local_addr.is_ipv4();
         let family = if ingress_is_v4 { "ipv4" } else { "ipv6" };
 
-        loop {
-            match recv_dgram(socket, buf).await {
-                Err(e) => {
-                    if backoff.failed(&e, Instant::now()) {
-                        warn!("tproxy UDP '{in_name}' {family} recv error: {e}");
-                    } else {
-                        debug!("tproxy UDP '{in_name}' {family} recv error: {e}");
+        match state.recv_one().await {
+            Err(e) => {
+                if state.backoff.failed(&e, Instant::now()) {
+                    warn!("tproxy UDP '{in_name}' {family} recv error: {e}");
+                } else {
+                    debug!("tproxy UDP '{in_name}' {family} recv error: {e}");
+                }
+                None
+            }
+            Ok(RecvOutcome::Drop(reason)) => {
+                match reason {
+                    RecvDrop::Truncated => debug!(
+                        "tproxy UDP '{in_name}' {family}: dropping truncated datagram"
+                    ),
+                    RecvDrop::BadSource => debug!(
+                        "tproxy UDP '{in_name}' {family}: dropping datagram with invalid source addr"
+                    ),
+                    RecvDrop::MissingOrigDst => debug!(
+                        "tproxy UDP '{in_name}' {family}: dropping datagram without usable ORIGDSTADDR cmsg"
+                    ),
+                    RecvDrop::MappedV6 => {
+                        state.mapped_v6_drops += 1;
+                        let total = state.mapped_v6_drops;
+                        debug!(
+                            "tproxy UDP '{in_name}' {family}: dropping IPv4-mapped endpoint \
+                             (total {total}); dual-socket flow keys are native-family"
+                        );
                     }
+                }
+                None
+            }
+            Ok(RecvOutcome::Datagram {
+                len,
+                client,
+                orig_dst,
+            }) => {
+                state.backoff.succeeded();
+                if !ingress_family_consistent(ingress_is_v4, client, orig_dst) {
+                    debug!(
+                        "tproxy UDP '{in_name}' {family}: dropping family-inconsistent \
+                         datagram {client} -> {orig_dst}"
+                    );
                     return None;
                 }
-                Ok(RecvOutcome::Drop(reason)) => {
-                    match reason {
-                        RecvDrop::Truncated => debug!(
-                            "tproxy UDP '{in_name}' {family}: dropping truncated datagram"
-                        ),
-                        RecvDrop::BadSource => debug!(
-                            "tproxy UDP '{in_name}' {family}: dropping datagram with invalid source addr"
-                        ),
-                        RecvDrop::MissingOrigDst => debug!(
-                            "tproxy UDP '{in_name}' {family}: dropping datagram without usable ORIGDSTADDR cmsg"
-                        ),
-                        RecvDrop::MappedV6 => {
-                            *mapped_v6_drops += 1;
-                            let total = *mapped_v6_drops;
-                            debug!(
-                                "tproxy UDP '{in_name}' {family}: dropping IPv4-mapped endpoint \
-                                 (total {total}); dual-socket flow keys are native-family"
-                            );
-                        }
-                    }
-                    // A dropped datagram is not proof of socket health — the
-                    // delay stays elevated while errors still interleave.
-                    continue;
+                // Sanity-guard the recovered destination before it ever
+                // reaches a flow — see `is_safe_orig_dst`.
+                if !is_safe_orig_dst(orig_dst, local_addr, local_addrs) {
+                    debug!(
+                        "tproxy UDP '{in_name}' {family}: dropping datagram to unsafe orig_dst {orig_dst}"
+                    );
+                    return None;
                 }
-                Ok(RecvOutcome::Datagram {
-                    len,
-                    client,
-                    orig_dst,
-                }) => {
-                    backoff.succeeded();
-                    if !ingress_family_consistent(ingress_is_v4, client, orig_dst) {
-                        debug!(
-                            "tproxy UDP '{in_name}' {family}: dropping family-inconsistent \
-                             datagram {client} -> {orig_dst}"
-                        );
-                        continue;
-                    }
-                    // Sanity-guard the recovered destination before it ever
-                    // reaches a flow — see `is_safe_orig_dst`.
-                    if !is_safe_orig_dst(orig_dst, local_addr, local_addrs) {
-                        debug!(
-                            "tproxy UDP '{in_name}' {family}: dropping datagram to unsafe orig_dst {orig_dst}"
-                        );
-                        continue;
-                    }
-                    // Zero-length datagrams are legal UDP — copied and
-                    // forwarded like any other.
-                    return Some((buf[..len].to_vec(), client, orig_dst));
-                }
+                // Zero-length datagrams are legal UDP — copied and forwarded
+                // like any other.
+                Some((state.buf[..len].to_vec(), client, orig_dst))
             }
         }
     }
 
     async fn wait_retry(deadline: Instant) {
         tokio::time::sleep_until(deadline).await;
+    }
+
+    fn dispatch_received(
+        tunnel: &Tunnel,
+        dispatch: &mut FlowDispatch,
+        received: Option<(Vec<u8>, SocketAddr, SocketAddr)>,
+    ) {
+        if let Some((data, client, orig_dst)) = received {
+            if !dispatch.dispatch(tunnel, data, client, orig_dst) {
+                debug!("tproxy UDP: dropped {client} -> {orig_dst} (flow/queue bound)");
+            }
+        }
+    }
+
+    /// Single-family listeners keep the pre-dual-stack receive shape: no
+    /// select branches or sibling backoff bookkeeping in the hot loop. The
+    /// receive/validate/dispatch steps are the same helpers the dual-path
+    /// uses, so filtering semantics cannot drift apart.
+    async fn run_single_ingress(
+        tunnel: &Tunnel,
+        state: &mut IngressState,
+        dispatch: &mut FlowDispatch,
+        in_name: &str,
+        local_addrs: Option<&HashSet<IpAddr>>,
+    ) {
+        loop {
+            // `retry_at` is empty on the hot path; only a socket-error backoff
+            // pays for the clock read.
+            if let Some(deadline) = state
+                .backoff
+                .retry_at
+                .filter(|deadline| *deadline > Instant::now())
+            {
+                wait_retry(deadline).await;
+                continue;
+            }
+            let received = recv_ingress(Some(&mut *state), in_name, local_addrs).await;
+            dispatch_received(tunnel, dispatch, received);
+        }
     }
 
     /// The UDP receive multiplexer: one or two ingress sockets → one flow
@@ -1359,6 +1414,14 @@ mod linux {
         }
         let local_addrs = local_addrs.as_deref();
 
+        if v4.is_some() != v6.is_some() {
+            let ((Some(state), None) | (None, Some(state))) = (v4.as_mut(), v6.as_mut()) else {
+                unreachable!("exactly one ingress checked above");
+            };
+            run_single_ingress(&tunnel, state, &mut dispatch, &in_name, local_addrs).await;
+            return;
+        }
+
         loop {
             let now = Instant::now();
             let v4_wait = v4
@@ -1372,18 +1435,10 @@ mod linux {
 
             tokio::select! {
                 received = recv_ingress(v4.as_mut(), &in_name, local_addrs), if v4_active => {
-                    if let Some((data, client, orig_dst)) = received {
-                        if !dispatch.dispatch(&tunnel, data, client, orig_dst) {
-                            debug!("tproxy UDP: dropped {client} -> {orig_dst} (flow/queue bound)");
-                        }
-                    }
+                    dispatch_received(&tunnel, &mut dispatch, received);
                 }
                 received = recv_ingress(v6.as_mut(), &in_name, local_addrs), if v6_active => {
-                    if let Some((data, client, orig_dst)) = received {
-                        if !dispatch.dispatch(&tunnel, data, client, orig_dst) {
-                            debug!("tproxy UDP: dropped {client} -> {orig_dst} (flow/queue bound)");
-                        }
-                    }
+                    dispatch_received(&tunnel, &mut dispatch, received);
                 }
                 // The deadline is already persisted in `IngressState`; when
                 // a sibling datagram cancels this sleep nothing is lost.
@@ -1415,6 +1470,148 @@ mod linux {
 
         fn v4(a: u8, b: u8, c: u8, d: u8, port: u16) -> SocketAddr {
             SocketAddr::from(([a, b, c, d], port))
+        }
+
+        fn dummy_udp_socket() -> UdpSocket {
+            let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            socket.set_nonblocking(true).unwrap();
+            UdpSocket::from_std(socket).unwrap()
+        }
+
+        /// A scripted ingress never reads its dummy socket; it exists only so
+        /// the production multiplexer can be exercised without a kernel
+        /// TPROXY path or capabilities.
+        fn scripted_ingress(local_addr: SocketAddr, outcomes: Vec<RecvOutcome>) -> UdpIngress {
+            UdpIngress {
+                socket: dummy_udp_socket(),
+                local_addr,
+                scripted: Some(outcomes.into_iter().collect()),
+            }
+        }
+
+        /// A programmatic scoped v6 bind must be rejected before any branch
+        /// rebuilds the address and loses `scope_id` — no capabilities are
+        /// needed because validation precedes socket creation.
+        #[test]
+        fn bind_transparent_rejects_scoped_v6_before_reconstruction() {
+            let ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
+            let addr = SocketAddr::V6(std::net::SocketAddrV6::new(ip, 7893, 0, 7));
+            let err = match bind_transparent(addr) {
+                Ok(_) => panic!("scoped v6 bind must be rejected"),
+                Err(err) => err,
+            };
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            assert!(err.to_string().contains("scoped IPv6"), "got: {err}");
+        }
+
+        /// The selectable receive future consumes at most one ingress packet
+        /// per outer poll, even when that packet is filtered.
+        #[tokio::test]
+        async fn recv_ingress_returns_after_one_filtered_datagram() {
+            let local = v4(0, 0, 0, 0, 7893);
+            let ingress = scripted_ingress(
+                local,
+                vec![
+                    RecvOutcome::Drop(RecvDrop::MissingOrigDst),
+                    RecvOutcome::Drop(RecvDrop::MissingOrigDst),
+                ],
+            );
+            let mut state = IngressState::new(ingress);
+            let received = tokio::time::timeout(
+                Duration::from_millis(100),
+                recv_ingress(Some(&mut state), "t", None),
+            )
+            .await
+            .expect("filtered datagram did not complete the receive branch");
+            assert!(received.is_none());
+            assert_eq!(
+                state.scripted.as_ref().unwrap().len(),
+                1,
+                "the second queued drop belongs to the next outer poll"
+            );
+            assert!(
+                state.backoff.waiting_until(Instant::now()).is_none(),
+                "ordinary filter drops must not become socket-error backoff"
+            );
+        }
+
+        /// A one-family listener takes the direct receive loop and still
+        /// reaches the ordinary flow dispatcher.
+        #[tokio::test]
+        async fn single_ingress_fast_path_dispatches_valid_datagram() {
+            let proxy = RecordingProxy::new(false);
+            let tunnel = mk_tunnel(Some(Arc::clone(&proxy)));
+            let ingresses = UdpIngresses {
+                v4: Some(scripted_ingress(
+                    v4(0, 0, 0, 0, 7893),
+                    vec![RecvOutcome::Datagram {
+                        len: 4,
+                        client: CLIENT,
+                        orig_dst: ORIG_DST,
+                    }],
+                )),
+                v6: None,
+            };
+            let task = tokio::spawn(run_udp(
+                tunnel,
+                ingresses,
+                Duration::from_secs(60),
+                0,
+                "t".into(),
+                7893,
+                None,
+                None,
+            ));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while proxy.dial_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("single ingress did not dispatch its valid datagram");
+            task.abort();
+        }
+
+        /// With one ingress producing an unbroken filtered-datagram stream,
+        /// the sibling's valid datagram still reaches the ordinary flow path.
+        #[tokio::test]
+        async fn sibling_valid_datagram_progresses_during_drop_flood() {
+            let proxy = RecordingProxy::new(false);
+            let tunnel = mk_tunnel(Some(Arc::clone(&proxy)));
+            let drops = (0..1024)
+                .map(|_| RecvOutcome::Drop(RecvDrop::MissingOrigDst))
+                .collect();
+            let client6 = v6(0x2001, 0xdb8, 0, 7, 41234);
+            let dst6 = v6(0x2001, 0xdb8, 0, 53, 53);
+            let ingresses = UdpIngresses {
+                v4: Some(scripted_ingress(v4(0, 0, 0, 0, 7893), drops)),
+                v6: Some(scripted_ingress(
+                    SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 7893),
+                    vec![RecvOutcome::Datagram {
+                        len: 4,
+                        client: client6,
+                        orig_dst: dst6,
+                    }],
+                )),
+            };
+            let task = tokio::spawn(run_udp(
+                tunnel,
+                ingresses,
+                Duration::from_secs(60),
+                0,
+                "t".into(),
+                7893,
+                None,
+                None,
+            ));
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while proxy.dial_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("valid sibling datagram starved behind filtered flood");
+            task.abort();
         }
 
         /// The flow key is `(client, orig_dst)` — the same client port
@@ -1609,9 +1806,18 @@ mod linux {
         /// its aligned boundary, not mistaken for the original destination.
         #[test]
         fn scan_orig_dst_skips_unknown_cmsg_then_finds_target() {
-            let mut words = vec![0u64; 8];
+            let mut words = vec![0u64; 12];
             let hdr_size = mem::size_of::<libc::cmsghdr>();
-            let off = put_cmsg(&mut words, 0, libc::SOL_IP, libc::IP_PKTINFO, hdr_size, &[]);
+            // hdr+1 is deliberately unaligned: skipping must round up to the
+            // next CMSG boundary before the target header can be found.
+            let off = put_cmsg(
+                &mut words,
+                0,
+                libc::SOL_IP,
+                libc::IP_PKTINFO,
+                hdr_size + 1,
+                &[0x5a],
+            );
             let payload = sockaddr_in6_payload(
                 libc::AF_INET6 as _,
                 "2001:db8::5353".parse().unwrap(),
@@ -1874,6 +2080,19 @@ mod linux {
             ] {
                 assert!(!is_safe_orig_dst(bad.parse().unwrap(), wild, none), "{bad}");
             }
+            assert!(!is_safe_orig_dst("[::1]:53".parse().unwrap(), wild, none));
+            assert!(!is_safe_orig_dst(
+                "[ff00::1]:53".parse().unwrap(),
+                wild,
+                none
+            ));
+            assert!(!is_safe_orig_dst("[::]:53".parse().unwrap(), wild, none));
+            let wild6 = "[::]:7895".parse::<SocketAddr>().unwrap();
+            assert!(!is_safe_orig_dst(
+                "[2001:db8::1]:7895".parse().unwrap(),
+                wild6,
+                none
+            ));
         }
     }
 }
@@ -2002,6 +2221,11 @@ mod tests {
                 fail_dial,
                 gates,
             })
+        }
+
+        #[cfg(target_os = "linux")]
+        pub(super) fn dial_count(&self) -> usize {
+            self.dials.load(Ordering::SeqCst)
         }
     }
 

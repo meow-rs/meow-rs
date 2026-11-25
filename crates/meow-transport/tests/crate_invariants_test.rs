@@ -628,7 +628,7 @@ const RAW_SOCKET_ALLOWLIST: &[(&str, &str, usize, &str)] = &[
         "crates/meow-listener/src/tproxy/udp.rs",
         "libc::socket(",
         1,
-        "IP_TRANSPARENT reply socket towards the inbound client",
+        "transparent UDP ingress/reply sockets; ingresses never dial, replies face the client",
     ),
     (
         "crates/meow-listener/src/tun/local_dns.rs",
