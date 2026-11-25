@@ -39,7 +39,7 @@ server = [
     "dep:rcgen",
     "dep:notify",
     "dep:x509-parser",
-    "dep:chrono",
+    "dep:time",
 ]
 
 [dependencies]
@@ -84,7 +84,7 @@ anyhow = "1.0"
 
 notify = { version = "8.2", optional = true }
 x509-parser = { version = "0.18", optional = true }
-chrono = { version = "0.4", optional = true }
+time = { workspace = true, optional = true }
 
 # libc is only used by the Android / OpenHarmony socket-protect helper (EINPROGRESS check on
 # the non-blocking connect). Off-Android the helper compiles down to a direct
