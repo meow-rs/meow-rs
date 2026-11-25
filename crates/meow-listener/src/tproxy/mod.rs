@@ -59,13 +59,25 @@ pub struct TProxyListener {
     route_override: Option<InboundRouteOverride>,
 }
 
+/// Abort the UDP multiplexer if the TCP listener frame exits or is
+/// cancelled; otherwise the detached spawn would outlive its listener.
+#[cfg(target_os = "linux")]
+struct AbortUdpTaskOnDrop(tokio::task::AbortHandle);
+
+#[cfg(target_os = "linux")]
+impl Drop for AbortUdpTaskOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Fallible setup artifacts held on the listener between
 /// [`TProxyListener::prepare`] and [`TProxyListener::run_on`]. `Drop` on
 /// the firewall guard tears the rules down.
 struct Prepared {
     /// Address the setup was performed against — `run_on` rejects the
     /// served socket if it resolves to a different address, so firewall
-    /// rules and the transparent UDP socket can't silently land on a
+    /// rules and the transparent UDP socket(s) can't silently land on a
     /// different port than the TCP listener.
     bound_addr: SocketAddr,
     firewall: Option<FirewallGuard>,
@@ -73,9 +85,10 @@ struct Prepared {
     /// self-target half of [`is_safe_orig_dst`]; `None` keeps the
     /// conservative same-port rule (interface enumeration unavailable).
     local_addrs: Option<Arc<HashSet<IpAddr>>>,
-    /// Bound `IP_TRANSPARENT` UDP socket (Linux `udp: true` only).
+    /// Bound transparent UDP ingress socket(s) (Linux `udp: true` only).
+    /// The family fan-out is atomic at prepare time.
     #[cfg(target_os = "linux")]
-    udp_socket: Option<tokio::net::UdpSocket>,
+    udp_ingresses: Option<udp::UdpIngresses>,
 }
 
 impl TProxyListener {
@@ -279,13 +292,16 @@ impl TProxyListener {
             None
         };
 
-        // #564: opt-in Linux UDP TPROXY datagram path on the same bound
-        // port. Both invariants are re-enforced here even though config
-        // parsing already rejects `udp` + managed firewall and non-IPv4
-        // binds — programmatic constructors get the same contract.
+        // #564/#1017: opt-in Linux UDP TPROXY datagram path on the same
+        // bound port. Both invariants are re-enforced here even though
+        // config parsing already rejects `udp` + managed firewall and the
+        // unsupported IPv6 listen shapes — programmatic constructors get
+        // the same contract. Binding is atomic: when `[::]` needs both
+        // families and one fails, the other socket is dropped with the
+        // error return rather than publishing a half-dual-stack listener.
         #[cfg(target_os = "linux")]
-        let udp_socket = if self.udp {
-            let sock = udp::bind_transparent(bound_addr).map_err(
+        let udp_ingresses = if self.udp {
+            let sockets = udp::bind_transparent(bound_addr).map_err(
                 |e| -> Box<dyn std::error::Error + Send + Sync> {
                     format!(
                         "tproxy `udp` transparent socket on {bound_addr} failed \
@@ -294,7 +310,7 @@ impl TProxyListener {
                     .into()
                 },
             )?;
-            Some(sock)
+            Some(sockets)
         } else {
             None
         };
@@ -319,7 +335,7 @@ impl TProxyListener {
             firewall,
             local_addrs,
             #[cfg(target_os = "linux")]
-            udp_socket,
+            udp_ingresses,
         });
         Ok(self)
     }
@@ -344,7 +360,7 @@ impl TProxyListener {
         if prepared.bound_addr != bound_addr {
             return Err(format!(
                 "TProxyListener::prepare ran against {} but run_on serves {} — \
-                 firewall rules/UDP socket would bind the wrong port",
+                 firewall rules/UDP socket(s) would bind the wrong port",
                 prepared.bound_addr, bound_addr
             )
             .into());
@@ -354,7 +370,9 @@ impl TProxyListener {
         let local_addrs = prepared.local_addrs;
 
         #[cfg(target_os = "linux")]
-        if let Some(udp_socket) = prepared.udp_socket {
+        let mut _udp_task = None;
+        #[cfg(target_os = "linux")]
+        if let Some(udp_ingresses) = prepared.udp_ingresses {
             let udp_tunnel = self.tunnel.clone();
             let udp_timeout = self.udp_timeout;
             let udp_max = self.max_connections;
@@ -362,12 +380,14 @@ impl TProxyListener {
             let udp_port = bound_addr.port();
             let udp_addrs = local_addrs.clone();
             let udp_override = self.route_override.clone();
-            // `run_udp` retries socket errors internally and only ends
-            // via abort — there is no error return to surface here.
-            tokio::spawn(async move {
+            // `run_udp` retries socket errors internally and only ends via
+            // abort. Keep an abort handle scoped to this frame so both
+            // ingress sockets and their reply dispatcher die with the TCP
+            // listener instead of becoming a detached task.
+            let task = tokio::spawn(async move {
                 udp::run_udp(
                     udp_tunnel,
-                    udp_socket,
+                    udp_ingresses,
                     udp_timeout,
                     udp_max,
                     udp_name,
@@ -377,6 +397,7 @@ impl TProxyListener {
                 )
                 .await;
             });
+            _udp_task = Some(AbortUdpTaskOnDrop(task.abort_handle()));
             info!(
                 "TProxy listener '{}': UDP TPROXY active on {} (external rules \
                  must steer LAN datagrams here — see docs/tproxy-gateway.md)",
