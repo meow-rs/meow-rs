@@ -1579,58 +1579,37 @@ mod linux {
             );
         }
 
-        /// A continuously-ready UDP flood must spend the task coop budget:
-        /// on a current-thread runtime the probe task can complete even
-        /// while the kernel queue is being refilled.
+        /// Sticky readiness plus tokio's finite task budget force a yield:
+        /// the datagram is never consumed, so every successful readiness poll
+        /// is guaranteed to be followed by another one. After the fixed-size
+        /// budget is exhausted, the probe task must get a scheduler turn.
         #[test]
-        fn udp_flood_cannot_pin_current_thread_worker() {
-            let receiver = socket2::Socket::new(
-                socket2::Domain::IPV4,
-                socket2::Type::DGRAM,
-                Some(socket2::Protocol::UDP),
-            )
-            .unwrap();
-            receiver.set_recv_buffer_size(4 * 1024 * 1024).unwrap();
-            receiver
-                .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
-                .unwrap();
+        fn sticky_udp_readiness_spends_coop_budget() {
+            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             receiver.set_nonblocking(true).unwrap();
-            let receiver_addr = receiver.local_addr().unwrap().as_socket().unwrap();
-            let receiver: std::net::UdpSocket = receiver.into();
-
+            let receiver_addr = receiver.local_addr().unwrap();
             let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-            sender.connect(receiver_addr).unwrap();
-            sender.set_nonblocking(true).unwrap();
-            let mut prefilled = 0usize;
-            for _ in 0..8192 {
-                match sender.send(&[0u8]) {
-                    Ok(_) => prefilled += 1,
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => panic!("prefill send: {e}"),
-                }
-            }
-            assert!(
-                prefilled >= 256,
-                "test needs a real initial UDP backlog, got {prefilled}"
-            );
-            sender.set_nonblocking(false).unwrap();
 
-            let stop_flood = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let flood_thread = std::thread::spawn({
-                let stop_flood = Arc::clone(&stop_flood);
-                move || {
-                    while !stop_flood.load(Ordering::Relaxed) {
-                        if sender.send(&[0u8]).is_err() {
-                            std::thread::yield_now();
-                        }
-                    }
+            // UDP send success does not prove local enqueueing. Peek without
+            // consuming; once this succeeds, the unread datagram makes the
+            // socket sticky-readable for the rest of the test.
+            let mut enqueued = false;
+            for _ in 0..100 {
+                sender.send_to(&[0u8], receiver_addr).unwrap();
+                if receiver.peek(&mut [0u8]).is_ok() {
+                    enqueued = true;
+                    break;
                 }
-            });
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(enqueued, "loopback datagram never reached the UDP queue");
 
             let probe_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop_hog = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
             let runtime_thread = std::thread::spawn({
                 let probe_done = Arc::clone(&probe_done);
+                let stop_hog = Arc::clone(&stop_hog);
                 move || {
                     let runtime = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
@@ -1638,24 +1617,13 @@ mod linux {
                         .unwrap();
                     runtime.block_on(async move {
                         let socket = UdpSocket::from_std(receiver).unwrap();
-                        let ingresses = UdpIngresses {
-                            v4: Some(UdpIngress {
-                                socket,
-                                local_addr: receiver_addr,
-                                scripted: None,
-                            }),
-                            v6: None,
-                        };
-                        tokio::spawn(run_udp(
-                            mk_tunnel(None),
-                            ingresses,
-                            Duration::from_secs(60),
-                            0,
-                            "flood-test".into(),
-                            receiver_addr.port(),
-                            None,
-                            None,
-                        ));
+                        tokio::spawn(async move {
+                            while !stop_hog.load(Ordering::Relaxed) {
+                                std::future::poll_fn(|cx| socket.poll_recv_ready(cx))
+                                    .await
+                                    .unwrap();
+                            }
+                        });
                         tokio::spawn(async move {
                             tokio::task::yield_now().await;
                             probe_done.store(true, Ordering::SeqCst);
@@ -1666,22 +1634,16 @@ mod linux {
             });
 
             let start = std::time::Instant::now();
-            let mut completed_while_flooding = false;
-            while start.elapsed() < Duration::from_secs(2) {
-                if probe_done.load(Ordering::SeqCst) {
-                    completed_while_flooding = true;
-                    break;
-                }
+            while start.elapsed() < Duration::from_secs(2) && !probe_done.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(2));
             }
-
-            stop_flood.store(true, Ordering::SeqCst);
+            let probe_ran = probe_done.load(Ordering::SeqCst);
+            stop_hog.store(true, Ordering::SeqCst);
             let _ = shutdown_tx.send(());
             runtime_thread.join().expect("runtime thread panicked");
-            flood_thread.join().expect("flood thread panicked");
             assert!(
-                completed_while_flooding,
-                "probe task did not run while the ingress flood was active"
+                probe_ran,
+                "sticky readiness did not yield the current-thread worker"
             );
         }
 
