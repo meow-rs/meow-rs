@@ -185,8 +185,11 @@ pub fn enable_raw_read_passthrough(stream: &mut dyn Stream) -> bool {
 
 /// Switch a TLS stream's writes, one-way, to the raw transport under it
 /// (XTLS-Vision DIRECT); shutdown then closes the transport without a
-/// TLS close_notify.  Call only after every TLS write has completed.
-/// `false` if the stream cannot switch or a TLS record is still pending.
+/// TLS close_notify.  `false` if the stream cannot switch (see
+/// [`supports_raw_passthrough`]) or the backend still holds a sealed write
+/// it cannot order before the raw bytes — BoringSSL refuses there, while
+/// the REALITY record layer always accepts: its pending ciphertext drains
+/// ahead of the first raw byte on every write path.
 pub fn enable_raw_write_passthrough(stream: &mut dyn Stream) -> bool {
     #[cfg(feature = "tls")]
     {

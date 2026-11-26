@@ -379,7 +379,11 @@ async fn read_client_hello_preflight(
                 "REALITY ClientHello pre-read record length out of range".into(),
             ));
         }
-        if wire_prefix.len() + len > MAX_AUTHED_STREAM_BYTES + 5 {
+        // The cap counts complete wire bytes — record headers included.
+        // `wire_prefix` already holds this record's header, so
+        // `wire_prefix.len() + len` is the exact total once the payload
+        // lands; the spec bound is 64 KiB of wire in at most 32 records.
+        if wire_prefix.len() + len > MAX_AUTHED_STREAM_BYTES {
             return Err(TransportError::ResourceLimit(
                 "REALITY ClientHello pre-read exceeds 64 KiB".into(),
             ));
@@ -487,9 +491,12 @@ fn parse_client_hello(raw: Vec<u8>) -> Result<ClientHello> {
         .collect();
     let compression_len = take_u8(&raw, &mut pos)? as usize;
     let compression = take(&raw, &mut pos, compression_len)?;
-    if !compression.contains(&0) {
+    // RFC 8446 §4.1.2: a TLS 1.3 ClientHello carries exactly one
+    // compression method, zero.  Anything else is not a REALITY client
+    // shape — browsers and both pinned clients all send exactly `[0]`.
+    if compression != [0] {
         return Err(TransportError::Tls(
-            "REALITY ClientHello lacks null compression".into(),
+            "REALITY ClientHello compression methods are not exactly [0]".into(),
         ));
     }
     let extensions_len = take_u16(&raw, &mut pos)? as usize;
@@ -1197,22 +1204,47 @@ impl DirectionalLimit {
     }
 
     fn refill(&mut self) {
+        const NANOS_PER_SECOND: u128 = 1_000_000_000;
         let now = Instant::now();
         let elapsed = now.saturating_duration_since(self.refill_at);
         if elapsed.is_zero() {
             return;
         }
-        let add =
-            (elapsed.as_nanos() * u128::from(self.bytes_per_second) / 1_000_000_000u128) as u64;
-        if add > 0 {
-            let spent = Duration::from_nanos(
-                (u128::from(add) * 1_000_000_000u128 / u128::from(self.bytes_per_second)) as u64,
-            );
-            self.refill_at += spent;
-            self.tokens = self.tokens.saturating_add(add).min(self.capacity);
-        } else if elapsed.as_secs() >= 1 {
+        if self.tokens >= self.capacity {
+            // While the bucket is full every further token is discarded,
+            // so the uncredited time is semantically a no-op; pinning the
+            // baseline keeps it from going stale over a long idle.
             self.refill_at = now;
+            return;
         }
+        // Nanoseconds times a byte rate overflows u64 within minutes at
+        // high rates, and even the u128 product can saturate for absurd
+        // idle×rate combinations.  The credit is only ever meaningful up
+        // to the room left in the bucket, so clamping the u128 value
+        // before the u64 conversion — instead of truncating it with
+        // `as` — loses nothing (issue #974).
+        let earned = elapsed
+            .as_nanos()
+            .saturating_mul(u128::from(self.bytes_per_second))
+            / NANOS_PER_SECOND;
+        if earned == 0 {
+            if elapsed.as_secs() >= 1 {
+                self.refill_at = now;
+            }
+            return;
+        }
+        let room = u128::from(self.capacity - self.tokens);
+        let add = earned.min(room);
+        // Advance the baseline by the exact time the credited tokens take
+        // to accrue, preserving the sub-token remainder.  `add` is no more
+        // than the whole tokens `elapsed` earns, so `spent` never passes
+        // `now`; the saturating conversion only triggers on multi-century
+        // idles, where pinning to any reachable instant is equivalent.
+        let spent_nanos = add * NANOS_PER_SECOND / u128::from(self.bytes_per_second);
+        self.refill_at += Duration::from_nanos(u64::try_from(spent_nanos).unwrap_or(u64::MAX));
+        // `add <= room` came from a u64 difference, so the conversion is
+        // lossless and the sum never exceeds `capacity`.
+        self.tokens += add as u64;
     }
 }
 
@@ -1231,6 +1263,10 @@ where
         limit.wait(initial.len()).await;
         writer.write_all(&initial).await?;
         writer.flush().await?;
+        // The preserved ClientHello can run to 64 KiB; holding it for the
+        // relay's lifetime would keep that allocation pinned per cover
+        // connection long after its only use.
+        drop(initial);
         let _ = activity.send(());
     }
     let mut buf = [0u8; COVER_BUFFER];
@@ -1715,5 +1751,139 @@ mod tests {
             "corrupt client Finished must close the authenticated branch"
         );
         let _ = client_task.await.expect("client task");
+    }
+
+    // ─── ClientHello pre-read wire cap, compression shape, token bucket ──────
+
+    /// C4: the pre-read cap is 64 KiB of *wire* bytes — record headers
+    /// included — not 64 KiB plus one header.  Drives the boundary: an
+    /// accumulation of exactly 64 KiB must pass the size check (and fail
+    /// later only because the peer hangs up), one byte more must be
+    /// rejected as a resource limit.
+    #[tokio::test]
+    async fn preflight_wire_cap_counts_record_headers() {
+        // The ClientHello claim is sized to never complete inside the
+        // cap: message_len 65532 → total 65536, accepted by the inner
+        // message-length check, so the wire byte cap is the only limit
+        // that can fire.  Three full records then a fourth sized to land
+        // exactly on, or one byte past, the 64 KiB wire total:
+        // 3 × (5 + 16384) = 49167, the fourth header adds 5, so the
+        // payload hitting exactly 65536 is 65536 − 49172 = 16364.
+        fn wire_input(last_payload_len: usize) -> Vec<u8> {
+            let mut input = Vec::new();
+            let mut first_payload = vec![0u8; MAX_PLAINTEXT_RECORD];
+            first_payload[..4].copy_from_slice(&[HS_CLIENT_HELLO, 0x00, 0xFF, 0xFC]);
+            for payload in [
+                first_payload,
+                vec![0u8; MAX_PLAINTEXT_RECORD],
+                vec![0u8; MAX_PLAINTEXT_RECORD],
+                vec![0u8; last_payload_len],
+            ] {
+                input.extend_from_slice(&[TLS_RECORD_HANDSHAKE, 0x03, 0x03]);
+                input.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+                input.extend_from_slice(&payload);
+            }
+            input
+        }
+
+        // Exactly at the cap: no resource error — the pre-read fails only
+        // because the peer's EOF arrives with the hello still incomplete.
+        let (mut writer, reader) = tokio::io::duplex(128 * 1024);
+        writer.write_all(&wire_input(16364)).await.unwrap();
+        drop(writer);
+        match read_client_hello_preflight(Box::new(reader)).await {
+            Err(TransportError::Io(_)) => {}
+            Err(err) => panic!("exactly 64 KiB of wire passes the size cap, got: {err:?}"),
+            Ok(_) => panic!("incomplete hello at exactly 64 KiB wire must not classify"),
+        }
+
+        // One byte past the cap: the wire limit itself must fire.  Before
+        // the fix the +5 header slack let this through to the same EOF.
+        let (mut writer, reader) = tokio::io::duplex(128 * 1024);
+        writer.write_all(&wire_input(16365)).await.unwrap();
+        drop(writer);
+        match read_client_hello_preflight(Box::new(reader)).await {
+            Err(TransportError::ResourceLimit(_)) => {}
+            Err(err) => panic!("64 KiB + 1 of wire hits the resource limit, got: {err:?}"),
+            Ok(_) => panic!("one byte past 64 KiB wire must be rejected"),
+        }
+    }
+
+    /// C6: TLS 1.3 admits exactly one compression method, zero — a REALITY
+    /// candidate carrying anything else is not parsed as a candidate.
+    #[test]
+    fn client_hello_compression_must_be_exactly_null() {
+        fn synthetic_client_hello(compression: &[u8]) -> Vec<u8> {
+            let mut body = vec![0x03, 0x03];
+            body.extend_from_slice(&[0xAA; 32]);
+            body.push(0x20);
+            body.extend_from_slice(&[0xBB; 32]);
+            body.extend_from_slice(&[0, 2, 0x13, 0x01]); // one cipher suite
+            body.push(compression.len() as u8);
+            body.extend_from_slice(compression);
+            body.extend_from_slice(&[0, 0]); // empty extension vector
+            let mut hello = vec![HS_CLIENT_HELLO];
+            put_u24(body.len(), &mut hello);
+            hello.extend_from_slice(&body);
+            hello
+        }
+
+        parse_client_hello(synthetic_client_hello(&[0])).expect("exactly [0] parses");
+        for bad in [&[][..], &[1][..], &[0, 0][..], &[1, 0][..], &[0, 1][..]] {
+            assert!(
+                parse_client_hello(synthetic_client_hello(bad)).is_err(),
+                "compression {bad:?} must be rejected"
+            );
+        }
+    }
+
+    /// C3: token accrual saturates at the bucket's room instead of
+    /// truncating the u128 intermediate — before the fix an idle×rate
+    /// product of exactly 2^65 wrapped the `as u64` credit to zero.
+    #[test]
+    fn refill_saturates_instead_of_truncating() {
+        // 2^63 B/s for 4 s earns exactly 2^65 tokens — beyond u64 — so
+        // any wrap in the conversion chain is visible as a missing or
+        // under-counted credit.
+        let mut limit = DirectionalLimit::new(1u64 << 63, 0, 0);
+        assert_eq!(limit.capacity, 1u64 << 63);
+        limit.tokens = 0;
+        limit.refill_at = Instant::now() - Duration::from_secs(4);
+        limit.refill();
+        assert_eq!(
+            limit.tokens, limit.capacity,
+            "the credit saturates the bucket instead of wrapping"
+        );
+        assert!(
+            limit.refill_at <= Instant::now(),
+            "the refill baseline must never pass the present"
+        );
+    }
+
+    /// A full bucket earns nothing further, and once room exists the
+    /// normal-rate accrual still credits whole tokens — the saturation
+    /// clamp must not eat ordinary refills.
+    #[test]
+    fn refill_still_accrues_at_normal_rates() {
+        let mut limit = DirectionalLimit::new(1000, 0, 0);
+        assert_eq!(limit.capacity, 1000);
+
+        // Full bucket: refill pins the baseline without changing tokens.
+        limit.refill();
+        assert_eq!(limit.tokens, 1000);
+        assert!(limit.refill_at <= Instant::now());
+
+        // Half-drained bucket after 400+ ms idle at 1000 B/s: the credit
+        // is hundreds of tokens, bounded by the rate and the elapsed
+        // floor of 400 ms.
+        limit.tokens = 500;
+        limit.refill_at = Instant::now() - Duration::from_millis(400);
+        limit.refill();
+        assert!(
+            limit.tokens >= 900,
+            "400 ms at 1000 B/s restores at least 400 tokens, got {}",
+            limit.tokens
+        );
+        assert!(limit.tokens <= 1000, "never beyond capacity");
     }
 }

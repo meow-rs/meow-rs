@@ -15,6 +15,7 @@ use aes_gcm::{
 use boring::aead::{AeadCtx, Algorithm};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha384, Sha512};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
@@ -472,7 +473,14 @@ pub(crate) struct RealityTlsStream {
     plain_pos: usize,
     plain_end: usize,
     read_state: StreamReadState,
-    write_pending: Option<StreamPendingWrite>,
+    /// Sealed ciphertext of the in-flight write batch; the bytes not yet
+    /// handed to the inner transport are `write_frame[write_pos..]`.
+    /// The buffer survives a completed drain — it is cleared in place and
+    /// its capacity reused by the next batch — so after the first write
+    /// the steady state seals without allocating.  Invariant: the buffer
+    /// is empty exactly when no write is pending.
+    write_frame: Vec<u8>,
+    write_pos: usize,
 }
 
 impl RealityTlsStream {
@@ -490,7 +498,8 @@ impl RealityTlsStream {
                 buf: [0; 5],
                 pos: 0,
             },
-            write_pending: None,
+            write_frame: Vec::new(),
+            write_pos: 0,
         }
     }
 
@@ -511,11 +520,20 @@ impl RealityTlsStream {
     }
 
     pub(crate) fn enable_raw_write_passthrough(&mut self) -> bool {
-        if self.write_pending.is_some() {
-            tracing::warn!("Reality TLS raw write switch refused: sealed record still pending");
-            return false;
-        }
+        // Undrained ciphertext does not block the switch: poll_write,
+        // poll_flush and poll_shutdown all drain the pending frame before
+        // any further byte reaches the transport, and the pending bytes
+        // are already-sealed records, so the wire order — the final TLS
+        // ciphertext first, the raw bytes after it — holds structurally
+        // (issue #974).
         self.write_raw_passthrough = true;
+        if self.write_frame.is_empty() && self.write_frame.capacity() > 0 {
+            // Nothing left to drain: no drain will ever run again, so the
+            // scratch release in `drain_pending_write` cannot fire — drop
+            // the capacity here instead.  With ciphertext still pending
+            // the release happens when that drain completes.
+            self.write_frame = Vec::new();
+        }
         tracing::debug!("Reality TLS raw write passthrough enabled");
         true
     }
@@ -531,12 +549,12 @@ impl RealityTlsStream {
     }
 
     fn drain_pending_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let Some(pending) = &mut self.write_pending else {
+        if self.write_frame.is_empty() {
             return Poll::Ready(Ok(()));
-        };
+        }
 
-        while pending.pos < pending.frame.len() {
-            match Pin::new(&mut self.inner).poll_write(cx, &pending.frame[pending.pos..])? {
+        while self.write_pos < self.write_frame.len() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.write_frame[self.write_pos..])? {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(0) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -544,11 +562,22 @@ impl RealityTlsStream {
                         "reality tls: zero write",
                     )));
                 }
-                Poll::Ready(n) => pending.pos += n,
+                Poll::Ready(n) => self.write_pos += n,
             }
         }
 
-        self.write_pending.take().expect("pending checked above");
+        self.write_pos = 0;
+        if self.write_raw_passthrough {
+            // DIRECT never seals again, so the scratch capacity is dead
+            // weight for the rest of the connection — release it rather
+            // than hold one batch-sized allocation per raw stream.
+            self.write_frame = Vec::new();
+        } else {
+            // Cleared in place, the batch-sized capacity is reused by the
+            // next seal: the non-DIRECT steady state allocates the frame
+            // buffer once after the handshake, not once per write.
+            self.write_frame.clear();
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -563,11 +592,6 @@ enum StreamReadState {
         header: [u8; 5],
         pos: usize,
     },
-}
-
-struct StreamPendingWrite {
-    frame: Vec<u8>,
-    pos: usize,
 }
 
 impl AsyncRead for RealityTlsStream {
@@ -667,7 +691,7 @@ impl AsyncWrite for RealityTlsStream {
         // rather than reporting the *old* record's length against the
         // new buffer (AsyncWrite does not guarantee the same buffer is
         // presented after a Pending).
-        if self.write_pending.is_some() {
+        if !self.write_frame.is_empty() {
             match self.drain_pending_write(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -689,13 +713,19 @@ impl AsyncWrite for RealityTlsStream {
         // `MAX_WRITE_BATCH` of plaintext is sealed into one buffer.
         let chunk_len = buf.len().min(MAX_WRITE_BATCH);
         let records = chunk_len.div_ceil(MAX_RECORD_PLAINTEXT);
-        let mut frame = Vec::with_capacity(chunk_len + records * RECORD_OVERHEAD);
+        // The frame is empty here (drained above), so this reserve only
+        // grows the scratch when a batch is the largest seen so far;
+        // same-size-or-smaller later writes seal into the existing
+        // capacity without allocating.
+        let this = self.as_mut().get_mut();
+        this.write_frame
+            .reserve(chunk_len + records * RECORD_OVERHEAD);
         for record in buf[..chunk_len].chunks(MAX_RECORD_PLAINTEXT) {
-            self.write_key
-                .seal_into(&mut frame, TLS_RECORD_APPLICATION_DATA, record)
+            this.write_key
+                .seal_into(&mut this.write_frame, TLS_RECORD_APPLICATION_DATA, record)
                 .map_err(transport_io_error)?;
         }
-        self.write_pending = Some(StreamPendingWrite { frame, pos: 0 });
+        debug_assert_eq!(self.write_pos, 0, "drained frame restarts at zero");
         // The records are buffered; report chunk_len immediately whether
         // or not the drain completes now.  The next poll_write /
         // poll_flush / poll_shutdown drains them.  Returning Pending here
@@ -1493,13 +1523,16 @@ impl RecordKey {
                 "TLS record exceeds u16 length: {record_len}"
             )));
         };
+        // The nonce is consumed before `out` is mutated: a failure here
+        // (sequence exhaustion is fatal) must not leave unencrypted
+        // plaintext appended to the frame.
+        let nonce = self.next_nonce()?;
         let start = out.len();
         out.extend_from_slice(&[TLS_RECORD_APPLICATION_DATA, 0x03, 0x03]);
         out.extend_from_slice(&record_len16.to_be_bytes());
         out.extend_from_slice(plaintext);
         out.push(inner_type);
         out.resize(start + 5 + record_len, 0);
-        let nonce = self.next_nonce();
         let (header, body) = out[start..].split_at_mut(5);
         let (data, tag) = body.split_at_mut(body_len);
         self.aead
@@ -1527,7 +1560,7 @@ impl RecordKey {
         let Some(split) = payload.len().checked_sub(RECORD_TAG_LEN) else {
             return Err(TransportError::Tls("TLS ciphertext too short".into()));
         };
-        let nonce = self.next_nonce();
+        let nonce = self.next_nonce()?;
         let (data, tag) = payload.split_at_mut(split);
         self.aead
             .open_in_place(&nonce, data, tag, header)
@@ -1541,14 +1574,22 @@ impl RecordKey {
         Ok((data[pos], pos))
     }
 
-    fn next_nonce(&mut self) -> [u8; 12] {
+    fn next_nonce(&mut self) -> Result<[u8; 12]> {
+        // RFC 8446 §5.3: the sequence number must not wrap.  Without rekey
+        // support the only compliant end of the keystream is a fatal
+        // error, taken before `u64::MAX` is ever used as a sequence value.
+        if self.seq == u64::MAX {
+            return Err(TransportError::Tls(
+                "TLS record sequence number exhausted".into(),
+            ));
+        }
         let mut nonce = self.iv;
         let seq = self.seq.to_be_bytes();
         for (dst, src) in nonce[4..].iter_mut().zip(seq) {
             *dst ^= src;
         }
         self.seq += 1;
-        nonce
+        Ok(nonce)
     }
 }
 
@@ -1559,11 +1600,15 @@ pub(crate) fn verify_finished(
     received: &[u8],
 ) -> Result<()> {
     let expected = finished_verify_data(hash, secret, transcript);
-    if expected.as_slice() == received {
+    // verify_data authenticates the peer's key material, so the comparison
+    // is constant-time.  The length is public — fixed by the suite's hash —
+    // and is checked first: `ct_eq` on uneven slices would still return
+    // unequal, but only after timing that depends on the mismatch shape.
+    if expected.len() == received.len() && bool::from(expected.as_slice().ct_eq(received)) {
         Ok(())
     } else {
         Err(TransportError::Tls(
-            "Reality TLS: server Finished verify_data mismatch".into(),
+            "Reality TLS: Finished verify_data mismatch".into(),
         ))
     }
 }
@@ -2289,7 +2334,7 @@ mod tests {
 
         // The pending record is buffered (not fully drained).
         assert!(
-            stream.write_pending.is_some(),
+            !stream.write_frame.is_empty(),
             "record buffered after Pending drain"
         );
 
@@ -2304,8 +2349,277 @@ mod tests {
         // The pending record from the second write should also be
         // drainable (inner accepts everything now).
         assert!(
-            stream.write_pending.is_none(),
+            stream.write_frame.is_empty(),
             "second record drained on this call"
+        );
+    }
+
+    // ─── Raw write passthrough ordering and write-scratch reuse (issue #974) ──
+
+    use std::sync::{Arc, Mutex};
+
+    /// Inner stream scripting a backpressure interleaving: the first
+    /// `poll_write` accepts only `accept_first` bytes, the second returns
+    /// `Pending` once (self-waking), and everything after that is accepted
+    /// in full.  Every accepted byte lands in `written` in wire order.
+    struct BackpressuredWriter {
+        written: Arc<Mutex<Vec<u8>>>,
+        accept_first: usize,
+        writes: usize,
+    }
+
+    impl AsyncRead for BackpressuredWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for BackpressuredWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            match self.writes {
+                1 => {
+                    let n = self.accept_first.min(buf.len());
+                    self.written.lock().unwrap().extend_from_slice(&buf[..n]);
+                    Poll::Ready(Ok(n))
+                }
+                2 => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                _ => {
+                    self.written.lock().unwrap().extend_from_slice(buf);
+                    Poll::Ready(Ok(buf.len()))
+                }
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Unpin for BackpressuredWriter {}
+
+    /// A4: with ciphertext still pending at the TLS layer — the state a
+    /// vision DIRECT frame leaves behind whenever the transport applies
+    /// backpressure — the raw write switch must succeed, and the bytes
+    /// that later reach the wire must be the rest of the sealed record
+    /// first, the raw bytes after it.
+    #[test]
+    fn raw_write_switch_with_pending_ciphertext_preserves_wire_order() {
+        let secret = [0x5Au8; 32];
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = RealityTlsStream::new(
+            Box::new(BackpressuredWriter {
+                written: Arc::clone(&written),
+                accept_first: 3,
+                writes: 0,
+            }),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+        );
+
+        use tokio::io::AsyncWriteExt;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // 27 bytes of plaintext seal into one 49-byte record
+        // (5 header + 27 + 1 inner type + 16 tag); the scripted
+        // backpressure leaves most of it pending.
+        let tls_plaintext = b"vision DIRECT frame payload";
+        assert_eq!(tls_plaintext.len(), 27);
+        rt.block_on(async {
+            let n = stream.write(tls_plaintext).await.unwrap();
+            assert_eq!(n, tls_plaintext.len());
+        });
+        assert!(
+            !stream.write_frame.is_empty(),
+            "ciphertext must still be pending after the partial drain"
+        );
+        assert_eq!(
+            written.lock().unwrap().len(),
+            3,
+            "only the first write landed"
+        );
+
+        // The switch must not be refused over the pending ciphertext.
+        assert!(
+            stream.enable_raw_write_passthrough(),
+            "raw write switch must accept pending ciphertext (A4)"
+        );
+
+        let raw_bytes = b"raw application bytes after the DIRECT switch";
+        rt.block_on(async {
+            stream.write_all(raw_bytes).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let wire = written.lock().unwrap().clone();
+        // One application-data record: `17 03 03` + u16 length, then the
+        // ciphertext body.  The plaintext fit a single record.
+        let record_len = tls_plaintext.len() + 1 + 16;
+        let ciphertext_len = 5 + record_len;
+        assert!(
+            wire.len() >= ciphertext_len + raw_bytes.len(),
+            "wire holds ciphertext then raw bytes"
+        );
+        assert_eq!(&wire[..3], &[0x17, 0x03, 0x03], "TLS appdata record header");
+        assert_eq!(
+            u16::from_be_bytes([wire[3], wire[4]]) as usize,
+            record_len,
+            "sealed record length"
+        );
+        // The sealed record decrypts, under a fresh key at sequence zero,
+        // to exactly the pre-switch plaintext — proving the ciphertext on
+        // the wire is the DIRECT frame, not a re-framed duplicate.
+        let mut receiver = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        let header: [u8; 5] = wire[..5].try_into().unwrap();
+        let (inner_type, plaintext) = receiver
+            .open(&header, &wire[5..ciphertext_len])
+            .expect("wire ciphertext must open under the write key");
+        assert_eq!(inner_type, TLS_RECORD_APPLICATION_DATA);
+        assert_eq!(plaintext, tls_plaintext);
+        // And after the final ciphertext byte the raw bytes follow
+        // verbatim — no TLS byte is ordered behind them.
+        assert_eq!(
+            &wire[ciphertext_len..ciphertext_len + raw_bytes.len()],
+            raw_bytes,
+            "raw bytes must follow the drained ciphertext in wire order"
+        );
+        assert_eq!(wire.len(), ciphertext_len + raw_bytes.len());
+    }
+
+    /// A7: the sealed-frame scratch is cleared in place when a drain
+    /// completes, so same-size-or-smaller later writes reuse its capacity
+    /// instead of allocating a fresh Vec per batch — and after the DIRECT
+    /// switch the buffer is released entirely, since no record is ever
+    /// sealed again.
+    #[test]
+    fn write_frame_capacity_is_reused_and_released_after_direct() {
+        let secret = [0x5Au8; 32];
+        let mut stream = RealityTlsStream::new(
+            Box::new(BackpressuredWriter {
+                written: Arc::new(Mutex::new(Vec::new())),
+                accept_first: usize::MAX,
+                writes: 0,
+            }),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+        );
+
+        use tokio::io::AsyncWriteExt;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            stream.write_all(&[0xAA; 1000]).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        assert!(stream.write_frame.is_empty(), "drain clears the frame");
+        let capacity = stream.write_frame.capacity();
+        let ptr = stream.write_frame.as_ptr();
+        assert!(
+            capacity >= 1000 + RECORD_OVERHEAD,
+            "scratch keeps batch capacity"
+        );
+
+        // A smaller write must reuse the allocation: same pointer, same
+        // capacity.
+        rt.block_on(async {
+            stream.write_all(&[0xBB; 100]).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        assert_eq!(
+            stream.write_frame.capacity(),
+            capacity,
+            "capacity unchanged"
+        );
+        assert_eq!(stream.write_frame.as_ptr(), ptr, "same allocation reused");
+
+        // After the DIRECT switch and the final drain the scratch is
+        // released — a raw stream must not pin batch-sized capacity.
+        assert!(stream.enable_raw_write_passthrough());
+        rt.block_on(async {
+            stream.write_all(b"raw").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        assert_eq!(
+            stream.write_frame.capacity(),
+            0,
+            "DIRECT releases the write scratch"
+        );
+    }
+
+    /// C7: the record sequence number must never wrap — at `u64::MAX`
+    /// both directions fail fatally instead of reusing a nonce.
+    #[test]
+    fn record_key_sequence_exhaustion_is_fatal() {
+        let secret = [0x2bu8; 32];
+
+        // u64::MAX - 1 is the last usable sequence value; the next seal
+        // hits the guard.
+        let mut sender = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        sender.seq = u64::MAX - 1;
+        sender
+            .seal(TLS_RECORD_APPLICATION_DATA, b"last")
+            .expect("u64::MAX - 1 still seals");
+        assert_eq!(sender.seq, u64::MAX);
+        let err = sender
+            .seal(TLS_RECORD_APPLICATION_DATA, b"one too far")
+            .expect_err("u64::MAX must be refused, not wrapped");
+        assert!(
+            matches!(&err, TransportError::Tls(msg) if msg.contains("sequence")),
+            "unexpected error: {err:?}"
+        );
+
+        let mut receiver = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        receiver.seq = u64::MAX;
+        let mut payload = vec![0u8; 32];
+        let header = [0x17, 0x03, 0x03, 0, 32];
+        assert!(
+            receiver.open_in_place(&header, &mut payload).is_err(),
+            "open at u64::MAX must fail rather than wrap the nonce"
+        );
+    }
+
+    /// C1: `verify_finished` accepts only the exact verify_data — a
+    /// flipped bit or a truncated value fails, through the same path the
+    /// client and server share.
+    #[test]
+    fn verify_finished_rejects_mismatch_and_wrong_length() {
+        let secret = b"test-secret";
+        let transcript = b"test-transcript";
+        let expected = finished_verify_data(HashAlg::Sha256, secret, transcript);
+        verify_finished(HashAlg::Sha256, secret, transcript, &expected)
+            .expect("exact verify_data passes");
+
+        let mut flipped = expected.clone();
+        flipped[0] ^= 1;
+        assert!(verify_finished(HashAlg::Sha256, secret, transcript, &flipped).is_err());
+        assert!(
+            verify_finished(
+                HashAlg::Sha256,
+                secret,
+                transcript,
+                &expected[..expected.len() - 1]
+            )
+            .is_err(),
+            "truncated verify_data must fail, not prefix-compare"
         );
     }
 
