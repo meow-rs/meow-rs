@@ -163,6 +163,9 @@ rcgen = "0.13"
 rustls = { workspace = true }
 tokio-rustls = { workspace = true }
 hex = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
 
 # listener-tun: the Wintun adapter's addresses are assigned through IP
 # Helper (`tun/windows_device.rs`) so they come up Preferred, not tentative.
