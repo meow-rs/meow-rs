@@ -1578,71 +1578,86 @@ mod linux {
             );
         }
 
-        /// Sticky readiness plus tokio's finite task budget force a yield:
-        /// the datagram is never consumed, so every successful readiness poll
-        /// is guaranteed to be followed by another one. After the fixed-size
-        /// budget is exhausted, the probe task must get a scheduler turn.
+        /// Draining a continuously-ready production receive path must spend
+        /// tokio's finite task budget before the finite kernel backlog is gone.
         #[test]
-        fn sticky_udp_readiness_spends_coop_budget() {
-            let receiver = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        fn production_udp_receive_spends_coop_budget() {
+            let receiver = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .unwrap();
+            receiver.set_recv_buffer_size(4 * 1024 * 1024).unwrap();
+            receiver
+                .bind(&"127.0.0.1:0".parse::<SocketAddr>().unwrap().into())
+                .unwrap();
             receiver.set_nonblocking(true).unwrap();
-            let receiver_addr = receiver.local_addr().unwrap();
+            let addr = receiver.local_addr().unwrap().as_socket().unwrap();
+            let receiver: std::net::UdpSocket = receiver.into();
             let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-
-            // UDP send success does not prove local enqueueing. Peek without
-            // consuming; once this succeeds, the unread datagram makes the
-            // socket sticky-readable for the rest of the test.
-            let mut enqueued = false;
-            for _ in 0..100 {
-                sender.send_to(&[0u8], receiver_addr).unwrap();
-                if receiver.peek(&mut [0u8]).is_ok() {
-                    enqueued = true;
-                    break;
+            sender.set_nonblocking(true).unwrap();
+            let mut sent = 0;
+            for _ in 0..2048 {
+                if sender.send_to(&[0], addr).is_ok() {
+                    sent += 1;
                 }
-                std::thread::sleep(Duration::from_millis(1));
             }
-            assert!(enqueued, "loopback datagram never reached the UDP queue");
-
+            assert!(sent >= 512, "loopback backlog too small: {sent}");
+            assert!(
+                receiver.peek(&mut [0]).is_ok(),
+                "no datagram entered the queue"
+            );
             let probe_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let stop_hog = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let probe_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-            let runtime_thread = std::thread::spawn({
+            let thread = std::thread::spawn({
                 let probe_done = Arc::clone(&probe_done);
-                let stop_hog = Arc::clone(&stop_hog);
+                let probe_count = Arc::clone(&probe_count);
+                let count = Arc::clone(&count);
+                let stop = Arc::clone(&stop);
                 move || {
-                    let runtime = tokio::runtime::Builder::new_current_thread()
+                    let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()
                         .unwrap();
-                    runtime.block_on(async move {
+                    rt.block_on(async move {
                         let socket = UdpSocket::from_std(receiver).unwrap();
+                        let hog_count = Arc::clone(&count);
                         tokio::spawn(async move {
-                            while !stop_hog.load(Ordering::Relaxed) {
-                                std::future::poll_fn(|cx| socket.poll_recv_ready(cx))
-                                    .await
-                                    .unwrap();
+                            let mut buf = vec![0; 64];
+                            while !stop.load(Ordering::Relaxed) {
+                                if recv_dgram(&socket, &mut buf).await.is_ok() {
+                                    hog_count.fetch_add(1, Ordering::SeqCst);
+                                }
                             }
                         });
+                        let probe_source = Arc::clone(&count);
                         tokio::spawn(async move {
                             tokio::task::yield_now().await;
+                            probe_count
+                                .store(probe_source.load(Ordering::SeqCst), Ordering::SeqCst);
                             probe_done.store(true, Ordering::SeqCst);
                         });
                         let _ = shutdown_rx.await;
                     });
                 }
             });
-
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_secs(2) && !probe_done.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(2));
             }
-            let probe_ran = probe_done.load(Ordering::SeqCst);
-            stop_hog.store(true, Ordering::SeqCst);
+            let ran = probe_done.load(Ordering::SeqCst);
+            let count_at_probe = probe_count.load(Ordering::SeqCst);
+            stop.store(true, Ordering::SeqCst);
             let _ = shutdown_tx.send(());
-            runtime_thread.join().expect("runtime thread panicked");
+            thread.join().unwrap();
+            assert!(ran, "production receive path did not yield");
             assert!(
-                probe_ran,
-                "sticky readiness did not yield the current-thread worker"
+                (100..512).contains(&count_at_probe),
+                "probe observed {count_at_probe} drained datagrams"
             );
         }
 
