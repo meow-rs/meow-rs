@@ -82,7 +82,15 @@ listener-vless = [
     "meow-transport/tls",
     "meow-transport/reality",
     "dep:meow-proxy",
+    "dep:bytes",
     "meow-proxy/vless-vision",
+    # The XUDP server codec lives in meow-proxy's `mux` module (it shares
+    # Mux.Cool wire constants with the client session driver). In every
+    # app build that carries this listener `mux` is already present
+    # (`full` bundles both, `minimal` neither), so this edge costs real
+    # binaries nothing; splitting the server codec out of the client
+    # feature is a meow-proxy-side follow-up.
+    "meow-proxy/mux",
 ]
 
 [dependencies]

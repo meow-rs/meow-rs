@@ -6,10 +6,10 @@
 //! decode → UUID authentication → command dispatch. TCP commands are
 //! wrapped in the server Vision codec and routed through
 //! [`route_inbound_tcp`] with the authenticated username in
-//! `Metadata.in_user`. REALITY classification failures are transparently
-//! relayed to the configured cover target; authenticated REALITY flows
-//! never dial that target. Mux/XUDP requests are explicitly closed in
-//! this wave (the XUDP session machine lands separately).
+//! `Metadata.in_user`; Mux commands run the XUDP association in
+//! [`crate::vless_xudp`] over the same codec in XUDP mode. REALITY
+//! classification failures are transparently relayed to the configured
+//! cover target; authenticated REALITY flows never dial that target.
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, SocketAddr};
@@ -63,9 +63,8 @@ pub struct VlessListenerSpec {
     /// `xtls-rprx-vision` flow.
     pub users: Vec<VlessUserSpec>,
     pub security: VlessSecuritySpec,
-    /// `udp: false` rejects Mux/XUDP at the VLESS command layer. The TCP
-    /// wave closes Mux either way; this flag carries the configured
-    /// contract forward for the XUDP wave.
+    /// `udp: false` rejects Mux/XUDP at the VLESS command layer — the
+    /// primary enforcement point ahead of the codec's own backstop.
     pub udp: bool,
 }
 
@@ -505,22 +504,37 @@ impl VlessListener {
                 }
             }
             VlessRequestCommand::Mux => {
-                // Wave 2B owns the XUDP session machine. Close deliberately
-                // here: no response header, no target resolution/dial and no
-                // half-constructed mux state. `udp: false` is the same wire
-                // refusal, just with a distinct diagnostic.
-                if self.udp {
-                    debug!(
-                        "vless listener '{}' mux command from {peer}: XUDP inbound is not linked in this build wave",
-                        self.name
-                    );
-                } else {
+                // `udp: false` refuses Mux at the VLESS header layer — the
+                // primary enforcement point, before any XUDP byte arrives
+                // (the codec's `udp_permitted` is only a backstop). No
+                // response header, no target resolution, no mux state.
+                if !self.udp {
                     debug!(
                         "vless listener '{}' mux command from {peer}: udp disabled",
                         self.name
                     );
+                    graceful_close(&mut stream).await;
+                    return;
                 }
-                graceful_close(&mut stream).await;
+                debug!(
+                    "vless listener '{}' {peer} user '{}' -> XUDP association",
+                    self.name, username
+                );
+                let conn = VisionServerConn::new(stream, request.uuid, VisionServerMode::Xudp);
+                let inner = Arc::clone(self.tunnel.inner());
+                crate::vless_xudp::run_xudp_conn(
+                    conn,
+                    inner,
+                    crate::vless_xudp::XudpFlowCtx {
+                        peer,
+                        in_name: &self.name,
+                        in_port,
+                        user: &username,
+                        route_override: self.route_override.as_ref(),
+                    },
+                    deadline,
+                )
+                .await;
             }
         }
     }

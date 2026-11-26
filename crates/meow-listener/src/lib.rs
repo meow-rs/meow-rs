@@ -23,12 +23,14 @@ mod pem;
 pub const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 /// Process-wide monotonic timestamp in milliseconds. Used by UDP flow tables
-/// (SOCKS5-UDP and the shadowsocks listener) for idle eviction. The `START`
-/// instant is lazily initialized on the first call and never changes.
+/// (SOCKS5-UDP, the shadowsocks listener, AnyTLS UoT and VLESS XUDP) for
+/// idle eviction. The `START` instant is lazily initialized on the first
+/// call and never changes.
 #[cfg(any(
     feature = "listener-socks5",
     feature = "listener-shadowsocks",
-    feature = "listener-anytls"
+    feature = "listener-anytls",
+    feature = "listener-vless"
 ))]
 pub(crate) fn monotonic_ms() -> u64 {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
@@ -58,6 +60,8 @@ pub mod tproxy;
 pub mod tun;
 #[cfg(feature = "listener-vless")]
 pub mod vless;
+#[cfg(feature = "listener-vless")]
+pub(crate) mod vless_xudp;
 #[cfg(feature = "listener-wireguard")]
 pub mod wireguard;
 
