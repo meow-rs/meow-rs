@@ -2419,7 +2419,7 @@ dependencies = [
 
 [[package]]
 name = "meow-anytls"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "bytes",
@@ -2448,7 +2448,7 @@ dependencies = [
 
 [[package]]
 name = "meow-api"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2495,7 +2495,7 @@ dependencies = [
 
 [[package]]
 name = "meow-app"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2533,7 +2533,7 @@ dependencies = [
 
 [[package]]
 name = "meow-bench"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2547,7 +2547,7 @@ dependencies = [
 
 [[package]]
 name = "meow-cli"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2574,7 +2574,7 @@ dependencies = [
 
 [[package]]
 name = "meow-common"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2601,7 +2601,7 @@ dependencies = [
 
 [[package]]
 name = "meow-config"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2637,7 +2637,7 @@ dependencies = [
 
 [[package]]
 name = "meow-dns"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "async-trait",
  "boring",
@@ -2671,7 +2671,7 @@ dependencies = [
 
 [[package]]
 name = "meow-listener"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2715,7 +2715,7 @@ dependencies = [
 
 [[package]]
 name = "meow-lwip"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "bindgen",
  "bytes",
@@ -2729,7 +2729,7 @@ dependencies = [
 
 [[package]]
 name = "meow-proxy"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "aes 0.8.4",
  "aes-gcm 0.10.3",
@@ -2786,7 +2786,7 @@ dependencies = [
 
 [[package]]
 name = "meow-rules"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "criterion",
  "ipnet",
@@ -2803,7 +2803,7 @@ dependencies = [
 
 [[package]]
 name = "meow-transport"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "aes 0.9.3",
  "aes-gcm 0.10.3",
@@ -2854,7 +2854,7 @@ dependencies = [
 
 [[package]]
 name = "meow-trie"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "criterion",
  "proptest",
@@ -2862,7 +2862,7 @@ dependencies = [
 
 [[package]]
 name = "meow-tunnel"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -2894,7 +2894,7 @@ dependencies = [
 
 [[package]]
 name = "meow-wgstack"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "bytes",
  "libc",
@@ -2907,7 +2907,7 @@ dependencies = [
 
 [[package]]
 name = "meow-wireguard"
-version = "0.29.0"
+version = "0.30.0"
 dependencies = [
  "aead 0.5.2",
  "base64 0.22.1",
