@@ -21,7 +21,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use crate::reality_hello::{EXT_KEY_SHARE, GROUP_X25519, GROUP_X25519_MLKEM768};
 use crate::reality_tls::{
     finished_verify_data, hkdf_sha256, put_u16, put_u24, read_record, read_u24, take, take_u16,
-    take_u8, verify_finished, wrap_plain_record, x25519, x25519_public_from_private,
+    take_u8, verify_finished, wrap_plain_record_tls13, x25519, x25519_public_from_private,
     ApplicationKeys, CipherSuite, HandshakeKeys, RealityTlsStream, HS_CERTIFICATE,
     HS_CERTIFICATE_VERIFY, HS_CLIENT_HELLO, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO,
     TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256,
@@ -270,7 +270,9 @@ impl RealityServer {
         transcript.extend_from_slice(&server_hello);
         let mut hs = HandshakeKeys::derive(prepared.cipher, &shared_secret, &transcript);
 
-        let ee = handshake_message(HS_ENCRYPTED_EXTENSIONS, &[]);
+        // EncryptedExtensions carries a two-byte extension-vector length even
+        // when it is empty; a zero-length body is not a legal TLS 1.3 message.
+        let ee = handshake_message(HS_ENCRYPTED_EXTENSIONS, &[0, 0]);
         transcript.extend_from_slice(&ee);
         let certificate_der = self.inner.certificate.for_auth_key(&prepared.auth_key);
         let certificate = certificate_message(&certificate_der);
@@ -312,8 +314,11 @@ impl RealityServer {
             ));
         }
         let mut encrypted = hs.server.seal(TLS_RECORD_HANDSHAKE, &encrypted_plain)?;
-        let mut out = wrap_plain_record(TLS_RECORD_HANDSHAKE, &server_hello)?;
-        out.extend_from_slice(&wrap_plain_record(TLS_RECORD_CHANGE_CIPHER_SPEC, &[1])?);
+        let mut out = wrap_plain_record_tls13(TLS_RECORD_HANDSHAKE, &server_hello)?;
+        out.extend_from_slice(&wrap_plain_record_tls13(
+            TLS_RECORD_CHANGE_CIPHER_SPEC,
+            &[1],
+        )?);
         out.append(&mut encrypted);
         inner.write_all(&out).await?;
         inner.flush().await?;
@@ -1241,6 +1246,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::reality_tls::wrap_plain_record;
     use crate::reality_tls::{build_reality_client_hello, RealityTlsLayer};
     use crate::tls::TlsConfig;
     use crate::Transport;

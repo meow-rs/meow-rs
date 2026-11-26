@@ -810,16 +810,29 @@ pub(crate) fn build_reality_client_hello(
     Ok((hello, aead_key))
 }
 
-pub(crate) fn wrap_plain_record(typ: u8, payload: &[u8]) -> Result<Vec<u8>> {
+fn wrap_plain_record_version(typ: u8, payload: &[u8], version: [u8; 2]) -> Result<Vec<u8>> {
     if payload.len() > u16::MAX as usize {
         return Err(TransportError::Tls("TLS record payload too large".into()));
     }
     let mut out = Vec::with_capacity(5 + payload.len());
     out.push(typ);
-    out.extend_from_slice(&[0x03, 0x01]);
+    out.extend_from_slice(&version);
     put_u16(payload.len() as u16, &mut out);
     out.extend_from_slice(payload);
     Ok(out)
+}
+
+/// TLS 1.3 permits 0x0301 on the first ClientHello record for middlebox
+/// compatibility, so the client-side writer keeps that legacy shape.
+pub(crate) fn wrap_plain_record(typ: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    wrap_plain_record_version(typ, payload, [0x03, 0x01])
+}
+
+/// Server responses use the TLS 1.3 record version. uTLS clients reject a
+/// ServerHello flight wrapped as 0x0301 even though they accept that version
+/// on an inbound ClientHello.
+pub(crate) fn wrap_plain_record_tls13(typ: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    wrap_plain_record_version(typ, payload, [0x03, 0x03])
 }
 
 async fn read_plain_handshake<R: AsyncRead + Unpin>(r: &mut R, expected: u8) -> Result<Vec<u8>> {
