@@ -7,6 +7,7 @@
 //! - [`encryption`] — VLESS post-quantum Encryption (`mlkem768x25519plus`, behind `vless-encryption`)
 
 pub(crate) mod conn;
+#[cfg(all(test, feature = "vless-vision"))]
 pub(crate) mod golden;
 pub(crate) mod header;
 
