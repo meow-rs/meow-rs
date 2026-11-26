@@ -8,6 +8,8 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+## [0.30.0] - 2026-11-26
+
 ### Added
 
 - `global-client-fingerprint` and `global-ua` — mihomo's two top-level
