@@ -1,9 +1,9 @@
 //! REALITY server-side authentication, handshake and cover relay.
 //!
-//! The accepted stream is the client-side [`crate::reality_tls::RealityTlsStream`]
-//! record implementation with its keys installed in the opposite directions.
-//! This keeps one audited record-layer implementation and gives the inbound
-//! the same independent raw-passthrough switches as the outbound.
+//! The accepted stream reuses the REALITY record implementation with its keys
+//! installed in the opposite directions.  This keeps one audited record-layer
+//! implementation and gives the inbound the same independent raw-passthrough
+//! switches as the outbound.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -117,6 +117,13 @@ fn default_now() -> SystemTime {
 
 impl RealityServer {
     pub fn new(config: &RealityServerConfig) -> Result<Self> {
+        Self::with_certificate(config, RealityCertificate::generate)
+    }
+
+    fn with_certificate(
+        config: &RealityServerConfig,
+        certificate: impl FnOnce() -> Result<RealityCertificate>,
+    ) -> Result<Self> {
         if config.short_ids.is_empty() || config.short_ids.len() > 64 {
             return Err(TransportError::Config(
                 "REALITY server requires 1..64 short IDs".into(),
@@ -147,11 +154,21 @@ impl RealityServer {
                     .map(|name| name.to_ascii_lowercase())
                     .collect(),
                 max_time_difference,
-                certificate: RealityCertificate::generate()?,
+                certificate: certificate()?,
                 now: config.now.unwrap_or(default_now),
                 #[cfg(test)]
                 corrupt_certificate_verify: false,
             }),
+        })
+    }
+
+    #[cfg(test)]
+    fn new_with_ed25519_private_der(
+        config: &RealityServerConfig,
+        private_key_der: &[u8],
+    ) -> Result<Self> {
+        Self::with_certificate(config, || {
+            RealityCertificate::from_private_key_der(private_key_der)
         })
     }
 
@@ -197,6 +214,24 @@ impl RealityServer {
         Ok(RealityServerAccept::Authenticated(stream))
     }
 
+    fn open_auth_plaintext(&self, hello: &ClientHello) -> Option<([u8; 32], Vec<u8>)> {
+        let auth_share = hello.auth_share()?;
+        let shared = x25519(&self.inner.private_key, &auth_share).ok()?;
+        let auth_key: [u8; 32] = hkdf_sha256(&shared, &hello.random[..20], b"REALITY", 32)
+            .try_into()
+            .expect("REALITY AuthKey length");
+
+        let ciphertext = hello.session_id.get(..16)?;
+        let tag = hello.session_id.get(16..32)?;
+        let mut aad = hello.raw.clone();
+        aad[39..71].fill(0);
+        let plaintext = aes_gcm_open(&auth_key, &hello.random[20..32], ciphertext, tag, &aad)?;
+        if plaintext.len() != 16 {
+            return None;
+        }
+        Some((auth_key, plaintext))
+    }
+
     fn classify(&self, hello: &ClientHello) -> Option<PreparedHandshake> {
         if !hello.reality_session_id_layout
             || !hello.offers_tls13
@@ -210,24 +245,12 @@ impl RealityServer {
         if !self.inner.server_names.contains(server_name) {
             return None;
         }
-        let auth_share = hello.auth_share()?;
-        let shared = x25519(&self.inner.private_key, &auth_share).ok()?;
-        let auth_key = hkdf_sha256(&shared, &hello.random[..20], b"REALITY", 32);
-
-        let ciphertext = hello.session_id.get(..16)?;
-        let tag = hello.session_id.get(16..32)?;
-        let mut aad = hello.raw.clone();
-        aad[39..71].fill(0);
-        let plaintext = aes_gcm_open(&auth_key, &hello.random[20..32], ciphertext, tag, &aad)?;
-        if plaintext.len() != 16 {
-            return None;
-        }
+        let (auth_key, plaintext) = self.open_auth_plaintext(hello)?;
+        let (_version, _reserved, unix_seconds, short_id) = parse_auth_plaintext(&plaintext)?;
         // The wire timestamp is whole Unix seconds, but the comparison
         // happens in the Duration domain: truncating the window to whole
         // seconds would collapse a sub-second window to zero width.
-        let client_time = Duration::from_secs(u64::from(u32::from_be_bytes(
-            plaintext[4..8].try_into().ok()?,
-        )));
+        let client_time = Duration::from_secs(u64::from(unix_seconds));
         if self.inner.max_time_difference != Duration::ZERO {
             let now = (self.inner.now)()
                 .duration_since(UNIX_EPOCH)
@@ -236,10 +259,9 @@ impl RealityServer {
                 return None;
             }
         }
-        let short_id: &[u8; 8] = plaintext[8..16].try_into().ok()?;
         let mut matched = subtle::Choice::from(0);
         for configured in &self.inner.short_ids {
-            matched |= configured.ct_eq(short_id);
+            matched |= configured.ct_eq(&short_id);
         }
         if !bool::from(matched) {
             return None;
@@ -252,7 +274,7 @@ impl RealityServer {
             session_id: hello.session_id.clone(),
             cipher,
             key_share,
-            auth_key: auth_key.try_into().expect("REALITY AuthKey length"),
+            auth_key,
         })
     }
 
@@ -285,10 +307,7 @@ impl RealityServer {
         let mut cv_body = Vec::with_capacity(2 + 2 + 64);
         put_u16(SIG_ED25519, &mut cv_body);
         put_u16(64, &mut cv_body);
-        let mut signed = vec![0x20; 64];
-        signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
-        signed.push(0);
-        signed.extend_from_slice(&hash.digest(&transcript));
+        let signed = certificate_verify_input(&hash.digest(&transcript));
         let signature = self.inner.certificate.sign(&signed)?;
         #[cfg(test)]
         let mut signature = signature;
@@ -352,6 +371,27 @@ fn valid_server_name(name: &str) -> bool {
 }
 
 const SIG_ED25519: u16 = 0x0807;
+
+fn parse_auth_plaintext(plaintext: &[u8]) -> Option<([u8; 3], u8, u32, [u8; 8])> {
+    if plaintext.len() != 16 {
+        return None;
+    }
+    Some((
+        plaintext[0..3].try_into().ok()?,
+        plaintext[3],
+        u32::from_be_bytes(plaintext[4..8].try_into().ok()?),
+        plaintext[8..16].try_into().ok()?,
+    ))
+}
+
+fn certificate_verify_input(transcript_hash: &[u8]) -> Vec<u8> {
+    let mut signed = Vec::with_capacity(64 + 33 + 1 + transcript_hash.len());
+    signed.extend_from_slice(&[0x20; 64]);
+    signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    signed.push(0);
+    signed.extend_from_slice(transcript_hash);
+    signed
+}
 
 enum Preflight {
     Candidate {
@@ -905,6 +945,22 @@ impl RealityCertificate {
     fn generate() -> Result<Self> {
         let key = PKey::generate(Id::ED25519)
             .map_err(|e| TransportError::Crypto(format!("REALITY Ed25519 identity: {e}")))?;
+        Self::from_key(key)
+    }
+
+    #[cfg(test)]
+    fn from_private_key_der(private_key_der: &[u8]) -> Result<Self> {
+        let key = PKey::private_key_from_der(private_key_der)
+            .map_err(|e| TransportError::Crypto(format!("REALITY Ed25519 test identity: {e}")))?;
+        if key.id() != Id::ED25519 {
+            return Err(TransportError::Crypto(
+                "REALITY test identity is not Ed25519".into(),
+            ));
+        }
+        Self::from_key(key)
+    }
+
+    fn from_key(key: PKey<Private>) -> Result<Self> {
         let mut public_key = [0u8; 32];
         let key_len = key
             .raw_public_key(&mut public_key)
@@ -1885,5 +1941,1005 @@ mod tests {
             limit.tokens
         );
         assert!(limit.tokens <= 1000, "never beyond capacity");
+    }
+}
+
+#[cfg(test)]
+mod independent_wire_vectors {
+    use super::*;
+    use std::collections::HashSet;
+
+    use aes_gcm::aead::{AeadInPlace, KeyInit};
+    use aes_gcm::{Aes128Gcm, Nonce, Tag};
+    use boring::sign::Verifier;
+    use hmac::Mac;
+    use sha2::{Digest, Sha256};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio::io::DuplexStream;
+
+    include!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/testdata/reality_independent_vectors.rs"
+    ));
+
+    type IndependentHmacSha256 = hmac::Hmac<Sha256>;
+    type IndependentHmacSha512 = hmac::Hmac<sha2::Sha512>;
+
+    fn hex_bytes(hex: &str) -> Vec<u8> {
+        assert_eq!(hex.len() % 2, 0, "hex input must have even length");
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("generated hex"))
+            .collect()
+    }
+
+    fn hex_array<const N: usize>(hex: &str) -> [u8; N] {
+        hex_bytes(hex)
+            .try_into()
+            .expect("generated hex constant length")
+    }
+
+    struct DecodedVector {
+        client_hello: Vec<u8>,
+        aad: Vec<u8>,
+        sid: Vec<u8>,
+        shared: Vec<u8>,
+        auth_key: Vec<u8>,
+        plaintext: Vec<u8>,
+    }
+
+    fn decode_vector(vector: &FrozenHelloVector) -> DecodedVector {
+        DecodedVector {
+            client_hello: hex_bytes(vector.client_hello_hex),
+            aad: hex_bytes(vector.aad_hex),
+            sid: hex_bytes(vector.sid_hex),
+            shared: hex_bytes(vector.shared_hex),
+            auth_key: hex_bytes(vector.auth_key_hex),
+            plaintext: hex_bytes(vector.plaintext_hex),
+        }
+    }
+
+    fn vector_now() -> SystemTime {
+        UNIX_EPOCH + Duration::from_secs(UNIX_SECONDS)
+    }
+
+    fn vector_config() -> RealityServerConfig {
+        RealityServerConfig {
+            private_key: hex_array(SERVER_STATIC_PRIVATE_HEX),
+            short_ids: vec![hex_array(SHORT_ID_HEX)],
+            server_names: HashSet::from([SERVER_NAME.to_string()]),
+            max_time_difference: None,
+            now: Some(vector_now),
+        }
+    }
+
+    fn vector_server() -> RealityServer {
+        RealityServer::new_with_ed25519_private_der(
+            &vector_config(),
+            &hex_bytes(ED25519_PRIVATE_DER_HEX),
+        )
+        .expect("fixed-vector REALITY server")
+    }
+
+    fn plaintext_record(payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() <= u16::MAX as usize);
+        let mut out = Vec::with_capacity(payload.len() + 5);
+        out.extend_from_slice(&[TLS_RECORD_HANDSHAKE, 0x03, 0x03]);
+        out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn independent_handshake_message(kind: u8, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + body.len());
+        out.push(kind);
+        out.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..4]);
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn sha256(data: &[u8]) -> [u8; 32] {
+        Sha256::digest(data).into()
+    }
+
+    fn hmac_sha256(key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+        let mut mac = <IndependentHmacSha256 as Mac>::new_from_slice(key)
+            .expect("HMAC-SHA256 accepts any key length");
+        for part in parts {
+            mac.update(part);
+        }
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    fn hmac_sha512(key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+        let mut mac = <IndependentHmacSha512 as Mac>::new_from_slice(key)
+            .expect("HMAC-SHA512 accepts any key length");
+        for part in parts {
+            mac.update(part);
+        }
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    fn hkdf_extract_independent(salt: &[u8], ikm: &[u8]) -> Vec<u8> {
+        hmac_sha256(salt, &[ikm])
+    }
+
+    fn hkdf_expand_independent(prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+        let mut okm = Vec::new();
+        let mut previous = Vec::new();
+        let mut counter = 1u8;
+        while okm.len() < len {
+            previous = hmac_sha256(prk, &[&previous, info, &[counter]]);
+            okm.extend_from_slice(&previous);
+            counter += 1;
+        }
+        okm.truncate(len);
+        okm
+    }
+
+    fn hkdf_expand_label_independent(
+        secret: &[u8],
+        label: &[u8],
+        context: &[u8],
+        len: usize,
+    ) -> Vec<u8> {
+        let mut info = Vec::new();
+        info.extend_from_slice(&(len as u16).to_be_bytes());
+        info.push((6 + label.len()) as u8);
+        info.extend_from_slice(b"tls13 ");
+        info.extend_from_slice(label);
+        info.push(context.len() as u8);
+        info.extend_from_slice(context);
+        hkdf_expand_independent(secret, &info, len)
+    }
+
+    fn derive_secret_independent(secret: &[u8], label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
+        hkdf_expand_label_independent(secret, label, transcript_hash, 32)
+    }
+
+    struct IndependentHandshakeSecrets {
+        client_secret: Vec<u8>,
+        server_secret: Vec<u8>,
+        master_secret: Vec<u8>,
+    }
+
+    fn derive_handshake_secrets(
+        shared_secret: &[u8],
+        transcript: &[u8],
+    ) -> IndependentHandshakeSecrets {
+        let zero = [0u8; 32];
+        let empty_hash = sha256(&[]);
+        let early_secret = hkdf_extract_independent(&zero, &zero);
+        let derived = derive_secret_independent(&early_secret, b"derived", &empty_hash);
+        let handshake_secret = hkdf_extract_independent(&derived, shared_secret);
+        let transcript_hash = sha256(transcript);
+        let client_secret =
+            derive_secret_independent(&handshake_secret, b"c hs traffic", &transcript_hash);
+        let server_secret =
+            derive_secret_independent(&handshake_secret, b"s hs traffic", &transcript_hash);
+        let derived = derive_secret_independent(&handshake_secret, b"derived", &empty_hash);
+        let master_secret = hkdf_extract_independent(&derived, &zero);
+        IndependentHandshakeSecrets {
+            client_secret,
+            server_secret,
+            master_secret,
+        }
+    }
+
+    fn independent_finished_verify_data(secret: &[u8], transcript: &[u8]) -> Vec<u8> {
+        let finished_key = hkdf_expand_label_independent(secret, b"finished", &[], 32);
+        hmac_sha256(&finished_key, &[&sha256(transcript)])
+    }
+
+    struct IndependentRecordKey {
+        cipher: Aes128Gcm,
+        iv: [u8; 12],
+        seq: u64,
+    }
+
+    impl IndependentRecordKey {
+        fn new(secret: &[u8]) -> Self {
+            let key = hkdf_expand_label_independent(secret, b"key", &[], 16);
+            let iv = hkdf_expand_label_independent(secret, b"iv", &[], 12);
+            Self {
+                cipher: Aes128Gcm::new_from_slice(&key).expect("AES-128 key length"),
+                iv: iv.try_into().expect("TLS IV length"),
+                seq: 0,
+            }
+        }
+
+        fn next_nonce(&mut self) -> [u8; 12] {
+            assert_ne!(self.seq, u64::MAX, "test nonce sequence must not wrap");
+            let mut nonce = self.iv;
+            for (dst, src) in nonce[4..].iter_mut().zip(self.seq.to_be_bytes()) {
+                *dst ^= src;
+            }
+            self.seq += 1;
+            nonce
+        }
+
+        fn seal(&mut self, inner_type: u8, plaintext: &[u8]) -> Vec<u8> {
+            let body_len = plaintext.len() + 1;
+            let record_len = body_len + 16;
+            let mut header = [TLS_RECORD_APPLICATION_DATA, 0x03, 0x03, 0, 0];
+            header[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
+            let nonce = self.next_nonce();
+            let mut body = plaintext.to_vec();
+            body.push(inner_type);
+            let tag = self
+                .cipher
+                .encrypt_in_place_detached(Nonce::from_slice(&nonce), &header, &mut body)
+                .expect("independent TLS record seal");
+            body.extend_from_slice(&tag);
+            let mut out = header.to_vec();
+            out.extend_from_slice(&body);
+            out
+        }
+
+        fn open(&mut self, header: &[u8; 5], payload: &[u8]) -> (u8, Vec<u8>) {
+            let split = payload
+                .len()
+                .checked_sub(16)
+                .expect("TLS ciphertext carries a tag");
+            let (data, tag) = payload.split_at(split);
+            let nonce = self.next_nonce();
+            let mut body = data.to_vec();
+            self.cipher
+                .decrypt_in_place_detached(
+                    Nonce::from_slice(&nonce),
+                    header,
+                    &mut body,
+                    Tag::from_slice(tag),
+                )
+                .expect("independent TLS record open");
+            let type_pos = body
+                .iter()
+                .rposition(|byte| *byte != 0)
+                .expect("TLS inner plaintext type");
+            let inner_type = body[type_pos];
+            body.truncate(type_pos);
+            (inner_type, body)
+        }
+    }
+
+    fn independent_take<'a>(input: &'a [u8], pos: &mut usize, len: usize) -> &'a [u8] {
+        let end = pos.checked_add(len).expect("parser offset overflow");
+        let out = input.get(*pos..end).expect("parser input truncated");
+        *pos = end;
+        out
+    }
+
+    fn independent_u16(input: &[u8], pos: &mut usize) -> u16 {
+        let bytes = independent_take(input, pos, 2);
+        u16::from_be_bytes([bytes[0], bytes[1]])
+    }
+
+    fn independent_u24(input: &[u8], pos: &mut usize) -> usize {
+        let bytes = independent_take(input, pos, 3);
+        ((bytes[0] as usize) << 16) | ((bytes[1] as usize) << 8) | bytes[2] as usize
+    }
+
+    struct IndependentServerHello {
+        cipher_suite: u16,
+        session_id: Vec<u8>,
+        group: u16,
+        share: Vec<u8>,
+    }
+
+    fn parse_server_hello_independent(raw: &[u8]) -> IndependentServerHello {
+        assert_eq!(raw[0], HS_SERVER_HELLO);
+        let mut pos = 1;
+        let body_len = independent_u24(raw, &mut pos);
+        assert_eq!(pos + body_len, raw.len(), "one exact ServerHello message");
+        assert_eq!(independent_take(raw, &mut pos, 2), &[0x03, 0x03]);
+        independent_take(raw, &mut pos, 32);
+        let sid_len = independent_take(raw, &mut pos, 1)[0] as usize;
+        let session_id = independent_take(raw, &mut pos, sid_len).to_vec();
+        let cipher_suite = independent_u16(raw, &mut pos);
+        assert_eq!(independent_take(raw, &mut pos, 1), &[0]);
+        let extensions_len = independent_u16(raw, &mut pos) as usize;
+        let extensions_end = pos + extensions_len;
+        let mut key_share = None;
+        while pos < extensions_end {
+            let ext_type = independent_u16(raw, &mut pos);
+            let ext_len = independent_u16(raw, &mut pos) as usize;
+            let data = independent_take(raw, &mut pos, ext_len);
+            match ext_type {
+                EXT_SUPPORTED_VERSIONS => assert_eq!(data, &[0x03, 0x04]),
+                EXT_KEY_SHARE => {
+                    let mut kp = 0;
+                    let group = independent_u16(data, &mut kp);
+                    let share_len = independent_u16(data, &mut kp) as usize;
+                    let share = independent_take(data, &mut kp, share_len).to_vec();
+                    assert_eq!(kp, data.len(), "ServerHello key_share exact length");
+                    key_share = Some((group, share));
+                }
+                _ => panic!("unexpected ServerHello extension {ext_type:#x}"),
+            }
+        }
+        assert_eq!(pos, extensions_end);
+        let (group, share) = key_share.expect("ServerHello key_share");
+        IndependentServerHello {
+            cipher_suite,
+            session_id,
+            group,
+            share,
+        }
+    }
+
+    struct IndependentHandshakeMessage {
+        kind: u8,
+        raw: Vec<u8>,
+        body: Vec<u8>,
+    }
+
+    fn split_handshake_messages(plaintext: &[u8]) -> Vec<IndependentHandshakeMessage> {
+        let mut out = Vec::new();
+        let mut pos = 0;
+        while pos < plaintext.len() {
+            let kind = independent_take(plaintext, &mut pos, 1)[0];
+            let len = independent_u24(plaintext, &mut pos);
+            let start = pos - 4;
+            let body = independent_take(plaintext, &mut pos, len).to_vec();
+            out.push(IndependentHandshakeMessage {
+                kind,
+                raw: plaintext[start..pos].to_vec(),
+                body,
+            });
+        }
+        out
+    }
+
+    fn extract_certificate_der(message: &IndependentHandshakeMessage) -> Vec<u8> {
+        assert_eq!(message.kind, HS_CERTIFICATE);
+        let body = &message.body;
+        assert_eq!(body[0], 0, "empty certificate request context");
+        let mut pos = 1;
+        let list_len = independent_u24(body, &mut pos);
+        assert_eq!(pos + list_len, body.len(), "single exact certificate list");
+        let der_len = independent_u24(body, &mut pos);
+        let der = independent_take(body, &mut pos, der_len).to_vec();
+        let extensions_len = independent_u16(body, &mut pos) as usize;
+        assert_eq!(extensions_len, 0, "no leaf extensions in the server vector");
+        assert_eq!(pos, body.len(), "exactly one certificate entry");
+        der
+    }
+
+    fn extract_certificate_verify(message: &IndependentHandshakeMessage) -> Vec<u8> {
+        assert_eq!(message.kind, HS_CERTIFICATE_VERIFY);
+        assert_eq!(&message.body[..2], &SIG_ED25519.to_be_bytes());
+        assert_eq!(&message.body[2..4], &64u16.to_be_bytes());
+        assert_eq!(message.body.len(), 4 + 64);
+        message.body[4..].to_vec()
+    }
+
+    fn verify_ed25519_signature(signature: &[u8], input: &[u8]) {
+        let key = PKey::public_key_from_der(&hex_bytes(ED25519_SPKI_DER_HEX))
+            .expect("fixed Ed25519 SPKI");
+        let mut verifier = Verifier::new_without_digest(&key).expect("Ed25519 verifier");
+        assert!(
+            verifier
+                .verify_oneshot(signature, input)
+                .expect("Ed25519 verification"),
+            "CertificateVerify signature must verify over the independent transcript input"
+        );
+    }
+
+    fn expected_leaf_for_auth_key(auth_key: &[u8]) -> Vec<u8> {
+        let mut der = hex_bytes(LEAF_DER_HEX);
+        let mac = hmac_sha512(auth_key, &[&hex_bytes(ED25519_PUBLIC_HEX)]);
+        assert_eq!(mac.len(), 64);
+        let signature_start = der.len() - 64;
+        der[signature_start..].copy_from_slice(&mac);
+        der
+    }
+
+    fn independent_shared_secret(
+        server_hello: &IndependentServerHello,
+        client_x25519_private: &[u8; 32],
+        hybrid_x25519_private: &[u8; 32],
+        mlkem_seed: &[u8; 64],
+    ) -> Vec<u8> {
+        if server_hello.group == GROUP_X25519 {
+            assert_eq!(server_hello.share.len(), 32);
+            let server_public: [u8; 32] = server_hello
+                .share
+                .as_slice()
+                .try_into()
+                .expect("X25519 server share length");
+            let secret = x25519_dalek::x25519(*client_x25519_private, server_public);
+            assert_ne!(secret, [0u8; 32], "low-order TLS ECDH must be rejected");
+            return secret.to_vec();
+        }
+        assert_eq!(server_hello.group, GROUP_X25519_MLKEM768);
+        assert_eq!(server_hello.share.len(), 1088 + 32);
+        let mlkem = boring::mlkem::MlKemPrivateKey::from_seed(
+            boring::mlkem::Algorithm::MlKem768,
+            mlkem_seed,
+        )
+        .expect("fixed ML-KEM seed");
+        let mlkem_secret = mlkem
+            .decapsulate(&server_hello.share[..1088])
+            .expect("server ML-KEM ciphertext decapsulates");
+        let server_x: [u8; 32] = server_hello.share[1088..]
+            .try_into()
+            .expect("hybrid X25519 server share length");
+        let x_secret = x25519_dalek::x25519(*hybrid_x25519_private, server_x);
+        assert_ne!(x_secret, [0u8; 32], "low-order hybrid TLS ECDH");
+        let mut shared = mlkem_secret.to_vec();
+        shared.extend_from_slice(&x_secret);
+        shared
+    }
+
+    async fn read_required_record(
+        io: &mut DuplexStream,
+        what: &str,
+    ) -> crate::reality_tls::TlsRecord {
+        tokio::time::timeout(Duration::from_secs(2), read_record(io))
+            .await
+            .unwrap_or_else(|_| panic!("timed out waiting for {what}"))
+            .unwrap_or_else(|e| panic!("failed to read {what}: {e}"))
+            .unwrap_or_else(|| panic!("EOF before {what}"))
+    }
+
+    #[derive(Clone, Copy)]
+    enum HelloFraming {
+        SingleRecord,
+        ByteWiseTcp,
+        SplitRecords(&'static [usize]),
+    }
+
+    async fn write_client_hello(io: &mut DuplexStream, hello: &[u8], framing: HelloFraming) {
+        match framing {
+            HelloFraming::SingleRecord => {
+                io.write_all(&plaintext_record(hello)).await.unwrap();
+            }
+            HelloFraming::ByteWiseTcp => {
+                for byte in plaintext_record(hello).chunks(1) {
+                    io.write_all(byte).await.unwrap();
+                    io.flush().await.unwrap();
+                }
+            }
+            HelloFraming::SplitRecords(pattern) => {
+                assert!(pattern.iter().all(|len| *len != 0));
+                let mut pos = 0;
+                let mut index = 0;
+                while pos < hello.len() {
+                    let len = pattern[index % pattern.len()].min(hello.len() - pos);
+                    io.write_all(&plaintext_record(&hello[pos..pos + len]))
+                        .await
+                        .unwrap();
+                    pos += len;
+                    index += 1;
+                }
+            }
+        }
+        io.flush().await.unwrap();
+    }
+
+    struct CompletedVectorHandshake {
+        server_stream: Box<dyn Stream>,
+        client_io: DuplexStream,
+        client_app: IndependentRecordKey,
+        server_app: IndependentRecordKey,
+        client_finished_record: Vec<u8>,
+        certificate_der: Vec<u8>,
+        selected_group: u16,
+    }
+
+    async fn perform_vector_handshake(
+        server: RealityServer,
+        vector: &FrozenHelloVector,
+        framing: HelloFraming,
+    ) -> CompletedVectorHandshake {
+        let decoded = decode_vector(vector);
+        let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let accept_task = tokio::spawn(async move { server.accept(Box::new(server_io)).await });
+        write_client_hello(&mut client_io, &decoded.client_hello, framing).await;
+
+        let server_hello_record = read_required_record(&mut client_io, "ServerHello").await;
+        assert_eq!(server_hello_record.typ, TLS_RECORD_HANDSHAKE);
+        let server_hello = parse_server_hello_independent(&server_hello_record.payload);
+        assert_eq!(server_hello.cipher_suite, TLS_AES_128_GCM_SHA256);
+        assert_eq!(
+            server_hello.session_id,
+            decoded.client_hello[39..71],
+            "ServerHello must echo the encrypted REALITY session id"
+        );
+        let ccs = read_required_record(&mut client_io, "compatibility CCS").await;
+        assert_eq!(ccs.typ, TLS_RECORD_CHANGE_CIPHER_SPEC);
+        assert_eq!(ccs.payload, [1]);
+        let encrypted_flight =
+            read_required_record(&mut client_io, "encrypted server flight").await;
+        assert_eq!(encrypted_flight.typ, TLS_RECORD_APPLICATION_DATA);
+
+        let mut transcript = decoded.client_hello.clone();
+        transcript.extend_from_slice(&server_hello_record.payload);
+        let shared = independent_shared_secret(
+            &server_hello,
+            &hex_array(CLIENT_X25519_PRIVATE_HEX),
+            &hex_array(HYBRID_X25519_PRIVATE_HEX),
+            &hex_array(MLKEM768_SEED_HEX),
+        );
+        let secrets = derive_handshake_secrets(&shared, &transcript);
+        let mut client_hs = IndependentRecordKey::new(&secrets.client_secret);
+        let mut server_hs = IndependentRecordKey::new(&secrets.server_secret);
+        let (inner_type, flight_plaintext) =
+            server_hs.open(&encrypted_flight.header, &encrypted_flight.payload);
+        assert_eq!(inner_type, TLS_RECORD_HANDSHAKE);
+        let messages = split_handshake_messages(&flight_plaintext);
+        assert_eq!(
+            messages
+                .iter()
+                .map(|message| message.kind)
+                .collect::<Vec<_>>(),
+            vec![
+                HS_ENCRYPTED_EXTENSIONS,
+                HS_CERTIFICATE,
+                HS_CERTIFICATE_VERIFY,
+                HS_FINISHED
+            ],
+            "server flight message order"
+        );
+        assert_eq!(messages[0].body, [0, 0], "empty EncryptedExtensions vector");
+        let certificate_der = extract_certificate_der(&messages[1]);
+        assert_eq!(
+            certificate_der,
+            expected_leaf_for_auth_key(&decoded.auth_key),
+            "{}: certificate HMAC must match the independent AuthKey/public-key vector",
+            vector.name
+        );
+        let cv_signature = extract_certificate_verify(&messages[2]);
+
+        let mut transcript_through_certificate = transcript.clone();
+        transcript_through_certificate.extend_from_slice(&messages[0].raw);
+        transcript_through_certificate.extend_from_slice(&messages[1].raw);
+        let mut cv_input = vec![0x20; 64];
+        cv_input.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        cv_input.push(0);
+        cv_input.extend_from_slice(&sha256(&transcript_through_certificate));
+        verify_ed25519_signature(&cv_signature, &cv_input);
+
+        let mut transcript_through_cv = transcript_through_certificate.clone();
+        transcript_through_cv.extend_from_slice(&messages[2].raw);
+        assert_eq!(
+            messages[3].body,
+            independent_finished_verify_data(&secrets.server_secret, &transcript_through_cv),
+            "server Finished verify_data must match the independent TLS key schedule"
+        );
+        let mut transcript_with_server_finished = transcript_through_cv.clone();
+        transcript_with_server_finished.extend_from_slice(&messages[3].raw);
+
+        let client_verify = independent_finished_verify_data(
+            &secrets.client_secret,
+            &transcript_with_server_finished,
+        );
+        let client_finished = independent_handshake_message(HS_FINISHED, &client_verify);
+        let client_finished_record = client_hs.seal(TLS_RECORD_HANDSHAKE, &client_finished);
+        client_io.write_all(&client_finished_record).await.unwrap();
+        client_io.flush().await.unwrap();
+
+        let accepted = tokio::time::timeout(Duration::from_secs(2), accept_task)
+            .await
+            .expect("REALITY accept timed out")
+            .expect("REALITY accept task joined")
+            .expect("independent vector Finished must be accepted");
+        let RealityServerAccept::Authenticated(server_stream) = accepted else {
+            panic!("valid frozen vector must select the authenticated branch");
+        };
+
+        let client_app_secret = hkdf_expand_label_independent(
+            &secrets.master_secret,
+            b"c ap traffic",
+            &sha256(&transcript_with_server_finished),
+            32,
+        );
+        let server_app_secret = hkdf_expand_label_independent(
+            &secrets.master_secret,
+            b"s ap traffic",
+            &sha256(&transcript_with_server_finished),
+            32,
+        );
+        CompletedVectorHandshake {
+            server_stream,
+            client_io,
+            client_app: IndependentRecordKey::new(&client_app_secret),
+            server_app: IndependentRecordKey::new(&server_app_secret),
+            client_finished_record,
+            certificate_der,
+            selected_group: server_hello.group,
+        }
+    }
+
+    async fn assert_vector_roundtrip(completed: &mut CompletedVectorHandshake) {
+        let ping = completed
+            .client_app
+            .seal(TLS_RECORD_APPLICATION_DATA, b"ping");
+        completed.client_io.write_all(&ping).await.unwrap();
+        completed.client_io.flush().await.unwrap();
+        let mut buf = [0u8; 4];
+        completed.server_stream.read_exact(&mut buf).await.unwrap();
+        assert_eq!(&buf, b"ping");
+        completed.server_stream.write_all(b"pong").await.unwrap();
+        completed.server_stream.flush().await.unwrap();
+        let record = read_required_record(&mut completed.client_io, "application pong").await;
+        assert_eq!(record.typ, TLS_RECORD_APPLICATION_DATA);
+        let (inner_type, plaintext) = completed.server_app.open(&record.header, &record.payload);
+        assert_eq!(inner_type, TLS_RECORD_APPLICATION_DATA);
+        assert_eq!(plaintext, b"pong");
+    }
+
+    async fn accept_cover_for_bytes(
+        server: RealityServer,
+        hello: &[u8],
+        trailing: &[u8],
+    ) -> (CoverRelay, DuplexStream) {
+        let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let accept_task = tokio::spawn(async move { server.accept(Box::new(server_io)).await });
+        let mut input = plaintext_record(hello);
+        input.extend_from_slice(trailing);
+        client_io.write_all(&input).await.unwrap();
+        client_io.flush().await.unwrap();
+        let accepted = tokio::time::timeout(Duration::from_secs(2), accept_task)
+            .await
+            .expect("cover accept timed out")
+            .expect("cover accept task joined")
+            .expect("cover classification must not be an I/O error");
+        let RealityServerAccept::Cover(relay) = accepted else {
+            panic!("negative vector must fall through to cover");
+        };
+        (relay, client_io)
+    }
+
+    async fn assert_no_response_bytes(client_io: &mut DuplexStream) {
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(5), client_io.read(&mut byte)).await {
+            Err(_) => {}
+            Ok(Ok(0)) => panic!("cover branch closed before any cover-target relay"),
+            Ok(Ok(n)) => panic!("unauthenticated candidate received {n} response bytes"),
+            Ok(Err(e)) => panic!("failed while checking for cover-branch response bytes: {e}"),
+        }
+    }
+
+    #[test]
+    fn frozen_positive_vector_matches_independent_oracle_byte_for_byte() {
+        let decoded = decode_vector(&POSITIVE_X25519);
+        assert_eq!(decoded.client_hello.len(), 204);
+        assert_eq!(decoded.client_hello[0], HS_CLIENT_HELLO);
+        assert_eq!(decoded.client_hello[38], 0x20);
+        assert_eq!(decoded.client_hello[39..71], decoded.sid[..]);
+        let mut reconstructed_aad = decoded.client_hello.clone();
+        reconstructed_aad[39..71].fill(0);
+        assert_eq!(reconstructed_aad, decoded.aad);
+        assert_eq!(decoded.plaintext.len(), 16);
+
+        let server_private = hex_array::<32>(SERVER_STATIC_PRIVATE_HEX);
+        let client_public = hex_array::<32>(CLIENT_X25519_PUBLIC_HEX);
+        let shared = x25519(&server_private, &client_public).expect("vector ECDH");
+        assert_eq!(shared.as_slice(), decoded.shared.as_slice());
+        let auth_key = hkdf_sha256(&shared, &decoded.client_hello[6..26], b"REALITY", 32);
+        assert_eq!(auth_key, decoded.auth_key);
+
+        let parsed = parse_client_hello(decoded.client_hello.clone()).expect("vector parses");
+        let server = vector_server();
+        let (opened_key, plaintext) = server
+            .open_auth_plaintext(&parsed)
+            .expect("positive frozen vector must authenticate cryptographically");
+        assert_eq!(opened_key.as_slice(), decoded.auth_key.as_slice());
+        assert_eq!(plaintext, decoded.plaintext);
+        let (version, reserved, unix_seconds, short_id) =
+            parse_auth_plaintext(&plaintext).expect("16-byte auth plaintext parses");
+        assert_eq!(version.as_slice(), hex_bytes(VERSION_HEX));
+        assert_eq!(reserved, 0);
+        assert_eq!(unix_seconds, UNIX_SECONDS as u32);
+        assert_eq!(short_id.as_slice(), hex_bytes(SHORT_ID_HEX));
+        assert!(
+            server.classify(&parsed).is_some(),
+            "positive vector also satisfies the frozen time window and Short ID"
+        );
+    }
+
+    #[test]
+    fn frozen_vector_key_material_is_bound_to_wire_bytes() {
+        let positive = hex_bytes(POSITIVE_X25519.client_hello_hex);
+        assert_eq!(&positive[6..38], &hex_bytes(RANDOM32_HEX));
+        assert_eq!(
+            x25519_public_from_private(&hex_array(SERVER_STATIC_PRIVATE_HEX)),
+            hex_array::<32>(SERVER_STATIC_PUBLIC_HEX)
+        );
+        assert_eq!(
+            x25519_public_from_private(&hex_array(CLIENT_X25519_PRIVATE_HEX)),
+            hex_array::<32>(CLIENT_X25519_PUBLIC_HEX)
+        );
+        assert_eq!(
+            x25519_public_from_private(&hex_array(HYBRID_X25519_PRIVATE_HEX)),
+            hex_array::<32>(HYBRID_X25519_PUBLIC_HEX)
+        );
+        assert_eq!(
+            x25519_public_from_private(&hex_array(WRONG_X25519_PRIVATE_HEX)),
+            hex_array::<32>(WRONG_X25519_PUBLIC_HEX)
+        );
+
+        let mut hybrid_share = hex_bytes(MLKEM768_PUBLIC_HEX);
+        hybrid_share.extend_from_slice(&hex_bytes(HYBRID_X25519_PUBLIC_HEX));
+        for vector in [&POSITIVE_HYBRID, &DUAL_SHARE, &LOW_ORDER] {
+            let hello = hex_bytes(vector.client_hello_hex);
+            assert!(
+                hello
+                    .windows(hybrid_share.len())
+                    .any(|window| window == hybrid_share),
+                "{} must carry the frozen ML-KEM public key followed by the hybrid X25519 share",
+                vector.name
+            );
+        }
+        let duplicate = hex_bytes(DUPLICATE_KEY_SHARE.client_hello_hex);
+        assert!(
+            duplicate
+                .windows(32)
+                .any(|window| window == hex_bytes(WRONG_X25519_PUBLIC_HEX)),
+            "the duplicate key_share vector carries the wrong second share as its negative control"
+        );
+    }
+
+    #[test]
+    fn fixed_leaf_hmac_and_certificate_verify_match_python_oracle() {
+        let certificate =
+            RealityCertificate::from_private_key_der(&hex_bytes(ED25519_PRIVATE_DER_HEX))
+                .expect("fixed Ed25519 key");
+        let auth_key = hex_array::<32>(POSITIVE_X25519.auth_key_hex);
+        let leaf = certificate.for_auth_key(&auth_key);
+        assert_eq!(leaf, hex_bytes(LEAF_DER_HEX));
+        assert_eq!(
+            &leaf[leaf.len() - 64..],
+            &hex_bytes(CERTIFICATE_HMAC_HEX),
+            "X.509 signatureValue content is exactly HMAC-SHA512(AuthKey, raw Ed25519 public key)"
+        );
+
+        let cv_input = certificate_verify_input(&hex_bytes(CV_TRANSCRIPT_HASH_HEX));
+        assert_eq!(cv_input, hex_bytes(CV_INPUT_HEX));
+        let cv_signature = certificate.sign(&cv_input).expect("sign fixed CV input");
+        assert_eq!(
+            cv_signature,
+            hex_bytes(CV_SIGNATURE_HEX),
+            "Ed25519 is deterministic; the signature must equal the Python cryptography oracle"
+        );
+        verify_ed25519_signature(&cv_signature, &cv_input);
+    }
+
+    #[tokio::test]
+    async fn frozen_x25519_vector_completes_full_handshake_and_round_trips() {
+        let mut completed = perform_vector_handshake(
+            vector_server(),
+            &POSITIVE_X25519,
+            HelloFraming::SingleRecord,
+        )
+        .await;
+        assert_eq!(completed.selected_group, GROUP_X25519);
+        assert_eq!(completed.certificate_der, hex_bytes(LEAF_DER_HEX));
+        assert_vector_roundtrip(&mut completed).await;
+    }
+
+    #[tokio::test]
+    async fn hybrid_only_vector_uses_final_32_bytes_and_completes() {
+        let mut completed = perform_vector_handshake(
+            vector_server(),
+            &POSITIVE_HYBRID,
+            HelloFraming::SingleRecord,
+        )
+        .await;
+        assert_eq!(completed.selected_group, GROUP_X25519_MLKEM768);
+        assert_vector_roundtrip(&mut completed).await;
+    }
+
+    #[tokio::test]
+    async fn dual_share_authentication_prefers_independent_x25519() {
+        assert_eq!(DUAL_SHARE.shared_hex, POSITIVE_X25519.shared_hex);
+        assert_ne!(DUAL_SHARE.shared_hex, POSITIVE_HYBRID.shared_hex);
+        let mut completed =
+            perform_vector_handshake(vector_server(), &DUAL_SHARE, HelloFraming::SingleRecord)
+                .await;
+        assert_eq!(
+            completed.selected_group, GROUP_X25519_MLKEM768,
+            "the TLS key exchange still prefers the offered hybrid share"
+        );
+        assert_vector_roundtrip(&mut completed).await;
+    }
+
+    #[tokio::test]
+    async fn single_bit_tampering_of_aad_ciphertext_or_tag_goes_to_cover() {
+        let base = decode_vector(&POSITIVE_X25519).client_hello;
+        for position in [
+            6,                      // client_random[0]: HKDF salt and AAD
+            PADDING_PAYLOAD_OFFSET, // ignored padding payload byte: pure AAD
+            39,                     // first ciphertext byte
+            54,                     // last ciphertext byte
+            55,                     // first GCM tag byte
+            70,                     // last GCM tag byte
+        ] {
+            let mut tampered = base.clone();
+            tampered[position] ^= 1;
+            let (relay, mut client_io) =
+                accept_cover_for_bytes(vector_server(), &tampered, &[]).await;
+            assert_eq!(
+                relay.wire_prefix_len(),
+                plaintext_record(&tampered).len(),
+                "position {position}: cover receives exactly the consumed CH record"
+            );
+            assert_no_response_bytes(&mut client_io).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn low_order_x25519_auth_share_is_rejected_without_panic() {
+        assert_eq!(hex_bytes(LOW_ORDER.shared_hex), vec![0u8; 32]);
+        let decoded = decode_vector(&LOW_ORDER);
+        let (relay, mut client_io) =
+            accept_cover_for_bytes(vector_server(), &decoded.client_hello, &[]).await;
+        assert_eq!(
+            relay.wire_prefix_len(),
+            plaintext_record(&decoded.client_hello).len()
+        );
+        assert_no_response_bytes(&mut client_io).await;
+    }
+
+    #[tokio::test]
+    async fn duplicate_key_share_and_supported_versions_are_rejected() {
+        // Implementation semantics pinned here: a duplicate extension is
+        // rejected outright.  The two key_share orders rule out both
+        // first-wins and last-wins fallback interpretation.
+        for vector in [
+            &DUPLICATE_KEY_SHARE,
+            &DUPLICATE_KEY_SHARE_REVERSED,
+            &DUPLICATE_SUPPORTED_VERSIONS,
+        ] {
+            let decoded = decode_vector(vector);
+            let (relay, mut client_io) =
+                accept_cover_for_bytes(vector_server(), &decoded.client_hello, &[]).await;
+            assert_eq!(
+                relay.wire_prefix_len(),
+                plaintext_record(&decoded.client_hello).len(),
+                "{} duplicate extension must preserve exactly the CH wire prefix",
+                vector.name
+            );
+            assert_no_response_bytes(&mut client_io).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn byte_by_byte_tcp_fragmentation_has_the_same_authentication_result() {
+        let mut completed =
+            perform_vector_handshake(vector_server(), &POSITIVE_X25519, HelloFraming::ByteWiseTcp)
+                .await;
+        assert_eq!(completed.selected_group, GROUP_X25519);
+        assert_vector_roundtrip(&mut completed).await;
+    }
+
+    #[tokio::test]
+    async fn pseudo_random_record_fragmentation_has_the_same_authentication_result() {
+        const PATTERN: &[usize] = &[1, 2, 7, 3, 31, 5, 11, 13];
+        let mut completed = perform_vector_handshake(
+            vector_server(),
+            &POSITIVE_X25519,
+            HelloFraming::SplitRecords(PATTERN),
+        )
+        .await;
+        assert_eq!(completed.selected_group, GROUP_X25519);
+        assert_vector_roundtrip(&mut completed).await;
+    }
+
+    #[tokio::test]
+    async fn valid_client_hello_preflight_stops_exactly_before_trailing_bytes() {
+        let hello = decode_vector(&POSITIVE_X25519).client_hello;
+        let expected_prefix = plaintext_record(&hello);
+        let trailing = b"already-readable trailing bytes";
+        let mut batch = expected_prefix.clone();
+        batch.extend_from_slice(trailing);
+        let (mut writer, reader) = tokio::io::duplex(128 * 1024);
+        writer.write_all(&batch).await.unwrap();
+        writer.flush().await.unwrap();
+        drop(writer);
+
+        let (mut inner, preflight) = read_client_hello_preflight(Box::new(reader))
+            .await
+            .expect("valid vector preflight");
+        let Preflight::Candidate { wire_prefix, .. } = preflight else {
+            panic!("valid frozen vector must remain a REALITY candidate");
+        };
+        assert_eq!(wire_prefix, expected_prefix);
+        let mut got = vec![0u8; trailing.len()];
+        inner.read_exact(&mut got).await.unwrap();
+        assert_eq!(got, trailing);
+    }
+
+    #[tokio::test]
+    async fn trailing_bytes_in_same_write_are_not_consumed_from_cover_stream() {
+        let mut tampered = decode_vector(&POSITIVE_X25519).client_hello;
+        tampered[70] ^= 1;
+        let trailing = b"trailing bytes in the same write batch";
+        let expected_prefix = plaintext_record(&tampered);
+        let (relay, client_io) = accept_cover_for_bytes(vector_server(), &tampered, trailing).await;
+        assert_eq!(relay.wire_prefix_len(), expected_prefix.len());
+        let (target_io, mut target_peer) = tokio::io::duplex(128 * 1024);
+        let relay_task = tokio::spawn(async move { relay.relay(Box::new(target_io)).await });
+
+        let mut got = vec![0u8; expected_prefix.len() + trailing.len()];
+        target_peer.read_exact(&mut got).await.unwrap();
+        assert_eq!(&got[..expected_prefix.len()], &expected_prefix[..]);
+        assert_eq!(&got[expected_prefix.len()..], trailing);
+        drop(client_io);
+        drop(target_peer);
+        relay_task.abort();
+    }
+
+    #[tokio::test]
+    async fn replayed_client_hello_is_accepted_but_replayed_old_finished_fails() {
+        // REALITY deliberately has no nonce replay cache in the freshness
+        // window: the same authenticated CH may open a new TLS transcript.
+        // A replayed Finished is cryptographically bound to the old random
+        // ServerHello/ephemeral share and must not validate on the new one.
+        let server = vector_server();
+        let first =
+            perform_vector_handshake(server.clone(), &POSITIVE_X25519, HelloFraming::SingleRecord)
+                .await;
+        let old_finished = first.client_finished_record.clone();
+        drop(first);
+
+        let second =
+            perform_vector_handshake(server.clone(), &POSITIVE_X25519, HelloFraming::SingleRecord)
+                .await;
+        assert_eq!(second.selected_group, GROUP_X25519);
+        drop(second);
+
+        let hello = decode_vector(&POSITIVE_X25519).client_hello;
+        let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let accept_task = tokio::spawn(async move { server.accept(Box::new(server_io)).await });
+        client_io
+            .write_all(&plaintext_record(&hello))
+            .await
+            .unwrap();
+        client_io.write_all(&old_finished).await.unwrap();
+        client_io.flush().await.unwrap();
+        let accept_result = tokio::time::timeout(Duration::from_secs(2), accept_task)
+            .await
+            .expect("old-Finished accept timed out")
+            .expect("old-Finished accept task joined");
+        assert!(
+            accept_result.is_err(),
+            "a Finished replayed from the first transcript must fail on the second"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticated_reality_does_not_depend_on_cover_target_availability() {
+        // The acceptor API has no cover dialer at all on the authenticated
+        // branch.  Completing this handshake without any target object is the
+        // transport-level proof that a down target cannot affect REALITY auth.
+        let mut completed = perform_vector_handshake(
+            vector_server(),
+            &POSITIVE_X25519,
+            HelloFraming::SingleRecord,
+        )
+        .await;
+        assert_vector_roundtrip(&mut completed).await;
+    }
+
+    #[tokio::test]
+    async fn cover_drop_after_simulated_target_dial_failure_closes_client_cleanly() {
+        // Ownership of dialing belongs to the inbound listener; the transport
+        // contract exercised here is the failure path after that dial returns
+        // error: drop the relay exactly once, with no background task or write.
+        let mut tampered = decode_vector(&POSITIVE_X25519).client_hello;
+        tampered[70] ^= 1;
+        let (relay, mut client_io) = accept_cover_for_bytes(vector_server(), &tampered, &[]).await;
+        drop(relay);
+        let mut byte = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(2), client_io.read(&mut byte))
+            .await
+            .expect("client close timed out")
+            .expect("client close read");
+        assert_eq!(
+            n, 0,
+            "dropping a never-dialed cover must close the client side"
+        );
     }
 }
