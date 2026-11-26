@@ -518,6 +518,13 @@ jobs:
             --test snell_server_docker_integration \
             --test xray_server_docker_integration --retries 2 --no-fail-fast
 
+      - name: Docker integration tests (VLESS Vision reverse interop: xray/mihomo clients -> meow server)
+        env:
+          MEOW_REQUIRE_DOCKER: "1"
+        run: |
+          cargo nextest run -p meow-listener --features listener-vless \
+            --test vless_interop_docker --retries 2 --no-fail-fast
+
       - name: AnyTLS unit and integration tests (embedded server)
         run: |
           cargo nextest run -p meow-anytls --lib --retries 2 --no-fail-fast
