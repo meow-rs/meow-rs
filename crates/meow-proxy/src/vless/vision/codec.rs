@@ -269,6 +269,121 @@ pub(crate) fn capped_padding_len(content_len: usize, long_padding: bool) -> usiz
         .min(XRAY_PADDING_CONTENT_CAP.saturating_sub(content_len))
 }
 
+/// Incremental boundary tracker for the inner TLS record stream after the
+/// ServerHello record.  `17 03 03` records with non-zero bodies build an
+/// eligibility streak; any other record type breaks the current write batch's
+/// eligibility but does not lose byte alignment, so a record fragmented over
+/// several writes can still complete and earn DIRECT later.
+#[derive(Clone, Copy)]
+pub(crate) struct TlsAppRecordTracker {
+    active: bool,
+    header: [u8; 5],
+    header_len: usize,
+    body_remaining: usize,
+    record_valid: bool,
+    complete_streak: bool,
+    batch_valid: bool,
+}
+
+impl TlsAppRecordTracker {
+    pub(crate) fn new() -> Self {
+        Self {
+            active: false,
+            header: [0; 5],
+            header_len: 0,
+            body_remaining: 0,
+            record_valid: false,
+            complete_streak: false,
+            batch_valid: true,
+        }
+    }
+
+    /// Start tracking exactly at the record boundary that ends the inner
+    /// ServerHello record.
+    pub(crate) fn activate(&mut self) {
+        *self = Self {
+            active: true,
+            ..Self::new()
+        };
+    }
+
+    pub(crate) fn active(&self) -> bool {
+        self.active
+    }
+
+    fn at_record_boundary(&self) -> bool {
+        self.header_len == 0 && self.body_remaining == 0
+    }
+
+    fn feed_byte(&mut self, byte: u8) {
+        if self.body_remaining > 0 {
+            self.body_remaining -= 1;
+            if self.body_remaining == 0 && self.record_valid {
+                self.complete_streak = true;
+            }
+            return;
+        }
+
+        self.header[self.header_len] = byte;
+        self.header_len += 1;
+        if self.header_len < self.header.len() {
+            return;
+        }
+
+        let record_len = u16::from_be_bytes([self.header[3], self.header[4]]) as usize;
+        self.record_valid = self.header[0] == TLS_APPLICATION_DATA
+            && self.header[1] == TLS_MAJOR
+            && self.header[2] == TLS_MAJOR
+            && record_len != 0;
+        if !self.record_valid {
+            self.batch_valid = false;
+            self.complete_streak = false;
+        }
+        self.header_len = 0;
+        self.body_remaining = record_len;
+    }
+
+    /// Feed one accepted write batch and report whether it ends at a complete
+    /// application-data record boundary without a foreign record in this
+    /// batch.  Bytes may continue a record started by an earlier batch: the
+    /// boundary property belongs to the byte stream, not to the arbitrary
+    /// write slicing.
+    pub(crate) fn feed_batch(&mut self, chunk: &[u8]) -> bool {
+        if !self.active || chunk.is_empty() {
+            return false;
+        }
+        self.batch_valid = true;
+        for &byte in chunk {
+            self.feed_byte(byte);
+        }
+        self.batch_valid && self.complete_streak && self.at_record_boundary()
+    }
+
+    /// Largest record-boundary cut not past `cap` from the current stream
+    /// position.  If even the first boundary is beyond the cap, fall back to
+    /// the flat cap; the stateful tracker will still recognize the record
+    /// when a later batch completes it.
+    pub(crate) fn aligned_cut(&self, buf: &[u8], cap: usize) -> usize {
+        debug_assert!(cap > 0);
+        if buf.len() <= cap {
+            return buf.len();
+        }
+        let mut probe = *self;
+        let mut last_boundary = 0usize;
+        for (index, &byte) in buf.iter().take(cap).enumerate() {
+            probe.feed_byte(byte);
+            if probe.at_record_boundary() {
+                last_boundary = index + 1;
+            }
+        }
+        if last_boundary == 0 {
+            cap
+        } else {
+            last_boundary
+        }
+    }
+}
+
 pub(crate) fn encode_padding_frame_with_padding_len(
     dst: &mut Vec<u8>,
     command: u8,
@@ -305,60 +420,6 @@ pub(crate) fn build_padding_frame(
     frame
 }
 
-/// Whether `buf` is exactly a sequence of complete TLS application-data
-/// records (`17 03 03 len`).  This is xray's `IsCompleteRecord` contract:
-/// CCS, alerts, truncated records and zero-length records are not eligible.
-pub(crate) fn is_complete_tls_application_records(buf: &[u8]) -> bool {
-    let mut pos = 0usize;
-    while pos < buf.len() {
-        if buf.len() - pos < 5 {
-            return false;
-        }
-        if buf[pos] != TLS_APPLICATION_DATA
-            || buf[pos + 1] != TLS_MAJOR
-            || buf[pos + 2] != TLS_MAJOR
-        {
-            return false;
-        }
-        let record_len = u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]) as usize;
-        if record_len == 0 || buf.len() - pos - 5 < record_len {
-            return false;
-        }
-        pos += 5 + record_len;
-    }
-    !buf.is_empty()
-}
-
-/// Largest record-aligned cut point not past `cap` for a buffer already
-/// verified by [`is_complete_tls_application_records`].  Falling back to
-/// the flat cap when even the first record does not fit is xray's own
-/// reshape outcome (`buf.Size/2` there); an aligned cut keeps every retry
-/// slice of a large write starting at a record boundary, so each chunk of
-/// the batch re-evaluates as complete application-data records instead of
-/// the DIRECT decision dying on the first mid-record split.
-pub(crate) fn record_aligned_cut(buf: &[u8], cap: usize) -> usize {
-    debug_assert!(is_complete_tls_application_records(buf));
-    if buf.len() <= cap {
-        return buf.len();
-    }
-    let mut pos = 0usize;
-    let mut last = 0usize;
-    while pos < buf.len() {
-        let record_len = u16::from_be_bytes([buf[pos + 3], buf[pos + 4]]) as usize;
-        let end = pos + 5 + record_len;
-        if end > cap {
-            break;
-        }
-        last = end;
-        pos = end;
-    }
-    if last == 0 {
-        cap
-    } else {
-        last
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -371,45 +432,55 @@ mod tests {
     }
 
     #[test]
-    fn complete_records_accepts_concatenated_app_data() {
-        let mut buf = app_record(b"hello");
-        buf.extend(app_record(b"world!"));
-        assert!(is_complete_tls_application_records(&buf));
+    fn tracker_accepts_records_fragmented_across_batches() {
+        let first = app_record(b"hello");
+        let second = app_record(b"world!");
+        let split = 3;
+        let mut tracker = TlsAppRecordTracker::new();
+        tracker.activate();
+
+        assert!(!tracker.feed_batch(&first[..split]));
+        let mut remainder = first[split..].to_vec();
+        remainder.extend_from_slice(&second);
+        assert!(tracker.feed_batch(&remainder));
     }
 
     #[test]
-    fn complete_records_rejects_partial_and_foreign_records() {
-        assert!(!is_complete_tls_application_records(&[]));
-        assert!(!is_complete_tls_application_records(&app_record(b"x")[..4]));
-        // Zero-length application records are not eligible in xray either.
-        assert!(!is_complete_tls_application_records(&app_record(b"")));
-        // A trailing CCS record disqualifies the batch.
-        let mut buf = app_record(b"data");
-        buf.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
-        assert!(!is_complete_tls_application_records(&buf));
-        // Truncated final record.
-        let mut buf = app_record(b"data");
-        buf.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x10, 0x01]);
-        assert!(!is_complete_tls_application_records(&buf));
+    fn tracker_rejects_foreign_and_zero_length_records_for_the_batch() {
+        let mut tracker = TlsAppRecordTracker::new();
+        tracker.activate();
+
+        let mut batch = app_record(b"data");
+        batch.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+        batch.extend_from_slice(&app_record(b"recovered"));
+        assert!(!tracker.feed_batch(&batch));
+        assert!(tracker.feed_batch(&app_record(b"next batch")));
+
+        let mut tracker = TlsAppRecordTracker::new();
+        tracker.activate();
+        assert!(!tracker.feed_batch(&app_record(b"")));
+        assert!(tracker.feed_batch(&app_record(b"valid afterwards")));
     }
 
     #[test]
-    fn record_aligned_cut_prefers_the_last_boundary_within_cap() {
+    fn tracker_aligned_cut_prefers_the_last_boundary_within_cap() {
         let mut buf = app_record(&[0u8; 100]);
         buf.extend(app_record(&[0u8; 100]));
         buf.extend(app_record(&[0u8; 100]));
+        let mut tracker = TlsAppRecordTracker::new();
+        tracker.activate();
         // Each record is 105 bytes; cap 220 fits exactly two.
-        assert_eq!(record_aligned_cut(&buf, 220), 210);
-        // Cap exactly at a boundary is that boundary.
-        assert_eq!(record_aligned_cut(&buf, 210), 210);
-        // Cap beyond the buffer is the whole buffer.
-        assert_eq!(record_aligned_cut(&buf, 1000), buf.len());
+        assert_eq!(tracker.aligned_cut(&buf, 220), 210);
+        assert_eq!(tracker.aligned_cut(&buf, 210), 210);
+        assert_eq!(tracker.aligned_cut(&buf, 1000), buf.len());
     }
 
     #[test]
-    fn record_aligned_cut_falls_back_when_first_record_exceeds_cap() {
+    fn tracker_aligned_cut_falls_back_when_first_record_exceeds_cap() {
         let buf = app_record(&[0u8; 500]);
-        assert_eq!(record_aligned_cut(&buf, 100), 100);
+        let mut tracker = TlsAppRecordTracker::new();
+        tracker.activate();
+        assert_eq!(tracker.aligned_cut(&buf, 100), 100);
     }
 
     #[test]

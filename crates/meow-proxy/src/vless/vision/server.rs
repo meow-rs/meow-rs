@@ -15,10 +15,9 @@ use meow_transport::Stream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use super::codec::{
-    capped_padding_len, encode_padding_frame_with_padding_len, is_complete_tls_application_records,
-    record_aligned_cut, PaddingCommand, PaddingReadPhase, PaddingReader, COMMAND_PADDING_CONTINUE,
-    COMMAND_PADDING_DIRECT, COMMAND_PADDING_END, FRAME_CONTENT_CAP, PADDING_HEADER_LEN,
-    PADDING_SCRATCH_LEN, UUID_LEN,
+    capped_padding_len, encode_padding_frame_with_padding_len, PaddingCommand, PaddingReadPhase,
+    PaddingReader, TlsAppRecordTracker, COMMAND_PADDING_CONTINUE, COMMAND_PADDING_DIRECT,
+    COMMAND_PADDING_END, FRAME_CONTENT_CAP, PADDING_HEADER_LEN, PADDING_SCRATCH_LEN, UUID_LEN,
 };
 use super::filter::TlsInspector;
 
@@ -32,10 +31,11 @@ pub enum VisionServerMode {
 
 #[derive(Debug, Clone, Copy)]
 struct PendingServerWrite {
-    consumed: usize,
     command: u8,
     end_padding_after_drain: bool,
 }
+
+const EMPTY_CONTROL_FRAME_BYTE_BUDGET: usize = 64 * 1024;
 
 fn write_terminated_error() -> io::Error {
     io::Error::new(
@@ -56,6 +56,7 @@ pub struct VisionServerConn {
     mode: VisionServerMode,
     reader: PaddingReader,
     inspector: TlsInspector,
+    downlink_records: TlsAppRecordTracker,
     pad_scratch: [u8; PADDING_SCRATCH_LEN],
     write_padding: bool,
     write_sent_uuid: bool,
@@ -84,6 +85,7 @@ impl VisionServerConn {
             mode,
             reader: PaddingReader::new(),
             inspector: TlsInspector::new(),
+            downlink_records: TlsAppRecordTracker::new(),
             pad_scratch: [0; PADDING_SCRATCH_LEN],
             write_padding: true,
             write_sent_uuid: false,
@@ -128,19 +130,37 @@ impl VisionServerConn {
         }
     }
 
-    fn inspect_downlink(&mut self, chunk: &[u8]) {
+    fn inspect_downlink(&mut self, chunk: &[u8]) -> bool {
         if self.write_raw {
-            return;
+            return false;
         }
         match self.mode {
-            VisionServerMode::Tcp => self.inspector.observe_server_stream(chunk),
-            VisionServerMode::Xudp => self.inspector.observe_opaque_packet(chunk),
+            VisionServerMode::Tcp => {
+                let serverhello_end = self.inspector.observe_server_stream(chunk);
+                let start = if self.downlink_records.active() {
+                    0
+                } else {
+                    let Some(start) = serverhello_end else {
+                        return false;
+                    };
+                    self.downlink_records.activate();
+                    start
+                };
+                if start > chunk.len() {
+                    return false;
+                }
+                self.downlink_records.feed_batch(&chunk[start..])
+            }
+            VisionServerMode::Xudp => {
+                self.inspector.observe_opaque_packet(chunk);
+                false
+            }
         }
     }
 
-    fn drain_pending_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<usize>>> {
+    fn drain_pending_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.pending_write.is_none() {
-            return Poll::Ready(Ok(None));
+            return Poll::Ready(Ok(()));
         }
 
         while self.write_frame_pos < self.write_frame.len() {
@@ -161,6 +181,21 @@ impl VisionServerConn {
             }
         }
 
+        let direct_frame = self
+            .pending_write
+            .as_ref()
+            .is_some_and(|pending| pending.command == COMMAND_PADDING_DIRECT);
+        if direct_frame {
+            // AsyncWrite completion only proves that the frame entered the
+            // outer TLS writer.  The raw switch happens after that writer's
+            // flush boundary so no ciphertext record is still pending.
+            match Pin::new(&mut *self.inner).poll_flush(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Ready(Ok(())) => {}
+            }
+        }
+
         let pending = self
             .pending_write
             .take()
@@ -170,6 +205,10 @@ impl VisionServerConn {
 
         if pending.end_padding_after_drain {
             self.write_padding = false;
+            // END/DIRECT permanently leave the framing path; release the one
+            // reusable 16 KiB frame allocation instead of carrying it through
+            // the raw-stream lifetime.
+            self.write_frame = Vec::new();
             if pending.command == COMMAND_PADDING_DIRECT {
                 // The DIRECT frame itself has now completely passed through
                 // the outer TLS writer.  Only the next write may become raw;
@@ -186,7 +225,7 @@ impl VisionServerConn {
                 tracing::debug!("XTLS Vision server direct write passthrough enabled");
             }
         }
-        Poll::Ready(Ok(Some(pending.consumed)))
+        Poll::Ready(Ok(()))
     }
 
     fn append_frame_prefix(&mut self) {
@@ -201,7 +240,6 @@ impl VisionServerConn {
         &mut self,
         command: u8,
         content: &[u8],
-        consumed: usize,
         end_padding_after_drain: bool,
         force_long_padding: bool,
     ) {
@@ -226,43 +264,34 @@ impl VisionServerConn {
         );
         self.write_sent_uuid = true;
         self.pending_write = Some(PendingServerWrite {
-            consumed,
             command,
             end_padding_after_drain,
         });
     }
 
     /// Build one padded write frame from the head of `buf` and return the
-    /// number of caller bytes ownership of which moved into the frame.
-    ///
-    /// Each `poll_write` call is one batch, evaluated fresh: padding
-    /// decisions depend only on monotonic inspector state and structural
-    /// record completeness, so a `write_all` retry of the remainder reaches
-    /// the same decision as one uninterrupted batch — and a cancelled write
-    /// can never leak stale batch state onto unrelated later payload
-    /// (spec §6 cancellation contract).
+    /// number of caller bytes ownership of which moved into the frame.  Once
+    /// copied, those bytes belong to the connection; the caller is never
+    /// charged for drain progress made after a later cancellation.
     fn prepare_write_frame(&mut self, buf: &[u8]) -> usize {
         debug_assert!(!buf.is_empty());
-        self.inspect_downlink(buf);
 
-        let complete_records = is_complete_tls_application_records(buf);
         let mut take = buf.len().min(FRAME_CONTENT_CAP);
-        if complete_records && take < buf.len() {
-            // Cutting at a record boundary keeps the retry slice starting
-            // with `17 03 03`, so the remainder re-evaluates as complete
-            // records and the batch's final frame can still earn DIRECT.
-            take = record_aligned_cut(buf, FRAME_CONTENT_CAP);
+        if self.downlink_records.active() && take < buf.len() {
+            take = self.downlink_records.aligned_cut(buf, FRAME_CONTENT_CAP);
         }
         debug_assert!(take > 0);
         let final_batch_frame = take == buf.len();
         let content = &buf[..take];
 
+        // Only the bytes actually owned by this frame feed the TLS inspectors
+        // and the cross-write record tracker.  The not-yet-accepted remainder
+        // is examined when a later write accepts it.
+        let complete_record_boundary = self.inspect_downlink(content);
+
         let mut command = COMMAND_PADDING_CONTINUE;
         let mut end_after_drain = false;
-        if final_batch_frame && complete_records && self.inspector.is_tls() {
-            // xray frames the whole batch and ends padding on its last
-            // buffer.  A complete-records buffer starts with `17 03 03` by
-            // construction, so xray's separate prefix check is implied.
+        if final_batch_frame && complete_record_boundary && self.inspector.is_tls() {
             end_after_drain = true;
             if self.inspector.enable_xtls() && self.raw_write_capable {
                 command = COMMAND_PADDING_DIRECT;
@@ -272,16 +301,20 @@ impl VisionServerConn {
                 }
                 command = COMMAND_PADDING_END;
             }
-        } else if !self.inspector.is_tls12_or_above() && self.inspector.packets_left() <= 1 {
-            // xray finishes one packet early for non-TLS traffic — even
-            // mid-batch, with the remainder flowing unframed.  Here the END
-            // lands on this frame and the caller's retry, if any, bypasses
-            // framing because `write_padding` is already off.
+        } else if (!self.inspector.is_tls12_or_above() && self.inspector.packets_left() <= 1)
+            || (self.inspector.is_tls12_or_above()
+                && self.inspector.packets_left() == 0
+                && !self.downlink_records.active())
+        {
+            // xray finishes one packet early for non-TLS traffic.  A
+            // ServerHello-shaped stream that exhausts the same budget before
+            // producing a record boundary is likewise inconclusive: it must
+            // fall back to END rather than staying framed forever.
             command = COMMAND_PADDING_END;
             end_after_drain = true;
         }
 
-        self.begin_frame(command, content, take, end_after_drain, false);
+        self.begin_frame(command, content, end_after_drain, false);
         take
     }
 
@@ -291,7 +324,7 @@ impl VisionServerConn {
         }
         // xray's empty first-frame special case always uses long padding to
         // hide the VLESS header timing/shape, independent of IsTLS.
-        self.begin_frame(COMMAND_PADDING_CONTINUE, &[], 0, false, true);
+        self.begin_frame(COMMAND_PADDING_CONTINUE, &[], false, true);
         true
     }
 
@@ -343,6 +376,7 @@ impl AsyncRead for VisionServerConn {
     ) -> Poll<io::Result<()>> {
         let this = &mut *self;
         let mut empty_control_frames = 0usize;
+        let mut control_frame_bytes = 0usize;
         loop {
             if buf.remaining() == 0 {
                 return Poll::Ready(Ok(()));
@@ -385,6 +419,7 @@ impl AsyncRead for VisionServerConn {
                             return Poll::Ready(Ok(()));
                         }
                         this.reader.note_header_bytes(n);
+                        control_frame_bytes += n;
                     }
 
                     let header = this.reader.finish_header();
@@ -464,6 +499,7 @@ impl AsyncRead for VisionServerConn {
                             return Poll::Ready(Ok(()));
                         }
                         this.reader.consume_padding(n);
+                        control_frame_bytes += n;
                         continue;
                     }
 
@@ -481,11 +517,9 @@ impl AsyncRead for VisionServerConn {
                     }
                     if parsed == PaddingCommand::Continue {
                         empty_control_frames += 1;
-                        if empty_control_frames >= 8 {
-                            // Empty camouflage frames are legal, but a peer
-                            // may stream them forever.  Yield cooperatively
-                            // instead of monopolising the executor inside one
-                            // poll_read.
+                        if empty_control_frames >= 8
+                            || control_frame_bytes >= EMPTY_CONTROL_FRAME_BYTE_BUDGET
+                        {
                             cx.waker().wake_by_ref();
                             return Poll::Pending;
                         }
@@ -507,29 +541,22 @@ impl AsyncWrite for VisionServerConn {
             return Poll::Ready(Err(write_terminated_error()));
         }
         if this.pending_write.is_some() {
-            return match this.drain_pending_write(cx) {
-                Poll::Ready(Ok(Some(n))) => Poll::Ready(Ok(n)),
-                Poll::Ready(Ok(None)) => Poll::Ready(Ok(0)),
-                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-                Poll::Pending => Poll::Pending,
-            };
+            match this.drain_pending_write(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
+                Poll::Pending => return Poll::Pending,
+            }
         }
 
         if buf.is_empty() {
             return Poll::Ready(Ok(0));
         }
         if !this.write_padding {
-            this.inspect_downlink(buf);
             return Pin::new(&mut *this.inner).poll_write(cx, buf);
         }
 
-        this.prepare_write_frame(buf);
-        match this.drain_pending_write(cx) {
-            Poll::Ready(Ok(Some(n))) => Poll::Ready(Ok(n)),
-            Poll::Ready(Ok(None)) => Poll::Ready(Ok(0)),
-            Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-            Poll::Pending => Poll::Pending,
-        }
+        let taken = this.prepare_write_frame(buf);
+        Poll::Ready(Ok(taken))
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
@@ -629,6 +656,180 @@ mod tests {
         record.extend_from_slice(&(payload.len() as u16).to_be_bytes());
         record.extend_from_slice(payload);
         record
+    }
+
+    fn serverhello_record(cipher: u16, extensions_vector: Option<&[u8]>) -> Vec<u8> {
+        let mut body = 0x0303u16.to_be_bytes().to_vec();
+        body.extend_from_slice(&[0x11; 32]);
+        body.push(0);
+        body.extend_from_slice(&cipher.to_be_bytes());
+        body.push(0);
+        if let Some(extensions) = extensions_vector {
+            body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+            body.extend_from_slice(extensions);
+        }
+
+        let handshake_len = 4 + body.len();
+        let mut record = vec![
+            0x16,
+            0x03,
+            0x03,
+            (handshake_len >> 8) as u8,
+            handshake_len as u8,
+            0x02,
+        ];
+        record.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..4]);
+        record.extend_from_slice(&body);
+        record
+    }
+
+    fn parse_written_frames(wire: &[u8]) -> Vec<(u8, Vec<u8>)> {
+        assert_eq!(
+            wire[..2],
+            super::super::super::header::RESPONSE_HEADER,
+            "server writes start with the VLESS response header"
+        );
+        let mut pos = 2;
+        let mut first = true;
+        let mut frames = Vec::new();
+        while pos < wire.len() {
+            if first {
+                assert_eq!(&wire[pos..pos + 16], &UUID);
+                pos += 16;
+                first = false;
+            }
+            let command = wire[pos];
+            let content_len = u16::from_be_bytes([wire[pos + 1], wire[pos + 2]]) as usize;
+            let padding_len = u16::from_be_bytes([wire[pos + 3], wire[pos + 4]]) as usize;
+            pos += 5;
+            let content = wire[pos..pos + content_len].to_vec();
+            pos += content_len;
+            assert!(wire[pos..pos + padding_len].iter().all(|&b| b == 0));
+            pos += padding_len;
+            frames.push((command, content));
+        }
+        frames
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum WriteEvent {
+        Write(Vec<u8>),
+        FlushPending,
+        FlushReady,
+    }
+
+    struct FlushGateStream {
+        events: Vec<WriteEvent>,
+        first_flush_pending: bool,
+    }
+
+    impl FlushGateStream {
+        fn new() -> Self {
+            Self {
+                events: Vec::new(),
+                first_flush_pending: true,
+            }
+        }
+    }
+
+    impl AsyncRead for FlushGateStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for FlushGateStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.events.push(WriteEvent::Write(buf.to_vec()));
+            Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.first_flush_pending {
+                self.first_flush_pending = false;
+                self.events.push(WriteEvent::FlushPending);
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.events.push(WriteEvent::FlushReady);
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct PartialThenPendingStream {
+        written: Vec<u8>,
+        max_write: usize,
+        writes_until_pending: usize,
+    }
+
+    impl PartialThenPendingStream {
+        fn new(max_write: usize, writes_until_pending: usize) -> Self {
+            Self {
+                written: Vec::new(),
+                max_write,
+                writes_until_pending,
+            }
+        }
+    }
+
+    impl AsyncRead for PartialThenPendingStream {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for PartialThenPendingStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.writes_until_pending == 0 {
+                self.writes_until_pending = usize::MAX;
+                cx.waker().wake_by_ref();
+                return Poll::Pending;
+            }
+            self.writes_until_pending -= 1;
+            let n = self.max_write.min(buf.len());
+            self.written.extend_from_slice(&buf[..n]);
+            Poll::Ready(Ok(n))
+        }
+
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    fn poll_write_once(conn: &mut VisionServerConn, buf: &[u8]) -> Poll<io::Result<usize>> {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        Pin::new(conn).poll_write(&mut cx, buf)
+    }
+
+    fn poll_flush_once(conn: &mut VisionServerConn) -> Poll<io::Result<()>> {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        Pin::new(conn).poll_flush(&mut cx)
     }
 
     // ─── Read side: golden frames and frame-boundary tolerance ────────
@@ -910,6 +1111,237 @@ mod tests {
         assert_eq!(&tail, b"after-end");
     }
 
+    #[test]
+    fn partial_write_cancel_then_different_payload_does_not_skip_caller_bytes() {
+        let stream = PartialThenPendingStream::new(7, 1);
+        let mut conn = VisionServerConn::new(Box::new(stream), UUID, VisionServerMode::Tcp);
+
+        let first_payload = vec![b'A'; 37];
+        assert!(matches!(
+            poll_write_once(&mut conn, &first_payload),
+            Poll::Ready(Ok(n)) if n == first_payload.len()
+        ));
+
+        // The first drain attempt makes partial progress and then pends.  That
+        // poll is dropped as a cancelled write; no caller byte from this
+        // payload has been accepted into the frame yet.
+        let cancelled_payload = vec![b'B'; 53];
+        assert!(matches!(
+            poll_write_once(&mut conn, &cancelled_payload),
+            Poll::Pending
+        ));
+
+        let replacement_payload = vec![b'C'; 53];
+        assert!(matches!(
+            poll_write_once(&mut conn, &replacement_payload),
+            Poll::Ready(Ok(n)) if n == replacement_payload.len()
+        ));
+        assert!(matches!(poll_flush_once(&mut conn), Poll::Ready(Ok(()))));
+
+        let written = conn
+            .inner
+            .as_mut()
+            .as_any_mut()
+            .downcast_mut::<PartialThenPendingStream>()
+            .expect("test stream type")
+            .written
+            .clone();
+        let frames = parse_written_frames(&written);
+        assert_eq!(frames.len(), 2, "cancelled payload was never accepted");
+        assert_eq!(frames[0].1, first_payload);
+        assert_eq!(frames[1].1, replacement_payload);
+    }
+
+    #[tokio::test]
+    async fn empty_control_frames_yield_on_the_byte_budget() {
+        let (mut conn, mut peer) = server_over_pipe(VisionServerMode::Tcp);
+        peer.write_all(&feed_frame(
+            COMMAND_PADDING_CONTINUE,
+            true,
+            &[],
+            u16::MAX as usize,
+        ))
+        .await
+        .unwrap();
+        peer.write_all(&feed_frame(COMMAND_PADDING_CONTINUE, false, b"after", 0))
+            .await
+            .unwrap();
+
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        let mut got = [0u8; 5];
+        let filled = {
+            let mut read_buf = ReadBuf::new(&mut got);
+            assert!(matches!(
+                Pin::new(&mut conn).poll_read(&mut cx, &mut read_buf),
+                Poll::Pending
+            ));
+            assert_eq!(read_buf.filled().len(), 0);
+            assert!(matches!(
+                Pin::new(&mut conn).poll_read(&mut cx, &mut read_buf),
+                Poll::Ready(Ok(()))
+            ));
+            read_buf.filled().len()
+        };
+        assert_eq!(&got[..filled], b"after");
+    }
+
+    #[tokio::test]
+    async fn tls12_serverhello_ends_padding_without_direct() {
+        let (mut conn, mut peer) = server_over_pipe(VisionServerMode::Tcp);
+        conn.raw_write_capable = true;
+        let hello = serverhello_record(0x1301, None);
+        conn.write_all(&hello).await.unwrap();
+
+        let batch = app_data_record(b"tls12-application-data");
+        conn.write_all(&batch).await.unwrap();
+        conn.flush().await.unwrap();
+
+        read_response_header(&mut peer).await;
+        let (command, _, _) = read_server_frame(&mut peer, true).await;
+        assert_eq!(command, COMMAND_PADDING_CONTINUE);
+        let (command, content, _) = read_server_frame(&mut peer, false).await;
+        assert_eq!(
+            command, COMMAND_PADDING_END,
+            "TLS 1.2 must never promise DIRECT"
+        );
+        assert_eq!(content, batch);
+        assert_eq!(
+            conn.write_frame.capacity(),
+            0,
+            "END releases the frame allocation"
+        );
+    }
+
+    #[tokio::test]
+    async fn fragmented_serverhello_exhausting_the_budget_falls_back_to_end() {
+        let (mut conn, mut peer) = server_over_pipe(VisionServerMode::Tcp);
+        let hello = golden_serverhello();
+        let chunks: Vec<_> = hello.chunks(10).collect();
+        assert_eq!(chunks.len(), 9);
+        for chunk in &chunks[..8] {
+            conn.write_all(chunk).await.unwrap();
+        }
+        conn.flush().await.unwrap();
+        conn.write_all(chunks[8]).await.unwrap();
+        conn.flush().await.unwrap();
+
+        read_response_header(&mut peer).await;
+        let mut reassembled = Vec::new();
+        for index in 0..8 {
+            let (command, content, _) = read_server_frame(&mut peer, index == 0).await;
+            assert_eq!(
+                command,
+                if index == 7 {
+                    COMMAND_PADDING_END
+                } else {
+                    COMMAND_PADDING_CONTINUE
+                }
+            );
+            reassembled.extend_from_slice(&content);
+        }
+        assert_eq!(reassembled, hello[..80]);
+        let mut tail = vec![0u8; chunks[8].len()];
+        peer.read_exact(&mut tail).await.unwrap();
+        assert_eq!(tail, chunks[8]);
+    }
+
+    #[tokio::test]
+    async fn direct_record_fragmented_across_writes_switches_on_completion() {
+        let (mut conn, mut peer) = server_over_pipe(VisionServerMode::Tcp);
+        conn.raw_write_capable = true;
+        conn.write_all(&golden_serverhello()).await.unwrap();
+        conn.flush().await.unwrap();
+
+        let record = app_data_record(b"fragmented application record");
+        // Two bytes leave even the record header split across write batches.
+        let split = 2;
+        conn.write_all(&record[..split]).await.unwrap();
+        conn.flush().await.unwrap();
+        conn.write_all(&record[split..]).await.unwrap();
+        let err = conn.flush().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+
+        read_response_header(&mut peer).await;
+        let (command, _, _) = read_server_frame(&mut peer, true).await;
+        assert_eq!(command, COMMAND_PADDING_CONTINUE);
+        let (command, first, _) = read_server_frame(&mut peer, false).await;
+        assert_eq!(command, COMMAND_PADDING_CONTINUE);
+        assert_eq!(first, record[..split]);
+        let (command, rest, _) = read_server_frame(&mut peer, false).await;
+        assert_eq!(
+            command, COMMAND_PADDING_DIRECT,
+            "completion of the cross-write record must still earn DIRECT"
+        );
+        assert_eq!(rest, record[split..]);
+        assert_eq!(
+            conn.write_frame.capacity(),
+            0,
+            "DIRECT releases the frame allocation"
+        );
+    }
+
+    #[test]
+    fn direct_raw_switch_waits_for_outer_flush() {
+        let mut conn = VisionServerConn::new(
+            Box::new(FlushGateStream::new()),
+            UUID,
+            VisionServerMode::Tcp,
+        );
+        conn.raw_write_capable = true;
+
+        let hello = golden_serverhello();
+        assert!(matches!(
+            poll_write_once(&mut conn, &hello),
+            Poll::Ready(Ok(n)) if n == hello.len()
+        ));
+        let batch = app_data_record(b"flush-boundary");
+        assert!(matches!(
+            poll_write_once(&mut conn, &batch),
+            Poll::Ready(Ok(n)) if n == batch.len()
+        ));
+
+        let raw = b"raw-after-direct";
+        assert!(
+            matches!(poll_write_once(&mut conn, raw), Poll::Pending),
+            "the first raw write must wait behind the outer-TLS flush"
+        );
+        let poll = poll_write_once(&mut conn, raw);
+        assert!(
+            matches!(poll, Poll::Ready(Err(ref error)) if error.kind() == io::ErrorKind::Unsupported),
+            "the plain test stream cannot really switch after the flush: {poll:?}"
+        );
+
+        let events = &conn
+            .inner
+            .as_mut()
+            .as_any_mut()
+            .downcast_ref::<FlushGateStream>()
+            .expect("concrete test stream")
+            .events;
+        let flush_ready = events
+            .iter()
+            .position(|event| matches!(event, WriteEvent::FlushReady))
+            .expect("outer TLS flush completes before raw writes");
+        let direct_write = events[..flush_ready]
+            .iter()
+            .rposition(|event| matches!(event, WriteEvent::Write(_)))
+            .expect("DIRECT frame write precedes the flush");
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, WriteEvent::Write(bytes) if bytes == raw)),
+            "raw payload must not bypass a failed post-flush switch: {events:?}"
+        );
+        assert!(
+            direct_write < flush_ready,
+            "wire order must be DIRECT frame, then outer flush: {events:?}"
+        );
+        assert!(events[direct_write..flush_ready]
+            .iter()
+            .any(|event| matches!(event, WriteEvent::FlushPending)));
+    }
+
     #[tokio::test]
     async fn tls13_flow_promises_direct_only_with_a_raw_capable_transport() {
         let (mut conn, mut peer) = server_over_pipe(VisionServerMode::Tcp);
@@ -921,9 +1353,11 @@ mod tests {
         conn.write_all(&golden_serverhello()).await.unwrap();
 
         let batch = app_data_record(b"x");
-        // The DIRECT frame drains onto the wire, then the switch failure
-        // surfaces inside the same write — the client error contract.
-        let err = conn.write_all(&batch).await.unwrap_err();
+        // Ownership of the batch passes into the pending DIRECT frame when
+        // it is copied; the failed raw switch surfaces when flush guarantees
+        // that frame's drain.
+        conn.write_all(&batch).await.unwrap();
+        let err = conn.flush().await.unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::Unsupported);
 
         // The frames are on the wire regardless: the DIRECT promise was
