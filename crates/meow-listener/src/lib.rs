@@ -86,8 +86,8 @@ pub use tproxy::TProxyListener;
 pub use tun::{OutboundBinding, TunListener, TunListenerConfig, TunReady, TunRouteScope, TunStack};
 #[cfg(feature = "listener-vless")]
 pub use vless::{
-    VlessFallbackLimit, VlessListener, VlessListenerSpec, VlessRealitySpec, VlessSecuritySpec,
-    VlessUserSpec,
+    validate_security_spec as validate_vless_security_spec, VlessFallbackLimit, VlessListener,
+    VlessListenerSpec, VlessRealitySpec, VlessSecuritySpec, VlessUserSpec,
 };
 #[cfg(feature = "listener-wireguard")]
 pub use wireguard::{WgListenerSpec, WgPeerSpec, WireGuardListener, WireGuardListenerGuard};

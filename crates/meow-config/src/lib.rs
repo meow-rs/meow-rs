@@ -624,23 +624,23 @@ pub(crate) fn parse_strict_uuid(s: &str) -> Result<[u8; 16], String> {
         for (i, c) in s.char_indices() {
             let expect_dash = matches!(i, 8 | 13 | 18 | 23);
             if expect_dash != (c == '-') {
-                return Err(format!(
-                    "invalid uuid '{s}': hyphens must sit exactly at the 8-4-4-4-12 \
-                     group boundaries"
-                ));
+                return Err(
+                    "invalid uuid: hyphens must sit exactly at the 8-4-4-4-12 group boundaries"
+                        .to_string(),
+                );
             }
         }
         s.chars().filter(|c| *c != '-').collect::<String>()
     } else if s.len() == 32 {
         if s.contains('-') {
-            return Err(format!(
-                "invalid uuid '{s}': use the canonical hyphenated form or 32 bare hex digits"
-            ));
+            return Err(
+                "invalid uuid: use the canonical hyphenated form or 32 bare hex digits".to_string(),
+            );
         }
         s.to_string()
     } else {
         return Err(format!(
-            "invalid uuid '{s}': expected 32 hex chars (with or without hyphens), got {} chars",
+            "invalid uuid: expected 32 hex chars (with or without hyphens), got {} chars",
             s.len()
         ));
     };
@@ -16655,5 +16655,20 @@ mod listener_surface_tests {
         assert!(debug.contains("REDACTED"), "{debug}");
         // Usernames are not wire secrets — they stay visible.
         assert!(debug.contains("alice"), "{debug}");
+    }
+
+    #[test]
+    fn strict_uuid_errors_never_echo_the_candidate() {
+        for candidate in [
+            "71884bd4d6a0-4e19-9895-3e1d8b469317-",
+            "71884bd4-d6a04e19-9895-3e1d8b469317",
+            "71884bd4-d6a0-4e19-9895-3e1d8b46931",
+        ] {
+            let err = parse_strict_uuid(candidate).unwrap_err();
+            assert!(
+                !err.contains(candidate),
+                "uuid candidate leaked into parse error: {err}"
+            );
+        }
     }
 }

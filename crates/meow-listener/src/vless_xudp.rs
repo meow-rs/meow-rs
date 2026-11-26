@@ -58,8 +58,8 @@ use bytes::Bytes;
 use meow_common::atomic::{AtomicU, Uint};
 use meow_common::{Metadata, ProxyPacketConn};
 use meow_proxy::mux::xudp::{
-    encode_end, encode_reply_keep_data, reply_source, XudpAction, XudpDecoder, XudpServer,
-    XudpTarget,
+    encode_end, encode_reply_keep_data, encoded_reply_keep_data_len, reply_source, XudpAction,
+    XudpAddr, XudpDecoder, XudpServer, XudpTarget, MAX_PAYLOAD_LEN,
 };
 use meow_proxy::vless_inbound::VisionServerConn;
 use meow_tunnel::{MatchedRule, ResolvedTarget, TunnelInner, UsingProxy};
@@ -95,6 +95,24 @@ const SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// Vision content read chunk. XUDP frames cross chunk boundaries freely
 /// (the decoder is incremental); the size only bounds per-read copies.
 const READ_BUF: usize = 16 * 1024;
+
+/// Smallest read size that still exposes every oversize payload: a
+/// cap-sized datagram fills MAX_PAYLOAD_LEN bytes, so any byte beyond
+/// that means "drop" rather than "truncate and forward".
+const PAYLOAD_PROBE_LEN: usize = MAX_PAYLOAD_LEN + 1;
+/// Conservative allowance for UDP encapsulation headers when the selected
+/// outbound is a raw-datagram transport. SOCKS5 adds at most 22 bytes and
+/// Shadowsocks UDP at most roughly 110 bytes for its AEAD-2022 header,
+/// nonce/tag and socket-address prefix; chained dialers can repeat such a
+/// hop up to the engine's 16-hop chain bound. 4 KiB is comfortably above
+/// that worst-case sum, while still an order of magnitude below the old
+/// 64 KiB per-flow allocation. Stream-framed transports do not consume
+/// this allowance because they reassemble a complete datagram before
+/// copying it into the caller buffer.
+const RAW_ENCAPSULATION_HEADROOM: usize = 4 * 1024;
+const RAW_ENCAPSULATED_REPLY_READ_BUF: usize = PAYLOAD_PROBE_LEN + RAW_ENCAPSULATION_HEADROOM;
+const _: () = assert!(PAYLOAD_PROBE_LEN > MAX_PAYLOAD_LEN);
+const _: () = assert!(RAW_ENCAPSULATED_REPLY_READ_BUF <= 13 * 1024);
 
 /// Millisecond timestamps in the platform atomic — see anytls_uot.
 fn now_ms() -> Uint {
@@ -133,43 +151,43 @@ impl TargetKey {
         let (ip, host, port) = target.metadata_parts();
         match ip {
             Some(ip) => TargetKey::Addr(SocketAddr::new(ip.to_canonical(), port)),
-            None => TargetKey::Host(Metadata::lower_host(host), port),
+            None => {
+                let XudpAddr::Domain(original) = &target.addr else {
+                    unreachable!("ip-less XUDP target is always domain-form")
+                };
+                // The per-packet key lookup must not reallocate long domain
+                // names: the decoder already owns them in a SmolStr, so an
+                // already-lowercase key is only an Arc refcount bump.
+                let host = if host.bytes().any(|b| b.is_ascii_uppercase()) {
+                    Metadata::lower_host(host)
+                } else {
+                    original.clone()
+                };
+                TargetKey::Host(host, port)
+            }
         }
     }
 }
 
 type FlowKey = (u16, TargetKey);
 
-/// One queued ingress datagram: the payload plus its share of the
-/// association's byte meter, released on Drop whatever path consumed it.
-struct QueuedPacket {
-    bytes: Bytes,
+/// A byte reservation against the association-wide queue meter. The
+/// reservation is atomic — concurrent ingress and egress charges can never
+/// slip a check-then-add pair past one another — and is released on Drop
+/// whichever queueing path owns it by then.
+struct MeterCharge {
+    bytes: usize,
     meter: Arc<AtomicUsize>,
 }
 
-impl Drop for QueuedPacket {
-    fn drop(&mut self) {
-        self.meter.fetch_sub(self.bytes.len(), Ordering::Relaxed);
-    }
-}
-
-/// One queued egress frame — same meter discipline as the ingress side:
-/// the spec's 4 MiB budget is one sum across both directions.
-struct EgressFrame {
-    bytes: Bytes,
-    meter: Arc<AtomicUsize>,
-}
-
-impl EgressFrame {
-    /// Charge the shared meter and bundle the frame, or refuse when the
-    /// budget is exhausted — the caller drops the datagram (and counts
-    /// it) rather than letting a stalled writer park unbounded memory.
-    fn charged(bytes: Bytes, meter: &Arc<AtomicUsize>) -> Option<Self> {
-        let new_pending = meter.load(Ordering::Relaxed) + bytes.len();
-        if new_pending > CONN_QUEUE_BYTES {
-            return None;
-        }
-        meter.fetch_add(bytes.len(), Ordering::Relaxed);
+impl MeterCharge {
+    fn acquire(meter: &Arc<AtomicUsize>, bytes: usize) -> Option<Self> {
+        meter
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |pending| {
+                let charged = pending.checked_add(bytes)?;
+                (charged <= CONN_QUEUE_BYTES).then_some(charged)
+            })
+            .ok()?;
         Some(Self {
             bytes,
             meter: Arc::clone(meter),
@@ -177,9 +195,40 @@ impl EgressFrame {
     }
 }
 
-impl Drop for EgressFrame {
+impl Drop for MeterCharge {
     fn drop(&mut self) {
-        self.meter.fetch_sub(self.bytes.len(), Ordering::Relaxed);
+        self.meter.fetch_sub(self.bytes, Ordering::Relaxed);
+    }
+}
+
+/// One queued ingress datagram: the payload plus its share of the
+/// association's byte meter, released on Drop whatever path consumed it.
+struct QueuedPacket {
+    bytes: Bytes,
+    _charge: MeterCharge,
+}
+
+/// One queued egress frame — same meter discipline as the ingress side:
+/// the spec's 4 MiB budget is one sum across both directions.
+struct EgressFrame {
+    bytes: Bytes,
+    _charge: MeterCharge,
+}
+
+impl EgressFrame {
+    /// Charge the shared meter and bundle the frame, or refuse when the
+    /// budget is exhausted — the caller drops the datagram (and counts
+    /// it) rather than letting a stalled writer park unbounded memory.
+    fn charged(bytes: Bytes, meter: &Arc<AtomicUsize>) -> Option<Self> {
+        let charge = MeterCharge::acquire(meter, bytes.len())?;
+        Some(Self::precharged(bytes, charge))
+    }
+
+    fn precharged(bytes: Bytes, charge: MeterCharge) -> Self {
+        Self {
+            bytes,
+            _charge: charge,
+        }
     }
 }
 
@@ -459,11 +508,20 @@ pub(crate) async fn run_xudp_conn(
     }
     guard.sweeper.abort();
     drop(out_tx);
-    if let Ok(mut w) = (&mut guard.writer).await {
-        // Polite close: the vision write half's shutdown propagates the
-        // outer TLS close_notify. Bounded — a dead peer must not stall
-        // teardown.
-        let _ = tokio::time::timeout(Duration::from_millis(500), w.shutdown()).await;
+    // The writer drains what is already queued before it exits, but a peer
+    // that stopped reading can park that drain in write_all/flush forever.
+    // Bound the JOIN, not just the closeNotify below; on timeout the guard
+    // aborts the writer and the association's connection slot is still
+    // released.
+    match tokio::time::timeout(Duration::from_millis(500), &mut guard.writer).await {
+        Ok(Ok(mut w)) => {
+            // Polite close: the vision write half's shutdown propagates the
+            // outer TLS close_notify. Bounded — a dead peer must not stall
+            // teardown.
+            let _ = tokio::time::timeout(Duration::from_millis(500), w.shutdown()).await;
+        }
+        Ok(Err(_)) => {}
+        Err(_) => guard.writer.abort(),
     }
 }
 
@@ -583,19 +641,18 @@ fn deliver_or_spawn(
         }
     };
 
-    // Charge the shared byte meter BEFORE enqueueing; only the read loop
-    // mutates it upward on the ingress side so check-then-add is
-    // race-free within one direction, and both directions together
-    // cannot exceed the budget by more than one frame's width.
-    let new_pending = meter.load(Ordering::Relaxed) + payload.len();
-    if new_pending > CONN_QUEUE_BYTES {
+    // Charge the shared byte meter atomically BEFORE enqueueing. Ingress
+    // is serialized on this read loop, but egress flow tasks charge the
+    // same meter concurrently — a load/check/add sequence here would let
+    // the two directions overrun the 4 MiB budget together.
+    let payload_len = payload.len();
+    let Some(charge) = MeterCharge::acquire(meter, payload_len) else {
         debug!("vless xudp {peer}: queued byte budget exhausted, dropping datagram");
         return;
-    }
-    meter.fetch_add(payload.len(), Ordering::Relaxed);
+    };
     match tx.try_send(QueuedPacket {
         bytes: payload,
-        meter: Arc::clone(meter),
+        _charge: charge,
     }) {
         Ok(()) => {}
         Err(mpsc::error::TrySendError::Full(queued)) => {
@@ -743,17 +800,27 @@ async fn run_xudp_flow(
             MatchedRule::new(&rule_name, &rule_payload, proxy.name()),
             UsingProxy::new(proxy.as_ref(), &metadata)
         );
+        // Direct and the in-process DNS responder hand back complete
+        // payload datagrams. Every other outbound may be (or sit above) a
+        // raw UDP encapsulation whose wire header shares this same caller
+        // buffer, so reserve the bounded headroom for those paths.
+        let raw_encapsulated = !matches!(
+            proxy.adapter_type(),
+            meow_common::AdapterType::Direct
+                | meow_common::AdapterType::Compatible
+                | meow_common::AdapterType::Dns
+        );
         let conn: Arc<dyn ProxyPacketConn> = Arc::from(
             inner
                 .dial_udp(proxy.as_ref(), &metadata)
                 .await
                 .map_err(|e| format!("dial_udp via {}: {e}", proxy.name()))?,
         );
-        Ok((conn, dst_addr))
+        Ok((conn, dst_addr, raw_encapsulated))
     }
     .await;
 
-    let (conn, dst_addr) = match outcome {
+    let (conn, dst_addr, raw_encapsulated) = match outcome {
         Ok(v) => v,
         Err(e) => {
             debug!("vless xudp flow to {}: {e}", metadata.remote_address());
@@ -770,27 +837,47 @@ async fn run_xudp_flow(
     // the flow, and a task abort drops BOTH arms plus the conn guard —
     // nothing survives to double-await or detach holding the UDP conn.
     let _conn_guard = ConnGuard(Arc::clone(&conn));
-    let mut rbuf = vec![0u8; 65535];
+    // One byte past the wire cap is the oversize probe. Raw UDP
+    // encapsulations receive their wire headers in this same buffer, so
+    // those paths add bounded headroom: a cap-sized payload still fits
+    // complete and a kernel-truncated oversize one cannot re-enter below
+    // the cap. Stream-framed conns reassemble complete datagrams and use
+    // only the probe size.
+    let read_buf_len = if raw_encapsulated {
+        RAW_ENCAPSULATED_REPLY_READ_BUF
+    } else {
+        PAYLOAD_PROBE_LEN
+    };
+    let mut rbuf = vec![0u8; read_buf_len];
     let reply = async {
         while let Ok((m, src)) = conn.read_packet(&mut rbuf).await {
             let wire_source = reply_source(&target, dialed_ip, src);
-            let Some(frame) = encode_reply_keep_data(sid, Some(&wire_source), &rbuf[..m]) else {
-                // Oversize (never split) or unrepresentable source —
-                // counted through the meter of ordinary drops in logs.
+            // Reserve exactly the frame's bytes before allocating/copying
+            // it; encoding first would pay the allocation while the meter
+            // is already full.
+            let Some(frame_len) = encoded_reply_keep_data_len(Some(&wire_source), m) else {
                 debug!(
                     "vless xudp flow to {dst_addr}: dropping unencodable reply ({} bytes)",
                     m
                 );
                 continue;
             };
-            let Some(charged) = EgressFrame::charged(frame, &meter) else {
+            let Some(charge) = MeterCharge::acquire(&meter, frame_len) else {
                 debug!("vless xudp flow to {dst_addr}: byte budget exhausted, dropping reply");
                 continue;
             };
+            let Some(frame) = encode_reply_keep_data(sid, Some(&wire_source), &rbuf[..m]) else {
+                continue;
+            };
+            debug_assert_eq!(frame.len(), frame_len);
             // Blocking send — bounded by EGRESS_QUEUE frames — applies
             // per-flow backpressure when the client stalls reading; the
             // write arm parking with it is the UoT cascade by design.
-            if out_tx.send(charged).await.is_err() {
+            if out_tx
+                .send(EgressFrame::precharged(frame, charge))
+                .await
+                .is_err()
+            {
                 break;
             }
             touch_activity(&last_activity);
@@ -869,5 +956,69 @@ struct ConnGuard(Arc<dyn ProxyPacketConn>);
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         let _ = self.0.close();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn meter_reserve_is_exact_and_refuses_beyond_the_shared_budget() {
+        let meter = Arc::new(AtomicUsize::new(0));
+        let first = MeterCharge::acquire(&meter, CONN_QUEUE_BYTES - 7).unwrap();
+        assert_eq!(meter.load(Ordering::Relaxed), CONN_QUEUE_BYTES - 7);
+        assert!(MeterCharge::acquire(&meter, 8).is_none());
+        let second = MeterCharge::acquire(&meter, 7).unwrap();
+        assert_eq!(meter.load(Ordering::Relaxed), CONN_QUEUE_BYTES);
+        assert!(MeterCharge::acquire(&meter, 1).is_none());
+        drop(first);
+        assert_eq!(meter.load(Ordering::Relaxed), 7);
+        drop(second);
+        assert_eq!(meter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn meter_reserve_stays_bounded_under_concurrent_charges() {
+        let meter = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let meter = Arc::clone(&meter);
+            threads.push(std::thread::spawn(move || {
+                for _ in 0..500 {
+                    if let Some(charge) = MeterCharge::acquire(&meter, 1024) {
+                        assert!(
+                            meter.load(Ordering::Relaxed) <= CONN_QUEUE_BYTES,
+                            "concurrent reservations overran the byte budget"
+                        );
+                        drop(charge);
+                    }
+                }
+            }));
+        }
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        assert_eq!(meter.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn target_key_merges_domain_case_without_rewriting_addresses() {
+        let port = 53;
+        let lower = XudpTarget {
+            addr: XudpAddr::Domain("echo.test".into()),
+            port,
+        };
+        let mixed = XudpTarget {
+            addr: XudpAddr::Domain("EcHo.TeSt".into()),
+            port,
+        };
+        assert_eq!(TargetKey::of(&lower), TargetKey::of(&mixed));
+
+        let v4 = XudpTarget {
+            addr: XudpAddr::Ipv4(std::net::Ipv4Addr::LOCALHOST),
+            port,
+        };
+        assert_ne!(TargetKey::of(&lower), TargetKey::of(&v4));
     }
 }

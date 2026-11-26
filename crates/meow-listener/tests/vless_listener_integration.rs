@@ -483,6 +483,42 @@ async fn start_udp_echo(bind: &str) -> SocketAddr {
     addr
 }
 
+async fn start_udp_oversize_then_echo(bind: &str, reply_len: usize) -> SocketAddr {
+    let socket = UdpSocket::bind(bind).await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let oversize = vec![0x5au8; reply_len];
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+            let reply = if &buf[..n] == b"trigger" {
+                oversize.as_slice()
+            } else {
+                &buf[..n]
+            };
+            if socket.send_to(reply, src).await.is_err() {
+                break;
+            }
+        }
+    });
+    addr
+}
+
+async fn start_udp_fixed_reply(bind: &str, reply_len: usize) -> SocketAddr {
+    let socket = UdpSocket::bind(bind).await.unwrap();
+    let addr = socket.local_addr().unwrap();
+    tokio::spawn(async move {
+        let reply = vec![0x5au8; reply_len];
+        let mut buf = vec![0u8; 65536];
+        while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+            let _ = n;
+            if socket.send_to(&reply, src).await.is_err() {
+                break;
+            }
+        }
+    });
+    addr
+}
+
 fn tunnel_with_hosts(rule_lines: &[&str], hosts: &[(&str, std::net::IpAddr)]) -> Tunnel {
     let mut trie = meow_trie::DomainTrie::new();
     for (name, ip) in hosts {
@@ -658,9 +694,31 @@ struct RawXudpClient {
 
 impl RawXudpClient {
     async fn connect(port: u16, uuid: [u8; 16]) -> Self {
+        Self::connect_with_recv_buffer(port, uuid, None).await
+    }
+
+    async fn connect_with_recv_buffer(
+        port: u16,
+        uuid: [u8; 16],
+        recv_buffer: Option<usize>,
+    ) -> Self {
         let layer = TlsLayer::new(&tls_client_config()).unwrap();
-        let raw: Box<dyn meow_transport::Stream> =
-            Box::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+        let raw: Box<dyn meow_transport::Stream> = if let Some(size) = recv_buffer {
+            let socket = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::STREAM,
+                Some(socket2::Protocol::TCP),
+            )
+            .unwrap();
+            socket.set_recv_buffer_size(size).unwrap();
+            let peer = SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), port);
+            socket.connect(&peer.into()).unwrap();
+            socket.set_nonblocking(true).unwrap();
+            let std_stream: std::net::TcpStream = socket.into();
+            Box::new(TcpStream::from_std(std_stream).unwrap())
+        } else {
+            Box::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap())
+        };
         let mut tls = layer.connect(raw).await.unwrap();
         let mut request = vec![0x00];
         request.extend_from_slice(&uuid);
@@ -1029,6 +1087,105 @@ async fn xudp_datagram_boundaries_preserved() {
     assert_keep_data(&f2, 13, &p2);
     let f3 = client.recv_frame_timed().await;
     assert_keep_data(&f3, 13, &p3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xudp_upstream_reply_cap_boundary_and_oversize_drop() {
+    let (cert, key) = tls_cert();
+    let tunnel = tunnel_with_rules(&[]);
+
+    // 8192 exactly is the inclusive wire cap: the complete datagram must
+    // survive byte-for-byte through the bounded upstream read buffer.
+    let exact_reply = start_udp_fixed_reply("127.0.0.1:0", 8192).await;
+    let (port, _listener, _task) = start_listener(
+        tls_spec(&cert, &key, vec![("alice", ALICE)]),
+        tunnel.clone(),
+        "vless-xudp-cap8192",
+    )
+    .await;
+    let mut client = RawXudpClient::connect(port, ALICE).await;
+    let target = v4_target([127, 0, 0, 1], exact_reply.port());
+    client.send(&new_data(21, &target, b"trigger")).await;
+    let frame = client.recv_frame_timed().await;
+    assert_keep_data(&frame, 21, &vec![0x5au8; 8192]);
+    drop(client);
+
+    // One byte beyond the cap is dropped whole. The following marker on
+    // the same session proves no truncated 8192-byte frame was forwarded.
+    let oversize_reply = start_udp_oversize_then_echo("127.0.0.1:0", 8193).await;
+    let (port, _listener, _task) = start_listener(
+        tls_spec(&cert, &key, vec![("alice", ALICE)]),
+        tunnel,
+        "vless-xudp-cap8193",
+    )
+    .await;
+    let mut client = RawXudpClient::connect(port, ALICE).await;
+    let target = v4_target([127, 0, 0, 1], oversize_reply.port());
+    let mut batch = new_data(22, &target, b"trigger");
+    batch.extend_from_slice(&keep_data(22, None, b"marker"));
+    client.send(&batch).await;
+    let frame = client.recv_frame_timed().await;
+    assert_keep_data(&frame, 22, b"marker");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xudp_fatal_teardown_is_bounded_when_writer_is_blocked() {
+    let reply_source = start_udp_fixed_reply("127.0.0.1:0", 8192).await;
+    let (cert, key) = tls_cert();
+    let tunnel = tunnel_with_rules(&[]);
+    let listener = Arc::new(
+        VlessListener::new(
+            tunnel,
+            "vless-xudp-blocked-teardown".into(),
+            tls_spec(&cert, &key, vec![("alice", ALICE)]),
+        )
+        .unwrap()
+        .with_max_connections(1),
+    );
+    let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = socket.local_addr().unwrap().port();
+    listener.note_bound_endpoint(socket.local_addr().unwrap());
+    let task_listener = Arc::clone(&listener);
+    let _task = tokio::spawn(async move {
+        let _ = task_listener.run_on(socket).await;
+    });
+
+    // A tiny client receive buffer plus 128 cap-sized replies leaves the
+    // server writer parked in TCP backpressure. The client deliberately
+    // does not read while queueing that work.
+    let mut client = RawXudpClient::connect_with_recv_buffer(port, ALICE, Some(4096)).await;
+    let target = v4_target([127, 0, 0, 1], reply_source.port());
+    let mut batch = Vec::new();
+    for sid in 1..=128u16 {
+        batch.extend_from_slice(&new_data(sid, &target, b"trigger"));
+    }
+    client.send(&batch).await;
+    sleep(Duration::from_millis(300)).await;
+
+    // Fatal ingress while the writer is blocked: teardown must bound the
+    // writer join and close the physical connection instead of waiting
+    // for the peer to drain a megabyte it is refusing to read.
+    let mut fatal = new_data(129, &target, b"");
+    fatal.truncate(fatal.len() - 2);
+    fatal.extend_from_slice(&8193u16.to_be_bytes());
+    fatal.extend_from_slice(&[0u8; 64]);
+    client.send(&fatal).await;
+
+    // The listener cap is one connection. Once teardown's bounded writer
+    // join fires, the first handler releases that slot and a second XUDP
+    // association works even though the first client still refuses to read.
+    sleep(Duration::from_millis(700)).await;
+    let echo = start_udp_echo("127.0.0.1:0").await;
+    let mut second = RawXudpClient::connect(port, ALICE).await;
+    second
+        .send(&new_data(
+            1,
+            &v4_target([127, 0, 0, 1], echo.port()),
+            b"slot-free",
+        ))
+        .await;
+    let frame = second.recv_frame_timed().await;
+    assert_keep_data(&frame, 1, b"slot-free");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -5250,9 +5250,10 @@ async fn put_configs(
     // persisted document): the lan ACL and the `listeners:` shape —
     // duplicate names/ports, `rule:` blocks, the one-TUN checks —
     // are properties of the document itself, so they must never be
-    // committed malformed the way an environment failure may. The
-    // feature gate stays degradable later: whether THIS build serves a
-    // listener type is environment, not shape.
+    // committed malformed the way an environment failure may. Feature
+    // gates are split below: gates that only decide whether this build can
+    // bind right now stay degradable, while anytls/vless are hard-rejected
+    // because persisting an unservable entry breaks the next startup.
     if let Err(e) = meow_config::resolve_lan_acl(&raw_config) {
         return reload_rejected(
             StatusCode::BAD_REQUEST,

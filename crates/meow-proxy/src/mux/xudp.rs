@@ -670,6 +670,36 @@ fn put_udp_target(out: &mut BytesMut, target: &XudpTarget) -> Option<()> {
     Some(())
 }
 
+/// Wire length of the `[network][port][atype][address]` block, or `None`
+/// for a source the one-byte domain length cannot represent.
+fn udp_target_wire_len(target: &XudpTarget) -> Option<usize> {
+    match &target.addr {
+        XudpAddr::Ipv4(_) => Some(1 + 2 + 1 + 4),
+        XudpAddr::Ipv6(_) => Some(1 + 2 + 1 + 16),
+        XudpAddr::Domain(host) => {
+            let len = host.len();
+            (1..=u8::MAX as usize)
+                .contains(&len)
+                .then_some(1 + 2 + 1 + 1 + len)
+        }
+    }
+}
+
+/// Exact encoded length of [`encode_reply_keep_data`], with the same
+/// validity verdict but none of the allocation or copying. The wiring uses
+/// this to reserve queue budget before paying for the frame.
+pub fn encoded_reply_keep_data_len(
+    source: Option<&XudpTarget>,
+    payload_len: usize,
+) -> Option<usize> {
+    if payload_len > MAX_PAYLOAD_LEN {
+        return None;
+    }
+    let target_len = source.map_or(Some(0), udp_target_wire_len)?;
+    // meta_len field + fixed meta + optional source + payload_len + payload.
+    Some(2 + 4 + target_len + 2 + payload_len)
+}
+
 /// Encode a reply frame: Keep+Data on the session the client opened —
 /// the server never sends New (xray `NewResponseWriter` is born with
 /// `followup=true`). `source` is the reply's real source address as the
@@ -686,10 +716,8 @@ pub fn encode_reply_keep_data(
     source: Option<&XudpTarget>,
     payload: &[u8],
 ) -> Option<Bytes> {
-    if payload.len() > MAX_PAYLOAD_LEN {
-        return None;
-    }
-    let mut out = BytesMut::with_capacity(32 + payload.len());
+    let capacity = encoded_reply_keep_data_len(source, payload.len())?;
+    let mut out = BytesMut::with_capacity(capacity);
     out.put_u16(0); // meta_len placeholder, patched below
     out.put_u16(session_id);
     out.put_u8(STATUS_KEEP);
@@ -2032,6 +2060,7 @@ mod tests {
     fn reply_encoding_rejects_oversize_payload_and_bad_domain() {
         let big = vec![0u8; MAX_PAYLOAD_LEN + 1];
         assert!(encode_reply_keep_data(0, None, &big).is_none());
+        assert!(encoded_reply_keep_data_len(None, big.len()).is_none());
         let exact = vec![0u8; MAX_PAYLOAD_LEN];
         assert!(encode_reply_keep_data(0, None, &exact).is_some());
 
@@ -2040,11 +2069,37 @@ mod tests {
             port: 53,
         };
         assert!(encode_reply_keep_data(0, Some(&long_domain), b"x").is_none());
+        assert!(encoded_reply_keep_data_len(Some(&long_domain), 1).is_none());
         let empty_domain = XudpTarget {
             addr: XudpAddr::Domain(SmolStr::default()),
             port: 53,
         };
         assert!(encode_reply_keep_data(0, Some(&empty_domain), b"x").is_none());
+    }
+
+    #[test]
+    fn encoded_reply_length_matches_every_source_shape_exactly() {
+        for payload_len in [0usize, 1, MAX_PAYLOAD_LEN] {
+            let payload = vec![0u8; payload_len];
+            let sources = [
+                None,
+                Some(ipv4_target(9, 9, 9, 9, 53)),
+                Some(XudpTarget {
+                    addr: XudpAddr::Ipv6(Ipv6Addr::LOCALHOST),
+                    port: 853,
+                }),
+                Some(domain_target("dns.example.com", 853)),
+                Some(domain_target(&"d".repeat(255), 853)),
+            ];
+            for source in sources {
+                let frame = encode_reply_keep_data(7, source.as_ref(), &payload).unwrap();
+                assert_eq!(
+                    encoded_reply_keep_data_len(source.as_ref(), payload_len),
+                    Some(frame.len()),
+                    "precheck length must be the exact encoded frame length"
+                );
+            }
+        }
     }
 
     #[test]

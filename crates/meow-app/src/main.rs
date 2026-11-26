@@ -562,6 +562,7 @@ fn run_application_inner(
             // An inbound this build did not compile would be
             // warn-skipped at startup — that must not pass a config test.
             ensure_inbounds_supported(&config)?;
+            ensure_vless_security_valid(&config)?;
             if args.config_string.is_some() {
                 info!("Configuration test passed (--config-string)");
             } else {
@@ -850,6 +851,60 @@ fn ensure_inbounds_supported(config: &meow_config::Config) -> anyhow::Result<()>
             "tun.enable is set but this build lacks the '{feature}' feature — \
              rebuild with it or set tun.enable: false"
         );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "listener-vless")]
+fn vless_security_spec(security: &meow_config::VlessSecurity) -> meow_listener::VlessSecuritySpec {
+    match security {
+        meow_config::VlessSecurity::StandardTls {
+            certificate,
+            private_key,
+            alpn,
+        } => meow_listener::VlessSecuritySpec::StandardTls {
+            certificate: certificate.clone(),
+            private_key: private_key.clone(),
+            alpn: alpn.clone(),
+        },
+        meow_config::VlessSecurity::Reality(reality) => {
+            meow_listener::VlessSecuritySpec::Reality(meow_listener::VlessRealitySpec {
+                dest: reality.dest.clone(),
+                private_key: reality.private_key,
+                short_ids: reality.short_ids.clone(),
+                server_names: reality.server_names.clone(),
+                max_time_difference_us: reality.max_time_difference_us,
+                limit_fallback_upload: meow_listener::VlessFallbackLimit {
+                    after_bytes: reality.limit_fallback_upload.after_bytes,
+                    bytes_per_sec: reality.limit_fallback_upload.bytes_per_sec,
+                    burst_bytes_per_sec: reality.limit_fallback_upload.burst_bytes_per_sec,
+                },
+                limit_fallback_download: meow_listener::VlessFallbackLimit {
+                    after_bytes: reality.limit_fallback_download.after_bytes,
+                    bytes_per_sec: reality.limit_fallback_download.bytes_per_sec,
+                    burst_bytes_per_sec: reality.limit_fallback_download.burst_bytes_per_sec,
+                },
+            })
+        }
+    }
+}
+
+/// `meow -t` shares startup's eager VLESS security validation. Unlike the
+/// rest of config validation this deliberately reads referenced PEM files:
+/// a certificate pair is runtime material whose syntax and key match cannot
+/// be checked from the YAML shape alone. It still binds nothing, resolves no
+/// cover target, and makes no network connection.
+fn ensure_vless_security_valid(config: &meow_config::Config) -> anyhow::Result<()> {
+    #[cfg(not(feature = "listener-vless"))]
+    let _ = config;
+    #[cfg(feature = "listener-vless")]
+    for nl in &config.listeners.named {
+        if let meow_config::ListenerSpec::Vless(cfg) = &nl.spec {
+            meow_listener::validate_vless_security_spec(vless_security_spec(&cfg.security))
+                .map_err(|e| {
+                    anyhow::anyhow!("listener '{}': invalid vless security: {e}", nl.name)
+                })?;
+        }
     }
     Ok(())
 }
@@ -2214,44 +2269,7 @@ async fn run(
             ListenerSpec::Vless(cfg) => {
                 #[cfg(feature = "listener-vless")]
                 {
-                    let security = match &cfg.security {
-                        meow_config::VlessSecurity::StandardTls {
-                            certificate,
-                            private_key,
-                            alpn,
-                        } => meow_listener::VlessSecuritySpec::StandardTls {
-                            certificate: certificate.clone(),
-                            private_key: private_key.clone(),
-                            alpn: alpn.clone(),
-                        },
-                        meow_config::VlessSecurity::Reality(reality) => {
-                            meow_listener::VlessSecuritySpec::Reality(
-                                meow_listener::VlessRealitySpec {
-                                    dest: reality.dest.clone(),
-                                    private_key: reality.private_key,
-                                    short_ids: reality.short_ids.clone(),
-                                    server_names: reality.server_names.clone(),
-                                    max_time_difference_us: reality.max_time_difference_us,
-                                    limit_fallback_upload: meow_listener::VlessFallbackLimit {
-                                        after_bytes: reality.limit_fallback_upload.after_bytes,
-                                        bytes_per_sec: reality.limit_fallback_upload.bytes_per_sec,
-                                        burst_bytes_per_sec: reality
-                                            .limit_fallback_upload
-                                            .burst_bytes_per_sec,
-                                    },
-                                    limit_fallback_download: meow_listener::VlessFallbackLimit {
-                                        after_bytes: reality.limit_fallback_download.after_bytes,
-                                        bytes_per_sec: reality
-                                            .limit_fallback_download
-                                            .bytes_per_sec,
-                                        burst_bytes_per_sec: reality
-                                            .limit_fallback_download
-                                            .burst_bytes_per_sec,
-                                    },
-                                },
-                            )
-                        }
-                    };
+                    let security = vless_security_spec(&cfg.security);
                     let spec = meow_listener::VlessListenerSpec {
                         users: cfg
                             .users
@@ -3901,6 +3919,143 @@ mod tests {
                 drop(binding);
                 assert!(meow_common::outbound_interface().is_none(), "{global}");
             }
+        }
+    }
+
+    #[cfg(feature = "listener-vless")]
+    mod vless_test_security {
+        use super::*;
+
+        const TEST_CERT: &str = r#"-----BEGIN CERTIFICATE-----
+MIICpDCCAYwCCQCb2SWxd4NvsjANBgkqhkiG9w0BAQsFADAUMRIwEAYDVQQDDAls
+b2NhbGhvc3QwHhcNMjYxMTI2MTgyMDEyWhcNMzYxMTIzMTgyMDEyWjAUMRIwEAYD
+VQQDDAlsb2NhbGhvc3QwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDM
+mkGQMyS/oSU0JO8ETadgzYUmVXB0lPNkwdhRS0nLqrNSW09G/+PhG7Ex0xLAIRH1
+HSLJPKs0oL/iVzuPx+L85/cHTISnw7loGVCcgHN/he8G9fWzs8VlJCwxKYOn6A3b
+NgZNCFCLS4aNVnFGauWS1MkvNzFqtz2eoLEgHherr5jtV1WlcdpxNl0xHuCesCHI
+BF041RO+0DhNTg4tahgVk3IZmSrR8kMCzx1EizBJlqBMJPHqTheFKjenelI3jolB
+YFFxR86U8d7iVceAzqBSnJOKPvx+2Y//87COT6TcJzsUg4ALZBp5Ym3yy9IzRlEd
+z+Tv3Sd8Y/w9a6bo3ZunAgMBAAEwDQYJKoZIhvcNAQELBQADggEBAEonlDigkFLY
+39hLj9jWvUmHpCRXpri+FKf8IEJvHxbn/ImWTdSXCGD0gyYndB3CI3piYU4nKiWz
+6puCyLWBw7RVNK/y0s6cAnieNkAJcFWfqXsskt8jqY3Nq2bWtKjJ0gyNG21yZEZg
+fQ+/5d2QpD4+fGkrtum8jYZR4gMSV+s5RGs2ayByiMzCisk+VHbjKAVygdqc3Jtq
+vQ4fzC+KxHuL0eCq/Bc1AJQ1lcoIEPYYlX5IMI/Kgx7OIgAneG2rswEc9YV0mpH8
+iRc/qmfkS4j+cho90gY3guK6sZTvJJzGpNIrN7qeYb+90UZ7vMJ2SOqKE6WRNWaD
++O+0KabQ2oo=
+-----END CERTIFICATE-----
+"#;
+        const TEST_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvgIBADANBgkqhkiG9w0BAQEFAASCBKgwggSkAgEAAoIBAQDMmkGQMyS/oSU0
+JO8ETadgzYUmVXB0lPNkwdhRS0nLqrNSW09G/+PhG7Ex0xLAIRH1HSLJPKs0oL/i
+VzuPx+L85/cHTISnw7loGVCcgHN/he8G9fWzs8VlJCwxKYOn6A3bNgZNCFCLS4aN
+VnFGauWS1MkvNzFqtz2eoLEgHherr5jtV1WlcdpxNl0xHuCesCHIBF041RO+0DhN
+Tg4tahgVk3IZmSrR8kMCzx1EizBJlqBMJPHqTheFKjenelI3jolBYFFxR86U8d7i
+VceAzqBSnJOKPvx+2Y//87COT6TcJzsUg4ALZBp5Ym3yy9IzRlEdz+Tv3Sd8Y/w9
+a6bo3ZunAgMBAAECggEBAMTfZVjwrVqrH5ZWN5tHcVgnSgjBy6ySKsV39ML8k+yi
+u1vyuozR6x8PO2h69p7i81mNCIzkkMTaLOkJESnfp529QqjGSxr2rS/qs/Nzci9x
+27cx8pNQ1w7kSJWhoapuEu8sw9FZv87ZBIZ5eBPPBkpL7648CJPr8CHz85u4+QPc
+AVtPs+cG1nScngnyewoImsv2JEZsqnDzPBejs+qFaUyTspNgaqwhZ2pi/GYRBoV5
+buT8PrpjK4ckStlSXBRbgafIYPN+AJaEvU7HCfu66a91w3HbpJdl54/JTCIjm5CW
+MPJiMuGUVWQkaQxOrBbk+cMeHY+tp8z+urFPu6UoepECgYEA8SPbZ2rHcS0bKg+P
+4KbCWY4WWPyGIo7rqimg576GqfE/PHMgBIC5cxcH38adnEiVqMxZ0JuPKq774j6D
+MZhnN+tlnc9hX8MofiK2HxE9G4VVM7bWY/3yR5MNQLoXmpy4uy1QEXzQJw3oo2Qe
+bfW6JG6dL0WdzH8KgoM0guhfQdkCgYEA2TX+9c4u3VbZVKkoc4vQ6DvPQJIPCHMu
+bD8gwY1ZmtRhRMBlyyIcQ10VRA5WS9OzAnErnWfkIaFGAUXrFcvGHp1RXcTn6g/E
+RY40iQQH9GwL4snu5oIBcWEnABurEaOzIejmubI+jt/u5YnPn83XIKv3mHk7QNn/
+J9RjxH9D2X8CgYB1CiNWqaQN0YfKvWzm6+mO0AEWxdJQ+a92kufvMzFnUJmRvIsA
+xH2+V6JRwbQEA9Ln7+9z6dzuKapF4HOK4d7PbGiQ1PP9J9sChdSBdbuEHQ4CoK6k
+L8ClbsFS9j+4onKjHtYq9rqNChotG84NLuRfBHU0WYTCmbK/L/GPzDtX2QKBgQCM
+Acz0ndEBZJCzjFGBoPaoKp0dbsf3115t8Ybom3bNYOXNjgJPHA6BsUca1e7z82Ho
+ShAl5qhasPxRp8KvCukKJLckrN4btcv6VX4xbwK9nsNOjIDL3bKWZVvhKvRqa0z0
+p43I1kaSi28OT3Uf+WsYKSBwDHyQAbQA9VrVdn7CewKBgG9FIFNdD+2RCVknVNXb
+0NOIduRdx69nUwfUrm9iE7GMeK02+zhbpiOEOlm40RZbxH3dL98naMNo6HgdoQdw
+RcBjFNmTQsDAu5vjXtOw8Yu3NxWfzeLwwaVvVCko8aXUTHqUaPQOfm9HiDXE36cH
+1KwIXpEoToqHaITDAs6F5ySk
+-----END PRIVATE KEY-----
+"#;
+        const MISMATCHED_KEY: &str = r#"-----BEGIN PRIVATE KEY-----
+MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDUwa45RDHDbXgk
+zwtca4bB4kKb+i1gN0DtNCoAAR0udopvL29pbjrn2saThBE+brnC1LNzKV8Pku31
+HUHx/xYZCc06Q8s6mPyUb59CDeysErac9ZFRU4CajwkQKQwLjEdAGVizBAbStylA
+wdV/gzofthvG4+GGoHqs+HY9fpIUk2YeiQKezSumppVJ2NFuJY1lN+AWh3Tfla0u
+R/Br/icsU09qTrwhFVHql1PhNB7yX2ABMhNPDHvfkqIOAhochSF298Gyph1GhM+2
+POEJobR/7/kHl1GyRdrQN7gi1jTR+tRIra+egDH9in1QQ/zAg6zX4oUxNxW4Ary6
+BPuuT+ZhAgMBAAECggEARMIDSEadvobWWS8AgPHPL0GsPTRxDbNNrFs7Z5z0jVuK
+CbzOyMfzCZNOscXwvLiUGD8db45jRmk5tgmqkkbaIWVlifr25w0iM+aPFY3iewnh
+MoC6YgoWedzYFPzvA5xmOnT2kYQvoFHJZ0A9e2QxmKYF/BURgazDeLsjm2QYWcVi
+Hp59aBQ0sMISkYhRqRtMs9EVLnEOtJVA2w3TIW4q55BtCZ/JeBTDQBbzb+K0FDdr
+7+gV44jJqBhRCUswdp3MbCO7Uy1SqBwRWKahVzqtC/EjJXFlEiiTtYbJ0aptRmKU
+nvCPJ6+KGK5XC2w5crhYOLBb2iLv75Gm162RQcoVQQKBgQD2RlAr0qYcDUssD4Xv
+4/8HqQ8NTGNAbghznRjj58TCcaEndlRv6AKkCNaH1S/q2OFNTC4p3TC9wxFq8IBW
+qW4mliZF/roTp/UKaLhqvFt4d+OOt6aMxN5/1btzYn+A6nsgvfvXK/NL6IIz1UdL
+ViB9eSoBL43P8/1o+WMMPZBpJQKBgQDdKIUVLtvSq2fYMKruesOtoeKcWygnzhba
+UZ9uL/y2m+gaxxntj2UF6Y8NnsYHcIYlLxeqENdHvvoSA2WB3lh0QV3LS8YQCEPA
+N7aGq09ebFfZMLOUS5CSvvzhfQk26ovlnIVKyU00HMNACAaLnt8ECcRnEIS+v8ue
+lA0cRC35jQKBgQC7noWlXS2/YUFLp+faAlBgfaNB9lgG1c0KhzxXJFL576decP+S
+4aZhYXpOsVN4DxJV2RuyORjQ+LNkTST44MtSCkHOQWlxYBuGepFEf4sQFAYAzFjO
+FY2Mxj+wf/GzPO/g2dvq6UjJI7FN28Yc1tiZvp0JmjjnnHIKbzPON3i1IQKBgDj2
+ZtC98QCiBW05m80w8ZWXTLbZA8681kYFH/tRgNXH8lBzV8pIVMzhC2eGrZrc8LBD
+IOU80TY5ik95cHuyuTW4YGAsdCdM+aZYszqchSTc4wOd96MKk4I4jwnFGsp6Pu41
+El/g2XHCtseXSZhMo0R2/49MQeSfoeKGX5oYNX9BAoGAG2DQq8VDDoaVy/QCwZXN
+jRMlyTkbj09s3i2Q2JPa8CRfrv6QXcNWSTzqED7HSA/wpBS/3lxdSjBSgrP2Mi2Q
+aR7y+yjHyFyl4TjohXNY2MEKAUK50TAcxkI02AVD5kLv0NkcrxCELt8ILHA2/o1R
+ebe3y+ZRTVQVKhyaC1jbQ5c=
+-----END PRIVATE KEY-----
+"#;
+
+        fn pem_block(pem: &str) -> String {
+            pem.lines().map(|line| format!("      {line}\n")).collect()
+        }
+
+        fn tls_listener_yaml(cert: &str, key: &str) -> String {
+            format!(
+                "listeners:\n  - name: vision-in\n    type: vless\n    port: 0\n    certificate: |\n{}    private-key: |\n{}    users:\n      - username: alice\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision\n",
+                pem_block(cert),
+                pem_block(key)
+            )
+        }
+
+        async fn config_from_yaml(yaml: &str) -> meow_config::Config {
+            let raw = meow_config::parse_raw_yaml(yaml).unwrap();
+            meow_config::build_config(raw, None).await.unwrap()
+        }
+
+        #[tokio::test]
+        async fn test_mode_vless_validation_accepts_a_matching_cert_pair() {
+            let config = config_from_yaml(&tls_listener_yaml(TEST_CERT, TEST_KEY)).await;
+            ensure_vless_security_valid(&config).unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_mode_vless_validation_rejects_a_mismatched_key() {
+            let config = config_from_yaml(&tls_listener_yaml(TEST_CERT, MISMATCHED_KEY)).await;
+            let err = ensure_vless_security_valid(&config).unwrap_err();
+            assert!(err.to_string().contains("invalid vless security"), "{err}");
+        }
+
+        #[tokio::test]
+        async fn test_mode_vless_validation_rejects_missing_cert_files() {
+            let yaml = "listeners:\n  - name: vision-in\n    type: vless\n    port: 0\n    certificate: missing-vless-cert.pem\n    private-key: missing-vless-key.pem\n    users:\n      - username: alice\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision\n";
+            let config = config_from_yaml(yaml).await;
+            assert!(ensure_vless_security_valid(&config).is_err());
+        }
+
+        #[tokio::test]
+        async fn test_mode_vless_validation_accepts_reality_and_rejects_short_id_overflow() {
+            let valid = "listeners:\n  - name: vision-in\n    type: vless\n    port: 0\n    reality-config:\n      dest: \"localhost:443\"\n      private-key: \"dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo\"\n      short-id: [\"0123456789abcdef\"]\n      server-names: [\"localhost\"]\n    users:\n      - username: alice\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision\n";
+            let config = config_from_yaml(valid).await;
+            ensure_vless_security_valid(&config).unwrap();
+
+            let ids = (0..65)
+                .map(|i| format!("\"{i:015x}1\""))
+                .collect::<Vec<_>>()
+                .join(", ");
+            let overflow = valid.replace(
+                "\"0123456789abcdef\"",
+                &format!("\"0123456789abcdef\", {ids}"),
+            );
+            let config = config_from_yaml(&overflow).await;
+            assert!(ensure_vless_security_valid(&config).is_err());
         }
     }
 }

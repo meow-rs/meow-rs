@@ -147,6 +147,84 @@ pub struct VlessListener {
     vision_raw_write_switches: AtomicUsize,
 }
 
+fn build_security_runtime(
+    security: VlessSecuritySpec,
+) -> Result<SecurityRuntime, Box<dyn std::error::Error + Send + Sync>> {
+    match security {
+        VlessSecuritySpec::StandardTls {
+            certificate,
+            private_key,
+            alpn,
+        } => {
+            let (certificate_chain_pem, private_key_pem) =
+                crate::pem::load_identity_pair(&certificate, &private_key, "vless")
+                    .map_err(|e| meow_common::MeowError::Config(e.to_string()))?;
+            let server = TlsServer::new(&TlsServerConfig {
+                certificate_chain_pem,
+                private_key_pem,
+                alpn,
+            })
+            .map_err(|e| meow_common::MeowError::Config(format!("vless TLS: {e}")))?;
+            Ok(SecurityRuntime::StandardTls(server))
+        }
+        VlessSecuritySpec::Reality(spec) => {
+            let (dest_host, dest_port) = parse_reality_dest(&spec.dest)
+                .map_err(|e| meow_common::MeowError::Config(e.to_string()))?;
+            let server = RealityServer::new(&RealityServerConfig {
+                private_key: spec.private_key,
+                short_ids: spec.short_ids,
+                server_names: spec.server_names.iter().cloned().collect(),
+                max_time_difference: Some(Duration::from_micros(spec.max_time_difference_us)),
+                now: Some(meow_common::protocol_now),
+            })
+            .map_err(|e| meow_common::MeowError::Config(format!("vless REALITY: {e}")))?;
+            // The transport's current relay interface carries one shared
+            // token-bucket capacity for both directions. Use the larger
+            // configured burst rather than silently tightening a direction
+            // whose operator configured more; the directional rates and
+            // exemptions themselves map exactly.
+            let burst_bytes = spec
+                .limit_fallback_upload
+                .burst_bytes_per_sec
+                .max(spec.limit_fallback_download.burst_bytes_per_sec);
+            Ok(SecurityRuntime::Reality(RealityRuntime {
+                server,
+                dest_host,
+                dest_port,
+                cover_limit: CoverBandwidthLimit {
+                    upload_bytes_per_second: spec.limit_fallback_upload.bytes_per_sec,
+                    upload_exempt_bytes: spec.limit_fallback_upload.after_bytes,
+                    download_bytes_per_second: spec.limit_fallback_download.bytes_per_sec,
+                    download_exempt_bytes: spec.limit_fallback_download.after_bytes,
+                    burst_bytes,
+                },
+                handshake_slots: Arc::new(Semaphore::new(REALITY_HANDSHAKE_SLOTS)),
+                cover_slots: Arc::new(Semaphore::new(REALITY_COVER_SLOTS)),
+            }))
+        }
+    }
+}
+
+/// Run the exact security-material validation [`VlessListener::new`]
+/// performs at startup, without binding sockets or contacting the cover
+/// target. `meow -t` uses this so a certificate/key or REALITY parameter
+/// that startup would reject cannot be reported as valid.
+pub fn validate_security_spec(
+    security: VlessSecuritySpec,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    build_security_runtime(security).map(drop)
+}
+
+fn cover_dial_budget(
+    deadline: tokio::time::Instant,
+    now: tokio::time::Instant,
+) -> Option<Duration> {
+    deadline
+        .checked_duration_since(now)
+        .filter(|remaining| !remaining.is_zero())
+        .map(|remaining| remaining.min(COVER_DIAL_TIMEOUT))
+}
+
 impl VlessListener {
     /// Build the listener and validate/load all security material eagerly:
     /// a bad PEM/key pair or malformed REALITY parameter is a startup
@@ -166,60 +244,7 @@ impl VlessListener {
             .into_iter()
             .map(|u| (u.uuid, SmolStr::from(u.username)))
             .collect();
-        let security = match spec.security {
-            VlessSecuritySpec::StandardTls {
-                certificate,
-                private_key,
-                alpn,
-            } => {
-                let (certificate_chain_pem, private_key_pem) =
-                    crate::pem::load_identity_pair(&certificate, &private_key, "vless")
-                        .map_err(|e| meow_common::MeowError::Config(e.to_string()))?;
-                let server = TlsServer::new(&TlsServerConfig {
-                    certificate_chain_pem,
-                    private_key_pem,
-                    alpn,
-                })
-                .map_err(|e| meow_common::MeowError::Config(format!("vless TLS: {e}")))?;
-                SecurityRuntime::StandardTls(server)
-            }
-            VlessSecuritySpec::Reality(spec) => {
-                let (dest_host, dest_port) = parse_reality_dest(&spec.dest)
-                    .map_err(|e| meow_common::MeowError::Config(e.to_string()))?;
-                let server = RealityServer::new(&RealityServerConfig {
-                    private_key: spec.private_key,
-                    short_ids: spec.short_ids,
-                    server_names: spec.server_names.iter().cloned().collect(),
-                    max_time_difference: Some(Duration::from_micros(spec.max_time_difference_us)),
-                    now: None,
-                })
-                .map_err(|e| meow_common::MeowError::Config(format!("vless REALITY: {e}")))?;
-                // The transport's current relay interface carries one
-                // shared token-bucket capacity for both directions. Use
-                // the larger configured burst rather than silently
-                // tightening a direction whose operator configured more;
-                // the directional rates and exemptions themselves map
-                // exactly.
-                let burst_bytes = spec
-                    .limit_fallback_upload
-                    .burst_bytes_per_sec
-                    .max(spec.limit_fallback_download.burst_bytes_per_sec);
-                SecurityRuntime::Reality(RealityRuntime {
-                    server,
-                    dest_host,
-                    dest_port,
-                    cover_limit: CoverBandwidthLimit {
-                        upload_bytes_per_second: spec.limit_fallback_upload.bytes_per_sec,
-                        upload_exempt_bytes: spec.limit_fallback_upload.after_bytes,
-                        download_bytes_per_second: spec.limit_fallback_download.bytes_per_sec,
-                        download_exempt_bytes: spec.limit_fallback_download.after_bytes,
-                        burst_bytes,
-                    },
-                    handshake_slots: Arc::new(Semaphore::new(REALITY_HANDSHAKE_SLOTS)),
-                    cover_slots: Arc::new(Semaphore::new(REALITY_COVER_SLOTS)),
-                })
-            }
-        };
+        let security = build_security_runtime(spec.security)?;
 
         let bound_endpoints = Arc::new(std::sync::RwLock::new(HashSet::new()));
         endpoint_registries()
@@ -423,7 +448,7 @@ impl VlessListener {
                 match accepted {
                     Some(RealityServerAccept::Authenticated(stream)) => Some(stream),
                     Some(RealityServerAccept::Cover(relay)) => {
-                        self.run_cover(reality, relay, peer).await;
+                        self.run_cover(reality, relay, peer, deadline).await;
                         None
                     }
                     None => None,
@@ -544,6 +569,7 @@ impl VlessListener {
         reality: &RealityRuntime,
         relay: meow_transport::reality_server::CoverRelay,
         peer: SocketAddr,
+        deadline: tokio::time::Instant,
     ) {
         // Covers are unauthenticated long-lived relays: refuse new work at
         // saturation rather than letting probes queue behind the 10-minute
@@ -555,25 +581,37 @@ impl VlessListener {
             );
             return;
         };
-        let target =
-            match tokio::time::timeout(COVER_DIAL_TIMEOUT, self.dial_cover_target(reality)).await {
-                Ok(Ok(target)) => target,
-                Ok(Err(e)) => {
-                    debug!(
-                        "vless listener '{}' cover from {peer}: target dial failed: {e}",
-                        self.name
-                    );
-                    return;
-                }
-                Err(_) => {
-                    debug!(
-                        "vless listener '{}' cover from {peer}: target dial exceeded {}s",
-                        self.name,
-                        COVER_DIAL_TIMEOUT.as_secs()
-                    );
-                    return;
-                }
-            };
+        // Accepting the REALITY ClientHello may already have consumed most
+        // of the 15s handshake budget. The cover dial gets the shorter of
+        // its own 3s budget and what remains of that absolute deadline;
+        // it must not restart a fresh 3s clock after a slow accept.
+        let now = tokio::time::Instant::now();
+        let Some(dial_budget) = cover_dial_budget(deadline, now) else {
+            debug!(
+                "vless listener '{}' cover from {peer}: handshake deadline already spent",
+                self.name
+            );
+            return;
+        };
+        let target = match tokio::time::timeout(dial_budget, self.dial_cover_target(reality)).await
+        {
+            Ok(Ok(target)) => target,
+            Ok(Err(e)) => {
+                debug!(
+                    "vless listener '{}' cover from {peer}: target dial failed: {e}",
+                    self.name
+                );
+                return;
+            }
+            Err(_) => {
+                debug!(
+                    "vless listener '{}' cover from {peer}: target dial exceeded {}ms",
+                    self.name,
+                    dial_budget.as_millis()
+                );
+                return;
+            }
+        };
         debug!(
             "vless listener '{}' cover from {peer}: relaying to {}:{}",
             self.name, reality.dest_host, reality.dest_port
@@ -887,5 +925,20 @@ mod tests {
             &endpoints,
             None,
         ));
+    }
+
+    #[test]
+    fn cover_dial_budget_is_capped_by_the_absolute_handshake_deadline() {
+        let now = tokio::time::Instant::now();
+        assert_eq!(
+            cover_dial_budget(now + Duration::from_secs(15), now),
+            Some(COVER_DIAL_TIMEOUT)
+        );
+        assert_eq!(
+            cover_dial_budget(now + Duration::from_millis(1200), now),
+            Some(Duration::from_millis(1200))
+        );
+        assert_eq!(cover_dial_budget(now, now), None);
+        assert_eq!(cover_dial_budget(now - Duration::from_millis(1), now), None);
     }
 }
