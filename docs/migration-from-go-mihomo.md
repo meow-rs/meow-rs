@@ -54,7 +54,7 @@ cause problems; items marked ~ work with caveats; items marked ✓ work.
 | `external-controller-routing-mark` | — | Parsed, warn-ignored (controller listener `SO_MARK` not implemented). |
 | `secret` (Bearer auth) | ✓ | Enforced (security fix vs upstream). Applies to every controller transport — plain, TLS, Unix socket and pipe alike (upstream's unix socket is unauthenticated). |
 | `authentication` + `skip-auth-prefixes` | ✓ | Inbound proxy auth (M1.F-3). |
-| `listeners:` named listeners | ✓ | Named listener array (M1.F-1). `type: socks` is accepted as an alias of `type: socks5` (canonical name stays `socks5`); the named-listener `udp` SOCKS option is not ported. Per-listener `proxy:`/`rule:` route overrides and `routing-mark` are supported (see below). `type: tun` declares a flat-form TUN device (`listeners:`-tuned defaults: `mtu` 9000, `udp-timeout` 300, `auto-route` off; presence is the enabled state — `enable`/nested `tun:`/`port`/`listen` are hard errors; one effective TUN — a named entry plus `tun.enable: true`, or two named entries, fails to parse). Starts at boot only and a failed spawn is fatal; `PUT`/`PATCH` `tun.enable` is refused while a named device runs. Same `listener-tun` feature; see [tun.md](tun.md#named-listeners-type-tun-entries). |
+| `listeners:` named listeners | ✓ | Named listener array (M1.F-1). `type: socks` is accepted as an alias of `type: socks5` (canonical name stays `socks5`); the named-listener `udp` SOCKS option is not ported. Per-listener `proxy:`/`rule:` route overrides and `routing-mark` are supported (see below). Server inbounds include Shadowsocks, AnyTLS, WireGuard and VLESS Vision (`type: vless`, standard TLS 1.3 or REALITY, `listener-vless` in `full` not `minimal`; see §VLESS). `type: tun` declares a flat-form TUN device (`listeners:`-tuned defaults: `mtu` 9000, `udp-timeout` 300, `auto-route` off; presence is the enabled state — `enable`/nested `tun:`/`port`/`listen` are hard errors; one effective TUN — a named entry plus `tun.enable: true`, or two named entries, fails to parse). Starts at boot only and a failed spawn is fatal; `PUT`/`PATCH` `tun.enable` is refused while a named device runs. Same `listener-tun` feature; see [tun.md](tun.md#named-listeners-type-tun-entries). |
 | `lan-allowed-ips`, `lan-disallowed-ips` | ✓ | CIDR admission on the mixed/HTTP/SOCKS TCP accept loops only — rejected peers drop silently at `accept` before auth or sniffing. Omitted allow list admits all; explicit `[]` admits none. Top-level keys only; nested under `listeners:` they are a hard parse error. Startup-only like the listeners themselves: `PUT /configs` validates and stores for the next boot. |
 | `proxies:` — Shadowsocks | ✓ | Including AEAD 2022 ciphers. |
 | `proxies:` — Trojan | ✓ | TLS + WebSocket transport. |
@@ -294,7 +294,74 @@ proxies:
 | `tls: false` with no outer encryption | Accepted silently | Warn-once at load — traffic is plaintext. |
 | `flow: xtls-rprx-vision` over `network: ws`/`grpc`/`h2`/`httpupgrade`/`xhttp` (no `encryption`) | Loads; every dial fails ("failed to use vision") | Hard parse error — Vision needs `network: tcp` with `tls: true` or REALITY. |
 
-**Deferred:** VLESS inbound.
+#### VLESS Vision server inbound (`listeners: type: vless`)
+
+Implemented behind `listener-vless` (in `full`/`default`, not `minimal`).
+The server side is deliberately narrower than the outbound: XTLS
+`xtls-rprx-vision` only, native TCP only, and the outer security is either a
+standard TLS 1.3 certificate pair or REALITY. TCP and XUDP traffic enter the
+same rule engine as the other inbounds; the authenticated `users:` username
+is available to `IN-USER`. The flow metadata is stamped `ConnType::Vless`,
+but the current `IN-TYPE` rule parser does not accept `VLESS` — use
+`IN-NAME`, `IN-PORT`, `IN-USER`, or the listener `proxy:`/`rule:` override.
+
+```yaml
+listeners:
+  - name: vision-in
+    type: vless
+    listen: "0.0.0.0,::"
+    port: 443
+    reality-config:
+      dest: "www.example.com:443"      # mihomo/xray `target` is not accepted
+      private-key: "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo"  # example only — generate your own
+      short-id: ["0123456789abcdef"]   # even hex, at most 16 chars
+      server-names: ["www.example.com"]
+      max-time-difference: 120000000   # microseconds; 0 disables freshness
+    users:
+      - username: alice                # list form, not username: uuid mapping
+        uuid: "71884bd4-d6a0-4e19-9895-3e1d8b469317"
+        flow: xtls-rprx-vision
+```
+
+For standard TLS instead of REALITY, replace `reality-config` with a flat
+`certificate` + `private-key` pair (both file paths or both inline PEM) and
+optional `alpn`. The two security modes are mutually exclusive and one is
+mandatory — there is no plaintext credential-bearing VLESS server mode.
+
+Migration traps:
+
+- `users:` is the mihomo VLESS **list** shape. An anytls-style
+  `users: {alice: uuid}` mapping is rejected with a reshaping hint.
+- Every user must spell `flow: xtls-rprx-vision`. The
+  `xtls-rprx-vision-udp443` suffix is client-local UDP/443 policy syntax and
+  is rejected on a server; no `-udp443` bytes ever appear in the wire flow.
+- Inbound uses `reality-config`; `reality-opts` is outbound spelling and
+  hard-errors. Xray's nested `target` is spelled `dest`, and `xver` /
+  PROXY-protocol handoff is unsupported.
+- Empty and all-zero short IDs are credentials meow refuses to mint, not
+  wildcards; entries are right-zero-padded to eight bytes, so padded
+  duplicates (`"ab"` and `"ab00"`) are rejected too.
+- A wrong UUID closes the connection silently after outer authentication —
+  it does not fall back, pass through, resolve DNS, or dial the target.
+- There is no VLESS fallback chain, no plaintext mode, no VLESS Encryption
+  server mode, no generic TCP-over-Mux.Cool, and no WebSocket/gRPC/XHTTP
+  front layer. `udp: false` rejects the Mux command before XUDP state.
+- UDP is XUDP inside the Vision connection. Control-plane sessions (sid) and
+  data-plane `(sid, target)` flows have separate lifetimes: a failed or
+  idle-evicted UDP flow respawns on the next datagram instead of blackholing
+  the whole sid. Xray GlobalID bytes are parsed for compatibility but do not
+  migrate sessions between connections.
+- REALITY cover is one fixed transparent TCP relay to `dest`; an ordinary or
+  unauthenticated TLS client talks to that target itself. This is not target
+  TLS shape mimicry. Authenticated REALITY clients never dial `dest`.
+- REALITY self-loops are rejected statically where possible and filtered at
+  runtime after address resolution; a target with no non-looping candidate
+  fails closed.
+- `meow -t` validates the typed listener shape but does not construct the
+  TLS/REALITY acceptor: unreadable certificates and certificate/key mismatches
+  are startup errors before binding, not `-t` errors.
+- See [specs/listener-vless.md](specs/listener-vless.md) for the complete
+  field table, wire limits, rejection matrix and interoperability evidence.
 
 ### HTTP CONNECT outbound
 
@@ -831,6 +898,7 @@ meow-rs uses Cargo feature flags where Go mihomo uses build tags:
 | Logbook (bundles SQLite) | `meow-app/logbook` (in `full`, not in `minimal`) | on |
 | Traffic ledger (SQLite + public-suffix list) | `meow-app/traffic-ledger` (in `full`, not in `minimal`) | on |
 | Shadowsocks inbound (`listeners:` `type: shadowsocks`) | `meow-app/listener-shadowsocks` (in `full`, not in `minimal`) | on |
+| VLESS Vision inbound (`listeners:` `type: vless`) | `meow-app/listener-vless` (in `full`, not in `minimal`) | on |
 
 To build without encrypted DNS (smaller binary):
 

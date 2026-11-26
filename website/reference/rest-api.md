@@ -276,7 +276,7 @@ route map).
 
 | Method | Path | Description |
 | --- | --- | --- |
-| `GET` | `/listeners` | Active listeners (`name`, `type`, `port`, `listen`; tproxy entries also report `firewall`, `udp`, `udp-timeout`; a multi-address `type: anytls` entry additionally reports `addresses: [{listen, port}, …]` — user digests and TLS material are never disclosed) |
+| `GET` | `/listeners` | Active listeners (`name`, `type`, `port`, `listen`; tproxy entries also report `firewall`, `udp`, `udp-timeout`; multi-address `type: anytls`/`type: vless` entries additionally report `addresses: [{listen, port}, …]` — credentials and TLS/REALITY material are never disclosed) |
 
 ## WebSocket streams
 

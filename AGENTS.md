@@ -129,7 +129,7 @@ the two HTTPS paths.
 ## Architecture
 
 ```
-Listeners (HTTP/SOCKS5/Mixed/TProxy)
+Listeners (HTTP/SOCKS5/Mixed/TProxy/TUN/WireGuard/AnyTLS/VLESS)
         |
         v
     Tunnel (routing engine)  <-->  DNS Resolver (Normal/Snooping)
@@ -152,14 +152,18 @@ Listeners (HTTP/SOCKS5/Mixed/TProxy)
 | `meow-rules` | Rule matching engine and parser (domain, IP-CIDR, GeoIP, process, logic composition) |
 | `meow-dns` | DNS resolver, cache, DNS snooping (IP→domain reverse table), UDP server |
 | `meow-tunnel` | Core routing engine: TCP/UDP relay, rule matching dispatch, connection statistics |
-| `meow-listener` | Inbound protocol handlers (Mixed/HTTP/SOCKS5/TProxy) |
+| `meow-listener` | Inbound protocol handlers (Mixed/HTTP/SOCKS5/TProxy, plus feature-gated TUN, WireGuard, AnyTLS and VLESS Vision/REALITY server inbounds) |
 | `meow-config` | YAML configuration parsing into typed structs |
 | `meow-api` | REST API server (Axum) for proxies, rules, connections, configs, traffic, DNS query |
 | `meow-app` | CLI entry point (`main.rs`) — wires config → tunnel → listeners → DNS → API |
 
 ### Startup Flow
 
-`meow-app/src/main.rs` → parse CLI args → `meow_config::load_config()` → create `Tunnel` → spawn DNS server, API server, listeners (Mixed/SOCKS/HTTP/TProxy) as tokio tasks → await SIGINT/SIGTERM.
+`meow-app/src/main.rs` → parse CLI args → `meow_config::load_config()` → create `Tunnel` → spawn DNS server, API server, and every configured listener (Mixed/SOCKS/HTTP/TProxy/TUN plus feature-gated server inbounds) as tokio tasks → await SIGINT/SIGTERM.
+
+### Server-inbound notes
+
+Feature-gated server inbounds live in `meow-listener`: WireGuard (`listener-wireguard`), AnyTLS (`listener-anytls`) and VLESS Vision (`listener-vless`). The VLESS listener terminates `xtls-rprx-vision` over TLS 1.3 or REALITY, routes TCP plus XUDP through the tunnel, stamps the authenticated user for `IN-USER`, and keeps REALITY cover traffic separate from authenticated flows. Its full contract is [docs/specs/listener-vless.md](docs/specs/listener-vless.md); note that flow metadata is `ConnType::Vless` but the current `IN-TYPE` parser does not accept `VLESS`.
 
 ### Key Patterns
 
