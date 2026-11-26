@@ -3,9 +3,10 @@
 //!
 //! This is deliberately an acceptor over an already-established stream, not
 //! a socket listener: binding, firewall policy, connection caps and deadlines
-//! belong to the inbound listener crate.  The returned stream is the same
-//! [`BoringTlsStream`] wrapper used by client connections, so the independent
-//! read/write raw switches have one implementation and one contract.
+//! belong to the inbound listener crate.  The returned stream uses the same
+//! BoringSSL raw-switch implementation as client connections from
+//! [`TlsLayer`](crate::tls::TlsLayer), so the independent read/write raw
+//! switches have one implementation and one contract.
 
 use std::io;
 
