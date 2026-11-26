@@ -281,9 +281,11 @@ without `fib daddr type local return`, a LAN client's DNS to `LAN_IP:53` gets
 TPROXY'd with `orig_dst = LAN_IP:53` and routed by meow to a destination where
 nothing listens. Ordering bites too: this chain runs at `priority mangle`
 (-150), *before* the `nat`/`dstnat` (-100) `meow_gateway` chain, so once a
-datagram is TPROXY'd the :53→:1053 DNAT hijack never sees it — `udp dport 53
-return` keeps forwarded DNS on the hijack path (clients pointed at `LAN_IP`
-are covered by the `fib local` rule instead). The reserved bypasses mirror the
+datagram is TPROXY'd the DNS DNAT hijack never sees it — `udp dport 53 return`
+keeps forwarded DNS on the hijack path. Only the v4 hijack is enabled by
+default; v6 DNS is hijacked only when the optional v6 DNAT rule below is
+enabled and meow DNS listens on IPv6. Otherwise clients must use the gateway's
+DNS address to receive fake-ip/fake-AAAA answers. The reserved bypasses mirror the
 TCP chain's `meow_gateway` behaviour. Keep the fake-ip ranges out of broad
 bypasses: when `fake-ip-range6` is inside ULA, its explicit capture rule must
 precede `fc00::/7` as shown, or clients receive fake AAAA answers that never
@@ -294,6 +296,10 @@ yours). Keep host-originated packets out of the TPROXY path: do not add a
 matching `output` rule for UDP. If the fwmark you pick collides with meow's
 `routing-mark`, meow's own outbound gets steered into the local table — keep
 the two mark values distinct.
+
+For the systemd unit below, persist these same `ip meow_udp` and `ip6
+meow_udp6` table definitions as `/etc/meow/udp.nft` (without the shell heredoc
+wrapper). The one-shot service then loads them together with `gateway.nft`.
 
 Replies are sent with the **original destination** as source address and port
 (via a per-family transparent socket bound per destination on first use), so
@@ -488,9 +494,15 @@ table inet meow_gateway {
         # Only forwarded LAN traffic; leave host-local traffic to meow's table.
         iifname != "eth0" return
 
-        # 1. DNS hijack: send all LAN DNS (v4) to meow's resolver.
+        # 1. DNS hijack: send LAN DNS to meow's resolver. The v4 rule is
+        # required for the fake-ip path. The v6 rule is optional and requires
+        # dns.listen to bind an IPv6 address reachable from LAN clients;
+        # substitute the gateway's LAN v6 address. Without it, clients using
+        # a hard-coded off-LAN v6 resolver bypass meow DNS and get no fake AAAA.
         meta nfproto ipv4 meta l4proto udp th dport 53 \
             dnat ip to 192.168.1.1:1053
+        # meta nfproto ipv6 meta l4proto udp th dport 53 \
+        #     dnat ip6 to [fd77::1]:1053
 
         # 2. Traffic addressed to the gateway itself (SSH, API, ...) -> leave.
         fib daddr type local return
@@ -508,7 +520,7 @@ table inet meow_gateway {
 }
 ```
 
-Replace `eth0`, `192.168.1.1`, `:1053`, and `:7893` with your values. Notes:
+Replace `eth0`, `192.168.1.1`, the optional `[fd77::1]`, `:1053`, and `:7893` with your values. Notes:
 
 - The DNS hijack catches clients that point at any resolver (e.g. `8.8.8.8`),
   forcing them through meow so fake-ip / snooping works. Clients that talk to a
@@ -552,6 +564,8 @@ ExecStartPre=/sbin/sysctl -w net.ipv6.conf.all.forwarding=1
 ExecStartPre=/etc/meow/wait-tproxy.sh
 ExecStart=/usr/sbin/nft -f /etc/meow/gateway.nft
 ExecStop=/usr/sbin/nft delete table inet meow_gateway
+ExecStop=-/usr/sbin/nft delete table ip meow_udp
+ExecStop=-/usr/sbin/nft delete table ip6 meow_udp6
 
 [Install]
 WantedBy=multi-user.target
@@ -589,6 +603,7 @@ half — `nft -f` does not cover `ip rule`/`ip route … table 100`, so UDP woul
 silently die on reboot without them:
 
 ```ini
+ExecStart=/usr/sbin/nft -f /etc/meow/udp.nft
 ExecStart=/sbin/ip rule add fwmark 0x1 lookup 100
 ExecStart=/sbin/ip route add local 0.0.0.0/0 dev lo table 100
 ExecStart=/sbin/ip -6 rule add fwmark 0x1 lookup 100
