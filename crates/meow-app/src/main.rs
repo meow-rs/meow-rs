@@ -836,6 +836,7 @@ fn listener_feature_gate(spec: &meow_config::ListenerSpec) -> Option<&'static st
         S::WireGuard(_) => (!cfg!(feature = "listener-wireguard")).then_some("listener-wireguard"),
         S::Tun(_) => (!cfg!(feature = "listener-tun")).then_some("listener-tun"),
         S::Anytls(_) => (!cfg!(feature = "listener-anytls")).then_some("listener-anytls"),
+        S::Vless(_) => (!cfg!(feature = "listener-vless")).then_some("listener-vless"),
     }
 }
 
@@ -1495,16 +1496,14 @@ fn bind_socket_addr(listen: &str, port: u16) -> Result<SocketAddr> {
     Ok(SocketAddr::new(ip, port))
 }
 
-/// Bind ALL of one AnyTLS listener's addresses, then apply its
+/// Bind ALL of one multi-address TCP listener's addresses, then apply its
 /// `routing-mark` — atomically: any failure returns the error and the
 /// already-bound sockets drop with the `Vec`, so a half-bound group is
-/// never left holding ports (F09/F11). `listeners[].routing-mark`
-/// applies to every socket this listener binds — the same
-/// `apply_listener_mark` contract the other socket listeners keep; a
-/// mark failure is a startup failure, not a skip: the group must not
-/// half-publish.
-#[cfg(feature = "listener-anytls")]
-async fn bind_anytls_sockets(
+/// never left holding ports. `listeners[].routing-mark` applies to every
+/// socket this listener binds; a mark failure is a startup failure, not a
+/// skip: the group must not half-publish.
+#[cfg(any(feature = "listener-anytls", feature = "listener-vless"))]
+async fn bind_multi_tcp_sockets(
     name: &str,
     addrs: &[meow_config::ListenerBind],
     routing_mark: Option<u32>,
@@ -2160,7 +2159,7 @@ async fn run(
                     // the returned Vec (upstream iterates all listen
                     // addresses; partial binds release on drop here).
                     let sockets =
-                        bind_anytls_sockets(&nl.name, &cfg.addresses, nl.routing_mark).await?;
+                        bind_multi_tcp_sockets(&nl.name, &cfg.addresses, nl.routing_mark).await?;
                     // Publish the REAL bound endpoints: `local_addr()`
                     // from EVERY socket, collected atomically — a single
                     // failure used to drop that entry and `zip`-misalign
@@ -2208,6 +2207,128 @@ async fn run(
                     listener_failed(&nl.name, "anytls requires feature 'listener-anytls'");
                     return Err(anyhow::anyhow!(
                         "listener '{}': anytls requires feature 'listener-anytls'",
+                        nl.name
+                    ));
+                }
+            }
+            ListenerSpec::Vless(cfg) => {
+                #[cfg(feature = "listener-vless")]
+                {
+                    let security = match &cfg.security {
+                        meow_config::VlessSecurity::StandardTls {
+                            certificate,
+                            private_key,
+                            alpn,
+                        } => meow_listener::VlessSecuritySpec::StandardTls {
+                            certificate: certificate.clone(),
+                            private_key: private_key.clone(),
+                            alpn: alpn.clone(),
+                        },
+                        meow_config::VlessSecurity::Reality(reality) => {
+                            meow_listener::VlessSecuritySpec::Reality(
+                                meow_listener::VlessRealitySpec {
+                                    dest: reality.dest.clone(),
+                                    private_key: reality.private_key,
+                                    short_ids: reality.short_ids.clone(),
+                                    server_names: reality.server_names.clone(),
+                                    max_time_difference_us: reality.max_time_difference_us,
+                                    limit_fallback_upload: meow_listener::VlessFallbackLimit {
+                                        after_bytes: reality.limit_fallback_upload.after_bytes,
+                                        bytes_per_sec: reality.limit_fallback_upload.bytes_per_sec,
+                                        burst_bytes_per_sec: reality
+                                            .limit_fallback_upload
+                                            .burst_bytes_per_sec,
+                                    },
+                                    limit_fallback_download: meow_listener::VlessFallbackLimit {
+                                        after_bytes: reality.limit_fallback_download.after_bytes,
+                                        bytes_per_sec: reality
+                                            .limit_fallback_download
+                                            .bytes_per_sec,
+                                        burst_bytes_per_sec: reality
+                                            .limit_fallback_download
+                                            .burst_bytes_per_sec,
+                                    },
+                                },
+                            )
+                        }
+                    };
+                    let spec = meow_listener::VlessListenerSpec {
+                        users: cfg
+                            .users
+                            .iter()
+                            .map(|u| meow_listener::VlessUserSpec {
+                                username: u.username.clone(),
+                                uuid: u.uuid,
+                            })
+                            .collect(),
+                        security,
+                        udp: cfg.udp,
+                    };
+                    let listener = match meow_listener::VlessListener::new(
+                        tunnel.clone(),
+                        nl.name.clone(),
+                        spec,
+                    ) {
+                        Ok(l) => std::sync::Arc::new(
+                            l.with_max_connections(nl.max_connections)
+                                .with_tcp_keepalive(config.listeners.tcp_keepalive)
+                                .with_route_override(nl.route_override.clone()),
+                        ),
+                        Err(e) => {
+                            listener_failed(&nl.name, &format!("invalid vless config: {e}"));
+                            return Err(anyhow::anyhow!(
+                                "listener '{}': invalid vless config: {e}",
+                                nl.name
+                            ));
+                        }
+                    };
+                    // Same atomic multi-bind contract as AnyTLS. REALITY
+                    // self-loop protection learns the real endpoints before
+                    // any accept task can classify a probe — important when
+                    // `port: 0` resolves to ephemeral ports.
+                    let sockets =
+                        bind_multi_tcp_sockets(&nl.name, &cfg.addresses, nl.routing_mark).await?;
+                    let bound_addrs: Vec<(String, u16)> = sockets
+                        .iter()
+                        .map(|s| {
+                            s.local_addr()
+                                .map(|b| {
+                                    listener.note_bound_endpoint(b);
+                                    (b.ip().to_string(), b.port())
+                                })
+                                .map_err(|e| {
+                                    anyhow::anyhow!(
+                                        "listener '{}': bound address read failed: {e}",
+                                        nl.name
+                                    )
+                                })
+                        })
+                        .collect::<Result<_, _>>()?;
+                    if let ListenerSpec::Vless(cfg) = &mut nl.spec {
+                        for (a, (ip, port)) in cfg.addresses.iter_mut().zip(&bound_addrs) {
+                            a.listen = ip.clone();
+                            a.port = *port;
+                        }
+                    }
+                    if let Some((ip, port)) = bound_addrs.first() {
+                        nl.listen = ip.clone();
+                        nl.port = *port;
+                    }
+                    for socket in sockets {
+                        let listener = std::sync::Arc::clone(&listener);
+                        tokio::spawn(async move {
+                            if let Err(e) = listener.run_on(socket).await {
+                                error!("VLESS listener error: {}", e);
+                            }
+                        });
+                    }
+                }
+                #[cfg(not(feature = "listener-vless"))]
+                {
+                    let _ = cfg;
+                    listener_failed(&nl.name, "vless requires feature 'listener-vless'");
+                    return Err(anyhow::anyhow!(
+                        "listener '{}': vless requires feature 'listener-vless'",
                         nl.name
                     ));
                 }
@@ -2801,7 +2922,7 @@ mod tests {
                 port: blocked_port,
             },
         ];
-        let err = bind_anytls_sockets("t", &addrs, None)
+        let err = bind_multi_tcp_sockets("t", &addrs, None)
             .await
             .expect_err("second address is occupied");
         assert!(err.to_string().contains(&blocked_port.to_string()), "{err}");

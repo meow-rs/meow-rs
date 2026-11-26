@@ -36,6 +36,7 @@ use meow_common::Metadata;
 /// The only successful response header a Vision server writes: version 0
 /// with an empty addon vector.  It rides immediately before the first
 /// downlink padding frame and is never a standalone connectivity ACK.
+#[cfg(feature = "vless-vision")]
 pub const RESPONSE_HEADER: [u8; 2] = [0x00, 0x00];
 
 // ─── Address type ─────────────────────────────────────────────────────────────

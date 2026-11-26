@@ -5268,24 +5268,27 @@ async fn put_configs(
             )
         }
     };
-    // The `type: anytls` feature gate is unbypassable, unlike the
-    // degradable gate below: a persisted entry this build cannot serve
-    // fails the NEXT boot's `ensure_inbounds_supported` hard-check, so
+    // The `type: anytls`/`type: vless` feature gates are unbypassable,
+    // unlike the degradable gate below: a persisted entry this build cannot
+    // serve fails the NEXT boot's `ensure_inbounds_supported` hard-check, so
     // committing it is a Class-A defect like malformed shape — reject it
     // identically even under `?force`.
     let gate = crate::listener_gate();
-    if let Some(l) = named_listeners
-        .iter()
-        .find(|l| matches!(l.spec, meow_config::ListenerSpec::Anytls(_)) && gate(&l.spec).is_some())
-    {
+    if let Some(l) = named_listeners.iter().find(|l| {
+        matches!(
+            l.spec,
+            meow_config::ListenerSpec::Anytls(_) | meow_config::ListenerSpec::Vless(_)
+        ) && gate(&l.spec).is_some()
+    }) {
         let feature = gate(&l.spec).expect("find() already selected a missing feature");
         return reload_rejected(
             StatusCode::BAD_REQUEST,
             &format!(
-                "listener '{}' (type anytls) requires cargo feature '{feature}', \
+                "listener '{}' (type {}) requires cargo feature '{feature}', \
                  which this build lacks — refusing to persist a config the next \
                  startup could not serve",
-                l.name
+                l.name,
+                l.spec.type_name()
             ),
         );
     }
@@ -6944,15 +6947,19 @@ async fn get_listeners(State(state): State<Arc<AppState>>) -> Json<serde_json::V
                 item["port"] = serde_json::json!(l.port);
                 item["listen"] = serde_json::json!(l.listen);
             }
-            // A multi-address `type: anytls` reports every bound target
-            // in declaration order — `listen`/`port` above stay the
-            // first entry for single-address parity. Only `listen`/
-            // `port` is emitted: user digests, certificate material and
-            // the private key never appear in API output.
-            if let meow_config::ListenerSpec::Anytls(cfg) = &l.spec {
-                if cfg.addresses.len() > 1 {
-                    item["addresses"] = serde_json::json!(cfg
-                        .addresses
+            // Multi-address AnyTLS/VLESS entries report every bound target
+            // in declaration order — `listen`/`port` above stay the first
+            // entry for single-address parity. Only `listen`/`port` is
+            // emitted: credentials, certificate material and private keys
+            // never appear in API output.
+            let multi_addresses = match &l.spec {
+                meow_config::ListenerSpec::Anytls(cfg) => Some(&cfg.addresses),
+                meow_config::ListenerSpec::Vless(cfg) => Some(&cfg.addresses),
+                _ => None,
+            };
+            if let Some(addresses) = multi_addresses {
+                if addresses.len() > 1 {
+                    item["addresses"] = serde_json::json!(addresses
                         .iter()
                         .map(|a| serde_json::json!({
                             "listen": a.listen,

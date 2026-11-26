@@ -12,9 +12,13 @@ pub mod sniffer;
     feature = "listener-mixed",
     feature = "listener-tproxy",
     feature = "listener-shadowsocks",
-    feature = "listener-anytls"
+    feature = "listener-anytls",
+    feature = "listener-vless"
 ))]
 mod keepalive;
+
+#[cfg(any(feature = "listener-anytls", feature = "listener-vless"))]
+mod pem;
 
 pub const DEFAULT_HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
@@ -52,6 +56,8 @@ mod socks5_udp;
 pub mod tproxy;
 #[cfg(feature = "listener-tun")]
 pub mod tun;
+#[cfg(feature = "listener-vless")]
+pub mod vless;
 #[cfg(feature = "listener-wireguard")]
 pub mod wireguard;
 
@@ -74,6 +80,11 @@ pub(crate) mod sniffer_quic;
 pub use tproxy::TProxyListener;
 #[cfg(feature = "listener-tun")]
 pub use tun::{OutboundBinding, TunListener, TunListenerConfig, TunReady, TunRouteScope, TunStack};
+#[cfg(feature = "listener-vless")]
+pub use vless::{
+    VlessFallbackLimit, VlessListener, VlessListenerSpec, VlessRealitySpec, VlessSecuritySpec,
+    VlessUserSpec,
+};
 #[cfg(feature = "listener-wireguard")]
 pub use wireguard::{WgListenerSpec, WgPeerSpec, WireGuardListener, WireGuardListenerGuard};
 
