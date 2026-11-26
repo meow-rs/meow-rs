@@ -302,8 +302,8 @@ The server side is deliberately narrower than the outbound: XTLS
 standard TLS 1.3 certificate pair or REALITY. TCP and XUDP traffic enter the
 same rule engine as the other inbounds; the authenticated `users:` username
 is available to `IN-USER`. The flow metadata is stamped `ConnType::Vless`,
-but the current `IN-TYPE` rule parser does not accept `VLESS` — use
-`IN-NAME`, `IN-PORT`, `IN-USER`, or the listener `proxy:`/`rule:` override.
+so `IN-TYPE,VLESS` matches these flows alongside `IN-NAME`, `IN-PORT`,
+`IN-USER`, and the listener `proxy:`/`rule:` override.
 
 ```yaml
 listeners:

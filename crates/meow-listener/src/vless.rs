@@ -191,7 +191,7 @@ impl VlessListener {
                     short_ids: spec.short_ids,
                     server_names: spec.server_names.iter().cloned().collect(),
                     max_time_difference: Some(Duration::from_micros(spec.max_time_difference_us)),
-                    now_unix: None,
+                    now: None,
                 })
                 .map_err(|e| meow_common::MeowError::Config(format!("vless REALITY: {e}")))?;
                 // The transport's current relay interface carries one

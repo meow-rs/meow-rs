@@ -128,7 +128,7 @@ bug. Keys belonging to other listener types (`cipher`, `password`,
 | `private-key` | string | ✓ | Unpadded URL-safe base64 decoding to exactly 32 bytes of X25519 private key — never PEM, hex, or a file path. |
 | `short-id` | list of strings | ✓ | Non-empty list. Each item is even-length hex of at most 16 characters, decoded and right-zero-padded to 8 bytes. Empty strings and all-zero values are rejected; duplicates are compared after padding (`"ab"` and `"ab00"` collide). Runtime accepts at most 64 entries. |
 | `server-names` | list of strings | ✓ | Exact-match SNI allowlist compared case-insensitively after ASCII lowercasing: non-empty ASCII DNS A-labels, no wildcards, IP literals, leading/trailing dots, or duplicates (case-insensitive). Runtime accepts at most 64 entries. The wire SNI is never rewritten. |
-| `max-time-difference` | integer | — | Microseconds. Absent/null means `120_000_000` (120 seconds); explicit `0` disables the freshness check; negative or non-integer values hard-error. The wire timestamp is whole Unix seconds; the current handshake compares it against the configured duration's whole-second component. |
+| `max-time-difference` | integer | — | Microseconds. Absent/null means `120_000_000` (120 seconds); explicit `0` disables the freshness check; negative or non-integer values hard-error. The wire timestamp is whole Unix seconds, but the skew against the server clock is compared in the microsecond domain — a sub-second window keeps its precision, in either direction, and the boundary is inclusive. |
 | `limit-fallback-upload` / `limit-fallback-download` | map | — | Optional cover-only rate limits with `after-bytes`, `bytes-per-sec`, `burst-bytes-per-sec`, all non-negative integers in bytes or bytes/second. `bytes-per-sec: 0` disables shaping for that direction. Unknown keys hard-error. A burst below the rate is raised to the rate; the current transport interface shares the larger of the two configured burst values across both directions. |
 | `proxy` | — | — | Unsupported nested cover-dial control; hard-errors. The top-level listener `proxy`/`rule` still applies to authenticated VLESS flows. |
 | `xver`, client-version pins, `show`, key logs, ML-DSA keys | — | — | Xray extensions meow does not serve; hard-errors. |
@@ -340,9 +340,9 @@ registry. `IN-PORT` reports the actual accepting port.
 `listen`/`port`, and `addresses[]` for multi-address entries. UUIDs,
 usernames, REALITY private keys, short IDs, certificate/private-key material,
 ClientHello bytes and handshake secrets are not exposed. Flow metadata is
-stamped `ConnType::Vless`, but the current `IN-TYPE` rule parser does **not**
-accept a `VLESS` payload; route these flows by `IN-NAME`, `IN-PORT`,
-`IN-USER`, or the listener's `proxy:`/`rule:` override instead.
+stamped `ConnType::Vless`, matchable via `IN-TYPE,VLESS` as well as
+`IN-NAME`, `IN-PORT`, `IN-USER`, or the listener's `proxy:`/`rule:`
+override.
 
 `PUT /configs` validates the same typed shape. A `type: vless` entry on a
 build without the `listener-vless` feature is rejected with 400 even under
@@ -392,14 +392,6 @@ not enable `listener-anytls` or the outbound REALITY feature separately.
   those failures are startup errors before binding. REALITY's runtime
   `1..=64` short-ID/server-name cardinality is likewise enforced by listener
   construction rather than by the config-shape pass.
-- **`IN-TYPE,VLESS` is not currently parseable.** VLESS flows stamp
-  `ConnType::Vless` in metadata, but the rule parser's accepted inbound-type
-  inventory was not extended. This is documented as the current behavior;
-  use the other inbound selectors or route overrides.
-- **Current time-window precision.** The config unit is microseconds, but the
-  REALITY wire timestamp is whole Unix seconds and the current handshake
-  compares using the duration's whole-second component. Sub-second configured
-  remainders therefore do not widen acceptance.
 
 ## Interoperability evidence
 

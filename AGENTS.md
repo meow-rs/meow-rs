@@ -163,7 +163,7 @@ Listeners (HTTP/SOCKS5/Mixed/TProxy/TUN/WireGuard/AnyTLS/VLESS)
 
 ### Server-inbound notes
 
-Feature-gated server inbounds live in `meow-listener`: WireGuard (`listener-wireguard`), AnyTLS (`listener-anytls`) and VLESS Vision (`listener-vless`). The VLESS listener terminates `xtls-rprx-vision` over TLS 1.3 or REALITY, routes TCP plus XUDP through the tunnel, stamps the authenticated user for `IN-USER`, and keeps REALITY cover traffic separate from authenticated flows. Its full contract is [docs/specs/listener-vless.md](docs/specs/listener-vless.md); note that flow metadata is `ConnType::Vless` but the current `IN-TYPE` parser does not accept `VLESS`.
+Feature-gated server inbounds live in `meow-listener`: WireGuard (`listener-wireguard`), AnyTLS (`listener-anytls`) and VLESS Vision (`listener-vless`). The VLESS listener terminates `xtls-rprx-vision` over TLS 1.3 or REALITY, routes TCP plus XUDP through the tunnel, stamps the authenticated user for `IN-USER`, and keeps REALITY cover traffic separate from authenticated flows. Its full contract is [docs/specs/listener-vless.md](docs/specs/listener-vless.md); flow metadata is `ConnType::Vless`, matchable via `IN-TYPE,VLESS`.
 
 ### Key Patterns
 

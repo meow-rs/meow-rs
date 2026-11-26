@@ -59,8 +59,9 @@ pub struct RealityServerConfig {
     /// Accepted client timestamp skew.  `None` uses the REALITY default of
     /// 120 seconds; `Some(Duration::ZERO)` disables the check.
     pub max_time_difference: Option<Duration>,
-    /// Test clock hook; production uses `None`.
-    pub now_unix: Option<fn() -> u64>,
+    /// Test clock hook; production uses `None`.  Sub-second precision is
+    /// significant to the freshness-window comparison.
+    pub now: Option<fn() -> SystemTime>,
 }
 
 impl fmt::Debug for RealityServerConfig {
@@ -87,7 +88,7 @@ struct RealityServerInner {
     server_names: HashSet<String>,
     max_time_difference: Duration,
     certificate: RealityCertificate,
-    now_unix: fn() -> u64,
+    now: fn() -> SystemTime,
     #[cfg(test)]
     corrupt_certificate_verify: bool,
 }
@@ -110,11 +111,8 @@ impl fmt::Debug for RealityServerAccept {
     }
 }
 
-fn default_now_unix() -> u64 {
+fn default_now() -> SystemTime {
     SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
 }
 
 impl RealityServer {
@@ -150,7 +148,7 @@ impl RealityServer {
                     .collect(),
                 max_time_difference,
                 certificate: RealityCertificate::generate()?,
-                now_unix: config.now_unix.unwrap_or(default_now_unix),
+                now: config.now.unwrap_or(default_now),
                 #[cfg(test)]
                 corrupt_certificate_verify: false,
             }),
@@ -224,11 +222,17 @@ impl RealityServer {
         if plaintext.len() != 16 {
             return None;
         }
-        let client_time = u32::from_be_bytes(plaintext[4..8].try_into().ok()?) as u64;
+        // The wire timestamp is whole Unix seconds, but the comparison
+        // happens in the Duration domain: truncating the window to whole
+        // seconds would collapse a sub-second window to zero width.
+        let client_time = Duration::from_secs(u64::from(u32::from_be_bytes(
+            plaintext[4..8].try_into().ok()?,
+        )));
         if self.inner.max_time_difference != Duration::ZERO {
-            let now = (self.inner.now_unix)();
-            let window = self.inner.max_time_difference.as_secs();
-            if now.abs_diff(client_time) > window {
+            let now = (self.inner.now)()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default();
+            if now.abs_diff(client_time) > self.inner.max_time_difference {
                 return None;
             }
         }
@@ -1276,7 +1280,7 @@ mod tests {
             short_ids: vec![[0u8; 8], SHORT_ID, [0xff; 8]],
             server_names: HashSet::from([SERVER_NAME.to_string()]),
             max_time_difference: None,
-            now_unix: Some(fixed_unix),
+            now: Some(fixed_system_time),
         }
     }
 
@@ -1373,6 +1377,19 @@ mod tests {
         rejected_client_goes_to_cover(config, server).await;
     }
 
+    async fn expect_authenticated(client_config: TlsConfig, server: RealityServer) {
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let accept_task = tokio::spawn(async move { server.accept(Box::new(server_io)).await });
+        let layer = RealityTlsLayer::new(&client_config).expect("client layer");
+        let client_task = tokio::spawn(async move { layer.connect(Box::new(client_io)).await });
+        let accepted = accept_task.await.expect("accept task").expect("accept");
+        assert!(
+            matches!(accepted, RealityServerAccept::Authenticated(_)),
+            "in-window REALITY client must authenticate"
+        );
+        assert!(client_task.await.expect("client task").is_ok());
+    }
+
     #[tokio::test]
     async fn expired_timestamp_goes_to_cover_but_zero_window_disables_check() {
         fn ancient_system_time() -> SystemTime {
@@ -1388,13 +1405,98 @@ mod tests {
         let mut sc = server_config(private);
         sc.max_time_difference = Some(Duration::ZERO);
         let server = RealityServer::new(&sc).expect("server");
-        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
-        let accept_task = tokio::spawn(async move { server.accept(Box::new(server_io)).await });
-        let layer = RealityTlsLayer::new(&config).expect("client layer");
-        let client_task = tokio::spawn(async move { layer.connect(Box::new(client_io)).await });
-        let accepted = accept_task.await.expect("accept task").expect("accept");
-        assert!(matches!(accepted, RealityServerAccept::Authenticated(_)));
-        assert!(client_task.await.expect("client task").is_ok());
+        expect_authenticated(config, server).await;
+    }
+
+    #[tokio::test]
+    async fn sub_second_window_accepts_client_ahead_across_second_boundary() {
+        // The client truncates its clock to whole wire seconds, so a client
+        // 100 ms ahead of the server can seal the *next* second.  A 500 ms
+        // window must still accept it: the diff is 100 ms, not one second.
+        fn server_now() -> SystemTime {
+            UNIX_EPOCH + Duration::from_millis(1_700_000_000_900)
+        }
+        fn client_now() -> SystemTime {
+            UNIX_EPOCH + Duration::from_secs(1_700_000_001)
+        }
+        let (private, public) = keypair();
+        let mut sc = server_config(private);
+        sc.max_time_difference = Some(Duration::from_millis(500));
+        sc.now = Some(server_now);
+        let server = RealityServer::new(&sc).expect("server");
+        let mut config = client_config(public, SHORT_ID, false);
+        config.reality.as_mut().unwrap().protocol_clock = Some(client_now);
+        expect_authenticated(config, server).await;
+    }
+
+    #[tokio::test]
+    async fn sub_second_window_rejects_outside_window_in_both_directions() {
+        fn server_now_late() -> SystemTime {
+            UNIX_EPOCH + Duration::from_millis(1_700_000_000_900)
+        }
+        fn server_now_early() -> SystemTime {
+            UNIX_EPOCH + Duration::from_millis(1_700_000_000_200)
+        }
+        fn client_now_ahead() -> SystemTime {
+            UNIX_EPOCH + Duration::from_secs(1_700_000_001)
+        }
+        let (private, public) = keypair();
+
+        // Client behind: seals second T against a server at T+900ms → 900 ms
+        // skew exceeds the 500 ms window.
+        let mut sc = server_config(private);
+        sc.max_time_difference = Some(Duration::from_millis(500));
+        sc.now = Some(server_now_late);
+        let server = RealityServer::new(&sc).expect("server");
+        rejected_client_goes_to_cover(client_config(public, SHORT_ID, false), server).await;
+
+        // Client ahead: seals T+1 against a server at T+200ms → 800 ms skew.
+        let mut sc = server_config(private);
+        sc.max_time_difference = Some(Duration::from_millis(500));
+        sc.now = Some(server_now_early);
+        let server = RealityServer::new(&sc).expect("server");
+        let mut config = client_config(public, SHORT_ID, false);
+        config.reality.as_mut().unwrap().protocol_clock = Some(client_now_ahead);
+        rejected_client_goes_to_cover(config, server).await;
+    }
+
+    #[tokio::test]
+    async fn window_boundary_is_inclusive() {
+        fn server_now_exact() -> SystemTime {
+            UNIX_EPOCH + Duration::from_millis(1_700_000_000_500)
+        }
+        fn server_now_beyond() -> SystemTime {
+            UNIX_EPOCH + Duration::from_millis(1_700_000_000_500) + Duration::from_micros(1)
+        }
+        let (private, public) = keypair();
+
+        // Skew exactly equal to the 500 ms window is accepted …
+        let mut sc = server_config(private);
+        sc.max_time_difference = Some(Duration::from_millis(500));
+        sc.now = Some(server_now_exact);
+        let server = RealityServer::new(&sc).expect("server");
+        expect_authenticated(client_config(public, SHORT_ID, false), server).await;
+
+        // … and one microsecond beyond it is rejected.
+        let mut sc = server_config(private);
+        sc.max_time_difference = Some(Duration::from_millis(500));
+        sc.now = Some(server_now_beyond);
+        let server = RealityServer::new(&sc).expect("server");
+        rejected_client_goes_to_cover(client_config(public, SHORT_ID, false), server).await;
+    }
+
+    #[tokio::test]
+    async fn huge_window_accepts_distant_timestamp_without_overflow() {
+        fn ancient_system_time() -> SystemTime {
+            UNIX_EPOCH + Duration::from_secs(1_000)
+        }
+        let (private, public) = keypair();
+        let mut sc = server_config(private);
+        sc.max_time_difference = Some(Duration::from_micros(u64::MAX));
+        let server = RealityServer::new(&sc).expect("server");
+        let mut config = client_config(public, SHORT_ID, false);
+        config.reality.as_mut().unwrap().protocol_clock = Some(ancient_system_time);
+        expect_authenticated(config, server).await;
     }
 
     #[tokio::test]

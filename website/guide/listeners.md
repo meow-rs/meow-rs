@@ -160,9 +160,9 @@ own OS-assigned port.
   required and the two modes are mutually exclusive. Wrong UUIDs close
   without a response or target dial; unauthenticated REALITY-looking or
   ordinary TLS traffic is transparently relayed to the fixed cover `dest`.
-  The authenticated username is available to `IN-USER`; use `IN-NAME`,
-  `IN-PORT`, `IN-USER`, or a listener `proxy:`/`rule:` override for routing
-  (the current `IN-TYPE` parser does not accept `VLESS`). See
+  The authenticated username is available to `IN-USER`, and `IN-TYPE,VLESS`
+  matches the inbound alongside `IN-NAME`, `IN-PORT`, or a listener
+  `proxy:`/`rule:` override. See
   [docs/specs/listener-vless.md](https://github.com/meow-rs/meow-rs/blob/main/docs/specs/listener-vless.md)
   and the [migration guide](https://github.com/meow-rs/meow-rs/blob/main/docs/migration-from-go-mihomo.md#vless-vision-server-inbound-listeners-type-vless)
   for traps such as `reality-config` versus `reality-opts`, empty short IDs,
@@ -193,7 +193,7 @@ Three rule types let you route based on *where a connection came in*:
 
 - `IN-PORT` — the listener port.
 - `IN-NAME` — the listener `name`.
-- `IN-TYPE` — `HTTP` / `HTTPS` / `SOCKS5` / `TPROXY` / `INNER` / `ANYTLS`.
+- `IN-TYPE` — `HTTP` / `HTTPS` / `SOCKS5` / `TPROXY` / `INNER` / `ANYTLS` / `VLESS`.
 
 ```yaml
 rules:
