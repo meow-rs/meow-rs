@@ -2861,6 +2861,7 @@ async fn test_tproxy_udp_rejects_unsupported_ipv6_listen_shapes() {
         ("[::ffff:1.2.3.4]:5332", "IPv4-mapped"),
         ("::ffff:1.2.3.4", "IPv4-mapped"),
         ("[fe80::1%1]:5332", "scoped"),
+        ("[2001:db8::1%0]:5332", "scoped"),
         ("[2001:db8::1%2]:5332", "scoped"),
         ("[fe80::1]:5332", "link-local"),
         ("fe80::1", "link-local"),
@@ -2890,18 +2891,22 @@ listeners:
 /// the UDP-only shape rejections must not leak into the TCP contract.
 #[tokio::test]
 async fn test_tproxy_ipv6_listen_without_udp_is_legal() {
-    let yaml = r#"
+    for listen in ["[::1]:5332", "[::1%0]:5332"] {
+        let yaml = format!(
+            r#"
 listeners:
   - name: my-tproxy
     type: tproxy
-    listen: "[::1]:5332"
+    listen: "{listen}"
     firewall: false
-"#;
-    let config = load_config_from_str(yaml).await.unwrap();
-    assert!(matches!(
-        config.listeners.named[0].spec,
-        ListenerSpec::TProxy { udp: false, .. }
-    ));
+"#
+        );
+        let config = load_config_from_str(&yaml).await.unwrap();
+        assert!(matches!(
+            config.listeners.named[0].spec,
+            ListenerSpec::TProxy { udp: false, .. }
+        ));
+    }
 }
 
 /// `firewall: false` alone (no `udp`) stays legal — it is the #563

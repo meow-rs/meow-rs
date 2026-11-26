@@ -5705,7 +5705,7 @@ fn validate_tproxy_udp_listen(listen: &str, name: &str) -> Result<(), anyhow::Er
     let IpAddr::V6(ip) = ip else {
         return Ok(());
     };
-    if scope_id != 0 {
+    if listen.contains('%') || scope_id != 0 {
         anyhow::bail!(
             "listeners[{name}]: `udp: true` does not accept scoped IPv6 listen \
              address '{listen}' — UDP TPROXY v1 supports only unscoped routable \
