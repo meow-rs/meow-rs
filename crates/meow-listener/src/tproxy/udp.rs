@@ -1580,8 +1580,21 @@ mod linux {
 
         /// Draining a continuously-ready production receive path must spend
         /// tokio's finite task budget before the finite kernel backlog is gone.
+        ///
+        /// The arithmetic is deliberately relative to a measured backlog. A
+        /// 1-byte loopback datagram costs roughly a kilobyte of skb truesize,
+        /// so the common 212992-byte `rmem_max` admits only about 369 packets
+        /// even when a larger buffer is requested. Correct coop behaviour is
+        /// one 128-poll budget window, or two in the least favourable task
+        /// spawn order (~256). Requiring 320 initial packets therefore leaves
+        /// at least 32 packets of regression margin; a non-cooperative drain
+        /// observes essentially the entire measured backlog before the probe.
         #[test]
         fn production_udp_receive_spends_coop_budget() {
+            const MIN_INITIAL_BACKLOG: usize = 320;
+            const REGRESSION_MARGIN: usize = 32;
+            const MIN_PROBE_PROGRESS: usize = 100;
+
             let receiver = socket2::Socket::new(
                 socket2::Domain::IPV4,
                 socket2::Type::DGRAM,
@@ -1595,19 +1608,27 @@ mod linux {
             receiver.set_nonblocking(true).unwrap();
             let addr = receiver.local_addr().unwrap().as_socket().unwrap();
             let receiver: std::net::UdpSocket = receiver.into();
+            let receiver_clone = receiver.try_clone().unwrap();
             let sender = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             sender.set_nonblocking(true).unwrap();
-            let mut sent = 0;
             for _ in 0..2048 {
-                if sender.send_to(&[0], addr).is_ok() {
-                    sent += 1;
-                }
+                let _ = sender.send_to(&[0], addr);
             }
-            assert!(sent >= 512, "loopback backlog too small: {sent}");
-            assert!(
-                receiver.peek(&mut [0]).is_ok(),
-                "no datagram entered the queue"
-            );
+
+            // Send success is not enqueue evidence. Wait until at least one
+            // datagram is visibly queued; the exact initial backlog is still
+            // measured below rather than inferred from send or peek success.
+            let mut peeked = false;
+            let peek_deadline = std::time::Instant::now() + Duration::from_millis(500);
+            while std::time::Instant::now() < peek_deadline {
+                if receiver_clone.peek(&mut [0]).is_ok() {
+                    peeked = true;
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert!(peeked, "no prefilled datagram entered the UDP queue");
+
             let probe_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
             let probe_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1645,19 +1666,56 @@ mod linux {
                     });
                 }
             });
+
             let start = std::time::Instant::now();
             while start.elapsed() < Duration::from_secs(2) && !probe_done.load(Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(2));
             }
             let ran = probe_done.load(Ordering::SeqCst);
-            let count_at_probe = probe_count.load(Ordering::SeqCst);
+            let probe_observed = probe_count.load(Ordering::SeqCst);
             stop.store(true, Ordering::SeqCst);
             let _ = shutdown_tx.send(());
             thread.join().unwrap();
+
+            // No sender remains active. Everything not consumed by the hog is
+            // still in the cloned receive queue, so consumed + remaining is
+            // the real initial backlog rather than an optimistic send count.
+            let hog_total = count.load(Ordering::SeqCst);
+            let mut remaining = 0usize;
+            let mut empty_polls = 0usize;
+            let mut drain_buf = [0u8; 64];
+            loop {
+                match receiver_clone.recv_from(&mut drain_buf) {
+                    Ok(_) => {
+                        remaining += 1;
+                        empty_polls = 0;
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        empty_polls += 1;
+                        if empty_polls == 20 {
+                            break;
+                        }
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    Err(e) => panic!("drain cloned receiver: {e}"),
+                }
+            }
+            let initial = hog_total + remaining;
+            assert!(
+                initial >= MIN_INITIAL_BACKLOG,
+                "environment provided initial UDP backlog {initial} \
+                 (hog {hog_total}, remaining {remaining}); need at least \
+                 {MIN_INITIAL_BACKLOG} for coop regression margins"
+            );
             assert!(ran, "production receive path did not yield");
             assert!(
-                (100..512).contains(&count_at_probe),
-                "probe observed {count_at_probe} drained datagrams"
+                probe_observed >= MIN_PROBE_PROGRESS,
+                "probe ran before meaningful production drain progress ({probe_observed})"
+            );
+            assert!(
+                probe_observed + REGRESSION_MARGIN < initial,
+                "probe observed {probe_observed} of {initial} drained datagrams; \
+                 non-cooperative drain leaves less than {REGRESSION_MARGIN} packets of margin"
             );
         }
 
