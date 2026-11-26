@@ -1537,9 +1537,8 @@ mod linux {
         fn bind_transparent_rejects_scoped_v6_before_reconstruction() {
             let ip: Ipv6Addr = "2001:db8::1".parse().unwrap();
             let addr = SocketAddr::V6(std::net::SocketAddrV6::new(ip, 7893, 0, 7));
-            let err = match bind_transparent(addr) {
-                Ok(_) => panic!("scoped v6 bind must be rejected"),
-                Err(err) => err,
+            let Err(err) = bind_transparent(addr) else {
+                panic!("scoped v6 bind must be rejected");
             };
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
             assert!(err.to_string().contains("scoped IPv6"), "got: {err}");
