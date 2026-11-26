@@ -499,9 +499,9 @@ table inet meow_gateway {
         # dns.listen to bind an IPv6 address reachable from LAN clients;
         # substitute the gateway's LAN v6 address. Without it, clients using
         # a hard-coded off-LAN v6 resolver bypass meow DNS and get no fake AAAA.
-        meta nfproto ipv4 meta l4proto udp th dport 53 \
+        meta nfproto ipv4 meta l4proto { tcp, udp } th dport 53 \
             dnat ip to 192.168.1.1:1053
-        # meta nfproto ipv6 meta l4proto udp th dport 53 \
+        # meta nfproto ipv6 meta l4proto { tcp, udp } th dport 53 \
         #     dnat ip6 to [fd77::1]:1053
 
         # 2. Traffic addressed to the gateway itself (SSH, API, ...) -> leave.
