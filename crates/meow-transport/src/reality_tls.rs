@@ -30,23 +30,22 @@ type HmacSha256 = Hmac<Sha256>;
 type HmacSha384 = Hmac<Sha384>;
 type HmacSha512 = Hmac<Sha512>;
 
-const TLS_RECORD_HANDSHAKE: u8 = 22;
-const TLS_RECORD_APPLICATION_DATA: u8 = 23;
-const TLS_RECORD_ALERT: u8 = 21;
-const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 20;
+pub(crate) const TLS_RECORD_HANDSHAKE: u8 = 22;
+pub(crate) const TLS_RECORD_APPLICATION_DATA: u8 = 23;
+pub(crate) const TLS_RECORD_ALERT: u8 = 21;
+pub(crate) const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 20;
 
-#[cfg(test)]
-const HS_CLIENT_HELLO: u8 = 1;
-const HS_SERVER_HELLO: u8 = 2;
+pub(crate) const HS_CLIENT_HELLO: u8 = 1;
+pub(crate) const HS_SERVER_HELLO: u8 = 2;
 const HS_NEW_SESSION_TICKET: u8 = 4;
-const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
-const HS_CERTIFICATE: u8 = 11;
-const HS_CERTIFICATE_VERIFY: u8 = 15;
-const HS_FINISHED: u8 = 20;
+pub(crate) const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
+pub(crate) const HS_CERTIFICATE: u8 = 11;
+pub(crate) const HS_CERTIFICATE_VERIFY: u8 = 15;
+pub(crate) const HS_FINISHED: u8 = 20;
 
-const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
-const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
-const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+pub(crate) const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+pub(crate) const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+pub(crate) const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
 const MLKEM768_CIPHERTEXT_BYTES: usize = 1088;
 /// REALITY ClientVer sent in the auth payload: the Xray-core release an
@@ -178,7 +177,7 @@ impl Transport for RealityTlsLayer {
     }
 }
 
-struct RealityConnected {
+pub(crate) struct RealityConnected {
     inner: Box<dyn Stream>,
     read_key: RecordKey,
     write_key: RecordKey,
@@ -365,6 +364,7 @@ async fn reality_handshake(
 
     let mut handshake_buf = VecDeque::new();
     let mut leaf_cert = None;
+    let mut certificate_verify = None;
     let mut flight = ServerFlightGuard::default();
     let server_finished;
 
@@ -382,9 +382,19 @@ async fn reality_handshake(
         };
         match msg.typ {
             HS_ENCRYPTED_EXTENSIONS | HS_CERTIFICATE | HS_CERTIFICATE_VERIFY => {
+                // CertificateVerify signs the transcript through Certificate;
+                // capture that hash before the CV itself enters the transcript.
+                let cv_transcript_hash =
+                    (msg.typ == HS_CERTIFICATE_VERIFY).then(|| cipher.hash().digest(&transcript));
                 flight.admit(&mut transcript, &msg)?;
                 if msg.typ == HS_CERTIFICATE {
                     leaf_cert = Some(parse_leaf_certificate(&msg.body)?);
+                }
+                if msg.typ == HS_CERTIFICATE_VERIFY {
+                    certificate_verify = Some(parse_certificate_verify(
+                        &msg.body,
+                        cv_transcript_hash.expect("captured above"),
+                    )?);
                 }
             }
             HS_FINISHED => {
@@ -417,7 +427,14 @@ async fn reality_handshake(
 
     let leaf_cert =
         leaf_cert.ok_or_else(|| TransportError::Tls("Reality TLS: missing certificate".into()))?;
-    verify_reality_certificate(&leaf_cert, &reality_auth_key)?;
+    let ed25519_pubkey = verify_reality_certificate(&leaf_cert, &reality_auth_key)?;
+    let certificate_verify = certificate_verify
+        .ok_or_else(|| TransportError::Tls("Reality TLS: missing CertificateVerify".into()))?;
+    verify_certificate_verify_ed25519(
+        &ed25519_pubkey,
+        &certificate_verify.transcript_hash,
+        &certificate_verify.signature,
+    )?;
 
     transcript.extend_from_slice(&server_finished);
     let app = ApplicationKeys::derive(cipher, &hs.master_secret, &transcript);
@@ -459,7 +476,7 @@ pub(crate) struct RealityTlsStream {
 }
 
 impl RealityTlsStream {
-    fn new(inner: Box<dyn Stream>, read_key: RecordKey, write_key: RecordKey) -> Self {
+    pub(crate) fn new(inner: Box<dyn Stream>, read_key: RecordKey, write_key: RecordKey) -> Self {
         Self {
             inner,
             read_key,
@@ -477,14 +494,30 @@ impl RealityTlsStream {
         }
     }
 
-    pub(crate) fn enable_raw_read_passthrough(&mut self) {
+    pub(crate) fn enable_raw_read_passthrough(&mut self) -> bool {
+        // This record layer never read-aheads beyond the record it is
+        // completing, but a caller can still switch halfway through that
+        // record.  Plaintext left from a completed record is safe: it drains
+        // before the first raw byte.  Partial ciphertext is not — it cannot
+        // be put back into the transport.
+        let clean_boundary = matches!(self.read_state, StreamReadState::Header { pos: 0, .. });
+        if !clean_boundary {
+            tracing::warn!("Reality TLS raw read switch refused: partial record buffered");
+            return false;
+        }
         self.read_raw_passthrough = true;
         tracing::debug!("Reality TLS raw read passthrough enabled");
+        true
     }
 
-    pub(crate) fn enable_raw_write_passthrough(&mut self) {
+    pub(crate) fn enable_raw_write_passthrough(&mut self) -> bool {
+        if self.write_pending.is_some() {
+            tracing::warn!("Reality TLS raw write switch refused: sealed record still pending");
+            return false;
+        }
         self.write_raw_passthrough = true;
         tracing::debug!("Reality TLS raw write passthrough enabled");
+        true
     }
 
     fn drain_read_plain(&mut self, buf: &mut ReadBuf<'_>) -> bool {
@@ -693,7 +726,7 @@ impl AsyncWrite for RealityTlsStream {
     }
 }
 
-fn spawn_reality_stream(state: RealityConnected) -> Box<dyn Stream> {
+pub(crate) fn spawn_reality_stream(state: RealityConnected) -> Box<dyn Stream> {
     Box::new(RealityTlsStream::new(
         state.inner,
         state.read_key,
@@ -714,7 +747,7 @@ fn transport_io_error(e: TransportError) -> io::Error {
     clippy::too_many_arguments,
     reason = "each argument is an independent handshake input (SNI, ALPN, random, both key shares, auth key, config, profile)"
 )]
-fn build_reality_client_hello(
+pub(crate) fn build_reality_client_hello(
     server_name: &str,
     alpn: &[String],
     random: &[u8; 32],
@@ -777,7 +810,7 @@ fn build_reality_client_hello(
     Ok((hello, aead_key))
 }
 
-fn wrap_plain_record(typ: u8, payload: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn wrap_plain_record(typ: u8, payload: &[u8]) -> Result<Vec<u8>> {
     if payload.len() > u16::MAX as usize {
         return Err(TransportError::Tls("TLS record payload too large".into()));
     }
@@ -855,13 +888,13 @@ async fn fill_decrypted_handshake<R: AsyncRead + Unpin>(
     }
 }
 
-struct TlsRecord {
-    header: [u8; 5],
-    typ: u8,
-    payload: Vec<u8>,
+pub(crate) struct TlsRecord {
+    pub(crate) header: [u8; 5],
+    pub(crate) typ: u8,
+    pub(crate) payload: Vec<u8>,
 }
 
-async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<TlsRecord>> {
+pub(crate) async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<TlsRecord>> {
     let mut header = [0u8; 5];
     match r.read_exact(&mut header).await {
         Ok(_) => {}
@@ -1104,7 +1137,7 @@ fn parse_leaf_certificate(body: &[u8]) -> Result<Vec<u8>> {
     Ok(cert)
 }
 
-fn verify_reality_certificate(cert_der: &[u8], auth_key: &[u8; 32]) -> Result<()> {
+fn verify_reality_certificate(cert_der: &[u8], auth_key: &[u8; 32]) -> Result<[u8; 32]> {
     let Some((ed25519_pubkey, cert_signature)) = extract_ed25519_cert_parts(cert_der) else {
         return Err(TransportError::Tls(
             "Reality authentication failed: leaf certificate is not Ed25519".into(),
@@ -1115,10 +1148,65 @@ fn verify_reality_certificate(cert_der: &[u8], auth_key: &[u8; 32]) -> Result<()
     h.update(&ed25519_pubkey);
     let expected = h.finalize().into_bytes();
     if expected.as_slice() == cert_signature.as_slice() {
-        Ok(())
+        Ok(ed25519_pubkey)
     } else {
         Err(TransportError::Tls(
             "Reality authentication failed: certificate signature HMAC mismatch".into(),
+        ))
+    }
+}
+
+struct ParsedCertificateVerify {
+    transcript_hash: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+fn parse_certificate_verify(
+    body: &[u8],
+    transcript_hash: Vec<u8>,
+) -> Result<ParsedCertificateVerify> {
+    let mut pos = 0;
+    let scheme = take_u16(body, &mut pos)?;
+    let sig_len = take_u16(body, &mut pos)? as usize;
+    let signature = take(body, &mut pos, sig_len)?.to_vec();
+    if pos != body.len() || scheme != 0x0807 || signature.len() != 64 {
+        return Err(TransportError::Tls(
+            "Reality TLS: CertificateVerify is not a canonical Ed25519 signature".into(),
+        ));
+    }
+    Ok(ParsedCertificateVerify {
+        transcript_hash,
+        signature,
+    })
+}
+
+fn verify_certificate_verify_ed25519(
+    public_key: &[u8; 32],
+    transcript_hash: &[u8],
+    signature: &[u8],
+) -> Result<()> {
+    // SubjectPublicKeyInfo for Ed25519: SEQ(SEQ(OID 1.3.101.112), BITSTRING key).
+    let mut spki = Vec::with_capacity(44);
+    spki.extend_from_slice(&[
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ]);
+    spki.extend_from_slice(public_key);
+    let key = boring::pkey::PKey::public_key_from_der(&spki)
+        .map_err(|e| TransportError::Tls(format!("Reality Ed25519 public key: {e}")))?;
+    let mut signed = vec![0x20; 64];
+    signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    signed.push(0);
+    signed.extend_from_slice(transcript_hash);
+    let mut verifier = boring::sign::Verifier::new_without_digest(&key)
+        .map_err(|e| TransportError::Tls(format!("Reality CertificateVerify verifier: {e}")))?;
+    let valid = verifier
+        .verify_oneshot(signature, &signed)
+        .map_err(|e| TransportError::Tls(format!("Reality CertificateVerify verification: {e}")))?;
+    if valid {
+        Ok(())
+    } else {
+        Err(TransportError::Tls(
+            "Reality TLS: CertificateVerify Ed25519 signature mismatch".into(),
         ))
     }
 }
@@ -1205,27 +1293,27 @@ fn der_read<'a>(input: &'a [u8], pos: &mut usize) -> Option<DerNode<'a>> {
 
 /// Transcript hash / HKDF hash of a TLS 1.3 cipher suite.
 #[derive(Clone, Copy)]
-enum HashAlg {
+pub(crate) enum HashAlg {
     Sha256,
     Sha384,
 }
 
 impl HashAlg {
-    fn len(self) -> usize {
+    pub(crate) fn len(self) -> usize {
         match self {
             Self::Sha256 => 32,
             Self::Sha384 => 48,
         }
     }
 
-    fn digest(self, data: &[u8]) -> Vec<u8> {
+    pub(crate) fn digest(self, data: &[u8]) -> Vec<u8> {
         match self {
             Self::Sha256 => Sha256::digest(data).to_vec(),
             Self::Sha384 => Sha384::digest(data).to_vec(),
         }
     }
 
-    fn hmac(self, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+    pub(crate) fn hmac(self, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
         match self {
             Self::Sha256 => {
                 let mut h =
@@ -1251,14 +1339,14 @@ impl HashAlg {
 /// picks, so all of them have to complete (a Go peer without AES
 /// hardware prefers ChaCha20-Poly1305).
 #[derive(Clone, Copy)]
-enum CipherSuite {
+pub(crate) enum CipherSuite {
     Aes128GcmSha256,
     Aes256GcmSha384,
     ChaCha20Poly1305Sha256,
 }
 
 impl CipherSuite {
-    fn try_from(value: u16) -> Result<Self> {
+    pub(crate) fn try_from(value: u16) -> Result<Self> {
         match value {
             TLS_AES_128_GCM_SHA256 => Ok(Self::Aes128GcmSha256),
             TLS_AES_256_GCM_SHA384 => Ok(Self::Aes256GcmSha384),
@@ -1276,7 +1364,7 @@ impl CipherSuite {
         }
     }
 
-    fn hash(self) -> HashAlg {
+    pub(crate) fn hash(self) -> HashAlg {
         match self {
             Self::Aes128GcmSha256 | Self::ChaCha20Poly1305Sha256 => HashAlg::Sha256,
             Self::Aes256GcmSha384 => HashAlg::Sha384,
@@ -1284,16 +1372,16 @@ impl CipherSuite {
     }
 }
 
-struct HandshakeKeys {
-    client: RecordKey,
-    server: RecordKey,
-    client_secret: Vec<u8>,
-    server_secret: Vec<u8>,
-    master_secret: Vec<u8>,
+pub(crate) struct HandshakeKeys {
+    pub(crate) client: RecordKey,
+    pub(crate) server: RecordKey,
+    pub(crate) client_secret: Vec<u8>,
+    pub(crate) server_secret: Vec<u8>,
+    pub(crate) master_secret: Vec<u8>,
 }
 
 impl HandshakeKeys {
-    fn derive(cipher: CipherSuite, shared_secret: &[u8], transcript: &[u8]) -> Self {
+    pub(crate) fn derive(cipher: CipherSuite, shared_secret: &[u8], transcript: &[u8]) -> Self {
         let hash = cipher.hash();
         let zero = vec![0u8; hash.len()];
         let empty_hash = hash.digest(&[]);
@@ -1317,13 +1405,13 @@ impl HandshakeKeys {
     }
 }
 
-struct ApplicationKeys {
-    client: RecordKey,
-    server: RecordKey,
+pub(crate) struct ApplicationKeys {
+    pub(crate) client: RecordKey,
+    pub(crate) server: RecordKey,
 }
 
 impl ApplicationKeys {
-    fn derive(cipher: CipherSuite, master_secret: &[u8], transcript: &[u8]) -> Self {
+    pub(crate) fn derive(cipher: CipherSuite, master_secret: &[u8], transcript: &[u8]) -> Self {
         let hash = cipher.hash();
         let transcript_hash = hash.digest(transcript);
         let client_secret = derive_secret(hash, master_secret, b"c ap traffic", &transcript_hash);
@@ -1349,7 +1437,7 @@ const MAX_WRITE_BATCH: usize = 4 * MAX_RECORD_PLAINTEXT;
 /// byte relayed over REALITY passes through here, and generic Rust cipher
 /// code compiled at the release profile's `opt-level = "z"` runs an order of
 /// magnitude behind BoringSSL's assembly (see `meow-proxy`'s `aead` module).
-struct RecordKey {
+pub(crate) struct RecordKey {
     aead: AeadCtx,
     iv: [u8; 12],
     seq: u64,
@@ -1357,7 +1445,7 @@ struct RecordKey {
 
 impl RecordKey {
     /// `secret` is a traffic secret of the suite's hash length.
-    fn new(cipher_suite: CipherSuite, secret: &[u8]) -> Self {
+    pub(crate) fn new(cipher_suite: CipherSuite, secret: &[u8]) -> Self {
         let hash = cipher_suite.hash();
         let key = hkdf_expand_label(hash, secret, b"key", &[], cipher_suite.key_len());
         let iv = hkdf_expand_label(hash, secret, b"iv", &[], 12);
@@ -1377,7 +1465,7 @@ impl RecordKey {
     }
 
     /// Seal `plaintext` as one TLS 1.3 record: header, ciphertext, tag.
-    fn seal(&mut self, inner_type: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn seal(&mut self, inner_type: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(RECORD_OVERHEAD + plaintext.len());
         self.seal_into(&mut out, inner_type, plaintext)?;
         Ok(out)
@@ -1408,7 +1496,7 @@ impl RecordKey {
     }
 
     /// Open a record's `ciphertext || tag` into a fresh plaintext buffer.
-    fn open(&mut self, header: &[u8; 5], ciphertext: &[u8]) -> Result<(u8, Vec<u8>)> {
+    pub(crate) fn open(&mut self, header: &[u8; 5], ciphertext: &[u8]) -> Result<(u8, Vec<u8>)> {
         let mut body = ciphertext.to_vec();
         let (inner_type, len) = self.open_in_place(header, &mut body)?;
         body.truncate(len);
@@ -1418,7 +1506,11 @@ impl RecordKey {
     /// Open a record's `ciphertext || tag` in place.  Returns the inner
     /// content type and the plaintext length; the plaintext is
     /// `payload[..len]`.
-    fn open_in_place(&mut self, header: &[u8; 5], payload: &mut [u8]) -> Result<(u8, usize)> {
+    pub(crate) fn open_in_place(
+        &mut self,
+        header: &[u8; 5],
+        payload: &mut [u8],
+    ) -> Result<(u8, usize)> {
         let Some(split) = payload.len().checked_sub(RECORD_TAG_LEN) else {
             return Err(TransportError::Tls("TLS ciphertext too short".into()));
         };
@@ -1447,7 +1539,12 @@ impl RecordKey {
     }
 }
 
-fn verify_finished(hash: HashAlg, secret: &[u8], transcript: &[u8], received: &[u8]) -> Result<()> {
+pub(crate) fn verify_finished(
+    hash: HashAlg,
+    secret: &[u8],
+    transcript: &[u8],
+    received: &[u8],
+) -> Result<()> {
     let expected = finished_verify_data(hash, secret, transcript);
     if expected.as_slice() == received {
         Ok(())
@@ -1458,7 +1555,7 @@ fn verify_finished(hash: HashAlg, secret: &[u8], transcript: &[u8], received: &[
     }
 }
 
-fn finished_verify_data(hash: HashAlg, secret: &[u8], transcript: &[u8]) -> Vec<u8> {
+pub(crate) fn finished_verify_data(hash: HashAlg, secret: &[u8], transcript: &[u8]) -> Vec<u8> {
     let finished_key = hkdf_expand_label(hash, secret, b"finished", &[], hash.len());
     hash.hmac(&finished_key, &[&hash.digest(transcript)])
 }
@@ -1484,7 +1581,7 @@ fn hkdf_expand_label(
     hkdf_expand(hash, secret, &info, len)
 }
 
-fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+pub(crate) fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     let prk = hkdf_extract(HashAlg::Sha256, salt, secret);
     hkdf_expand(HashAlg::Sha256, &prk, info, len)
 }
@@ -1506,17 +1603,17 @@ fn hkdf_expand(hash: HashAlg, prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     okm
 }
 
-fn clamp_x25519_private(private: &mut [u8; 32]) {
+pub(crate) fn clamp_x25519_private(private: &mut [u8; 32]) {
     private[0] &= 248;
     private[31] &= 127;
     private[31] |= 64;
 }
 
-fn x25519_public_from_private(private: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn x25519_public_from_private(private: &[u8; 32]) -> [u8; 32] {
     x25519_dalek::x25519(*private, x25519_dalek::X25519_BASEPOINT_BYTES)
 }
 
-fn x25519(private: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32]> {
+pub(crate) fn x25519(private: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32]> {
     let out = x25519_dalek::x25519(*private, *peer_public);
     // An all-zero shared secret means the peer sent a low-order point; BoringSSL's
     // `X25519` reports that as a failure and RFC 7748 §6.1 requires rejecting it.
@@ -1526,7 +1623,7 @@ fn x25519(private: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn take<'a>(input: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
+pub(crate) fn take<'a>(input: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = pos
         .checked_add(len)
         .ok_or_else(|| TransportError::Tls("TLS parser offset overflow".into()))?;
@@ -1537,29 +1634,29 @@ fn take<'a>(input: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
     Ok(out)
 }
 
-fn take_u8(input: &[u8], pos: &mut usize) -> Result<u8> {
+pub(crate) fn take_u8(input: &[u8], pos: &mut usize) -> Result<u8> {
     Ok(take(input, pos, 1)?[0])
 }
 
-fn take_u16(input: &[u8], pos: &mut usize) -> Result<u16> {
+pub(crate) fn take_u16(input: &[u8], pos: &mut usize) -> Result<u16> {
     let b = take(input, pos, 2)?;
     Ok(u16::from_be_bytes([b[0], b[1]]))
 }
 
-fn take_u24(input: &[u8], pos: &mut usize) -> Result<usize> {
+pub(crate) fn take_u24(input: &[u8], pos: &mut usize) -> Result<usize> {
     let b = take(input, pos, 3)?;
     Ok(read_u24(b))
 }
 
-fn read_u24(b: &[u8]) -> usize {
+pub(crate) fn read_u24(b: &[u8]) -> usize {
     ((b[0] as usize) << 16) | ((b[1] as usize) << 8) | b[2] as usize
 }
 
-fn put_u16(value: u16, out: &mut Vec<u8>) {
+pub(crate) fn put_u16(value: u16, out: &mut Vec<u8>) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
-fn put_u24(value: usize, out: &mut Vec<u8>) {
+pub(crate) fn put_u24(value: usize, out: &mut Vec<u8>) {
     out.push(((value >> 16) & 0xff) as u8);
     out.push(((value >> 8) & 0xff) as u8);
     out.push((value & 0xff) as u8);
@@ -2741,7 +2838,9 @@ mod tests {
             let hs = HandshakeKeys::derive(cipher, &shared_secret, &transcript);
             let (mut server_hs, mut client_hs) = (hs.server, hs.client);
 
-            let cert_pubkey = [0x22u8; 32];
+            let ed_key = boring::pkey::PKey::generate(boring::pkey::Id::ED25519).unwrap();
+            let mut cert_pubkey = [0u8; 32];
+            assert_eq!(ed_key.raw_public_key(&mut cert_pubkey).unwrap().len(), 32);
             let cert =
                 build_test_ed25519_cert(&cert_pubkey, &reality_cert_hmac(&auth_key, &cert_pubkey));
             let mut cert_body = vec![0]; // certificate_request_context
@@ -2750,15 +2849,29 @@ mod tests {
             cert_body.extend_from_slice(&cert);
             cert_body.extend_from_slice(&[0, 0]); // no entry extensions
 
+            let ee = handshake_message(HS_ENCRYPTED_EXTENSIONS, Vec::new()).raw;
+            transcript.extend_from_slice(&ee);
+            let certificate = handshake_message(HS_CERTIFICATE, cert_body).raw;
+            transcript.extend_from_slice(&certificate);
+            let mut signed = vec![0x20; 64];
+            signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+            signed.push(0);
+            signed.extend_from_slice(&cipher.hash().digest(&transcript));
+            let signature = boring::sign::Signer::new_without_digest(&ed_key)
+                .unwrap()
+                .sign_oneshot_to_vec(&signed)
+                .unwrap();
+            let mut cv_body = Vec::with_capacity(4 + signature.len());
+            cv_body.extend_from_slice(&[0x08, 0x07]);
+            put_u16(signature.len() as u16, &mut cv_body);
+            cv_body.extend_from_slice(&signature);
+            let certificate_verify = handshake_message(HS_CERTIFICATE_VERIFY, cv_body).raw;
+            transcript.extend_from_slice(&certificate_verify);
+
             let mut flight = Vec::new();
-            for (typ, body) in [
-                (HS_ENCRYPTED_EXTENSIONS, vec![0, 0]),
-                (HS_CERTIFICATE, cert_body),
-                (HS_CERTIFICATE_VERIFY, vec![0x08, 0x07, 0, 0]),
-            ] {
-                flight.extend_from_slice(&handshake_message(typ, body).raw);
-            }
-            transcript.extend_from_slice(&flight);
+            flight.extend_from_slice(&ee);
+            flight.extend_from_slice(&certificate);
+            flight.extend_from_slice(&certificate_verify);
             let verify_data = finished_verify_data(cipher.hash(), &hs.server_secret, &transcript);
             let finished = handshake_message(HS_FINISHED, verify_data).raw;
             flight.extend_from_slice(&finished);

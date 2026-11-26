@@ -37,4 +37,13 @@ pub enum TransportError {
 
     #[error("invalid config: {0}")]
     Config(String),
+
+    #[error("resource limit: {0}")]
+    ResourceLimit(String),
+
+    #[error("timeout: {0}")]
+    Timeout(String),
+
+    #[error("cryptographic failure: {0}")]
+    Crypto(String),
 }

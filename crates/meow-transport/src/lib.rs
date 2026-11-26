@@ -17,7 +17,8 @@
 //! * No dependency on any other workspace crate (`meow-common`, `meow-proxy`,
 //!   `meow-dns`, `meow-config`). This crate is a protocol-agnostic leaf.
 //! * No `anyhow::Error` in any public function signature — only [`TransportError`].
-//! * No server-side code (`accept`/`bind`/`listen`/`TcpListener`) in `src/`.
+//! * Socket ownership (`bind`/`listen`/`TcpListener`) stays out of `src/`; inbound
+//!   stream acceptors are allowed, but only over caller-supplied streams.
 //!   Test helpers in `tests/support/` are whitelisted.
 
 use std::any::Any;
@@ -40,6 +41,8 @@ pub mod tls;
 
 #[cfg(all(feature = "tls", feature = "reality"))]
 mod reality_hello;
+#[cfg(all(feature = "tls", feature = "reality"))]
+pub mod reality_server;
 #[cfg(all(feature = "tls", feature = "reality"))]
 mod reality_tls;
 
@@ -168,8 +171,7 @@ pub fn enable_raw_read_passthrough(stream: &mut dyn Stream) -> bool {
         #[cfg(feature = "reality")]
         {
             if let Some(reality) = any.downcast_mut::<reality_tls::RealityTlsStream>() {
-                reality.enable_raw_read_passthrough();
-                return true;
+                return reality.enable_raw_read_passthrough();
             }
         }
         if let Some(boring) = any.downcast_mut::<tls::boring_stream::BoringTlsStream>() {
@@ -192,8 +194,7 @@ pub fn enable_raw_write_passthrough(stream: &mut dyn Stream) -> bool {
         #[cfg(feature = "reality")]
         {
             if let Some(reality) = any.downcast_mut::<reality_tls::RealityTlsStream>() {
-                reality.enable_raw_write_passthrough();
-                return true;
+                return reality.enable_raw_write_passthrough();
             }
         }
         if let Some(boring) = any.downcast_mut::<tls::boring_stream::BoringTlsStream>() {
