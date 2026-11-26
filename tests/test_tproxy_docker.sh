@@ -28,7 +28,6 @@ if ! docker info >/dev/null 2>&1; then
 fi
 
 BUILDER_IMAGE="${MEOW_TPROXY_BUILDER_IMAGE:-meow-tproxy-builder}"
-DOCKER_IMAGE="meow-tproxy-test"
 FEATURES="ss,trojan,vless,vless-vision,vless-encryption,vmess,snell,hysteria2,anytls,ech-tls-tunnel,dns-server,dns-encrypted,listener-http,listener-socks5,listener-tproxy,listener-mixed"
 
 if [ -n "${MEOW_TPROXY_CACHE_ROOT:-}" ]; then
@@ -41,14 +40,18 @@ else
     CACHE_ROOT="$(mktemp -d /tmp/meow-tproxy-build.XXXXXX)"
     CACHE_TEMP=1
 fi
-TARGET_DIR="$CACHE_ROOT/target"
+CHECKOUT_ID="$(printf %s "$ROOT_DIR" | cksum | awk '{print $1}')"
+RUN_ID="$$-$(date +%s)-$RANDOM"
+DOCKER_IMAGE="meow-tproxy-test-$RUN_ID"
+TARGET_DIR="$CACHE_ROOT/target-$CHECKOUT_ID"
 CARGO_HOME_DIR="$CACHE_ROOT/cargo-home"
-BUILD_CTX="$CACHE_ROOT/context"
-EMPTY_CTX="$CACHE_ROOT/empty-context"
+BUILD_CTX="$CACHE_ROOT/context-$RUN_ID"
+EMPTY_CTX="$CACHE_ROOT/empty-context-$RUN_ID"
 CONTAINER_LOG=""
 mkdir -p "$TARGET_DIR" "$CARGO_HOME_DIR" "$BUILD_CTX" "$EMPTY_CTX"
 
 cleanup() {
+    docker image rm -f "$DOCKER_IMAGE" >/dev/null 2>&1 || true
     [ -z "$CONTAINER_LOG" ] || rm -f "$CONTAINER_LOG"
     rm -rf "$BUILD_CTX" "$EMPTY_CTX" 2>/dev/null || true
     if [ "$CACHE_TEMP" -eq 1 ]; then
