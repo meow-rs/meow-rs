@@ -14,6 +14,7 @@ meow-rs is the engine of the meow apps:
 
 - **Android** -- [meow-android](https://github.com/meow-rs/meow-android): [Google Play](https://play.google.com/store/apps/details?id=io.github.madeye.meow), [GitHub Releases](https://github.com/meow-rs/meow-android/releases/latest)
 - **iOS, iPadOS and Apple TV** -- [meow-ios](https://github.com/meow-rs/meow-ios): [App Store](https://apps.apple.com/us/app/meow-smart-vpn/id6778303404), [TestFlight public beta](https://testflight.apple.com/join/HSptQN3h)
+- **Homebrew CLI** -- `brew install meow` installs both `meow` and `meow-cli`
 
 ## Features
 
