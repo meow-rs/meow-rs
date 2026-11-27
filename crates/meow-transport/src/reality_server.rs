@@ -4793,6 +4793,21 @@ mod independent_wire_vectors {
         crypto: MirrorCryptoInput,
         expect_frozen_wire: bool,
     ) -> MirrorVectorSession {
+        open_mirror_vector_session_framed(
+            vector,
+            crypto,
+            expect_frozen_wire,
+            HelloFraming::SingleRecord,
+        )
+        .await
+    }
+
+    async fn open_mirror_vector_session_framed(
+        vector: &FrozenMirrorVector,
+        crypto: MirrorCryptoInput,
+        expect_frozen_wire: bool,
+        framing: HelloFraming,
+    ) -> MirrorVectorSession {
         let server = vector_server();
         let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
         let classify_server = server.clone();
@@ -4801,11 +4816,8 @@ mod independent_wire_vectors {
                 .verify_client_hello(Box::new(server_io))
                 .await
         });
-        client_io
-            .write_all(&hex_bytes(vector.ch_wire_hex))
-            .await
-            .unwrap();
-        client_io.flush().await.unwrap();
+        let single_record = matches!(framing, HelloFraming::SingleRecord);
+        write_client_hello(&mut client_io, &hex_bytes(vector.ch_message_hex), framing).await;
         let classified = tokio::time::timeout(Duration::from_secs(2), classify_task)
             .await
             .expect("mirror classification timed out")
@@ -4814,7 +4826,13 @@ mod independent_wire_vectors {
         let RealityClientHello::Verified { stream, hello } = classified else {
             panic!("{}: frozen mirror CH must authenticate", vector.name);
         };
-        assert_eq!(hello.ch_wire(), hex_bytes(vector.ch_wire_hex));
+        // ch_wire is the exact upload prefix as received on the wire, so it
+        // is deliberately framing-dependent; only the single-record control
+        // reproduces the frozen wire.  Framing invariance of the logical
+        // transcript is proven by the frozen-flight comparison downstream.
+        if single_record {
+            assert_eq!(hello.ch_wire(), hex_bytes(vector.ch_wire_hex));
+        }
         let prefix = mirror_target_prefix(vector);
         let template = MirrorTemplate::parse(&hello, &prefix)
             .unwrap_or_else(|error| panic!("{}: template parse failed: {error}", vector.name));
@@ -6018,6 +6036,31 @@ mod independent_wire_vectors {
                 MirrorTemplate::parse(&verified, &prefix).is_ok(),
                 "{name}: template must parse when the profile is clean"
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn mirrored_flight_is_invariant_under_client_hello_reframing() {
+        // The logical transcript is the assembled CH message, never its
+        // record or TCP framing: the same authenticated CH split across many
+        // TLS records, dribbled byte-wise over one record, or sent whole must
+        // reproduce the frozen logical CH byte-for-byte and therefore the
+        // byte-identical frozen mirrored flight.
+        for vector in [&MIRROR_X25519_AES128, &MIRROR_HYBRID_AES256] {
+            for framing in [
+                HelloFraming::SingleRecord,
+                HelloFraming::ByteWiseTcp,
+                HelloFraming::SplitRecords(&[113, 64, 7]),
+            ] {
+                let session = open_mirror_vector_session_framed(
+                    vector,
+                    mirror_fixed_crypto(vector),
+                    true,
+                    framing,
+                )
+                .await;
+                drop(session);
+            }
         }
     }
 }
