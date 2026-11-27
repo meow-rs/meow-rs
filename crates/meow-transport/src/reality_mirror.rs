@@ -854,7 +854,13 @@ impl<'a> TargetFlightScanner<'a> {
                         return;
                     }
                     if self.prefix[self.cursor] == TLS_RECORD_CHANGE_CIPHER_SPEC {
-                        if self.prefix.len() - self.cursor < COMPAT_CCS_RECORD.len() {
+                        if self.prefix.len() - self.cursor < COMPAT_CCS_RECORD.len() - 1 {
+                            return;
+                        }
+                        if self.prefix[self.cursor..self.cursor + COMPAT_CCS_RECORD.len() - 1]
+                            != COMPAT_CCS_RECORD[..COMPAT_CCS_RECORD.len() - 1]
+                        {
+                            self.incompatible = Some(MirrorCoverReason::DestProfile);
                             return;
                         }
                         self.phase = TargetScanPhase::CompatCcs {
@@ -2895,6 +2901,49 @@ mod tests {
             TargetScanState::Incompatible(MirrorCoverReason::DestAlert)
         );
         assert_eq!(scanner.read_window(), 0);
+    }
+
+    #[test]
+    fn scanner_types_bad_ccs_header_at_five_bytes_without_waiting_for_body() {
+        let hello = x25519_verified();
+        let sh = valid_x25519_sh(&hello, false);
+        let sh_prefix = target_prefix(&sh.message, false, &[]);
+
+        // A canonical five-byte CCS header is only a pause: the scanner must
+        // neither reject nor freeze before the single body byte arrives.
+        let context = mirror_context_for_test(&hello);
+        let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+            .expect("test profile admits scanner");
+        push_scanner(&mut scanner, &sh_prefix);
+        assert_eq!(
+            push_scanner(&mut scanner, &[0x14, 0x03, 0x03, 0x00, 0x01]),
+            TargetScanState::NeedBytes,
+            "canonical CCS header stalls at five bytes"
+        );
+        assert_eq!(
+            push_scanner(&mut scanner, &[0x01]),
+            TargetScanState::NeedBytes,
+            "canonical CCS is complete but no application record exists yet"
+        );
+
+        for (head, name) in [
+            (
+                [0x14, 0x03, 0x01, 0x00, 0x01],
+                "non-TLS-1.3 CCS record version",
+            ),
+            ([0x14, 0x03, 0x03, 0x00, 0x02], "non-unit CCS record length"),
+        ] {
+            let context = mirror_context_for_test(&hello);
+            let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+                .expect("test profile admits scanner");
+            push_scanner(&mut scanner, &sh_prefix);
+            assert_eq!(
+                push_scanner(&mut scanner, &head),
+                TargetScanState::Incompatible(MirrorCoverReason::DestProfile),
+                "{name} is rejected when the five-byte header completes"
+            );
+            assert_eq!(scanner.read_window(), 0, "{name} closes the scan");
+        }
     }
 
     #[test]
