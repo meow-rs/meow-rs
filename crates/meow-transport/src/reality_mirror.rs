@@ -14,9 +14,9 @@ use crate::reality_tls::{x25519, x25519_public_from_private, TranscriptHasher};
 #[cfg(test)]
 use crate::reality_server::VerifiedHello;
 use crate::reality_server::{
-    certificate_message, certificate_verify_input, encapsulate_server_share, handshake_message,
-    hybrid_key_share_usable, x25519_public_key_usable, AuthenticatedMirrorContext, ChosenKeyShare,
-    RealityCertificate, SIG_ED25519,
+    certificate_message, certificate_verify_input, encapsulate_server_share_bytes,
+    handshake_message, hybrid_key_share_usable, x25519_public_key_usable,
+    AuthenticatedMirrorContext, RealityCertificate, SIG_ED25519,
 };
 use crate::reality_tls::{
     finished_verify_data_with_hash, put_u16, read_u24, ApplicationKeys, CipherSuite, HandshakeKeys,
@@ -1170,10 +1170,7 @@ fn random_ephemeral_exchange(
 ) -> TransportResult<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     let entry = client_key_share_entry(verified, group)
         .ok_or_else(|| TransportError::Tls("REALITY mirror client key share disappeared".into()))?;
-    encapsulate_server_share(&ChosenKeyShare {
-        group,
-        client_share: entry.to_vec(),
-    })
+    encapsulate_server_share_bytes(group, entry)
 }
 
 fn build_mirror_flight(
@@ -1655,7 +1652,7 @@ fn prepare_mirrored_flight_impl(
         cipher: template.cipher,
         client_handshake: hs.client,
         master_secret: hs.master_secret,
-        transcript_t3_hash: built.hashes.t3.clone(),
+        transcript_t3_hash: built.hashes.t3,
         expected_client_finished: built.expected_client_finished,
     };
     // tls_dh and every unneeded handshake secret are dropped (and erased)

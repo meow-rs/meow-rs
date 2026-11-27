@@ -1401,16 +1401,15 @@ fn chosen_key_share_for(hello: &ClientHello, group: u16) -> Option<ChosenKeyShar
     })
 }
 
-pub(crate) fn encapsulate_server_share(
-    chosen: &ChosenKeyShare,
+pub(crate) fn encapsulate_server_share_bytes(
+    group: u16,
+    client_share: &[u8],
 ) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     let mut x_private = Zeroizing::new(rand::random::<[u8; 32]>());
     crate::reality_tls::clamp_x25519_private(&mut x_private);
     let x_public = x25519_public_from_private(&x_private);
-    if chosen.group == GROUP_X25519 {
-        let client: [u8; 32] = chosen
-            .client_share
-            .as_slice()
+    if group == GROUP_X25519 {
+        let client: [u8; 32] = client_share
             .try_into()
             .map_err(|_| TransportError::Tls("REALITY X25519 key share length".into()))?;
         return Ok((
@@ -1418,11 +1417,11 @@ pub(crate) fn encapsulate_server_share(
             Zeroizing::new(x25519(&x_private, &client)?.to_vec()),
         ));
     }
-    if chosen.group != GROUP_X25519_MLKEM768 || chosen.client_share.len() != HYBRID_SHARE_LEN {
+    if group != GROUP_X25519_MLKEM768 || client_share.len() != HYBRID_SHARE_LEN {
         return Err(TransportError::Tls("unsupported REALITY key share".into()));
     }
-    let mlkem_public_bytes = &chosen.client_share[..HYBRID_SHARE_LEN - 32];
-    let client_x: [u8; 32] = chosen.client_share[HYBRID_SHARE_LEN - 32..]
+    let mlkem_public_bytes = &client_share[..HYBRID_SHARE_LEN - 32];
+    let client_x: [u8; 32] = client_share[HYBRID_SHARE_LEN - 32..]
         .try_into()
         .expect("32-byte suffix");
     let mlkem_public = MlKemPublicKey::from_slice(MlKemAlgorithm::MlKem768, mlkem_public_bytes)
@@ -1437,13 +1436,19 @@ pub(crate) fn encapsulate_server_share(
         ));
     }
     let x_secret = x25519(&x_private, &client_x)?;
-    let mut server_share = Vec::with_capacity(1088 + 32);
-    server_share.extend_from_slice(&ciphertext);
+    let mut server_share = ciphertext;
+    server_share.reserve_exact(32);
     server_share.extend_from_slice(&x_public);
     let mut shared = Zeroizing::new(Vec::with_capacity(64));
     shared.extend_from_slice(&mlkem_secret[..]);
     shared.extend_from_slice(&x_secret[..]);
     Ok((server_share, shared))
+}
+
+pub(crate) fn encapsulate_server_share(
+    chosen: &ChosenKeyShare,
+) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
+    encapsulate_server_share_bytes(chosen.group, &chosen.client_share)
 }
 
 fn build_server_hello(
