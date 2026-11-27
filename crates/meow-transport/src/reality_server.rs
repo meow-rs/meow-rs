@@ -18,6 +18,7 @@ use hmac::{Hmac, Mac};
 use sha2::Sha512;
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use zeroize::Zeroizing;
 
 use crate::reality_hello::{EXT_KEY_SHARE, GROUP_X25519, GROUP_X25519_MLKEM768};
 use crate::reality_tls::{
@@ -298,7 +299,9 @@ pub struct RealityServer {
 
 struct RealityServerInner {
     instance: Arc<()>,
-    private_key: [u8; 32],
+    // The only long-lived caller-owned copy of the static private key; the
+    // config's own copy belongs to the caller and is outside this contract.
+    private_key: Zeroizing<[u8; 32]>,
     short_ids: Vec<[u8; 8]>,
     server_names: HashSet<String>,
     max_time_difference: Duration,
@@ -351,7 +354,7 @@ pub struct VerifiedHello {
     pub(crate) issuer: Arc<()>,
     pub(crate) hello: ClientHello,
     pub(crate) ch_wire: Vec<u8>,
-    pub(crate) auth_key: [u8; 32],
+    pub(crate) auth_key: Zeroizing<[u8; 32]>,
     pub(crate) local_cipher: CipherSuite,
     pub(crate) local_key_group: u16,
 }
@@ -361,7 +364,7 @@ pub struct VerifiedHello {
 /// advanced over the original logical CH exactly once.
 pub struct AuthenticatedMirrorContext {
     pub(crate) issuer: Arc<()>,
-    pub(crate) auth_key: [u8; 32],
+    pub(crate) auth_key: Zeroizing<[u8; 32]>,
     pub(crate) session_id: [u8; 32],
     pub(crate) cipher_suites: OfferedCipherSuites,
     pub(crate) supported_groups: SupportedGroups,
@@ -496,7 +499,7 @@ impl RealityServer {
         Ok(Self {
             inner: Arc::new(RealityServerInner {
                 instance: Arc::new(()),
-                private_key: config.private_key,
+                private_key: Zeroizing::new(config.private_key),
                 short_ids: config.short_ids.clone(),
                 server_names: config
                     .server_names
@@ -664,17 +667,20 @@ impl RealityServer {
         )
     }
 
-    fn open_auth_plaintext(&self, hello: &mut ClientHello) -> Option<([u8; 32], Vec<u8>)> {
+    fn open_auth_plaintext(&self, hello: &mut ClientHello) -> Option<OpenedAuth> {
         let auth_share = hello.auth_share()?;
         let shared = x25519(&self.inner.private_key, &auth_share).ok()?;
-        let auth_key: [u8; 32] = hkdf_sha256(&shared, &hello.random[..20], b"REALITY", 32)
-            .try_into()
-            .expect("REALITY AuthKey length");
+        let auth_key = Zeroizing::new(
+            <[u8; 32]>::try_from(
+                &hkdf_sha256(&shared[..], &hello.random[..20], b"REALITY", 32)[..],
+            )
+            .expect("REALITY AuthKey length"),
+        );
 
         let session_id = hello.session_id;
         hello.raw[39..71].fill(0);
         let plaintext = aes_gcm_open(
-            &auth_key,
+            &auth_key[..],
             &hello.random[20..32],
             &session_id[..16],
             &session_id[16..32],
@@ -685,10 +691,13 @@ impl RealityServer {
         if plaintext.len() != 16 {
             return None;
         }
-        Some((auth_key, plaintext))
+        Some(OpenedAuth(auth_key, plaintext))
     }
 
-    fn validate_hello(&self, hello: &mut ClientHello) -> Option<([u8; 32], CipherSuite, u16)> {
+    fn validate_hello(
+        &self,
+        hello: &mut ClientHello,
+    ) -> Option<(Zeroizing<[u8; 32]>, CipherSuite, u16)> {
         if !hello.reality_session_id_layout
             || !hello.offers_tls13
             || hello.duplicate_extension
@@ -701,7 +710,7 @@ impl RealityServer {
         if !self.inner.server_names.contains(server_name) {
             return None;
         }
-        let (auth_key, plaintext) = self.open_auth_plaintext(hello)?;
+        let OpenedAuth(auth_key, plaintext) = self.open_auth_plaintext(hello)?;
         let (_version, _reserved, unix_seconds, short_id) = parse_auth_plaintext(&plaintext)?;
         // The wire timestamp is whole Unix seconds, but the comparison
         // happens in the Duration domain: truncating the window to whole
@@ -1298,7 +1307,7 @@ struct PreparedHandshake {
     session_id: Vec<u8>,
     cipher: CipherSuite,
     key_share: ChosenKeyShare,
-    auth_key: [u8; 32],
+    auth_key: Zeroizing<[u8; 32]>,
 }
 
 pub(crate) struct ChosenKeyShare {
@@ -1353,8 +1362,10 @@ fn chosen_key_share_for(hello: &ClientHello, group: u16) -> Option<ChosenKeyShar
     })
 }
 
-pub(crate) fn encapsulate_server_share(chosen: &ChosenKeyShare) -> Result<(Vec<u8>, Vec<u8>)> {
-    let mut x_private = rand::random::<[u8; 32]>();
+pub(crate) fn encapsulate_server_share(
+    chosen: &ChosenKeyShare,
+) -> Result<(Vec<u8>, Zeroizing<Vec<u8>>)> {
+    let mut x_private = Zeroizing::new(rand::random::<[u8; 32]>());
     crate::reality_tls::clamp_x25519_private(&mut x_private);
     let x_public = x25519_public_from_private(&x_private);
     if chosen.group == GROUP_X25519 {
@@ -1363,7 +1374,10 @@ pub(crate) fn encapsulate_server_share(chosen: &ChosenKeyShare) -> Result<(Vec<u
             .as_slice()
             .try_into()
             .map_err(|_| TransportError::Tls("REALITY X25519 key share length".into()))?;
-        return Ok((x_public.to_vec(), x25519(&x_private, &client)?.to_vec()));
+        return Ok((
+            x_public.to_vec(),
+            Zeroizing::new(x25519(&x_private, &client)?.to_vec()),
+        ));
     }
     if chosen.group != GROUP_X25519_MLKEM768 || chosen.client_share.len() != HYBRID_SHARE_LEN {
         return Err(TransportError::Tls("unsupported REALITY key share".into()));
@@ -1377,6 +1391,7 @@ pub(crate) fn encapsulate_server_share(chosen: &ChosenKeyShare) -> Result<(Vec<u
     let (ciphertext, mlkem_secret) = mlkem_public
         .encapsulate()
         .map_err(|e| TransportError::Crypto(format!("REALITY ML-KEM encapsulation: {e}")))?;
+    let mlkem_secret = Zeroizing::new(mlkem_secret);
     if ciphertext.len() != 1088 {
         return Err(TransportError::Crypto(
             "REALITY ML-KEM ciphertext length".into(),
@@ -1386,9 +1401,9 @@ pub(crate) fn encapsulate_server_share(chosen: &ChosenKeyShare) -> Result<(Vec<u
     let mut server_share = Vec::with_capacity(1088 + 32);
     server_share.extend_from_slice(&ciphertext);
     server_share.extend_from_slice(&x_public);
-    let mut shared = Vec::with_capacity(64);
-    shared.extend_from_slice(&mlkem_secret);
-    shared.extend_from_slice(&x_secret);
+    let mut shared = Zeroizing::new(Vec::with_capacity(64));
+    shared.extend_from_slice(&mlkem_secret[..]);
+    shared.extend_from_slice(&x_secret[..]);
     Ok((server_share, shared))
 }
 
@@ -1457,8 +1472,8 @@ pub(crate) fn certificate_message(certificate_der: &[u8]) -> Vec<u8> {
 async fn read_client_finished(
     inner: &mut Box<dyn Stream>,
     hs: &mut HandshakeKeys,
-) -> Result<Vec<u8>> {
-    let mut handshake_bytes = Vec::new();
+) -> Result<Zeroizing<Vec<u8>>> {
+    let mut handshake_bytes = Zeroizing::new(Vec::new());
     for _ in 0..MAX_AUTHED_STREAM_RECORDS {
         let Some(record) = read_record(inner).await? else {
             return Err(TransportError::Tls(
@@ -1502,7 +1517,7 @@ async fn read_client_finished(
                 ));
             }
             if handshake_bytes.len() == total {
-                return Ok(handshake_bytes[4..].to_vec());
+                return Ok(Zeroizing::new(handshake_bytes[4..].to_vec()));
             }
         }
     }
@@ -1511,19 +1526,23 @@ async fn read_client_finished(
     ))
 }
 
+/// REALITY session-id open result: the derived AuthKey and the sealed
+/// 16-byte plaintext, both caller-owned secrets kept in erasing wrappers.
+struct OpenedAuth(Zeroizing<[u8; 32]>, Zeroizing<Vec<u8>>);
+
 fn aes_gcm_open(
     key: &[u8],
     nonce: &[u8],
     ciphertext: &[u8],
     tag: &[u8],
     aad: &[u8],
-) -> Option<Vec<u8>> {
+) -> Option<Zeroizing<Vec<u8>>> {
     if key.len() != 32 || nonce.len() != 12 || ciphertext.len() != 16 || tag.len() != 16 {
         return None;
     }
     let ctx = boring::aead::AeadCtx::new_default_tag(&boring::aead::Algorithm::aes_256_gcm(), key)
         .ok()?;
-    let mut data = ciphertext.to_vec();
+    let mut data = Zeroizing::new(ciphertext.to_vec());
     let mut tag_buf = [0u8; 16];
     tag_buf.copy_from_slice(tag);
     let mut nonce_buf = [0u8; 12];
@@ -1992,6 +2011,45 @@ mod tests {
     const SERVER_NAME: &str = "www.example.com";
     const SHORT_ID: [u8; 8] = [1, 2, 3, 4, 5, 6, 7, 8];
 
+    /// Compile-time erasure contract: every caller-owned secret buffer keeps
+    /// its `Zeroizing` wrapper.  These bindings fail to type-check the moment
+    /// a field is unwrapped back to a plain array or Vec, which is the only
+    /// meaningful mutation signal available — post-drop heap inspection would
+    /// be undefined behavior, and zeroize's own Drop semantics are upstream's
+    /// test burden.
+    #[test]
+    fn secret_buffers_keep_zeroizing_wrappers() {
+        use zeroize::Zeroizing;
+        let (private, _public) = keypair();
+        let server = RealityServer::new(&server_config(private)).expect("server");
+        let _: &Zeroizing<[u8; 32]> = &server.inner.private_key;
+
+        let hs = HandshakeKeys::derive(CipherSuite::Aes128GcmSha256, &[0x55; 32], b"transcript");
+        let _: &Zeroizing<Vec<u8>> = &hs.client_secret;
+        let _: &Zeroizing<Vec<u8>> = &hs.server_secret;
+        let _: &Zeroizing<Vec<u8>> = &hs.master_secret;
+
+        let shared =
+            x25519(&[0x08; 32], &x25519_public_from_private(&[0x09; 32])).expect("test ECDH");
+        let _: &Zeroizing<[u8; 32]> = &shared;
+
+        let hello = verified_hello_for_zeroize_types();
+        let _: &Zeroizing<[u8; 32]> = &hello.auth_key;
+        let (context, _wire) = hello.into_mirror_upload().finish_upload();
+        let _: &Zeroizing<[u8; 32]> = &context.auth_key;
+    }
+
+    fn verified_hello_for_zeroize_types() -> VerifiedHello {
+        VerifiedHello {
+            issuer: Arc::new(()),
+            hello: ClientHello::test_empty(),
+            ch_wire: Vec::new(),
+            auth_key: zeroize::Zeroizing::new([0x23; 32]),
+            local_cipher: CipherSuite::Aes128GcmSha256,
+            local_key_group: GROUP_X25519,
+        }
+    }
+
     fn fixed_unix() -> u64 {
         1_700_000_000
     }
@@ -2364,7 +2422,7 @@ mod tests {
             crate::reality_hello::HelloProfile::Chrome,
         )
         .expect("manual hybrid hello");
-        (hello, random, auth_key)
+        (hello, random, *auth_key)
     }
 
     fn key_share_data_range(hello: &[u8], wanted_group: u16) -> Option<std::ops::Range<usize>> {
@@ -2886,7 +2944,7 @@ mod tests {
         let body_len = hello.len() - 4;
         hello[1..4].copy_from_slice(&(body_len as u32).to_be_bytes()[1..4]);
 
-        let auth_key = hkdf_sha256(&shared, &random[..20], b"REALITY", 32);
+        let auth_key = hkdf_sha256(&shared[..], &random[..20], b"REALITY", 32);
         let mut plaintext = Vec::with_capacity(16);
         plaintext.extend_from_slice(&[0, 0, 0, 0]);
         plaintext.extend_from_slice(&(fixed_unix() as u32).to_be_bytes());
@@ -4014,16 +4072,16 @@ mod independent_wire_vectors {
         let client_public = hex_array::<32>(CLIENT_X25519_PUBLIC_HEX);
         let shared = x25519(&server_private, &client_public).expect("vector ECDH");
         assert_eq!(shared.as_slice(), decoded.shared.as_slice());
-        let auth_key = hkdf_sha256(&shared, &decoded.client_hello[6..26], b"REALITY", 32);
-        assert_eq!(auth_key, decoded.auth_key);
+        let auth_key = hkdf_sha256(&shared[..], &decoded.client_hello[6..26], b"REALITY", 32);
+        assert_eq!(auth_key[..], decoded.auth_key);
 
         let mut parsed = parse_client_hello(decoded.client_hello.clone()).expect("vector parses");
         let server = vector_server();
-        let (opened_key, plaintext) = server
+        let OpenedAuth(opened_key, plaintext) = server
             .open_auth_plaintext(&mut parsed)
             .expect("positive frozen vector must authenticate cryptographically");
         assert_eq!(opened_key.as_slice(), decoded.auth_key.as_slice());
-        assert_eq!(plaintext, decoded.plaintext);
+        assert_eq!(plaintext[..], decoded.plaintext);
         let (version, reserved, unix_seconds, short_id) =
             parse_auth_plaintext(&plaintext).expect("16-byte auth plaintext parses");
         assert_eq!(version.as_slice(), hex_bytes(VERSION_HEX));
@@ -4362,11 +4420,11 @@ mod independent_wire_vectors {
     fn mirror_fixed_crypto(vector: &FrozenMirrorVector) -> MirrorCryptoInput {
         MirrorCryptoInput {
             server_random: hex_array(vector.server_random_hex),
-            x25519_private: hex_array(vector.server_x25519_private_hex),
+            x25519_private: Zeroizing::new(hex_array(vector.server_x25519_private_hex)),
             mlkem_ciphertext: (!vector.mlkem_ciphertext_hex.is_empty())
                 .then(|| hex_bytes(vector.mlkem_ciphertext_hex)),
             mlkem_secret: (!vector.mlkem_secret_hex.is_empty())
-                .then(|| hex_bytes(vector.mlkem_secret_hex)),
+                .then(|| Zeroizing::new(hex_bytes(vector.mlkem_secret_hex))),
         }
     }
 

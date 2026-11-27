@@ -17,6 +17,16 @@ use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
+use zeroize::Zeroizing;
+
+// Secret-erasure contract: every caller-owned buffer that carries handshake
+// secrets — private keys, ECDH/KEM shared secrets, AuthKey, the HKDF chain,
+// traffic secrets and Finished intermediates — is held in `Zeroizing` so the
+// bytes are erased on every exit path (success, error, cancellation-induced
+// drop).  The contract covers only buffers this crate owns: copies inside
+// crypto backends (BoringSSL, x25519-dalek), register/stack spill from the
+// scalar multiplication itself, and allocator reuse after free are outside
+// what any RAII wrapper can erase.
 
 use crate::{
     reality_hello::{
@@ -201,39 +211,25 @@ pub(crate) struct RealityConnected {
 struct HybridKeyMaterial {
     pq_public: boring::mlkem::MlKemPublicKey,
     pq_private: boring::mlkem::MlKemPrivateKey,
-    x_private: [u8; 32],
+    x_private: Zeroizing<[u8; 32]>,
     x_public: [u8; 32],
-}
-
-impl Drop for HybridKeyMaterial {
-    fn drop(&mut self) {
-        self.x_private.fill(0);
-    }
 }
 
 /// TLS 1.3 key-exchange shared secret: a fixed-size X25519 secret, or
 /// the hybrid's ML-KEM-768 || X25519 concat (32 + 32 bytes). Both halves
 /// live on the stack, so neither handshake path allocates for the
-/// secret. `Drop` erases whichever half holds secret bytes.
+/// secret. `Drop` erases whichever half holds secret bytes — volatile
+/// writes the compiler may not elide, unlike the fill they replace.
 enum SharedSecret {
-    X25519([u8; 32]),
-    Hybrid([u8; 64]),
+    X25519(Zeroizing<[u8; 32]>),
+    Hybrid(Zeroizing<[u8; 64]>),
 }
 
 impl SharedSecret {
     fn as_bytes(&self) -> &[u8] {
         match self {
-            Self::X25519(secret) => secret,
-            Self::Hybrid(secret) => secret,
-        }
-    }
-}
-
-impl Drop for SharedSecret {
-    fn drop(&mut self) {
-        match self {
-            Self::X25519(secret) => secret.fill(0),
-            Self::Hybrid(secret) => secret.fill(0),
+            Self::X25519(secret) => &secret[..],
+            Self::Hybrid(secret) => &secret[..],
         }
     }
 }
@@ -245,7 +241,7 @@ async fn reality_handshake(
     reality: &RealityConfig,
     profile: HelloProfile,
 ) -> Result<RealityConnected> {
-    let mut client_private = rand::random::<[u8; 32]>();
+    let mut client_private = Zeroizing::new(rand::random::<[u8; 32]>());
     clamp_x25519_private(&mut client_private);
     let client_public = x25519_public_from_private(&client_private);
     let auth_key = x25519(&client_private, &reality.public_key)?;
@@ -256,7 +252,7 @@ async fn reality_handshake(
         let (pq_public, pq_private) =
             boring::mlkem::MlKemPrivateKey::generate(boring::mlkem::Algorithm::MlKem768)
                 .map_err(|e| TransportError::Tls(format!("ML-KEM-768 keygen: {e}")))?;
-        let mut x_private = rand::random::<[u8; 32]>();
+        let mut x_private = Zeroizing::new(rand::random::<[u8; 32]>());
         clamp_x25519_private(&mut x_private);
         let x_public = x25519_public_from_private(&x_private);
         Some(HybridKeyMaterial {
@@ -269,7 +265,7 @@ async fn reality_handshake(
         None
     };
 
-    let mut client_random = rand::random::<[u8; 32]>();
+    let client_random = rand::random::<[u8; 32]>();
     let (client_hello, reality_auth_key) = build_reality_client_hello(
         server_name,
         alpn,
@@ -305,52 +301,54 @@ async fn reality_handshake(
             "Reality TLS: server did not echo ClientHello session_id".into(),
         ));
     }
-    let shared_secret = match parsed_server_hello.group {
-        GROUP_X25519 => {
-            let mut share = [0u8; 32];
-            share.copy_from_slice(parsed_server_hello.key_share);
-            SharedSecret::X25519(x25519(&client_private, &share)?)
-        }
-        // X25519MLKEM768: server share = ML-KEM ciphertext || X25519;
-        // shared secret = ML-KEM secret || X25519 secret.
-        GROUP_X25519_MLKEM768 => {
-            let Some(hybrid) = hybrid.as_ref() else {
-                return Err(TransportError::Tls(
-                    "Reality TLS: server picked X25519MLKEM768, which was not offered".into(),
-                ));
-            };
-            let (ct, x_pub) = parsed_server_hello
-                .key_share
-                .split_at_checked(MLKEM768_CIPHERTEXT_BYTES)
-                .filter(|(_, x)| x.len() == 32)
-                .ok_or_else(|| {
-                    TransportError::Tls("Reality TLS: malformed X25519MLKEM768 share".into())
-                })?;
-            let mut share = [0u8; 32];
-            share.copy_from_slice(x_pub);
-            let mut pq = hybrid
-                .pq_private
-                .decapsulate(ct)
-                .map_err(|e| TransportError::Tls(format!("ML-KEM-768 decapsulation: {e}")))?;
-            // Construct the secret before the fallible X25519 exchange:
-            // if the peer's share is a low-order point, `?` returns with
-            // the object live and `Drop` still erases the ML-KEM half —
-            // a bare buffer built up in pieces would leak it unwiped.
-            let mut secret = SharedSecret::Hybrid([0u8; 64]);
-            let SharedSecret::Hybrid(bytes) = &mut secret else {
-                unreachable!("just constructed as Hybrid")
-            };
-            bytes[..32].copy_from_slice(&pq);
-            pq.fill(0);
-            bytes[32..].copy_from_slice(&x25519(&hybrid.x_private, &share)?);
-            secret
-        }
-        other => {
-            return Err(TransportError::Tls(format!(
-                "Reality TLS: server key-share group 0x{other:04x} was not offered"
-            )))
-        }
-    };
+    let shared_secret =
+        match parsed_server_hello.group {
+            GROUP_X25519 => {
+                let mut share = [0u8; 32];
+                share.copy_from_slice(parsed_server_hello.key_share);
+                SharedSecret::X25519(x25519(&client_private, &share)?)
+            }
+            // X25519MLKEM768: server share = ML-KEM ciphertext || X25519;
+            // shared secret = ML-KEM secret || X25519 secret.
+            GROUP_X25519_MLKEM768 => {
+                let Some(hybrid) = hybrid.as_ref() else {
+                    return Err(TransportError::Tls(
+                        "Reality TLS: server picked X25519MLKEM768, which was not offered".into(),
+                    ));
+                };
+                let (ct, x_pub) = parsed_server_hello
+                    .key_share
+                    .split_at_checked(MLKEM768_CIPHERTEXT_BYTES)
+                    .filter(|(_, x)| x.len() == 32)
+                    .ok_or_else(|| {
+                        TransportError::Tls("Reality TLS: malformed X25519MLKEM768 share".into())
+                    })?;
+                let mut share = [0u8; 32];
+                share.copy_from_slice(x_pub);
+                let pq =
+                    Zeroizing::new(hybrid.pq_private.decapsulate(ct).map_err(|e| {
+                        TransportError::Tls(format!("ML-KEM-768 decapsulation: {e}"))
+                    })?);
+                // Construct the secret before the fallible X25519 exchange:
+                // if the peer's share is a low-order point, `?` returns with
+                // the object live and `Drop` still erases the ML-KEM half —
+                // a bare buffer built up in pieces would leak it unwiped.
+                let mut secret = SharedSecret::Hybrid(Zeroizing::new([0u8; 64]));
+                let SharedSecret::Hybrid(bytes) = &mut secret else {
+                    unreachable!("just constructed as Hybrid")
+                };
+                bytes[..32].copy_from_slice(&pq[..]);
+                drop(pq);
+                let x_shared = x25519(&hybrid.x_private, &share)?;
+                bytes[32..].copy_from_slice(&x_shared[..]);
+                secret
+            }
+            other => {
+                return Err(TransportError::Tls(format!(
+                    "Reality TLS: server key-share group 0x{other:04x} was not offered"
+                )))
+            }
+        };
     // Key exchange is done: drop the hybrid private material now — its
     // `Drop` erases the X25519 half and boring cleanses the ML-KEM half —
     // instead of keeping it alive across the flight loop's awaits.
@@ -448,9 +446,6 @@ async fn reality_handshake(
     let encrypted_finished = client_hs.seal(TLS_RECORD_HANDSHAKE, &client_finished)?;
     inner.write_all(&encrypted_finished).await?;
     inner.flush().await?;
-
-    client_random.fill(0);
-    client_private.fill(0);
 
     tracing::debug!("Reality TLS handshake complete");
     Ok(RealityConnected {
@@ -798,7 +793,7 @@ pub(crate) fn build_reality_client_hello(
     auth_key: &[u8; 32],
     reality: &RealityConfig,
     profile: HelloProfile,
-) -> Result<(Vec<u8>, [u8; 32])> {
+) -> Result<(Vec<u8>, Zeroizing<[u8; 32]>)> {
     // The hello comes back with a zeroed 32-byte session_id at [39..71];
     // the seal below authenticates those exact bytes as AAD, so nothing
     // but the session_id may change after this point.
@@ -814,10 +809,10 @@ pub(crate) fn build_reality_client_hello(
     )?;
 
     let auth_key = hkdf_sha256(auth_key, &hello[4 + 2..4 + 2 + 20], b"REALITY", 32);
-    let mut aead_key = [0u8; 32];
+    let mut aead_key = Zeroizing::new([0u8; 32]);
     aead_key.copy_from_slice(&auth_key);
 
-    let mut reality_plain = [0u8; 16];
+    let mut reality_plain = Zeroizing::new([0u8; 16]);
     // Protocol timestamp: the injected protocol clock when present
     // (`ntp:` offset per issue #974), else the OS clock.
     let unix = reality.protocol_clock.unwrap_or(SystemTime::now)()
@@ -835,10 +830,10 @@ pub(crate) fn build_reality_client_hello(
     reality_plain[4..8].copy_from_slice(&unix.to_be_bytes());
     reality_plain[8..16].copy_from_slice(&reality.short_id);
 
-    let cipher = Aes256Gcm::new_from_slice(&aead_key)
+    let cipher = Aes256Gcm::new_from_slice(&*aead_key)
         .map_err(|e| TransportError::Tls(format!("Reality AES-GCM key: {e}")))?;
     let nonce = Nonce::from_slice(&random[20..32]);
-    let mut session_id = reality_plain.to_vec();
+    let mut session_id = Zeroizing::new(reality_plain.to_vec());
     let tag = cipher
         .encrypt_in_place_detached(nonce, &hello, &mut session_id)
         .map_err(|e| TransportError::Tls(format!("Reality session_id seal: {e}")))?;
@@ -1462,9 +1457,9 @@ impl CipherSuite {
 pub(crate) struct HandshakeKeys {
     pub(crate) client: RecordKey,
     pub(crate) server: RecordKey,
-    pub(crate) client_secret: Vec<u8>,
-    pub(crate) server_secret: Vec<u8>,
-    pub(crate) master_secret: Vec<u8>,
+    pub(crate) client_secret: Zeroizing<Vec<u8>>,
+    pub(crate) server_secret: Zeroizing<Vec<u8>>,
+    pub(crate) master_secret: Zeroizing<Vec<u8>>,
 }
 
 impl HandshakeKeys {
@@ -1482,15 +1477,22 @@ impl HandshakeKeys {
         debug_assert_eq!(transcript_hash.len(), hash.len());
         let zero = vec![0u8; hash.len()];
         let empty_hash = hash.digest(&[]);
+        // The early/derived/handshake chain is only needed to produce the
+        // traffic secrets; each intermediate is erased at the end of its
+        // scope instead of surviving in the allocator until reuse.
         let early_secret = hkdf_extract(hash, &zero, &zero);
-        let derived = derive_secret(hash, &early_secret, b"derived", &empty_hash);
-        let handshake_secret = hkdf_extract(hash, &derived, shared_secret);
+        let handshake_secret = {
+            let derived = derive_secret(hash, &early_secret, b"derived", &empty_hash);
+            hkdf_extract(hash, &derived, shared_secret)
+        };
         let client_secret =
             derive_secret(hash, &handshake_secret, b"c hs traffic", transcript_hash);
         let server_secret =
             derive_secret(hash, &handshake_secret, b"s hs traffic", transcript_hash);
-        let derived = derive_secret(hash, &handshake_secret, b"derived", &empty_hash);
-        let master_secret = hkdf_extract(hash, &derived, &zero);
+        let master_secret = {
+            let derived = derive_secret(hash, &handshake_secret, b"derived", &empty_hash);
+            hkdf_extract(hash, &derived, &zero)
+        };
         Self {
             client: RecordKey::new(cipher, &client_secret),
             server: RecordKey::new(cipher, &server_secret),
@@ -1544,7 +1546,7 @@ const MAX_WRITE_BATCH: usize = 4 * MAX_RECORD_PLAINTEXT;
 /// magnitude behind BoringSSL's assembly (see `meow-proxy`'s `aead` module).
 pub(crate) struct RecordKey {
     aead: AeadCtx,
-    iv: [u8; 12],
+    iv: Zeroizing<[u8; 12]>,
     seq: u64,
 }
 
@@ -1552,9 +1554,11 @@ impl RecordKey {
     /// `secret` is a traffic secret of the suite's hash length.
     pub(crate) fn new(cipher_suite: CipherSuite, secret: &[u8]) -> Self {
         let hash = cipher_suite.hash();
+        // The expanded key bytes are handed to the backend AEAD; both
+        // expansion outputs stay in erasing locals rather than plain Vecs.
         let key = hkdf_expand_label(hash, secret, b"key", &[], cipher_suite.key_len());
         let iv = hkdf_expand_label(hash, secret, b"iv", &[], 12);
-        let mut iv_arr = [0u8; 12];
+        let mut iv_arr = Zeroizing::new([0u8; 12]);
         iv_arr.copy_from_slice(&iv);
         let algorithm = match cipher_suite {
             CipherSuite::Aes128GcmSha256 => Algorithm::aes_128_gcm(),
@@ -1579,7 +1583,7 @@ impl RecordKey {
         Self {
             aead: AeadCtx::new_default_tag(&algorithm, key)
                 .expect("TLS 1.3 key length matches the suite"),
-            iv: *iv,
+            iv: Zeroizing::new(*iv),
             seq: 0,
         }
     }
@@ -1690,7 +1694,7 @@ impl RecordKey {
                 "TLS record sequence number exhausted".into(),
             ));
         }
-        let mut nonce = self.iv;
+        let mut nonce = *self.iv;
         let seq = self.seq.to_be_bytes();
         for (dst, src) in nonce[4..].iter_mut().zip(seq) {
             *dst ^= src;
@@ -1720,7 +1724,11 @@ pub(crate) fn verify_finished(
     }
 }
 
-pub(crate) fn finished_verify_data(hash: HashAlg, secret: &[u8], transcript: &[u8]) -> Vec<u8> {
+pub(crate) fn finished_verify_data(
+    hash: HashAlg,
+    secret: &[u8],
+    transcript: &[u8],
+) -> Zeroizing<Vec<u8>> {
     finished_verify_data_with_hash(hash, secret, &hash.digest(transcript))
 }
 
@@ -1728,12 +1736,17 @@ pub(crate) fn finished_verify_data_with_hash(
     hash: HashAlg,
     secret: &[u8],
     transcript_hash: &[u8],
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     let finished_key = hkdf_expand_label(hash, secret, b"finished", &[], hash.len());
-    hash.hmac(&finished_key, &[transcript_hash])
+    Zeroizing::new(hash.hmac(&finished_key, &[transcript_hash]))
 }
 
-fn derive_secret(hash: HashAlg, secret: &[u8], label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
+fn derive_secret(
+    hash: HashAlg,
+    secret: &[u8],
+    label: &[u8],
+    transcript_hash: &[u8],
+) -> Zeroizing<Vec<u8>> {
     hkdf_expand_label(hash, secret, label, transcript_hash, hash.len())
 }
 
@@ -1743,7 +1756,7 @@ fn hkdf_expand_label(
     label: &[u8],
     context: &[u8],
     len: usize,
-) -> Vec<u8> {
+) -> Zeroizing<Vec<u8>> {
     let mut info = Vec::with_capacity(2 + 1 + 6 + label.len() + 1 + context.len());
     put_u16(len as u16, &mut info);
     info.push((6 + label.len()) as u8);
@@ -1754,26 +1767,33 @@ fn hkdf_expand_label(
     hkdf_expand(hash, secret, &info, len)
 }
 
-pub(crate) fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+pub(crate) fn hkdf_sha256(
+    secret: &[u8],
+    salt: &[u8],
+    info: &[u8],
+    len: usize,
+) -> Zeroizing<Vec<u8>> {
     let prk = hkdf_extract(HashAlg::Sha256, salt, secret);
     hkdf_expand(HashAlg::Sha256, &prk, info, len)
 }
 
-fn hkdf_extract(hash: HashAlg, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
-    hash.hmac(salt, &[ikm])
+fn hkdf_extract(hash: HashAlg, salt: &[u8], ikm: &[u8]) -> Zeroizing<Vec<u8>> {
+    Zeroizing::new(hash.hmac(salt, &[ikm]))
 }
 
-fn hkdf_expand(hash: HashAlg, prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+fn hkdf_expand(hash: HashAlg, prk: &[u8], info: &[u8], len: usize) -> Zeroizing<Vec<u8>> {
     let mut okm = Vec::with_capacity(len);
-    let mut previous = Vec::new();
+    // Every intermediate block is key material of the same strength as the
+    // final output, so the chaining value is erased rather than abandoned.
+    let mut previous = Zeroizing::new(Vec::new());
     let mut counter = 1u8;
     while okm.len() < len {
-        previous = hash.hmac(prk, &[&previous, info, &[counter]]);
+        *previous = hash.hmac(prk, &[&previous, info, &[counter]]);
         okm.extend_from_slice(&previous);
         counter = counter.checked_add(1).expect("HKDF output too long");
     }
     okm.truncate(len);
-    okm
+    Zeroizing::new(okm)
 }
 
 pub(crate) fn clamp_x25519_private(private: &mut [u8; 32]) {
@@ -1786,8 +1806,8 @@ pub(crate) fn x25519_public_from_private(private: &[u8; 32]) -> [u8; 32] {
     x25519_dalek::x25519(*private, x25519_dalek::X25519_BASEPOINT_BYTES)
 }
 
-pub(crate) fn x25519(private: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32]> {
-    let out = x25519_dalek::x25519(*private, *peer_public);
+pub(crate) fn x25519(private: &[u8; 32], peer_public: &[u8; 32]) -> Result<Zeroizing<[u8; 32]>> {
+    let out = Zeroizing::new(x25519_dalek::x25519(*private, *peer_public));
     // An all-zero shared secret means the peer sent a low-order point; BoringSSL's
     // `X25519` reports that as a failure and RFC 7748 §6.1 requires rejecting it.
     if bool::from(out.ct_eq(&[0u8; 32])) {
@@ -3130,8 +3150,11 @@ mod tests {
 
             let mut transcript = client_hello.clone();
             transcript.extend_from_slice(&server_hello);
-            let hs =
-                HandshakeKeys::derive(CipherSuite::Aes128GcmSha256, &shared_secret, &transcript);
+            let hs = HandshakeKeys::derive(
+                CipherSuite::Aes128GcmSha256,
+                &shared_secret[..],
+                &transcript,
+            );
             let mut server_hs = hs.server;
 
             // Every EncryptedExtensions below is the largest that fits in a
@@ -3256,7 +3279,7 @@ mod tests {
             // key and the client's share, session_id opened with the hello
             // (session_id zeroed) as AAD.
             let shared = x25519(&reality_private, &client_public).expect("auth ECDH");
-            let auth_key = hkdf_sha256(&shared, &client_hello[6..26], b"REALITY", 32);
+            let auth_key = hkdf_sha256(&shared[..], &client_hello[6..26], b"REALITY", 32);
             let mut aad = client_hello.clone();
             aad[39..71].fill(0);
             let (sealed, tag) = client_hello[39..71].split_at(16);
@@ -3319,7 +3342,7 @@ mod tests {
                 let mut secret = pq_secret.to_vec();
                 let mut hybrid_x = [0u8; 32];
                 hybrid_x.copy_from_slice(&data[data.len() - 32..]);
-                secret.extend_from_slice(&x25519(&eph_private, &hybrid_x).expect("ECDH"));
+                secret.extend_from_slice(&x25519(&eph_private, &hybrid_x).expect("ECDH")[..]);
                 (
                     secret,
                     build_fake_server_hello_group(
@@ -3382,7 +3405,7 @@ mod tests {
             flight.extend_from_slice(&certificate);
             flight.extend_from_slice(&certificate_verify);
             let verify_data = finished_verify_data(cipher.hash(), &hs.server_secret, &transcript);
-            let finished = handshake_message(HS_FINISHED, verify_data).raw;
+            let finished = handshake_message(HS_FINISHED, verify_data[..].to_vec()).raw;
             flight.extend_from_slice(&finished);
             transcript.extend_from_slice(&finished);
             server_io
@@ -3395,7 +3418,7 @@ mod tests {
             assert_eq!(typ, TLS_RECORD_HANDSHAKE);
             assert_eq!(
                 client_finished[4..],
-                finished_verify_data(cipher.hash(), &hs.client_secret, &transcript)
+                finished_verify_data(cipher.hash(), &hs.client_secret, &transcript)[..]
             );
 
             let mut app = ApplicationKeys::derive(cipher, &hs.master_secret, &transcript);

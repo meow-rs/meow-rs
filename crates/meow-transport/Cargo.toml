@@ -47,6 +47,7 @@ reality = [
     "dep:rand",
     "dep:x25519-dalek",
     "dep:subtle",
+    "dep:zeroize",
 ]
 ws = [
     "dep:tokio-tungstenite",
@@ -164,6 +165,11 @@ httparse = { version = "1", optional = true }
 
 # reality feature — pure-Rust X25519 for the REALITY handshake.
 x25519-dalek = { workspace = true, optional = true }
+# reality feature — RAII erasure of caller-owned handshake secrets (static
+# and ephemeral X25519 private keys, ECDH/ML-KEM shared secrets, AuthKey, the
+# HKDF chain and Finished intermediates).  zeroize's volatile-write Drop is
+# the part a plain `fill(0)` cannot guarantee the compiler keeps.
+zeroize = { version = "1.9", optional = true }
 
 # kcptun feature — see the `kcptun` feature comment above for why aes is pinned
 # to the cipher-0.5 line while vmess's aes stays on 0.8.

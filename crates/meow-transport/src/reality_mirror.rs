@@ -6,6 +6,7 @@ use std::ops::Range;
 use crate::reality_hello::{GROUP_X25519, GROUP_X25519_MLKEM768};
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncReadExt;
+use zeroize::Zeroizing;
 
 use crate::reality_server::{
     certificate_message, certificate_verify_input, encapsulate_server_share, handshake_message,
@@ -937,9 +938,9 @@ fn scan_server_hello_shape(sh: &[u8]) -> std::result::Result<usize, MirrorCoverR
 #[derive(Clone)]
 pub(crate) struct MirrorCryptoInput {
     pub(crate) server_random: [u8; 32],
-    pub(crate) x25519_private: [u8; 32],
+    pub(crate) x25519_private: Zeroizing<[u8; 32]>,
     pub(crate) mlkem_ciphertext: Option<Vec<u8>>,
-    pub(crate) mlkem_secret: Option<Vec<u8>>,
+    pub(crate) mlkem_secret: Option<Zeroizing<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -954,7 +955,7 @@ struct BuiltMirrorFlight {
     plaintext: Vec<u8>,
     handshake: HandshakeKeys,
     hashes: MirrorTranscriptHashes,
-    expected_client_finished: Vec<u8>,
+    expected_client_finished: Zeroizing<Vec<u8>>,
 }
 
 fn valid_server_random(random: [u8; 32]) -> bool {
@@ -987,7 +988,7 @@ fn fixed_ephemeral_exchange(
     verified: &dyn MirrorHelloView,
     group: u16,
     fixed: &MirrorCryptoInput,
-) -> TransportResult<(Vec<u8>, Vec<u8>)> {
+) -> TransportResult<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     let entry = client_key_share_entry(verified, group)
         .ok_or_else(|| TransportError::Tls("REALITY mirror client key share disappeared".into()))?;
     let client_x_offset = match group {
@@ -1007,7 +1008,7 @@ fn fixed_ephemeral_exchange(
     let x_public = x25519_public_from_private(&fixed.x25519_private);
     let x_secret = x25519(&fixed.x25519_private, &client_x)?;
     if group == GROUP_X25519 {
-        return Ok((x_public.to_vec(), x_secret.to_vec()));
+        return Ok((x_public.to_vec(), Zeroizing::new(x_secret[..].to_vec())));
     }
     let ciphertext = fixed
         .mlkem_ciphertext
@@ -1025,9 +1026,9 @@ fn fixed_ephemeral_exchange(
     let mut server_share = Vec::with_capacity(1120);
     server_share.extend_from_slice(ciphertext);
     server_share.extend_from_slice(&x_public);
-    let mut tls_dh = Vec::with_capacity(64);
-    tls_dh.extend_from_slice(mlkem_secret);
-    tls_dh.extend_from_slice(&x_secret);
+    let mut tls_dh = Zeroizing::new(Vec::with_capacity(64));
+    tls_dh.extend_from_slice(&mlkem_secret[..]);
+    tls_dh.extend_from_slice(&x_secret[..]);
     Ok((server_share, tls_dh))
 }
 
@@ -1035,7 +1036,7 @@ fn ephemeral_exchange(
     verified: &dyn MirrorHelloView,
     group: u16,
     fixed: Option<&MirrorCryptoInput>,
-) -> TransportResult<(Vec<u8>, Vec<u8>)> {
+) -> TransportResult<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     if let Some(fixed) = fixed {
         return fixed_ephemeral_exchange(verified, group, fixed);
     }
@@ -1125,9 +1126,9 @@ impl PreparedFlight {
 pub struct MirroredHandshakeCompletion {
     cipher: CipherSuite,
     client_handshake: RecordKey,
-    master_secret: Vec<u8>,
+    master_secret: Zeroizing<Vec<u8>>,
     transcript_t3_hash: Vec<u8>,
-    expected_client_finished: Vec<u8>,
+    expected_client_finished: Zeroizing<Vec<u8>>,
 }
 
 impl fmt::Debug for MirroredHandshakeCompletion {
@@ -1170,7 +1171,7 @@ impl MirroredHandshakeCompletion {
 #[derive(Debug)]
 struct MirroredFinishedMessage {
     len: usize,
-    bytes: [u8; 52],
+    bytes: Zeroizing<[u8; 52]>,
 }
 
 async fn read_mirrored_client_finished(
@@ -1180,10 +1181,10 @@ async fn read_mirrored_client_finished(
 ) -> TransportResult<MirroredFinishedMessage> {
     let mut total_wire = 0usize;
     let mut ignored_ccs = false;
-    let mut body = Vec::with_capacity(16401);
+    let mut body = Zeroizing::new(Vec::with_capacity(16401));
     let mut handshake = MirroredFinishedMessage {
         len: 0,
-        bytes: [0; 52],
+        bytes: Zeroizing::new([0; 52]),
     };
     for _ in 0..32 {
         let mut header = [0u8; 5];
@@ -1248,7 +1249,7 @@ async fn read_mirrored_client_finished(
             .map_err(TransportError::Io)?;
         total_wire += record_len;
         if header[0] == TLS_RECORD_CHANGE_CIPHER_SPEC {
-            if body != [1] {
+            if body[..] != [1] {
                 return Err(TransportError::Tls(
                     "REALITY mirrored client Finished carries a non-canonical CCS".into(),
                 ));
@@ -1400,6 +1401,8 @@ fn prepare_mirrored_flight_view(
         transcript_t3_hash: built.hashes.t3.clone(),
         expected_client_finished: built.expected_client_finished,
     };
+    // tls_dh and every unneeded handshake secret are dropped (and erased)
+    // here, before the caller ever sees the prepared flight.
     Ok(PreparedFlight { wire, completion })
 }
 
@@ -1489,7 +1492,7 @@ mod tests {
                 parse_explicit_arena_bytes: 0,
             },
             ch_wire: Vec::new(),
-            auth_key: [0x23; 32],
+            auth_key: Zeroizing::new([0x23; 32]),
             local_cipher: CipherSuite::Aes128GcmSha256,
             local_key_group: selected,
         }
@@ -2130,9 +2133,9 @@ mod tests {
             let template = MirrorTemplate::parse(&hello, &prefix).expect("template");
             let fixed = MirrorCryptoInput {
                 server_random: [0x66; 32],
-                x25519_private: [0x91; 32],
+                x25519_private: Zeroizing::new([0x91; 32]),
                 mlkem_ciphertext: (group == 0x11ec).then(|| vec![0xa5; 1088]),
-                mlkem_secret: (group == 0x11ec).then(|| vec![0x77; 32]),
+                mlkem_secret: (group == 0x11ec).then(|| Zeroizing::new(vec![0x77; 32])),
             };
             let certificate = RealityCertificate::generate().expect("test certificate");
             let prepared = prepare_mirrored_flight(&certificate, &hello, template, Some(&fixed))
