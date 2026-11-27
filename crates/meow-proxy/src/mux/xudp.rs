@@ -826,10 +826,14 @@ pub fn reply_source(
         IpAddr::V6(v6) => XudpAddr::Ipv6(v6),
     };
     match (&target.addr, dialed_ip) {
-        (XudpAddr::Domain(_), Some(dialed)) if dialed == actual_source.ip() => XudpTarget {
-            addr: target.addr.clone(),
-            port: actual_source.port(),
-        },
+        (XudpAddr::Domain(_), Some(dialed))
+            if dialed.to_canonical() == actual_source.ip().to_canonical() =>
+        {
+            XudpTarget {
+                addr: target.addr.clone(),
+                port: actual_source.port(),
+            }
+        }
         _ => XudpTarget {
             addr: ip_addr,
             port: actual_source.port(),

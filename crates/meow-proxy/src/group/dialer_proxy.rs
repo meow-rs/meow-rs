@@ -123,6 +123,10 @@ impl ProxyPacketConn for ArcPacketConn {
         self.0.close()
     }
 
+    fn local_udp_destination(&self, requested: SocketAddr) -> Option<SocketAddr> {
+        self.0.local_udp_destination(requested)
+    }
+
     /// A pure shim — the inner conn's own poll capability, passed
     /// through untouched.
     fn poll_packet_conn(self: Arc<Self>) -> Option<Arc<dyn PollPacketConn>> {

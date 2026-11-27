@@ -48,28 +48,26 @@
 //! task cancel — reaps all of them through the [`AssociationGuard], with
 //! each flow's UDP conn closed by its own guard.
 //!
-//! # Cross-crate interface needs (known gaps)
+//! # Cross-crate interfaces this module relies on
 //!
-//! Two correctness gaps cannot be closed inside this crate:
-//!
-//! * F11 — stream-framed [`ProxyPacketConn`]s (plain VLESS UoT, mux)
-//!   consume an oversized inbound datagram whole before reporting that it
-//!   did not fit the caller's buffer. That error is recoverable — framing
-//!   is intact — but indistinguishable from a fatal transport error
-//!   through the current `MeowError` surface, so the flow retires and the
-//!   client must re-send to respawn it. Needs a matchable error variant
-//!   (e.g. `MeowError::UdpPacketTooLarge { packet_len, buffer_len }`) in
-//!   meow-common, produced by meow-proxy's framed readers only after the
-//!   datagram was fully consumed, and transparently forwarded by
-//!   meow-tunnel's counted wrapper.
-//! * F12 — the reply-source domain rewrite keys on `metadata.dst_ip`,
-//!   the pre-dial resolution, but a DIRECT outbound with
-//!   `dns.direct-nameserver` re-resolves and connect()s elsewhere.
-//!   Needs an object-safe capability on `ProxyPacketConn` (e.g.
-//!   `local_udp_destination(requested) -> Option<SocketAddr>`) answered
-//!   by the final DIRECT/COMPATIBLE conn with the peer its socket is
-//!   actually bound to (`None` for remote-resolution/proxied paths),
-//!   forwarded by meow-tunnel's counted wrapper.
+//! * Oversized replies on stream-framed [`ProxyPacketConn`]s (plain
+//!   VLESS UoT, mux) surface as [`meow_common::MeowError::UdpPacketTooLarge`],
+//!   emitted only after the datagram was consumed whole and framing is
+//!   intact — the reply loop drops just that packet and continues, while
+//!   EOF, half-frame and transport errors still retire the flow.
+//!   meow-tunnel's counted wrapper forwards the variant matchable and
+//!   counts no download bytes for the dropped datagram.
+//! * The reply-source domain rewrite keys on the conn's own answer to
+//!   `ProxyPacketConn::local_udp_destination` — locally-known evidence
+//!   of where the dial truly went. A connect()ed DIRECT/COMPATIBLE
+//!   socket answers its bound peer, so a rewrite fires exactly when the
+//!   reply comes from the peer the dial used (canonicalized on both
+//!   sides of the comparison inside `reply_source`); proxied and
+//!   remote-resolution paths answer `None` and their real sources go on
+//!   the wire unchanged. The pre-dial resolution is deliberately never
+//!   consulted: under `dns.direct-nameserver` a DIRECT outbound
+//!   re-resolves and connect()s elsewhere, and keying on it would pin
+//!   the domain onto replies nothing local can attribute.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -1022,17 +1020,17 @@ async fn run_xudp_flow(
             return;
         }
     };
-    // Best listener-side approximation of the dial address for the
-    // reply-source domain rewrite. `metadata.dst_ip` is the PRE-dial
-    // resolution: a DIRECT outbound with `dns.direct-nameserver` may
-    // re-resolve the domain to a different address and connect() its
-    // socket there, making the rewrite attribute replies to the wrong
-    // source. The exact answer requires the outbound conn to expose its
-    // bound peer — see the F12 interface note in the module docs; until
-    // then the pre-dial IP is the closest available evidence, correct
-    // whenever the dial truly used it and for every remote-resolution
-    // proxy (whose real source goes on the wire unchanged anyway).
-    let dialed_ip = metadata.dst_ip;
+    // Reply-source rewrite evidence comes from the conn itself: a
+    // connect()ed raw socket answers its bound peer (the kernel only
+    // passes replies from there, so a match IS the dial), an unbound one
+    // the canonical write destination, and every proxied or synthetic
+    // conn answers None — no local evidence ties its replies to the dial,
+    // so their real sources go on the wire unchanged. The pre-dial
+    // resolution in `metadata.dst_ip` is never consulted: a DIRECT
+    // outbound under `dns.direct-nameserver` re-resolves and connect()s
+    // elsewhere, and keying on it would attribute those replies to a
+    // source nothing was sent to.
+    let dialed_ip = conn.local_udp_destination(dst_addr).map(|a| a.ip());
 
     // Reply reader, writer, flush watch and idle deadline — ALL polled
     // as plain futures inside THIS task: whichever ends first retires
@@ -1051,15 +1049,20 @@ async fn run_xudp_flow(
     };
     let mut rbuf = vec![0u8; read_buf_len];
     let reply = async {
-        while let Ok((m, src)) = conn.read_packet(&mut rbuf).await {
-            // NOTE(F11): stream-framed conns (plain VLESS, mux) consume an
-            // oversized datagram WHOLE before erroring, so their error
-            // here is recoverable — the framing is intact and only this
-            // packet should drop. `ProxyPacketConn` currently exposes no
-            // way to distinguish that case from a fatal transport error,
-            // so every error retires the flow; the next uplink datagram
-            // respawns it. The cross-crate interface needed is documented
-            // in the module docs.
+        loop {
+            let (m, src) = match conn.read_packet(&mut rbuf).await {
+                Ok(v) => v,
+                // Stream-framed conns (plain VLESS, mux) consume an
+                // oversized datagram WHOLE before reporting it — the
+                // framing is intact, so only this packet drops and the
+                // flow survives. EOF, half-frame and transport errors
+                // retire the flow; the next uplink datagram respawns it.
+                Err(meow_common::MeowError::UdpPacketTooLarge { .. }) => {
+                    debug!("vless xudp flow to {dst_addr}: dropping oversized upstream reply");
+                    continue;
+                }
+                Err(_) => break,
+            };
             let wire_source = reply_source(&target, dialed_ip, src);
             // Reserve exactly the frame's bytes before allocating/copying
             // it; encoding first would pay the allocation while the meter
@@ -1456,6 +1459,15 @@ mod tests {
         m
     }
 
+    fn domain_target_bytes(name: &str, port: u16) -> Vec<u8> {
+        let mut m = vec![0x02];
+        m.extend_from_slice(&port.to_be_bytes());
+        m.push(0x02);
+        m.push(name.len() as u8);
+        m.extend_from_slice(name.as_bytes());
+        m
+    }
+
     fn new_data(sid: u16, target_meta: &[u8], payload: &[u8]) -> Vec<u8> {
         xudp_frame(sid, 0x01, 0x01, target_meta, Some(payload))
     }
@@ -1475,6 +1487,7 @@ mod tests {
         closes: AtomicUsize,
         writes: AtomicUsize,
         inject: tokio::sync::broadcast::Sender<(Bytes, SocketAddr)>,
+        local_dest: Option<SocketAddr>,
     }
 
     struct HarnessProbeConn {
@@ -1512,6 +1525,11 @@ mod tests {
         fn close(&self) -> meow_common::Result<()> {
             self.probe.closes.fetch_add(1, Ordering::Relaxed);
             Ok(())
+        }
+
+        fn local_udp_destination(&self, requested: SocketAddr) -> Option<SocketAddr> {
+            let _ = requested;
+            self.probe.local_dest
         }
     }
 
@@ -1574,18 +1592,33 @@ mod tests {
     }
 
     fn harness_probe() -> (Arc<HarnessProbe>, meow_tunnel::Tunnel) {
+        harness_probe_opts(&[], None)
+    }
+
+    /// The probe harness with tunnel-resolver hosts entries and a probe
+    /// conn answer for `local_udp_destination` — the two knobs the
+    /// reply-source rewrite tests need.
+    fn harness_probe_opts(
+        hosts: &[(&str, std::net::IpAddr)],
+        local_dest: Option<SocketAddr>,
+    ) -> (Arc<HarnessProbe>, meow_tunnel::Tunnel) {
         let probe = Arc::new(HarnessProbe {
             dials: AtomicUsize::new(0),
             closes: AtomicUsize::new(0),
             writes: AtomicUsize::new(0),
             inject: tokio::sync::broadcast::channel(64).0,
+            local_dest,
         });
+        let mut trie = meow_trie::DomainTrie::new();
+        for (host, ip) in hosts {
+            trie.insert(host, vec![*ip].into());
+        }
         let resolver = Arc::new(meow_dns::Resolver::new(
             vec![],
             vec![],
             meow_common::DnsMode::Normal,
-            meow_trie::DomainTrie::new(),
-            false,
+            trie,
+            true,
             true,
         ));
         let tunnel = meow_tunnel::Tunnel::new(resolver);
@@ -1771,6 +1804,136 @@ mod tests {
             payloads.iter().any(|p| p.len() == 6000),
             "the frame already mid-write when End landed must complete intact: lengths {:?}",
             payloads.iter().map(|p| p.len()).collect::<Vec<_>>()
+        );
+    }
+
+    /// F12 negative pin: the probe conn — like every proxied, framed or
+    /// synthetic conn — answers `local_udp_destination` with the default
+    /// None because no local evidence ties its replies to the dial. Even
+    /// when a reply's source exactly matches the pre-dial resolution the
+    /// rewrite must stay silent: keying on `metadata.dst_ip` would pin
+    /// the domain onto a reply that provably went somewhere a proxy
+    /// chose, not where the socket dialed.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn none_answering_conn_never_rewrites_reply_sources() {
+        use meow_proxy::mux::xudp::XudpAddr;
+        let (conn, mut client) = xudp_harness(2048);
+        let pre_resolved: std::net::IpAddr = "10.99.0.1".parse().unwrap();
+        let (probe, tunnel) = harness_probe_opts(&[("probe.test", pre_resolved)], None);
+        let _assoc = tokio::spawn(run_xudp_conn(
+            conn,
+            Arc::clone(tunnel.inner()),
+            harness_ctx(),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        ));
+        let target_meta = domain_target_bytes("probe.test", 15353);
+        client
+            .send_xudp(&new_data(7, &target_meta, b"uplink"))
+            .await
+            .unwrap();
+        wait_for(
+            || probe.writes.load(Ordering::Relaxed) == 1,
+            "the flow write",
+        )
+        .await;
+
+        // The reply source byte-for-byte matches the pre-dial resolution
+        // — the exact case `metadata.dst_ip` keying would rewrite.
+        probe
+            .inject
+            .send((
+                Bytes::from_static(b"reply"),
+                "10.99.0.1:15353".parse().unwrap(),
+            ))
+            .unwrap();
+        let frames = client.collect_frames(Duration::from_millis(500)).await;
+        let target = frames
+            .iter()
+            .find_map(|f| match f {
+                XudpFrame::Keep {
+                    target: Some(t),
+                    payload: Some(p),
+                    ..
+                } if p.as_ref() == b"reply" => Some(t.clone()),
+                _ => None,
+            })
+            .expect("the reply frame");
+        assert_eq!(
+            target.addr,
+            XudpAddr::Ipv4("10.99.0.1".parse().unwrap()),
+            "a None-answering conn must keep the real wire source: {target:?}"
+        );
+    }
+
+    /// F12 positive pin: when the conn answers its true peer through
+    /// `local_udp_destination`, a reply from exactly that peer — here a
+    /// DIFFERENT address than the pre-dial resolution, modelling the
+    /// `dns.direct-nameserver` re-resolution — is rewritten back to the
+    /// domain with the real reply port preserved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn conn_answered_peer_rewrites_reply_sources_to_the_domain() {
+        use meow_proxy::mux::xudp::XudpAddr;
+        let (conn, mut client) = xudp_harness(2048);
+        let pre_resolved: std::net::IpAddr = "10.99.0.1".parse().unwrap();
+        let real_peer: SocketAddr = "10.99.0.2:15353".parse().unwrap();
+        let (probe, tunnel) = harness_probe_opts(&[("probe.test", pre_resolved)], Some(real_peer));
+        let _assoc = tokio::spawn(run_xudp_conn(
+            conn,
+            Arc::clone(tunnel.inner()),
+            harness_ctx(),
+            tokio::time::Instant::now() + Duration::from_secs(60),
+        ));
+        let target_meta = domain_target_bytes("probe.test", 15353);
+        client
+            .send_xudp(&new_data(7, &target_meta, b"uplink"))
+            .await
+            .unwrap();
+        wait_for(
+            || probe.writes.load(Ordering::Relaxed) == 1,
+            "the flow write",
+        )
+        .await;
+
+        // A reply from the conn-answered peer rewrites to the domain…
+        probe
+            .inject
+            .send((Bytes::from_static(b"reply"), real_peer))
+            .unwrap();
+        // …while one from any other source — including the pre-dial
+        // resolution — stays a raw IP. The probe conn re-subscribes its
+        // broadcast on every read, so back-to-back injections can race
+        // the resubscribe; space them like the other harness tests do.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        probe
+            .inject
+            .send((
+                Bytes::from_static(b"other"),
+                "10.99.0.1:15353".parse().unwrap(),
+            ))
+            .unwrap();
+        let frames = client.collect_frames(Duration::from_millis(500)).await;
+        let by_payload = |want: &[u8]| {
+            frames.iter().find_map(|f| match f {
+                XudpFrame::Keep {
+                    target: Some(t),
+                    payload: Some(p),
+                    ..
+                } if p.as_ref() == want => Some(t.clone()),
+                _ => None,
+            })
+        };
+        let rewritten = by_payload(b"reply").expect("the reply frame");
+        assert_eq!(
+            rewritten.addr,
+            XudpAddr::Domain("probe.test".into()),
+            "the conn-answered peer's reply must be rewritten: {rewritten:?}"
+        );
+        assert_eq!(rewritten.port, 15353, "the real reply port is preserved");
+        let other = by_payload(b"other").expect("the other-source frame");
+        assert_eq!(
+            other.addr,
+            XudpAddr::Ipv4("10.99.0.1".parse().unwrap()),
+            "the pre-dial resolution must NOT rewrite once evidence comes from the conn: {other:?}"
         );
     }
 

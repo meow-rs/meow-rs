@@ -101,7 +101,7 @@ fn tls_spec(cert: &str, key: &str, users: Vec<(&str, [u8; 16])>) -> VlessListene
     }
 }
 
-fn reality_spec(dest: String, users: Vec<(&str, [u8; 16])>) -> VlessListenerSpec {
+fn reality_spec(dest: &str, users: Vec<(&str, [u8; 16])>) -> VlessListenerSpec {
     VlessListenerSpec {
         users: users
             .into_iter()
@@ -111,7 +111,8 @@ fn reality_spec(dest: String, users: Vec<(&str, [u8; 16])>) -> VlessListenerSpec
             })
             .collect(),
         security: VlessSecuritySpec::Reality(VlessRealitySpec {
-            dest,
+            dest_host: meow_config::parse_vless_reality_dest(dest).unwrap().0,
+            dest_port: meow_config::parse_vless_reality_dest(dest).unwrap().1,
             private_key: REALITY_PRIVATE,
             short_ids: vec![SHORT_ID],
             server_names: vec!["localhost".into()],
@@ -417,7 +418,7 @@ async fn reality_vision_authenticated_echo() {
     let echo = start_tcp_echo().await;
     let tunnel = tunnel_with_rules(&[]);
     let (port, _listener, _task) = start_listener(
-        reality_spec("127.0.0.1:9".into(), vec![("alice", ALICE)]),
+        reality_spec("127.0.0.1:9", vec![("alice", ALICE)]),
         tunnel,
         "vless-reality-it",
     )
@@ -434,7 +435,7 @@ async fn reality_ordinary_tls_is_transparently_cover_relayed() {
     let tunnel = tunnel_with_rules(&[]);
     let (port, _listener, _task) = start_listener(
         reality_spec(
-            format!("127.0.0.1:{}", cover.port()),
+            &format!("127.0.0.1:{}", cover.port()),
             vec![("alice", ALICE)],
         ),
         tunnel,
@@ -1577,7 +1578,6 @@ fn tunnel_with_named_proxy(name: &str, proxy: Arc<dyn meow_common::Proxy>) -> Tu
 /// loop treats it as drop-this-packet rather than flow-fatal. Until then
 /// the flow dies and the marker never arrives.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-#[ignore = "needs the F11 cross-crate error type in meow-common/meow-proxy; see vless_xudp module docs"]
 async fn xudp_plain_vless_oversize_reply_drops_packet_not_flow() {
     let server = start_plain_vless_oversize_then_echo().await;
     let outbound: Arc<dyn meow_common::Proxy> = Arc::new(
@@ -1614,6 +1614,106 @@ async fn xudp_plain_vless_oversize_reply_drops_packet_not_flow() {
         .expect("normal reply after a consumed oversize reply")
         .expect("connection closed after a consumed oversize reply");
     assert_keep_data(&frame, 31, b"marker");
+}
+
+/// Acceptance test for the F12 cross-crate fix: a DIRECT outbound under
+/// `dns.direct-nameserver` re-resolves the domain and connect()s elsewhere
+/// than the pre-dial (main-resolver) resolution. The reply-source rewrite
+/// must key on the conn's real bound peer — reported through
+/// `ProxyPacketConn::local_udp_destination` — so the domain is restored
+/// exactly when the reply comes from the peer the socket truly dialed.
+/// Before the fix the rewrite keys on `metadata.dst_ip` (192.0.2.1 here),
+/// never matches the real source (127.0.0.1) and the wire source stays a
+/// raw IP.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xudp_direct_nameserver_reply_rewrites_to_the_real_dial_peer() {
+    use meow_proxy::mux::xudp::XudpAddr;
+    let echo = start_udp_echo("127.0.0.1:0").await;
+
+    // The adapter's resolver: main view answers the unroutable TEST-NET
+    // address (never used for a named destination once a direct resolver
+    // exists), the `dns.direct-nameserver` view answers loopback.
+    let mut main_trie = meow_trie::DomainTrie::new();
+    main_trie.insert(
+        "echo.test",
+        vec!["192.0.2.1".parse::<std::net::IpAddr>().unwrap()].into(),
+    );
+    let mut adapter_resolver = Resolver::new(
+        vec![],
+        vec![],
+        meow_common::DnsMode::Normal,
+        main_trie,
+        true,
+        true,
+    );
+    let mut direct_trie = meow_trie::DomainTrie::new();
+    direct_trie.insert(
+        "echo.test",
+        vec!["127.0.0.1".parse::<std::net::IpAddr>().unwrap()].into(),
+    );
+    adapter_resolver.set_direct_resolver(Arc::new(Resolver::new(
+        vec![],
+        vec![],
+        meow_common::DnsMode::Normal,
+        direct_trie,
+        true,
+        true,
+    )));
+    let direct = meow_proxy::DirectAdapter::new().with_resolver(Arc::new(adapter_resolver));
+    let outbound: Arc<dyn meow_common::Proxy> = Arc::new(
+        meow_config::proxy_parser::WrappedProxy::new(Box::new(direct)),
+    );
+
+    // The tunnel's own resolver pre-resolves echo.test to the TEST-NET
+    // address — `metadata.dst_ip` at dial time is 192.0.2.1 while the
+    // socket truly connect()s to 127.0.0.1.
+    let mut tunnel_trie = meow_trie::DomainTrie::new();
+    tunnel_trie.insert(
+        "echo.test",
+        vec!["192.0.2.1".parse::<std::net::IpAddr>().unwrap()].into(),
+    );
+    let resolver = Arc::new(Resolver::new(
+        vec![],
+        vec![],
+        meow_common::DnsMode::Normal,
+        tunnel_trie,
+        true,
+        true,
+    ));
+    let tunnel = Tunnel::new(resolver);
+    let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+    let mut proxies = res.proxies;
+    proxies.insert("direct-ns".into(), outbound);
+    tunnel.update_proxies(proxies, res.dialer_registry);
+    tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(
+        "direct-ns",
+    ))]);
+
+    let (cert, key) = tls_cert();
+    let (port, _listener, _task) = start_listener(
+        tls_spec(&cert, &key, vec![("alice", ALICE)]),
+        tunnel,
+        "vless-xudp-direct-ns",
+    )
+    .await;
+
+    let mut client = RawXudpClient::connect(port, ALICE).await;
+    client
+        .send(&new_data(
+            51,
+            &domain_target("echo.test", echo.port()),
+            b"direct-ns-probe",
+        ))
+        .await;
+    let frame = client.recv_frame_timed().await;
+    let src = assert_keep_data(&frame, 51, b"direct-ns-probe");
+    assert_eq!(
+        src.addr,
+        XudpAddr::Domain("echo.test".into()),
+        "the reply genuinely comes from the direct-resolved peer, so the \
+         wire source must be rewritten back to the domain"
+    );
+    assert_eq!(src.port, echo.port(), "the real reply port is preserved");
 }
 
 struct GatedDialState {

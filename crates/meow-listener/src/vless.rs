@@ -85,9 +85,13 @@ pub enum VlessSecuritySpec {
 }
 
 pub struct VlessRealitySpec {
-    /// `host:port` as written. The host is resolved only when a cover
-    /// connection actually needs dialing.
-    pub dest: String,
+    /// Cover target host, resolved only when a cover connection actually
+    /// needs dialing. Structured upstream: meow-config parses and
+    /// validates the configured `dest` string once (shape, bracketed
+    /// IPv6, decimal non-zero port) and the app wiring passes the split
+    /// result through — the listener must never re-parse a string form.
+    pub dest_host: String,
+    pub dest_port: u16,
     pub private_key: [u8; 32],
     pub short_ids: Vec<[u8; 8]>,
     pub server_names: Vec<String>,
@@ -194,8 +198,8 @@ fn build_security_runtime(
             Ok(SecurityRuntime::StandardTls(server))
         }
         VlessSecuritySpec::Reality(spec) => {
-            let (dest_host, dest_port) = parse_reality_dest(&spec.dest)
-                .map_err(|e| meow_common::MeowError::Config(e.to_string()))?;
+            let dest_host = spec.dest_host.clone();
+            let dest_port = spec.dest_port;
             let server = RealityServer::new(&RealityServerConfig {
                 private_key: spec.private_key,
                 short_ids: spec.short_ids,
@@ -805,48 +809,6 @@ fn build_tcp_metadata(
     metadata
 }
 
-/// Validate/split a REALITY `dest` (`host:port`, bracketed IPv6). The
-/// config builder already enforces this shape; the listener-facing spec
-/// remains useful for programmatic construction and tests.
-fn parse_reality_dest(dest: &str) -> Result<(String, u16), anyhow::Error> {
-    if dest.is_empty() || dest.contains("://") || dest.contains('@') || dest.contains('/') {
-        anyhow::bail!("vless REALITY dest must be bare host:port");
-    }
-    let (host, port_str) = if let Some(rest) = dest.strip_prefix('[') {
-        let Some((host, tail)) = rest.split_once(']') else {
-            anyhow::bail!("vless REALITY dest: bracketed IPv6 must close as [addr]:port");
-        };
-        let Some(port) = tail.strip_prefix(':') else {
-            anyhow::bail!("vless REALITY dest: bracketed IPv6 must be followed by :port");
-        };
-        if host.parse::<std::net::Ipv6Addr>().is_err() {
-            anyhow::bail!("vless REALITY dest: invalid IPv6 literal");
-        }
-        (host.to_string(), port)
-    } else {
-        let Some((host, port)) = dest.rsplit_once(':') else {
-            anyhow::bail!("vless REALITY dest: missing :port");
-        };
-        if host.contains(':') {
-            anyhow::bail!("vless REALITY dest: IPv6 destinations must be bracketed");
-        }
-        (host.to_string(), port)
-    };
-    if host.is_empty() || host.chars().any(char::is_whitespace) {
-        anyhow::bail!("vless REALITY dest: invalid host");
-    }
-    if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
-        anyhow::bail!("vless REALITY dest: invalid port");
-    }
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| anyhow::anyhow!("vless REALITY dest: invalid port"))?;
-    if port == 0 {
-        anyhow::bail!("vless REALITY dest: port 0 is not dialable");
-    }
-    Ok((host, port))
-}
-
 fn canonical_endpoint(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
 }
@@ -1045,7 +1007,8 @@ mod tests {
                 uuid: [0x11; 16],
             }],
             security: VlessSecuritySpec::Reality(VlessRealitySpec {
-                dest: "127.0.0.1:9".into(),
+                dest_host: "127.0.0.1".into(),
+                dest_port: 9,
                 private_key: [0x42; 32],
                 short_ids: vec![[0; 8]],
                 server_names: vec!["localhost".into()],
@@ -1176,36 +1139,6 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         panic!("endpoint outlived its listen socket");
-    }
-
-    #[test]
-    fn reality_dest_parser_accepts_domain_ipv4_and_bracketed_ipv6() {
-        assert_eq!(
-            parse_reality_dest("example.com:443").unwrap(),
-            ("example.com".to_string(), 443)
-        );
-        assert_eq!(
-            parse_reality_dest("127.0.0.1:8443").unwrap(),
-            ("127.0.0.1".to_string(), 8443)
-        );
-        assert_eq!(
-            parse_reality_dest("[::1]:8443").unwrap(),
-            ("::1".to_string(), 8443)
-        );
-    }
-
-    #[test]
-    fn reality_dest_parser_rejects_unsafe_or_undialable_shapes() {
-        for dest in [
-            "",
-            "https://example.com:443",
-            "example.com",
-            "::1:443",
-            "example.com:0",
-            "user@example.com:443",
-        ] {
-            assert!(parse_reality_dest(dest).is_err(), "{dest} must fail");
-        }
     }
 
     #[test]

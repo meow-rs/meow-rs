@@ -1386,14 +1386,15 @@ fn tls_spec(certificate: String, private_key: String) -> VlessListenerSpec {
     }
 }
 
-fn reality_spec(dest: String) -> VlessListenerSpec {
+fn reality_spec(dest: &str) -> VlessListenerSpec {
     VlessListenerSpec {
         users: vec![VlessUserSpec {
             username: "alice".into(),
             uuid: USER_UUID,
         }],
         security: VlessSecuritySpec::Reality(VlessRealitySpec {
-            dest,
+            dest_host: meow_config::parse_vless_reality_dest(dest).unwrap().0,
+            dest_port: meow_config::parse_vless_reality_dest(dest).unwrap().1,
             private_key: REALITY_PRIVATE,
             short_ids: vec![SHORT_ID],
             server_names: vec![REALITY_NAME.into()],
@@ -2370,7 +2371,7 @@ async fn reverse_vless_vision_interop_matrix() {
     )
     .await;
     let (reality_port, reality_listener) = start_vless_listener(
-        reality_spec(format!("{}:{}", cover.ip(), cover.port())),
+        reality_spec(&format!("{}:{}", cover.ip(), cover.port())),
         tunnel,
         "interop-vless-reality",
     )

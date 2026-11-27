@@ -1335,11 +1335,16 @@ impl ProxyPacketConn for PacketConn {
                                 continue;
                             }
                             if bytes.len() > buf.len() {
-                                return Err(MeowError::Proxy(format!(
-                                    "mux.cool: UDP packet ({} bytes) exceeds read buffer ({} bytes)",
-                                    bytes.len(),
-                                    buf.len()
-                                )));
+                                // The datagram is already fully consumed
+                                // (the channel carries whole reassembled
+                                // datagrams; this one drops with the
+                                // error), so the conn stays usable — the
+                                // matchable variant lets the caller drop
+                                // just this packet.
+                                return Err(MeowError::UdpPacketTooLarge {
+                                    packet_len: bytes.len(),
+                                    buffer_len: buf.len(),
+                                });
                             }
                             buf[..bytes.len()].copy_from_slice(&bytes);
                             let src = dest.map_or(self.bound, |(dest, port)| {

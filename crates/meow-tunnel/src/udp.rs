@@ -113,6 +113,10 @@ impl ProxyPacketConn for CountedPacketConn {
     fn close(&self) -> meow_common::Result<()> {
         self.conn.close()
     }
+
+    fn local_udp_destination(&self, requested: SocketAddr) -> Option<SocketAddr> {
+        self.conn.local_udp_destination(requested)
+    }
 }
 
 impl Drop for CountedPacketConn {
@@ -1604,5 +1608,126 @@ mod tests {
         let new_src: SocketAddr = "127.0.0.1:45679".parse().unwrap();
         handle_udp(tunnel.inner(), b"ping", new_src, mk_metadata(new_src, dst)).await;
         assert_eq!(calls.load(Ordering::SeqCst), 1, "a new flow scans once");
+    }
+
+    /// A packet conn whose first read fails with the matchable oversize
+    /// variant (the shape a stream-framed conn produces after draining a
+    /// datagram whole) and whose second read delivers a normal packet.
+    struct OversizeThenOkConn {
+        reads: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ProxyPacketConn for OversizeThenOkConn {
+        async fn read_packet(&self, buf: &mut [u8]) -> MeowResult<(usize, SocketAddr)> {
+            if self.reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                return Err(MeowError::UdpPacketTooLarge {
+                    packet_len: 16 * 1024,
+                    buffer_len: buf.len(),
+                });
+            }
+            buf[..4].copy_from_slice(b"pong");
+            Ok((4, "127.0.0.1:53".parse().unwrap()))
+        }
+        async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> MeowResult<usize> {
+            Ok(buf.len())
+        }
+        fn local_addr(&self) -> MeowResult<SocketAddr> {
+            Ok("0.0.0.0:0".parse().unwrap())
+        }
+        fn close(&self) -> MeowResult<()> {
+            Ok(())
+        }
+    }
+
+    struct OversizeStubProxy {
+        health: ProxyHealth,
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for OversizeStubProxy {
+        fn name(&self) -> &str {
+            "oversize-stub"
+        }
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+        fn addr(&self) -> &str {
+            ""
+        }
+        fn support_udp(&self) -> bool {
+            true
+        }
+        async fn dial_tcp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyConn>> {
+            Err(MeowError::NotSupported("stub".into()))
+        }
+        async fn dial_udp(&self, _metadata: &Metadata) -> MeowResult<Box<dyn ProxyPacketConn>> {
+            Ok(Box::new(OversizeThenOkConn {
+                reads: AtomicUsize::new(0),
+            }))
+        }
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    impl Proxy for OversizeStubProxy {
+        fn alive(&self) -> bool {
+            true
+        }
+        fn alive_for_url(&self, _url: &str) -> bool {
+            true
+        }
+        fn last_delay(&self) -> u16 {
+            0
+        }
+        fn last_delay_for_url(&self, _url: &str) -> u16 {
+            0
+        }
+        fn delay_history(&self) -> Vec<DelayHistory> {
+            Vec::new()
+        }
+    }
+
+    /// The counted wrapper must forward the matchable oversize variant
+    /// unharmed — a `Proxy`/stringification at this layer would make the
+    /// XUDP reply loop retire flows it should keep — and must not count
+    /// the dropped datagram as download bytes.
+    #[tokio::test]
+    async fn counted_conn_forwards_oversize_variant_uncounted() {
+        let tunnel = mk_tunnel();
+        let stats = tunnel.statistics();
+        let proxy = OversizeStubProxy {
+            health: ProxyHealth::new(),
+        };
+        let src: SocketAddr = "127.0.0.1:41100".parse().unwrap();
+        let dst: SocketAddr = "127.0.0.1:53".parse().unwrap();
+        let conn = tunnel
+            .inner()
+            .dial_udp(&proxy, &mk_metadata(src, dst))
+            .await
+            .expect("dial");
+
+        let mut buf = [0u8; 8192];
+        let err = conn
+            .read_packet(&mut buf)
+            .await
+            .expect_err("first read is the oversize drop");
+        assert!(
+            matches!(err, MeowError::UdpPacketTooLarge { packet_len, .. } if packet_len == 16 * 1024),
+            "the variant must survive the counted wrapper matchable, got: {err}"
+        );
+        assert_eq!(
+            stats.snapshot(),
+            (0, 0),
+            "a dropped oversize datagram counts no download bytes"
+        );
+
+        let (n, _) = conn
+            .read_packet(&mut buf)
+            .await
+            .expect("second read delivers");
+        assert_eq!(&buf[..n], b"pong");
+        assert_eq!(stats.snapshot(), (0, 4));
     }
 }

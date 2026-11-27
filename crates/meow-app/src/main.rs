@@ -870,7 +870,8 @@ fn vless_security_spec(security: &meow_config::VlessSecurity) -> meow_listener::
         },
         meow_config::VlessSecurity::Reality(reality) => {
             meow_listener::VlessSecuritySpec::Reality(meow_listener::VlessRealitySpec {
-                dest: reality.dest.clone(),
+                dest_host: reality.dest_host.clone(),
+                dest_port: reality.dest_port,
                 private_key: reality.private_key,
                 short_ids: reality.short_ids.clone(),
                 server_names: reality.server_names.clone(),

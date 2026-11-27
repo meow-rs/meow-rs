@@ -140,11 +140,14 @@ impl PacketReader {
 
         let packet_len = self.payload.len();
         if packet_len > out.len() {
+            // Fully drained before erroring, so the framing stays aligned —
+            // the matchable variant lets the caller drop just this packet
+            // instead of retiring the conn.
             self.reset();
-            return Err(MeowError::Proxy(format!(
-                "mux: UDP packet ({packet_len} bytes) exceeds read buffer ({} bytes)",
-                out.len()
-            )));
+            return Err(MeowError::UdpPacketTooLarge {
+                packet_len,
+                buffer_len: out.len(),
+            });
         }
         out[..packet_len].copy_from_slice(&self.payload);
         self.reset();
