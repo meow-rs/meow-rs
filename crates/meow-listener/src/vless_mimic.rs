@@ -434,7 +434,10 @@ impl TargetIo for TcpStream {
                 buf.len(),
             )
         };
-        socket.recv(uninit)
+        match socket.recv(uninit) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => socket.recv(uninit),
+            result => result,
+        }
     }
 }
 
