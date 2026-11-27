@@ -6,8 +6,8 @@
 //! streamed through the parser, never reassembled into an allocation.
 
 use super::codec::{
-    TLS13_CIPHER_SUITES, TLS_CLIENT_HELLO, TLS_FILTER_PACKETS, TLS_HANDSHAKE, TLS_MAJOR,
-    TLS_SERVER_HELLO,
+    TlsRecordVersion, TLS13_CIPHER_SUITES, TLS_CLIENT_HELLO, TLS_FILTER_PACKETS, TLS_HANDSHAKE,
+    TLS_MAJOR, TLS_SERVER_HELLO,
 };
 
 const TLS_VERSION_1_2: u16 = 0x0303;
@@ -18,6 +18,7 @@ const SERVER_HELLO_MIN_LEN: usize = 2 + 32 + 1 + 2 + 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ServerHelloOutcome {
     tls13_supported: bool,
+    record_version: Option<TlsRecordVersion>,
     cipher: Option<u16>,
 }
 
@@ -270,14 +271,23 @@ impl ServerHelloParser {
     }
 
     fn outcome(&self) -> ServerHelloOutcome {
-        let tls13_supported = self.stage == ServerHelloStage::Complete
+        let structurally_valid = self.stage == ServerHelloStage::Complete
             && self.server_version == Some(TLS_VERSION_1_2)
-            && self.compression == Some(0)
+            && self.compression == Some(0);
+        let tls13_supported = structurally_valid
             && self.supported_versions_seen
             && self.supported_versions_tls13
             && !self.supported_versions_duplicate;
+        let record_version = if tls13_supported {
+            Some(TlsRecordVersion::Tls13)
+        } else if structurally_valid && !self.supported_versions_seen {
+            Some(TlsRecordVersion::Tls12)
+        } else {
+            None
+        };
         ServerHelloOutcome {
             tls13_supported,
+            record_version,
             cipher: self.cipher,
         }
     }
@@ -507,6 +517,13 @@ impl TlsRecordScanner {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ServerHelloObservation {
+    pub(crate) end: usize,
+    pub(crate) version: Option<TlsRecordVersion>,
+    pub(crate) direct_cipher: bool,
+}
+
 /// TLS detection state shared by both directions of one Vision connection.
 /// The packet budget is deliberately shared, matching xray's single
 /// `NumberOfPacketToFilter` counter: uplink and downlink non-empty chunks
@@ -568,17 +585,33 @@ impl TlsInspector {
         self.apply_scanner_flags();
     }
 
-    /// Observe downlink bytes.  The returned index is the first byte after
-    /// the record carrying the first ServerHello decision, when that record
-    /// ends inside this chunk.
-    pub(crate) fn observe_server_stream(&mut self, chunk: &[u8]) -> Option<usize> {
+    /// Observe downlink bytes.  A returned observation carries the end of the
+    /// record containing the first ServerHello decision plus the version and
+    /// cipher eligibility identified from that same ServerHello.
+    pub(crate) fn observe_server_stream(&mut self, chunk: &[u8]) -> Option<ServerHelloObservation> {
         if chunk.is_empty() || self.packets_left == 0 {
             return None;
         }
         self.packets_left -= 1;
         let serverhello_end = self.server_stream.feed(chunk);
+        let outcome = self.server_stream.outcome;
         self.apply_scanner_flags();
-        serverhello_end
+        serverhello_end.map(|end| {
+            let (version, direct_cipher) = outcome.map_or((None, false), |outcome| {
+                (
+                    outcome.record_version,
+                    outcome.tls13_supported
+                        && outcome
+                            .cipher
+                            .is_some_and(|cipher| TLS13_CIPHER_SUITES.contains(&cipher)),
+                )
+            });
+            ServerHelloObservation {
+                end,
+                version,
+                direct_cipher,
+            }
+        })
     }
 
     fn apply_scanner_flags(&mut self) {
@@ -682,10 +715,26 @@ mod tests {
     fn tls12_serverhello_without_supported_versions_does_not_enable_direct() {
         let hello = serverhello_record(&[], 0x1301, None);
         let mut inspector = TlsInspector::new();
-        inspector.observe_server_stream(&hello);
+        let observation = inspector.observe_server_stream(&hello).unwrap();
+        assert_eq!(observation.end, hello.len());
+        assert_eq!(observation.version, Some(TlsRecordVersion::Tls12));
+        assert!(!observation.direct_cipher);
         assert!(inspector.is_tls12_or_above());
         assert!(!inspector.enable_xtls());
         assert_eq!(inspector.packets_left(), 0);
+    }
+
+    #[test]
+    fn tls13_version_is_independent_of_direct_cipher_eligibility() {
+        let vector = extension(EXT_SUPPORTED_VERSIONS, &[0x03, 0x04]);
+        for (cipher, direct) in [(0x1301, true), (0x1305, false)] {
+            let hello = serverhello_record(&[], cipher, Some(&vector));
+            let mut inspector = TlsInspector::new();
+            let observation = inspector.observe_server_stream(&hello).unwrap();
+            assert_eq!(observation.version, Some(TlsRecordVersion::Tls13));
+            assert_eq!(observation.direct_cipher, direct);
+            assert_eq!(inspector.enable_xtls(), direct);
+        }
     }
 
     #[test]
@@ -729,7 +778,8 @@ mod tests {
         vector.extend_from_slice(&one);
         let hello = serverhello_record(&[], 0x1301, Some(&vector));
         let mut inspector = TlsInspector::new();
-        inspector.observe_server_stream(&hello);
+        let observation = inspector.observe_server_stream(&hello).unwrap();
+        assert_eq!(observation.version, None);
         assert!(inspector.is_tls12_or_above());
         assert!(!inspector.enable_xtls());
         assert_eq!(inspector.packets_left(), 0);

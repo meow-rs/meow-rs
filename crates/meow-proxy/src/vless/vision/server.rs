@@ -136,15 +136,18 @@ impl VisionServerConn {
         }
         match self.mode {
             VisionServerMode::Tcp => {
-                let serverhello_end = self.inspector.observe_server_stream(chunk);
+                let observation = self.inspector.observe_server_stream(chunk);
                 let start = if self.downlink_records.active() {
                     0
                 } else {
-                    let Some(start) = serverhello_end else {
+                    let Some(observation) = observation else {
                         return false;
                     };
-                    self.downlink_records.activate();
-                    start
+                    let Some(version) = observation.version else {
+                        return false;
+                    };
+                    self.downlink_records.activate(version);
+                    observation.end
                 };
                 if start > chunk.len() {
                     return false;
@@ -455,11 +458,43 @@ impl AsyncRead for VisionServerConn {
                     }
                     let filled_before = buf.filled().len();
                     let n = {
+                        let seed = buf
+                            .initialized()
+                            .len()
+                            .saturating_sub(filled_before)
+                            .min(want);
                         let mut bounded = buf.take(want);
+                        if seed != 0 {
+                            // The child starts at the parent's unfilled cursor;
+                            // the seed prefix is exactly the region the parent
+                            // already knows to be initialized.
+                            unsafe { bounded.assume_init(seed) };
+                        }
+                        let start = bounded.filled().as_ptr();
+                        let capacity = bounded.capacity();
                         match Pin::new(&mut *this.inner).poll_read(cx, &mut bounded) {
                             Poll::Pending => return Poll::Pending,
                             Poll::Ready(Err(error)) => return Poll::Ready(Err(error)),
-                            Poll::Ready(Ok(())) => bounded.filled().len(),
+                            Poll::Ready(Ok(())) => {
+                                assert_eq!(
+                                    bounded.filled().as_ptr(),
+                                    start,
+                                    "AsyncRead implementation replaced the bounded ReadBuf"
+                                );
+                                assert!(
+                                    bounded.capacity() <= capacity,
+                                    "bounded ReadBuf grew beyond the parent's unfilled region"
+                                );
+                                let initialized = bounded.initialized().len();
+                                let filled = bounded.filled().len();
+                                if initialized != 0 {
+                                    // The checked child cursors describe a
+                                    // contiguous prefix of the parent's current
+                                    // unfilled region.
+                                    unsafe { buf.assume_init(initialized) };
+                                }
+                                filled
+                            }
                         }
                     };
                     if n == 0 {
@@ -594,6 +629,7 @@ impl ProxyConn for VisionServerConn {}
 mod tests {
     use super::*;
     use crate::vless::golden::vectors;
+    use bytes::BufMut;
     use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt, DuplexStream};
 
     const UUID: [u8; 16] = vectors::GOLDEN_UUID;
@@ -645,6 +681,33 @@ mod tests {
         frame.extend_from_slice(content);
         frame.resize(frame.len() + padding_len, 0);
         frame
+    }
+
+    async fn assert_padded_content_read_through_bulk_spare(preinitialize: usize) {
+        let payload = b"bulk-read";
+        let (mut conn, mut peer) = server_over_pipe(VisionServerMode::Tcp);
+        peer.write_all(&feed_frame(COMMAND_PADDING_CONTINUE, true, payload, 0))
+            .await
+            .unwrap();
+
+        let mut storage = bytes::BytesMut::with_capacity(64);
+        {
+            let spare = storage.chunk_mut();
+            // The same spare-capacity view tokio_util::io::poll_read_buf
+            // hands to readers on the relay's BytesMut bulk path.
+            let spare = unsafe { spare.as_uninit_slice_mut() };
+            let mut read_buf = ReadBuf::uninit(spare);
+            if preinitialize != 0 {
+                read_buf.initialize_unfilled_to(preinitialize);
+            }
+            let waker = futures::task::noop_waker();
+            let mut cx = Context::from_waker(&waker);
+            match Pin::new(&mut conn).poll_read(&mut cx, &mut read_buf) {
+                Poll::Ready(Ok(())) => {}
+                other => panic!("scripted frame must be immediately readable: {other:?}"),
+            }
+            assert_eq!(read_buf.filled(), payload);
+        }
     }
 
     fn golden_serverhello() -> Vec<u8> {
@@ -946,6 +1009,16 @@ mod tests {
         let mut got = vec![0u8; payload.len()];
         conn.read_exact(&mut got).await.unwrap();
         assert_eq!(&got, payload);
+    }
+
+    #[tokio::test]
+    async fn padded_content_read_supports_uninitialized_bulk_spare() {
+        assert_padded_content_read_through_bulk_spare(0).await;
+    }
+
+    #[tokio::test]
+    async fn padded_content_read_supports_partially_initialized_bulk_spare() {
+        assert_padded_content_read_through_bulk_spare(4).await;
     }
 
     #[tokio::test]
@@ -1279,6 +1352,53 @@ mod tests {
             0,
             "DIRECT releases the frame allocation"
         );
+    }
+
+    #[tokio::test]
+    async fn tls13_oversize_app_record_is_not_direct_evidence() {
+        let (mut conn, mut peer) = server_over_pipe(VisionServerMode::Tcp);
+        conn.raw_write_capable = true;
+        conn.write_all(&golden_serverhello()).await.unwrap();
+
+        let oversized_payload = vec![0x5au8; 16 * 1024 + 257];
+        let oversized = app_data_record(&oversized_payload);
+        conn.write_all(&oversized).await.unwrap();
+        let oversized_flush = conn.flush().await;
+
+        read_response_header(&mut peer).await;
+        let mut commands = Vec::new();
+        let mut reassembled = Vec::new();
+        for index in 0..3 {
+            let (command, content, _) = read_server_frame(&mut peer, index == 0).await;
+            commands.push(command);
+            if index > 0 {
+                reassembled.extend_from_slice(&content);
+            }
+        }
+        assert_eq!(
+            commands,
+            [
+                COMMAND_PADDING_CONTINUE,
+                COMMAND_PADDING_CONTINUE,
+                COMMAND_PADDING_CONTINUE,
+            ],
+            "an over-cap TLS 1.3 record must not earn END or DIRECT"
+        );
+        assert_eq!(reassembled, oversized, "framing remains byte-exact");
+        assert!(
+            oversized_flush.is_ok(),
+            "without a DIRECT promise the flush stays inside padding: {oversized_flush:?}"
+        );
+
+        // A later clean batch can still prove eligibility: the over-cap
+        // record invalidates only the evidence boundary it belongs to.
+        let valid = app_data_record(b"valid-after-oversize");
+        conn.write_all(&valid).await.unwrap();
+        let err = conn.flush().await.unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::Unsupported);
+        let (command, content, _) = read_server_frame(&mut peer, false).await;
+        assert_eq!(command, COMMAND_PADDING_DIRECT);
+        assert_eq!(content, valid);
     }
 
     #[test]

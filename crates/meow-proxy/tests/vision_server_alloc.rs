@@ -16,6 +16,11 @@ use std::io;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+#[cfg(feature = "mux")]
+use meow_proxy::mux::xudp::{
+    encode_reply_keep_data, XudpAction, XudpAddr, XudpDecoder, XudpFrame, XudpNetwork, XudpServer,
+    XudpTarget,
+};
 use meow_proxy::vless_inbound::{VisionServerConn, VisionServerMode};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
@@ -251,4 +256,112 @@ fn hostile_u16_lengths_cannot_force_allocation() {
     // 65535 + 3 content bytes declared, 2048 already delivered by the
     // warm-up: every declared content byte — and nothing else — arrives.
     assert_eq!(total, usize::from(u16::MAX) + 3 - 2048);
+}
+
+#[cfg(feature = "mux")]
+fn xudp_keep_data_wire(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&4u16.to_be_bytes()); // meta_len: sid + status + option
+    out.extend_from_slice(&0u16.to_be_bytes());
+    out.push(0x02); // Keep
+    out.push(0x01); // Data
+    out.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+    out.extend_from_slice(payload);
+    out
+}
+
+/// XUDP owns datagrams as `Bytes` while they sit in the listener's queues.
+/// Once the fixed slab metadata is warm, recycling those owned buffers must
+/// make both codec directions allocation-free; the traffic below exceeds the
+/// pool's total backing store several times over.
+#[cfg(feature = "mux")]
+#[test]
+fn xudp_steady_state_codec_paths_allocate_nothing() {
+    const DEPTH: usize = 8;
+    const ITERATIONS: usize = 320;
+
+    let target = XudpTarget {
+        addr: XudpAddr::Ipv4(std::net::Ipv4Addr::new(192, 0, 2, 53)),
+        port: 53,
+    };
+    let payload = vec![0x5au8; 1024];
+    let wire = xudp_keep_data_wire(&payload);
+
+    let mut decoder = XudpDecoder::new();
+    let mut server = XudpServer::new(true);
+    server
+        .handle_frame(XudpFrame::New {
+            session_id: 0,
+            network: XudpNetwork::Udp,
+            target: target.clone(),
+            global_id: None,
+            payload: None,
+        })
+        .unwrap();
+
+    let mut ingress_in_flight = Vec::with_capacity(DEPTH);
+    for _ in 0..64 {
+        decoder.feed(&wire).unwrap();
+        let frame = decoder.next_frame().unwrap();
+        let action = server.handle_frame(frame).unwrap().unwrap();
+        ingress_in_flight.push(action);
+        if ingress_in_flight.len() == DEPTH {
+            ingress_in_flight.clear();
+        }
+    }
+    ingress_in_flight.clear();
+
+    let (ingress_allocs, ingress_bytes) = allocation_count(|| {
+        let mut bytes = 0usize;
+        for _ in 0..ITERATIONS {
+            decoder.feed(&wire).unwrap();
+            let frame = decoder.next_frame().unwrap();
+            let action = server.handle_frame(frame).unwrap().unwrap();
+            if let XudpAction::Datagram { payload, .. } = &action {
+                bytes += payload.len();
+            }
+            ingress_in_flight.push(action);
+            if ingress_in_flight.len() == DEPTH {
+                ingress_in_flight.clear();
+            }
+        }
+        bytes
+    });
+    assert_eq!(ingress_bytes, ITERATIONS * payload.len());
+
+    let reply_payload = vec![0xa5u8; 1024];
+    const REPLY_WIRE_LEN: usize = 2 + 4 + 8 + 2 + 1024;
+    let mut egress_in_flight = Vec::with_capacity(DEPTH);
+    let mut warmup_hold = Vec::new();
+    for index in 0..320 {
+        let frame = encode_reply_keep_data(0, Some(&target), &reply_payload).unwrap();
+        if index == 0 {
+            assert_eq!(frame.len(), REPLY_WIRE_LEN);
+        }
+        warmup_hold.push(frame);
+    }
+    drop(warmup_hold);
+
+    let (egress_allocs, egress_bytes) = allocation_count(|| {
+        let mut bytes = 0usize;
+        for _ in 0..ITERATIONS {
+            let frame = encode_reply_keep_data(0, Some(&target), &reply_payload).unwrap();
+            bytes += frame.len();
+            egress_in_flight.push(frame);
+            if egress_in_flight.len() == DEPTH {
+                egress_in_flight.clear();
+            }
+        }
+        bytes
+    });
+    assert_eq!(egress_bytes, ITERATIONS * REPLY_WIRE_LEN);
+
+    assert_eq!(
+        ingress_allocs, 0,
+        "XUDP ingress allocated {ingress_allocs} times in steady state"
+    );
+    assert_eq!(
+        egress_allocs, 0,
+        "XUDP egress allocated {egress_allocs} times in steady state"
+    );
 }

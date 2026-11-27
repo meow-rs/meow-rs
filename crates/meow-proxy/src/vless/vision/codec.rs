@@ -35,6 +35,26 @@ pub(crate) const XRAY_PADDING_CONTENT_CAP: usize = XRAY_BUFFER_SIZE - PADDING_HE
 pub(crate) const FRAME_CONTENT_CAP: usize = 16 * 1024;
 pub(crate) const PADDING_SCRATCH_LEN: usize = 1024;
 
+/// TLS version identified from the negotiated ServerHello, used only to
+/// select the record-length ceiling for later ciphertext evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TlsRecordVersion {
+    Tls12,
+    Tls13,
+}
+
+impl TlsRecordVersion {
+    fn max_record_body_len(self) -> usize {
+        match self {
+            // RFC 8446 §5.2: 2^14 plaintext bytes plus at most 256 bytes of
+            // encryption expansion.  TLS 1.2 permits the older 2^14 + 2048
+            // ciphertext envelope (RFC 5246 §6.2.3).
+            Self::Tls13 => 16 * 1024 + 256,
+            Self::Tls12 => 16 * 1024 + 2048,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaddingCommand {
     Continue,
@@ -277,6 +297,7 @@ pub(crate) fn capped_padding_len(content_len: usize, long_padding: bool) -> usiz
 #[derive(Clone, Copy)]
 pub(crate) struct TlsAppRecordTracker {
     active: bool,
+    version: TlsRecordVersion,
     header: [u8; 5],
     header_len: usize,
     body_remaining: usize,
@@ -289,6 +310,7 @@ impl TlsAppRecordTracker {
     pub(crate) fn new() -> Self {
         Self {
             active: false,
+            version: TlsRecordVersion::Tls13,
             header: [0; 5],
             header_len: 0,
             body_remaining: 0,
@@ -300,9 +322,10 @@ impl TlsAppRecordTracker {
 
     /// Start tracking exactly at the record boundary that ends the inner
     /// ServerHello record.
-    pub(crate) fn activate(&mut self) {
+    pub(crate) fn activate(&mut self, version: TlsRecordVersion) {
         *self = Self {
             active: true,
+            version,
             ..Self::new()
         };
     }
@@ -334,7 +357,7 @@ impl TlsAppRecordTracker {
         self.record_valid = self.header[0] == TLS_APPLICATION_DATA
             && self.header[1] == TLS_MAJOR
             && self.header[2] == TLS_MAJOR
-            && record_len != 0;
+            && (1..=self.version.max_record_body_len()).contains(&record_len);
         if !self.record_valid {
             self.batch_valid = false;
             self.complete_streak = false;
@@ -437,7 +460,7 @@ mod tests {
         let second = app_record(b"world!");
         let split = 3;
         let mut tracker = TlsAppRecordTracker::new();
-        tracker.activate();
+        tracker.activate(TlsRecordVersion::Tls13);
 
         assert!(!tracker.feed_batch(&first[..split]));
         let mut remainder = first[split..].to_vec();
@@ -446,9 +469,46 @@ mod tests {
     }
 
     #[test]
+    fn tracker_tls13_record_length_cap_is_enforced() {
+        let exact_payload = vec![0u8; 16 * 1024 + 256];
+        let mut tracker = TlsAppRecordTracker::new();
+        tracker.activate(TlsRecordVersion::Tls13);
+        assert!(tracker.feed_batch(&app_record(&exact_payload)));
+
+        let oversized_payload = vec![0u8; 16 * 1024 + 257];
+        let mut tracker = TlsAppRecordTracker::new();
+        tracker.activate(TlsRecordVersion::Tls13);
+        assert!(
+            !tracker.feed_batch(&app_record(&oversized_payload)),
+            "TLS 1.3 ciphertext records above 2^14 + 256 must not be DIRECT evidence"
+        );
+    }
+
+    #[test]
+    fn tracker_tls12_uses_legacy_record_length_cap() {
+        let legacy_len = 16 * 1024 + 257;
+        let mut tracker = TlsAppRecordTracker::new();
+        tracker.activate(TlsRecordVersion::Tls12);
+        assert!(
+            tracker.feed_batch(&app_record(&vec![0u8; legacy_len])),
+            "lengths above the TLS 1.3 cap remain valid TLS 1.2 records"
+        );
+
+        let exact_payload = vec![0u8; 16 * 1024 + 2048];
+        let mut tracker = TlsAppRecordTracker::new();
+        tracker.activate(TlsRecordVersion::Tls12);
+        assert!(tracker.feed_batch(&app_record(&exact_payload)));
+
+        let oversized_payload = vec![0u8; 16 * 1024 + 2049];
+        let mut tracker = TlsAppRecordTracker::new();
+        tracker.activate(TlsRecordVersion::Tls12);
+        assert!(!tracker.feed_batch(&app_record(&oversized_payload)));
+    }
+
+    #[test]
     fn tracker_rejects_foreign_and_zero_length_records_for_the_batch() {
         let mut tracker = TlsAppRecordTracker::new();
-        tracker.activate();
+        tracker.activate(TlsRecordVersion::Tls13);
 
         let mut batch = app_record(b"data");
         batch.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
@@ -457,7 +517,7 @@ mod tests {
         assert!(tracker.feed_batch(&app_record(b"next batch")));
 
         let mut tracker = TlsAppRecordTracker::new();
-        tracker.activate();
+        tracker.activate(TlsRecordVersion::Tls13);
         assert!(!tracker.feed_batch(&app_record(b"")));
         assert!(tracker.feed_batch(&app_record(b"valid afterwards")));
     }
@@ -468,7 +528,7 @@ mod tests {
         buf.extend(app_record(&[0u8; 100]));
         buf.extend(app_record(&[0u8; 100]));
         let mut tracker = TlsAppRecordTracker::new();
-        tracker.activate();
+        tracker.activate(TlsRecordVersion::Tls13);
         // Each record is 105 bytes; cap 220 fits exactly two.
         assert_eq!(tracker.aligned_cut(&buf, 220), 210);
         assert_eq!(tracker.aligned_cut(&buf, 210), 210);
@@ -479,7 +539,7 @@ mod tests {
     fn tracker_aligned_cut_falls_back_when_first_record_exceeds_cap() {
         let buf = app_record(&[0u8; 500]);
         let mut tracker = TlsAppRecordTracker::new();
-        tracker.activate();
+        tracker.activate(TlsRecordVersion::Tls13);
         assert_eq!(tracker.aligned_cut(&buf, 100), 100);
     }
 

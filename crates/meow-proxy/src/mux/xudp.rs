@@ -67,8 +67,10 @@
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use bytes::{BufMut, Bytes, BytesMut};
+use parking_lot::Mutex;
 use smol_str::SmolStr;
 
 use super::muxcool::{
@@ -93,6 +95,65 @@ pub const MAX_PAYLOAD_LEN: usize = MAX_UDP_PAYLOAD;
 /// at the same number keeps the table itself bounded under sid spraying.
 /// Real XUDP clients only ever use sid 0.
 pub const MAX_SESSIONS: usize = 128;
+
+const XUDP_POOL_SHARDS: usize = 4;
+const XUDP_POOL_SLABS_PER_SHARD: usize = 4;
+const XUDP_POOL_SLAB_LEN: usize = 16 * 1024;
+
+struct XudpSlabShard {
+    slots: [Option<BytesMut>; XUDP_POOL_SLABS_PER_SHARD],
+    next: usize,
+}
+
+impl XudpSlabShard {
+    const fn new() -> Self {
+        Self {
+            slots: [const { None }; XUDP_POOL_SLABS_PER_SHARD],
+            next: 0,
+        }
+    }
+
+    fn checkout(&mut self, len: usize) -> Option<BytesMut> {
+        for offset in 0..XUDP_POOL_SLABS_PER_SHARD {
+            let index = (self.next + offset) % XUDP_POOL_SLABS_PER_SHARD;
+            if self.slots[index].is_none() {
+                self.slots[index] = Some(BytesMut::with_capacity(XUDP_POOL_SLAB_LEN));
+            }
+            let tail = self.slots[index].as_mut()?;
+            debug_assert_eq!(tail.len(), 0);
+            if tail.capacity() < len && !tail.try_reclaim(len) {
+                continue;
+            }
+            let rest = tail.split_off(len);
+            let out = std::mem::replace(tail, rest);
+            self.next = index;
+            return Some(out);
+        }
+        None
+    }
+}
+
+static XUDP_SLAB_POOL: [Mutex<XudpSlabShard>; XUDP_POOL_SHARDS] =
+    [const { Mutex::new(XudpSlabShard::new()) }; XUDP_POOL_SHARDS];
+static XUDP_POOL_NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
+
+/// Exact-size writable backing for one XUDP datagram/frame. Pool slots stay
+/// zero-length tails: splitting first makes the returned prefix independently
+/// owned, while frozen `Bytes` in queues pin only their own slab region. When
+/// every fixed slot is pinned, exact allocation is the correct fallback —
+/// backpressure and queue limits belong to the listener, not the codec.
+fn xudp_frame_buffer(len: usize) -> BytesMut {
+    if len <= XUDP_POOL_SLAB_LEN {
+        let start = XUDP_POOL_NEXT_SHARD.fetch_add(1, Ordering::Relaxed) % XUDP_POOL_SHARDS;
+        for offset in 0..XUDP_POOL_SHARDS {
+            let index = (start + offset) % XUDP_POOL_SHARDS;
+            if let Some(buf) = XUDP_SLAB_POOL[index].lock().checkout(len) {
+                return buf;
+            }
+        }
+    }
+    BytesMut::with_capacity(len)
+}
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -479,7 +540,7 @@ pub struct XudpDecoder {
     meta_pos: usize,
     head: Option<FrameHead>,
     payload_len: usize,
-    payload: Vec<u8>,
+    payload: Option<BytesMut>,
     ready: VecDeque<XudpFrame>,
 }
 
@@ -500,7 +561,7 @@ impl XudpDecoder {
             meta_pos: 0,
             head: None,
             payload_len: 0,
-            payload: Vec::new(),
+            payload: None,
             ready: VecDeque::new(),
         }
     }
@@ -553,8 +614,7 @@ impl XudpDecoder {
                                 return Err(XudpError::PayloadTooLarge(len as u16));
                             }
                             self.payload_len = len;
-                            self.payload.clear();
-                            self.payload.reserve(len);
+                            self.payload = (len != 0).then(|| xudp_frame_buffer(len));
                             if len == 0 {
                                 self.emit_frame();
                                 self.state = DecodeState::MetaLen;
@@ -586,11 +646,15 @@ impl XudpDecoder {
                     };
                 }
                 DecodeState::Payload => {
-                    let need = self.payload_len - self.payload.len();
+                    let payload = self
+                        .payload
+                        .as_mut()
+                        .expect("non-zero payload length allocates its gather buffer");
+                    let need = self.payload_len - payload.len();
                     let take = need.min(input.len());
-                    self.payload.extend_from_slice(&input[..take]);
+                    payload.extend_from_slice(&input[..take]);
                     input = &input[take..];
-                    if self.payload.len() < self.payload_len {
+                    if payload.len() < self.payload_len {
                         continue;
                     }
                     self.emit_frame();
@@ -601,16 +665,16 @@ impl XudpDecoder {
         Ok(())
     }
 
-    /// Assemble the public frame from the parsed head plus whatever
-    /// payload accumulated, and queue it. The gather buffer moves into
-    /// the frame — the fill copy is the only one, since fragmented input
-    /// has to be gathered regardless; the next frame's buffer regrows
-    /// from empty, bounded by the same 8192 cap.
+    /// Assemble the public frame from the parsed head plus whatever payload
+    /// accumulated, and queue it. Freezing moves backing ownership to the
+    /// queued datagram; no decoder-owned copy remains to pin the slab.
     fn emit_frame(&mut self) {
         let head = self.head.take().expect("emit requires a parsed head");
         let payload = head.has_data.then(|| {
-            debug_assert_eq!(self.payload.len(), self.payload_len);
-            Bytes::from(std::mem::take(&mut self.payload))
+            self.payload.take().map_or_else(Bytes::new, |buf| {
+                debug_assert_eq!(buf.len(), self.payload_len);
+                buf.freeze()
+            })
         });
         let frame = match head.status {
             STATUS_NEW => XudpFrame::New {
@@ -717,7 +781,7 @@ pub fn encode_reply_keep_data(
     payload: &[u8],
 ) -> Option<Bytes> {
     let capacity = encoded_reply_keep_data_len(source, payload.len())?;
-    let mut out = BytesMut::with_capacity(capacity);
+    let mut out = xudp_frame_buffer(capacity);
     out.put_u16(0); // meta_len placeholder, patched below
     out.put_u16(session_id);
     out.put_u8(STATUS_KEEP);
