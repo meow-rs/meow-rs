@@ -418,7 +418,23 @@ pub(crate) trait TargetIo: Stream + 'static {
 
 impl TargetIo for TcpStream {
     fn try_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        TcpStream::try_read(self, buf)
+        // tokio::TcpStream::try_read is gated by cached readiness.  The
+        // pre-commit barrier must instead ask the kernel: the scan loop may
+        // legitimately have drained the socket and cleared READABLE before a
+        // byte arrives inside the synchronous prepare window.  socket2 performs
+        // a plain nonblocking recv on the same already-nonblocking fd; there is
+        // no tokio userspace read buffer this can race with.
+        let socket = socket2::SockRef::from(&*self);
+        // SAFETY: an initialized `u8` slice is a valid maybe-uninitialized
+        // slice over the same storage.  socket2 documents that recv initializes
+        // at most the returned prefix and never reads the input buffer.
+        let uninit = unsafe {
+            std::slice::from_raw_parts_mut(
+                buf.as_mut_ptr().cast::<std::mem::MaybeUninit<u8>>(),
+                buf.len(),
+            )
+        };
+        socket.recv(uninit)
     }
 }
 
@@ -507,15 +523,15 @@ async fn upload_ch_once(
     probe_deadline: Instant,
     handshake_deadline: Instant,
 ) -> UploadWriteOutcome {
-    let mut write = Box::pin(target.write(bytes));
+    let mut write = Box::pin(target.write_all(bytes));
     tokio::select! {
         biased;
         _ = tokio::time::sleep_until(handshake_deadline) => UploadWriteOutcome::HandshakeDeadline,
         _ = tokio::time::sleep_until(probe_deadline) => UploadWriteOutcome::ProbeDeadline,
         result = &mut write => {
             match result {
-                Ok(n) if n == bytes.len() => UploadWriteOutcome::Written,
-                Ok(_) | Err(_) => UploadWriteOutcome::Io,
+                Ok(()) => UploadWriteOutcome::Written,
+                Err(_) => UploadWriteOutcome::Io,
             }
         }
     }
@@ -1002,6 +1018,9 @@ where
         return None;
     }
 
+    #[cfg(test)]
+    tests::invoke_pre_commit_hook();
+
     let mut tail = [0u8; 1];
     match target.stream.try_read(&mut tail) {
         Ok(0) => {
@@ -1096,6 +1115,19 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
     use tokio::time::advance;
 
+    thread_local! {
+        static PRE_COMMIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    pub(super) fn invoke_pre_commit_hook() {
+        PRE_COMMIT_HOOK.with(|hook| {
+            if let Some(hook) = hook.borrow_mut().take() {
+                hook();
+            }
+        });
+    }
+
     const PRIVATE: [u8; 32] = [0x42; 32];
     const SHORT: [u8; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
 
@@ -1164,6 +1196,9 @@ mod tests {
         steps: Arc<Mutex<VecDeque<TryStep>>>,
         dropped: Arc<std::sync::atomic::AtomicBool>,
         writes: Arc<Mutex<Vec<u8>>>,
+        max_write_chunk: usize,
+        zero_writes: bool,
+        write_calls: Arc<AtomicUsize>,
     }
 
     impl Drop for MockTarget {
@@ -1188,9 +1223,15 @@ mod tests {
             cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if self.zero_writes {
+                self.write_calls.fetch_add(1, Ordering::Relaxed);
+                return Poll::Ready(Ok(0));
+            }
+            let limited = &buf[..buf.len().min(self.max_write_chunk)];
+            let result = Pin::new(&mut self.inner).poll_write(cx, limited);
             if let Poll::Ready(Ok(n)) = result {
-                self.writes.lock().unwrap().extend_from_slice(&buf[..n]);
+                self.write_calls.fetch_add(1, Ordering::Relaxed);
+                self.writes.lock().unwrap().extend_from_slice(&limited[..n]);
             }
             result
         }
@@ -1225,6 +1266,8 @@ mod tests {
         inner: DuplexStream,
         input: VecDeque<u8>,
         writes: Arc<Mutex<Vec<u8>>>,
+        fail_after_first_write_bytes: Option<usize>,
+        write_call: usize,
     }
 
     impl AsyncRead for ScriptedClient {
@@ -1249,9 +1292,20 @@ mod tests {
             cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+            let mut write_buf = buf;
+            if let Some(limit) = self.fail_after_first_write_bytes {
+                if self.write_call != 0 {
+                    return Poll::Ready(Ok(0));
+                }
+                self.write_call += 1;
+                write_buf = &buf[..buf.len().min(limit)];
+            }
+            let result = Pin::new(&mut self.inner).poll_write(cx, write_buf);
             if let Poll::Ready(Ok(n)) = result {
-                self.writes.lock().unwrap().extend_from_slice(&buf[..n]);
+                self.writes
+                    .lock()
+                    .unwrap()
+                    .extend_from_slice(&write_buf[..n]);
             }
             result
         }
@@ -1273,17 +1327,48 @@ mod tests {
         steps: Vec<TryStep>,
         writes: Arc<Mutex<Vec<u8>>>,
     ) -> (MockTarget, DuplexStream, Arc<std::sync::atomic::AtomicBool>) {
+        mock_target_shaped(steps, writes, usize::MAX, false)
+    }
+
+    fn mock_target_shaped(
+        steps: Vec<TryStep>,
+        writes: Arc<Mutex<Vec<u8>>>,
+        max_write_chunk: usize,
+        zero_writes: bool,
+    ) -> (MockTarget, DuplexStream, Arc<std::sync::atomic::AtomicBool>) {
+        let (target, peer, dropped, _) =
+            mock_target_shaped_with_counter(steps, writes, max_write_chunk, zero_writes);
+        (target, peer, dropped)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn mock_target_shaped_with_counter(
+        steps: Vec<TryStep>,
+        writes: Arc<Mutex<Vec<u8>>>,
+        max_write_chunk: usize,
+        zero_writes: bool,
+    ) -> (
+        MockTarget,
+        DuplexStream,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<AtomicUsize>,
+    ) {
         let (inner, peer) = tokio::io::duplex(256 * 1024);
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let write_calls = Arc::new(AtomicUsize::new(0));
         (
             MockTarget {
                 inner,
                 steps: Arc::new(Mutex::new(steps.into())),
                 dropped: Arc::clone(&dropped),
                 writes,
+                max_write_chunk,
+                zero_writes,
+                write_calls: Arc::clone(&write_calls),
             },
             peer,
             dropped,
+            write_calls,
         )
     }
 
@@ -1302,10 +1387,21 @@ mod tests {
                 inner,
                 input: ch.iter().copied().collect(),
                 writes: Arc::clone(&writes),
+                fail_after_first_write_bytes: None,
+                write_call: 0,
             },
             peer,
             writes,
         )
+    }
+
+    fn scripted_client_failing_after_first_write(
+        ch: &[u8],
+        bytes: usize,
+    ) -> (ScriptedClient, DuplexStream, Arc<Mutex<Vec<u8>>>) {
+        let (mut client, peer, writes) = scripted_client(ch);
+        client.fail_after_first_write_bytes = Some(bytes);
+        (client, peer, writes)
     }
 
     async fn capture_client_hello() -> Vec<u8> {
@@ -1326,7 +1422,7 @@ mod tests {
         wire
     }
 
-    async fn read_record(stream: &mut DuplexStream) -> Vec<u8> {
+    async fn read_record<S: AsyncRead + Unpin>(stream: &mut S) -> Vec<u8> {
         let mut head = [0u8; 5];
         stream.read_exact(&mut head).await.unwrap();
         let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
@@ -1391,10 +1487,10 @@ mod tests {
         ch[5 + 39..5 + 71].try_into().unwrap()
     }
 
-    fn spawn_machine(
+    fn spawn_machine<T: TargetIo>(
         runtime: &Arc<RealityRuntime>,
         client: ScriptedClient,
-        target: MockTarget,
+        target: T,
         deadline: Instant,
     ) -> tokio::task::JoinHandle<Option<Box<dyn Stream>>> {
         let permit = Arc::clone(&runtime.handshake_slots)
@@ -1419,7 +1515,10 @@ mod tests {
         })
     }
 
-    async fn upload_and_write_flight(ch: &[u8], target_peer: &mut DuplexStream) -> Vec<u8> {
+    async fn upload_and_write_flight<S: AsyncRead + AsyncWrite + Unpin>(
+        ch: &[u8],
+        target_peer: &mut S,
+    ) -> Vec<u8> {
         let uploaded = read_record(target_peer).await;
         assert_eq!(
             uploaded, ch,
@@ -1430,6 +1529,131 @@ mod tests {
         target_peer.write_all(&flight).await.unwrap();
         target_peer.flush().await.unwrap();
         flight
+    }
+
+    async fn real_target_pair() -> (TcpStream, TcpStream) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let peer = TcpStream::connect(addr).await.unwrap();
+        let (target, _) = listener.accept().await.unwrap();
+        (target, peer)
+    }
+
+    async fn real_precommit_case(eof: bool) -> (RealityV2MetricsSnapshot, Vec<u8>, Vec<u8>) {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, _client_peer, writes) = scripted_client(&ch);
+        let (target, mut target_peer) = real_target_pair().await;
+        let machine = spawn_machine(
+            &runtime,
+            client,
+            target,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let flight = upload_and_write_flight(&ch, &mut target_peer).await;
+        // Loopback TCP readiness is real OS work even though the test clock is
+        // paused.  Let the runtime process the already-uploaded flight before
+        // opening the virtual quiet window; blocking this thread would also
+        // block the current-thread state machine, so settle in a blocking task.
+        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
+        tokio::task::spawn_blocking(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            let _ = settled_tx.send(());
+        });
+        settled_rx.await.unwrap();
+        yields(10).await;
+        PRE_COMMIT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if eof {
+                    socket2::SockRef::from(&target_peer)
+                        .shutdown(std::net::Shutdown::Write)
+                        .unwrap();
+                    // FIN delivery is kernel work; keep this inside the
+                    // synchronous prepare-window hook so recv observes the
+                    // already-delivered EOF rather than a timing artifact.
+                    std::thread::sleep(Duration::from_millis(2));
+                    drop(target_peer);
+                } else {
+                    target_peer.try_write(&[0x77]).unwrap();
+                }
+            }));
+        });
+        advance(Duration::from_millis(100)).await;
+        yields(30).await;
+        let snap = snapshot(&runtime);
+        let written = writes.lock().unwrap().clone();
+        machine.abort();
+        (snap, written, flight)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_real_loopback_raw_recv_observes_prepare_window_tail_byte() {
+        let (snap, written, flight) = real_precommit_case(false).await;
+        let mut expected = flight;
+        expected.push(0x77);
+        assert_eq!(snap.cover_total.get("late_dest_bytes"), Some(&1));
+        assert_eq!(snap.committed_total, 0);
+        assert_eq!(written, expected);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_real_loopback_raw_recv_observes_prepare_window_eof() {
+        let (snap, written, flight) = real_precommit_case(true).await;
+        assert_eq!(snap.cover_total.get("dest_eof"), Some(&1));
+        assert_eq!(snap.committed_total, 0);
+        assert_eq!(written, flight);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_upload_partial_writes_continue_remaining_ch_exactly_once() {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, _client_peer, _writes) = scripted_client(&ch);
+        let target_writes = Arc::new(Mutex::new(Vec::new()));
+        let (target, mut target_peer, _dropped, write_calls) =
+            mock_target_shaped_with_counter(vec![], Arc::clone(&target_writes), 128, false);
+        let machine = spawn_machine(
+            &runtime,
+            client,
+            target,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let uploaded = read_record(&mut target_peer).await;
+        assert_eq!(
+            uploaded, ch,
+            "continued writes preserve exact CH bytes and order"
+        );
+        assert!(
+            write_calls.load(Ordering::Relaxed) > 1,
+            "test must exercise multiple partial target writes"
+        );
+        assert_eq!(snapshot(&runtime).probe_started_total, 1);
+        machine.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_upload_zero_write_closes_without_cover_or_commit() {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, _client_peer, _writes) = scripted_client(&ch);
+        let target_writes = Arc::new(Mutex::new(Vec::new()));
+        let (target, _target_peer, dropped, write_calls) =
+            mock_target_shaped_with_counter(vec![], target_writes, usize::MAX, true);
+        let machine = spawn_machine(
+            &runtime,
+            client,
+            target,
+            Instant::now() + Duration::from_secs(5),
+        );
+        yields(30).await;
+        machine.await.unwrap();
+        let snap = snapshot(&runtime);
+        assert_eq!(write_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(snap.probe_started_total, 1);
+        assert_eq!(snap.close_total.get(&("upload", "dest_io")), Some(&1));
+        assert_eq!(snap.cover_total.values().sum::<usize>(), 0);
+        assert_eq!(snap.committed_total, 0);
+        assert!(dropped.load(Ordering::Relaxed));
     }
 
     #[tokio::test(start_paused = true)]
@@ -1606,6 +1830,44 @@ mod tests {
         assert_ne!(
             written, flight,
             "committed wire is resealed rather than the recovered target prefix"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_emit_failure_after_partial_write_closes_without_cover_or_replay() {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, _client_peer, writes) = scripted_client_failing_after_first_write(&ch, 64);
+        let (target, mut target_peer, dropped) = mock_target(vec![]);
+        let machine = spawn_machine(
+            &runtime,
+            client,
+            target,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let flight = upload_and_write_flight(&ch, &mut target_peer).await;
+        yields(10).await;
+        advance(Duration::from_millis(100)).await;
+        yields(30).await;
+        machine.await.unwrap();
+        let snap = snapshot(&runtime);
+        let written = writes.lock().unwrap().clone();
+        assert_eq!(
+            written.len(),
+            64,
+            "only the accepted partial emit reaches the client"
+        );
+        assert_ne!(
+            written, flight,
+            "post-commit failure must not replay the recovered target prefix"
+        );
+        assert_eq!(snap.committed_total, 1);
+        assert_eq!(snap.close_total.get(&("emit", "emit_io")), Some(&1));
+        assert_eq!(snap.cover_total.values().sum::<usize>(), 0);
+        assert_eq!(snap.mimic_hit_total, 0);
+        assert!(
+            dropped.load(Ordering::Relaxed),
+            "post-commit failure closes the target"
         );
     }
 
