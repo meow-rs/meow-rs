@@ -1133,6 +1133,7 @@ fn endpoint_is_self(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meow_transport::Transport;
     use tokio::io::AsyncReadExt;
 
     fn test_tunnel() -> Tunnel {
@@ -1147,7 +1148,10 @@ mod tests {
         Tunnel::new(resolver)
     }
 
-    fn test_reality_listener() -> Arc<VlessListener> {
+    fn test_reality_listener_with(
+        dest_port: u16,
+        mimic: VlessRealityMimicSpec,
+    ) -> Arc<VlessListener> {
         let spec = VlessListenerSpec {
             users: vec![VlessUserSpec {
                 username: "alice".into(),
@@ -1155,18 +1159,22 @@ mod tests {
             }],
             security: VlessSecuritySpec::Reality(VlessRealitySpec {
                 dest_host: "127.0.0.1".into(),
-                dest_port: 9,
+                dest_port,
                 private_key: [0x42; 32],
                 short_ids: vec![[0; 8]],
                 server_names: vec!["localhost".into()],
                 max_time_difference_us: 0,
                 limit_fallback_upload: VlessFallbackLimit::default(),
                 limit_fallback_download: VlessFallbackLimit::default(),
-                mimic: VlessRealityMimicSpec::off(),
+                mimic,
             }),
             udp: true,
         };
         Arc::new(VlessListener::new(test_tunnel(), "test".into(), spec).unwrap())
+    }
+
+    fn test_reality_listener() -> Arc<VlessListener> {
+        test_reality_listener_with(9, VlessRealityMimicSpec::off())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1232,6 +1240,13 @@ mod tests {
             closed,
             "overflow REALITY socket was parked behind the classification semaphore instead of refused"
         );
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .close_total
+                .get(&("admission", "handshake_saturated")),
+            Some(&1)
+        );
 
         // Freeing one slot admits the next socket: it stays open, parked
         // inside the handshake exactly like a silent classified peer.
@@ -1246,6 +1261,70 @@ mod tests {
         drop(admitted);
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_first_cover_saturation_closes_without_cover_or_probe_counters() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = target.accept().await {
+                held.push(stream);
+            }
+        });
+        let listener = test_reality_listener_with(target_port, VlessRealityMimicSpec::default());
+        let SecurityRuntime::Reality(reality) = &listener.security else {
+            panic!("test listener must be REALITY");
+        };
+        let mut held_permits = Vec::new();
+        for _ in 0..REALITY_COVER_SLOTS {
+            held_permits.push(
+                Arc::clone(&reality.cover_slots)
+                    .try_acquire_owned()
+                    .unwrap(),
+            );
+        }
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+
+        let tls = meow_transport::tls::TlsConfig {
+            skip_cert_verify: true,
+            ..meow_transport::tls::TlsConfig::new("localhost")
+        };
+        let layer = meow_transport::tls::TlsLayer::new(&tls).unwrap();
+        let raw: Box<dyn Stream> = Box::new(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap(),
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), layer.connect(raw)).await;
+        let mut snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        for _ in 0..100 {
+            snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+            if snapshot.close_total.get(&("cover", "cover_saturated")) == Some(&1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            snapshot.close_total.get(&("cover", "cover_saturated")),
+            Some(&1),
+            "C saturation is the only terminal counter: {snapshot:?}"
+        );
+        assert_eq!(snapshot.cover_total.values().sum::<usize>(), 0);
+        assert_eq!(snapshot.probe_started_total, 0);
+        assert_eq!(snapshot.committed_total, 0);
+        assert_eq!(snapshot.mimic_hit_total, 0);
+        assert_eq!(snapshot.close_total.values().sum::<usize>(), 1);
+        assert_eq!(snapshot.active_handshakes, 0);
+        assert_eq!(snapshot.active_probes, 0);
+        drop(held_permits);
+        task.abort();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

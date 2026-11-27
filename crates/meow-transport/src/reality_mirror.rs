@@ -3269,4 +3269,113 @@ mod tests {
             vec![8, 307, 1, 1]
         );
     }
+
+    #[test]
+    fn staged_bprobe_capacity_measurements_cover_sha384_hybrid_and_sixteen_records() {
+        fn spread_record_lengths(total_wire: usize, record_count: usize) -> Vec<u16> {
+            let mut lengths = vec![18usize; record_count];
+            let mut extra = total_wire - record_count * (5 + 18);
+            for len in &mut lengths {
+                let add = extra.min(16_401 - 18);
+                *len += add;
+                extra -= add;
+            }
+            assert_eq!(extra, 0, "records can represent the requested wire width");
+            lengths.into_iter().map(|len| len as u16).collect()
+        }
+
+        for (name, use_hybrid, cipher) in [
+            ("x25519-sha384-16rec", false, 0x1302u16),
+            ("hybrid-sha256-16rec", true, 0x1301u16),
+            ("hybrid-sha384-16rec", true, 0x1302u16),
+        ] {
+            let hello = if use_hybrid {
+                hybrid_verified()
+            } else {
+                x25519_verified()
+            };
+            let (group, target_share) = if use_hybrid {
+                (0x11ec, hybrid_target_share())
+            } else {
+                (0x001d, x25519_public(0x40))
+            };
+            let sh = server_hello(
+                &hello,
+                cipher,
+                group,
+                &target_share,
+                false,
+                [0x77; 32],
+                0,
+                None,
+                false,
+                0x0304,
+            );
+            let base = 5 + sh.message.len() + COMPAT_CCS_RECORD.len();
+            let record_lengths = spread_record_lengths(TARGET_SCAN_WIRE_LIMIT - base, 16);
+            let prefix = target_prefix(&sh.message, true, &record_lengths);
+            assert_eq!(
+                prefix.len(),
+                TARGET_SCAN_WIRE_LIMIT,
+                "{name}: exactly W input"
+            );
+
+            let certificate = RealityCertificate::generate().expect("test certificate");
+            let context = mirror_context_for_test(&hello);
+            let retained_shares = context.key_shares.retained_capacity();
+            let mut scanner = TargetFlightScanner::new(&context, certificate.der_len())
+                .expect("mirrorable synthetic profile");
+            assert_eq!(
+                push_scanner(&mut scanner, &prefix),
+                TargetScanState::Freezable
+            );
+            let record_head_bytes =
+                scanner.record_heads.capacity() * std::mem::size_of::<[u8; 5]>();
+            // The 4096 term is the listener scan scratch.  It is counted in
+            // the scanning sample even though it is not owned by the scanner.
+            let scanning = scanner.prefix.capacity() + record_head_bytes + retained_shares + 4096;
+            assert!(scanning <= 136_417, "{name}: scanning sample {scanning}");
+
+            let template = scanner.freeze().expect("W-shaped flight freezes");
+            let frozen = template.target_prefix.capacity()
+                + template.record_heads.capacity() * std::mem::size_of::<[u8; 5]>()
+                + retained_shares;
+            assert_eq!(
+                scanning - frozen,
+                4096,
+                "{name}: scan scratch is released before prepare"
+            );
+
+            let logical_flight = mirrored_flight_len(template.cipher, certificate.der_len());
+            let small_coexisting = logical_flight
+                + certificate.der_len()
+                + template.share_range.len()
+                + 64
+                + template.record_heads.len() * std::mem::size_of::<MirroredRecordPlan>();
+            assert!(
+                small_coexisting <= 4096,
+                "{name}: small prepare allocations {small_coexisting}"
+            );
+            let prepared = prepare_mirrored_flight_context(&certificate, context, template)
+                .expect("W-shaped template prepares");
+            let prepared_and_sealed = prepared.target_prefix.capacity()
+                + prepared.wire.capacity()
+                + retained_shares
+                + 4096;
+            assert!(
+                prepared_and_sealed <= 136_417,
+                "{name}: prepared/sealed sample {prepared_and_sealed} exceeds Bprobe"
+            );
+            eprintln!(
+                "bprobe-stage {name}: scanning={scanning} frozen={frozen} prepared_or_sealed={prepared_and_sealed} small_coexisting={small_coexisting} G={retained_shares} records=16"
+            );
+            let committed = prepared.commit();
+            let (wire, _completion) = committed.into_wire_and_completion();
+            assert_eq!(
+                wire.len(),
+                TARGET_SCAN_WIRE_LIMIT,
+                "{name}: sealed wire width"
+            );
+        }
+    }
 }

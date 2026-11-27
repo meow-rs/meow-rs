@@ -2112,16 +2112,15 @@ async fn reality_mimic_ordinary_tls_enters_auth_failed_cover_once() {
         .await
         .expect("cover TLS timeout")
         .expect("cover TLS handshake through dial-first auth_failed fallback");
-    tls.write_all(b"ordinary tls through mimic cover")
-        .await
-        .unwrap();
+    let payload: Vec<u8> = (0..1024 * 1024).map(|index| (index % 251) as u8).collect();
+    tls.write_all(&payload).await.unwrap();
     tls.flush().await.unwrap();
-    let mut got = vec![0u8; b"ordinary tls through mimic cover".len()];
+    let mut got = vec![0u8; payload.len()];
     timeout(T, tls.read_exact(&mut got))
         .await
-        .expect("cover echo timeout")
-        .expect("cover echo read");
-    assert_eq!(got, b"ordinary tls through mimic cover");
+        .expect("large cover echo timeout")
+        .expect("large cover echo read");
+    assert_eq!(got, payload, "1 MiB cover transfer is byte exact");
 
     let snapshot = listener
         .reality_v2_metrics_snapshot()
@@ -2137,5 +2136,304 @@ async fn reality_mimic_ordinary_tls_enters_auth_failed_cover_once() {
         "normal cover EOF is not a close: {:?}",
         snapshot.close_total
     );
+    task.abort();
+}
+
+async fn start_silent_mimic_target() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut buf = [0u8; 8192];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+async fn start_alert_mimic_target() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let _first = read_one_tls_record(&mut stream).await;
+                // fatal alert: TLS alert record, handshake-failure-ish body
+                stream
+                    .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28])
+                    .await
+                    .expect("alert write");
+                stream.flush().await.expect("alert flush");
+                let mut buf = [0u8; 512];
+                loop {
+                    match stream.read(&mut buf).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+async fn wait_for_metric(
+    listener: &VlessListener,
+    mut predicate: impl FnMut(&meow_listener::RealityV2MetricsSnapshot) -> bool,
+) -> meow_listener::RealityV2MetricsSnapshot {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = listener
+            .reality_v2_metrics_snapshot()
+            .expect("reality metrics");
+        if predicate(&snapshot) {
+            return snapshot;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "metric condition timed out; last snapshot {snapshot:?}"
+        );
+        sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn dial_first_spec_with(
+    dest: SocketAddr,
+    tune: impl FnOnce(&mut VlessRealitySpec),
+) -> VlessListenerSpec {
+    let mut spec = reality_dial_first_spec(dest, vec![("alice", ALICE)]);
+    let VlessSecuritySpec::Reality(reality) = &mut spec.security else {
+        unreachable!()
+    };
+    tune(reality);
+    spec
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reality_mimic_probe_timeout_hands_off_once_and_releases_probe() {
+    let target = start_silent_mimic_target().await;
+    let spec = dial_first_spec_with(target, |reality| {
+        reality.mimic.probe_timeout_ms = 500;
+    });
+    let (port, listener, task) =
+        start_listener(spec, tunnel_with_rules(&[]), "vless-mimic-probe-timeout-it").await;
+    let echo = start_tcp_echo().await;
+    let adapter = vision_reality_adapter(port, ALICE);
+    let dial = tokio::spawn(async move { adapter.dial_tcp(&metadata(echo)).await });
+
+    let snapshot = wait_for_metric(&listener, |s| {
+        s.cover_total.get("probe_timeout") == Some(&1)
+    })
+    .await;
+    assert_eq!(snapshot.probe_started_total, 1);
+    assert_eq!(snapshot.committed_total, 0);
+    assert_eq!(snapshot.mimic_hit_total, 0);
+    assert_eq!(snapshot.active_probes, 0, "P is released at cover handoff");
+    assert_eq!(
+        snapshot.active_handshakes, 0,
+        "H is released at cover handoff"
+    );
+    assert_eq!(snapshot.active_covers, 1);
+    assert!(
+        snapshot.close_total.is_empty(),
+        "cover handoff is not a close: {:?}",
+        snapshot.close_total
+    );
+    dial.abort();
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reality_mimic_dest_alert_recovers_prefix_into_cover_once() {
+    let target = start_alert_mimic_target().await;
+    let (port, listener, task) = start_listener(
+        reality_dial_first_spec(target, vec![("alice", ALICE)]),
+        tunnel_with_rules(&[]),
+        "vless-mimic-dest-alert-it",
+    )
+    .await;
+    let echo = start_tcp_echo().await;
+    let adapter = vision_reality_adapter(port, ALICE);
+    let dial = tokio::spawn(async move { adapter.dial_tcp(&metadata(echo)).await });
+
+    let snapshot =
+        wait_for_metric(&listener, |s| s.cover_total.get("dest_alert") == Some(&1)).await;
+    assert_eq!(snapshot.probe_started_total, 1);
+    assert_eq!(snapshot.committed_total, 0);
+    assert_eq!(snapshot.mimic_hit_total, 0);
+    assert_eq!(snapshot.active_probes, 0);
+    assert_eq!(snapshot.active_handshakes, 0);
+    // The REALITY client may already have reacted to the relayed alert and
+    // closed its side, so C may legitimately have ended by the time the
+    // counter is observed.  P/H release is the ownership invariant here.
+    assert!(
+        snapshot.close_total.is_empty(),
+        "typed incompatibility is cover, not close: {:?}",
+        snapshot.close_total
+    );
+    dial.abort();
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reality_mimic_probe_quota_falls_back_before_upload_and_keeps_single_probe() {
+    let target = start_silent_mimic_target().await;
+    let spec = dial_first_spec_with(target, |reality| {
+        reality.mimic.max_concurrent_probes = 1;
+        reality.mimic.probe_timeout_ms = 5_000;
+    });
+    let (port, listener, task) =
+        start_listener(spec, tunnel_with_rules(&[]), "vless-mimic-probe-quota-it").await;
+    let echo = start_tcp_echo().await;
+
+    let adapter1 = vision_reality_adapter(port, ALICE);
+    let meta = metadata(echo);
+    let first = tokio::spawn(async move { adapter1.dial_tcp(&meta).await });
+    wait_for_metric(&listener, |s| s.probe_started_total == 1).await;
+
+    let adapter2 = vision_reality_adapter(port, ALICE);
+    let meta2 = metadata(echo);
+    let second = tokio::spawn(async move { adapter2.dial_tcp(&meta2).await });
+    let snapshot = wait_for_metric(&listener, |s| {
+        s.cover_total.get("probe_saturated") == Some(&1)
+    })
+    .await;
+    assert_eq!(
+        snapshot.probe_started_total, 1,
+        "second connection must not start a probe"
+    );
+    assert_eq!(snapshot.committed_total, 0);
+    assert_eq!(
+        snapshot.active_probes, 1,
+        "first probe remains owner of the only P slot"
+    );
+    assert_eq!(
+        snapshot.active_covers, 1,
+        "second connection owns C after fallback"
+    );
+    assert!(
+        snapshot.close_total.is_empty(),
+        "P fallback is cover, not close: {:?}",
+        snapshot.close_total
+    );
+    first.abort();
+    second.abort();
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reality_mimic_upload_shaping_falls_back_before_probe() {
+    let target = start_silent_mimic_target().await;
+    let spec = dial_first_spec_with(target, |reality| {
+        reality.limit_fallback_upload.bytes_per_sec = 1;
+        reality.limit_fallback_upload.after_bytes = 8;
+    });
+    let (port, listener, task) = start_listener(
+        spec,
+        tunnel_with_rules(&[]),
+        "vless-mimic-upload-shaping-it",
+    )
+    .await;
+    let echo = start_tcp_echo().await;
+    let adapter = vision_reality_adapter(port, ALICE);
+    let meta = metadata(echo);
+    let dial = tokio::spawn(async move { adapter.dial_tcp(&meta).await });
+
+    let snapshot = wait_for_metric(&listener, |s| {
+        s.cover_total.get("upload_shaping") == Some(&1)
+    })
+    .await;
+    assert_eq!(snapshot.probe_started_total, 0);
+    assert_eq!(snapshot.committed_total, 0);
+    assert_eq!(snapshot.active_probes, 0);
+    assert_eq!(snapshot.active_covers, 1);
+    assert!(snapshot.close_total.is_empty());
+    dial.abort();
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reality_mimic_connect_failure_closes_without_local_tls_or_redial() {
+    // Port 9 is reserved/discard and is not listening in the test environment;
+    // the fixed-target contract requires exactly this one connect attempt.
+    let mut spec = reality_dial_first_spec("127.0.0.1:9".parse().unwrap(), vec![("alice", ALICE)]);
+    if let VlessSecuritySpec::Reality(reality) = &mut spec.security {
+        reality.dest_host = "127.0.0.1".into();
+        reality.dest_port = 9;
+    }
+    let (port, listener, task) =
+        start_listener(spec, tunnel_with_rules(&[]), "vless-mimic-connect-close-it").await;
+    let echo = start_tcp_echo().await;
+    let adapter = vision_reality_adapter(port, ALICE);
+    let result = timeout(Duration::from_secs(2), adapter.dial_tcp(&metadata(echo))).await;
+    assert!(
+        result.is_err() || result.unwrap().is_err(),
+        "connect failure must not produce local TLS"
+    );
+
+    let snapshot = wait_for_metric(&listener, |s| {
+        s.close_total.get(&("read_and_dial", "connect")) == Some(&1)
+    })
+    .await;
+    assert_eq!(snapshot.dial_started_total, 1);
+    assert_eq!(
+        snapshot.tcp_connect_started_total, 1,
+        "no alternate-address retry or redial"
+    );
+    assert_eq!(snapshot.probe_started_total, 0);
+    assert_eq!(snapshot.committed_total, 0);
+    assert_eq!(snapshot.cover_total.values().sum::<usize>(), 0);
+    assert_eq!(snapshot.active_handshakes, 0);
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reality_mimic_probe_eof_enters_half_close_aware_cover_once() {
+    let listener_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let target = listener_tcp.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener_tcp.accept().await {
+            tokio::spawn(async move {
+                let _first = read_one_tls_record(&mut stream).await;
+                // Two incomplete record-header bytes are consumed into the
+                // scanner prefix without typing incompatibility; EOF then
+                // selects the half-close-preserving dest_eof handoff.
+                stream
+                    .write_all(&[0x16, 0x03])
+                    .await
+                    .expect("partial target write");
+                stream.flush().await.expect("partial target flush");
+                drop(stream);
+            });
+        }
+    });
+    let (port, listener, task) = start_listener(
+        reality_dial_first_spec(target, vec![("alice", ALICE)]),
+        tunnel_with_rules(&[]),
+        "vless-mimic-dest-eof-it",
+    )
+    .await;
+    let echo = start_tcp_echo().await;
+    let adapter = vision_reality_adapter(port, ALICE);
+    let dial = tokio::spawn(async move { adapter.dial_tcp(&metadata(echo)).await });
+
+    let snapshot = wait_for_metric(&listener, |s| s.cover_total.get("dest_eof") == Some(&1)).await;
+    assert_eq!(snapshot.probe_started_total, 1);
+    assert_eq!(snapshot.committed_total, 0);
+    assert_eq!(snapshot.active_probes, 0);
+    assert_eq!(snapshot.active_handshakes, 0);
+    assert!(
+        snapshot.close_total.is_empty(),
+        "EOF fallback is cover, not close: {:?}",
+        snapshot.close_total
+    );
+    dial.abort();
     task.abort();
 }

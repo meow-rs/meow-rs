@@ -441,6 +441,10 @@ async fn handoff_cover(
     probe_permit: Option<OwnedSemaphorePermit>,
     accountant: &mut CloseAccountant,
 ) {
+    // Selecting cover enters the CoverPending state before C is acquired;
+    // admission failure therefore belongs to the cover phase rather than to
+    // whichever probe/read branch selected the fallback.
+    accountant.set_phase(ClosePhase::Cover);
     if Instant::now() >= handshake_deadline {
         accountant.close(CloseReason::Deadline);
         return;
