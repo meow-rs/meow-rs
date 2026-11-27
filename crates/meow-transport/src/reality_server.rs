@@ -297,6 +297,7 @@ pub struct RealityServer {
 }
 
 struct RealityServerInner {
+    instance: Arc<()>,
     private_key: [u8; 32],
     short_ids: Vec<[u8; 8]>,
     server_names: HashSet<String>,
@@ -347,6 +348,7 @@ impl fmt::Debug for RealityClientHello {
 /// callers can obtain it only by validating a real ClientHello against a
 /// [`RealityServer`].
 pub struct VerifiedHello {
+    pub(crate) issuer: Arc<()>,
     pub(crate) hello: ClientHello,
     pub(crate) ch_wire: Vec<u8>,
     pub(crate) auth_key: [u8; 32],
@@ -420,6 +422,7 @@ impl RealityServer {
             .unwrap_or(Duration::from_secs(120));
         Ok(Self {
             inner: Arc::new(RealityServerInner {
+                instance: Arc::new(()),
                 private_key: config.private_key,
                 short_ids: config.short_ids.clone(),
                 server_names: config
@@ -518,6 +521,11 @@ impl RealityServer {
         inner: Box<dyn Stream>,
         hello: VerifiedHello,
     ) -> Result<Box<dyn Stream>> {
+        if !Arc::ptr_eq(&hello.issuer, &self.inner.instance) {
+            return Err(TransportError::Tls(
+                "REALITY verified ClientHello belongs to a different server instance".into(),
+            ));
+        }
         let VerifiedHello {
             hello,
             auth_key,
@@ -549,6 +557,11 @@ impl RealityServer {
         hello: &VerifiedHello,
         template: MirrorTemplate,
     ) -> Result<PreparedFlight> {
+        if !Arc::ptr_eq(&hello.issuer, &self.inner.instance) {
+            return Err(TransportError::Tls(
+                "REALITY verified ClientHello belongs to a different server instance".into(),
+            ));
+        }
         crate::reality_mirror::prepare_mirrored_flight(
             &self.inner.certificate,
             hello,
@@ -628,6 +641,7 @@ impl RealityServer {
     ) -> std::result::Result<VerifiedHello, Vec<u8>> {
         match self.validate_hello(&mut hello) {
             Some((auth_key, local_cipher, local_key_group)) => Ok(VerifiedHello {
+                issuer: Arc::clone(&self.inner.instance),
                 hello,
                 ch_wire,
                 auth_key,
@@ -1989,6 +2003,36 @@ mod tests {
             "a statically verified ClientHello completes through the split v1 API"
         );
         assert!(client_task.await.expect("client task").is_ok());
+    }
+
+    #[tokio::test]
+    async fn verified_hello_is_bound_to_issuing_server_instance() {
+        let (private, public) = keypair();
+        let server_a = RealityServer::new(&server_config(private)).expect("server A");
+        let server_b = RealityServer::new(&server_config(private)).expect("server B");
+        let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let verify_task =
+            tokio::spawn(async move { server_a.verify_client_hello(Box::new(server_io)).await });
+        let hello = manual_valid_hello(public, rand::random::<[u8; 32]>());
+        client_io
+            .write_all(&wrap_plain_record(TLS_RECORD_HANDSHAKE, &hello).unwrap())
+            .await
+            .unwrap();
+        client_io.flush().await.unwrap();
+        let classified = verify_task.await.expect("verify task").expect("verify");
+        let RealityClientHello::Verified { stream, hello } = classified else {
+            panic!("valid ClientHello must verify")
+        };
+        assert!(
+            server_b.complete_handshake(stream, *hello).await.is_err(),
+            "a different RealityServer instance must reject the token before output"
+        );
+        let mut byte = [0u8; 1];
+        match tokio::time::timeout(Duration::from_millis(5), client_io.read_exact(&mut byte)).await
+        {
+            Err(_) | Ok(Err(_)) => {}
+            Ok(Ok(n)) => panic!("cross-instance rejection emitted {n} handshake bytes"),
+        }
     }
 
     async fn rejected_client_goes_to_cover(client_config: TlsConfig, server: RealityServer) {

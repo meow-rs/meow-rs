@@ -997,6 +997,7 @@ mod tests {
             share_slots.insert(group, &bytes);
         }
         VerifiedHello {
+            issuer: std::sync::Arc::new(()),
             hello: ClientHello {
                 raw: vec![1, 0, 0, 0],
                 random: [0x11; 32],
