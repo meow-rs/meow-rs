@@ -1108,6 +1108,7 @@ fn parse_client_hello(raw: Vec<u8>) -> Result<ClientHello> {
     }
 
     let mut server_name = None;
+    let mut saw_host_name = false;
     let mut supported_groups = SupportedGroups::default();
     let mut key_shares = ClientKeyShares::default();
     let mut offers_tls13 = false;
@@ -1130,7 +1131,12 @@ fn parse_client_hello(raw: Vec<u8>) -> Result<ClientHello> {
             duplicate_extension = true;
         }
         match ext_type {
-            EXT_SERVER_NAME => parse_server_name(data, &mut server_name, &mut sni_malformed),
+            EXT_SERVER_NAME => parse_server_name(
+                data,
+                &mut server_name,
+                &mut saw_host_name,
+                &mut sni_malformed,
+            ),
             EXT_PRE_SHARED_KEY => has_pre_shared_key = true,
             EXT_EARLY_DATA => has_early_data = true,
             EXT_RECORD_SIZE_LIMIT => {
@@ -1210,7 +1216,12 @@ fn parse_client_hello(raw: Vec<u8>) -> Result<ClientHello> {
     })
 }
 
-fn parse_server_name(data: &[u8], server_name: &mut Option<FixedServerName>, malformed: &mut bool) {
+fn parse_server_name(
+    data: &[u8],
+    server_name: &mut Option<FixedServerName>,
+    saw_host_name: &mut bool,
+    malformed: &mut bool,
+) {
     let mut pos = 0;
     let Ok(list_len) = take_u16(data, &mut pos) else {
         *malformed = true;
@@ -1246,10 +1257,11 @@ fn parse_server_name(data: &[u8], server_name: &mut Option<FixedServerName>, mal
             *malformed = true;
             return;
         };
-        if server_name.is_some() {
+        if *saw_host_name {
             *malformed = true;
             return;
         }
+        *saw_host_name = true;
         *server_name = FixedServerName::from_wire(name);
     }
     if lp != list.len() {
@@ -3126,6 +3138,18 @@ mod tests {
         out
     }
 
+    fn sni_extension_body(entries: &[&[u8]]) -> Vec<u8> {
+        let list_len: usize = entries.iter().map(|name| 3 + name.len()).sum();
+        let mut body = Vec::new();
+        body.extend_from_slice(&(list_len as u16).to_be_bytes());
+        for name in entries {
+            body.push(0);
+            body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            body.extend_from_slice(name);
+        }
+        body
+    }
+
     fn stress_valid_client_hello(
         server_public: [u8; 32],
         padding_len: usize,
@@ -3133,18 +3157,30 @@ mod tests {
         unknown_group_count: usize,
         duplicate_x25519: bool,
     ) -> Vec<u8> {
+        let sni_body = sni_extension_body(&[SERVER_NAME.as_bytes()]);
+        stress_valid_client_hello_with_sni(
+            server_public,
+            padding_len,
+            unknown_share_count,
+            unknown_group_count,
+            duplicate_x25519,
+            &sni_body,
+        )
+    }
+
+    fn stress_valid_client_hello_with_sni(
+        server_public: [u8; 32],
+        padding_len: usize,
+        unknown_share_count: usize,
+        unknown_group_count: usize,
+        duplicate_x25519: bool,
+        sni_body: &[u8],
+    ) -> Vec<u8> {
         let mut client_private = rand::random::<[u8; 32]>();
         crate::reality_tls::clamp_x25519_private(&mut client_private);
         let client_public = x25519_public_from_private(&client_private);
         let shared = x25519(&client_private, &server_public).unwrap();
         let random = rand::random::<[u8; 32]>();
-
-        let name = SERVER_NAME.as_bytes();
-        let mut sni_body = Vec::new();
-        sni_body.extend_from_slice(&(name.len() as u16 + 3).to_be_bytes());
-        sni_body.push(0);
-        sni_body.extend_from_slice(&(name.len() as u16).to_be_bytes());
-        sni_body.extend_from_slice(name);
 
         let mut groups = Vec::new();
         groups.extend_from_slice(&GROUP_X25519.to_be_bytes());
@@ -3180,7 +3216,7 @@ mod tests {
         shares_body.extend_from_slice(&shares);
 
         let mut extensions = Vec::new();
-        extensions.extend_from_slice(&stress_extension(EXT_SERVER_NAME, &sni_body));
+        extensions.extend_from_slice(&stress_extension(EXT_SERVER_NAME, sni_body));
         extensions.extend_from_slice(&stress_extension(EXT_SUPPORTED_VERSIONS, &[2, 0x03, 0x04]));
         extensions.extend_from_slice(&stress_extension(EXT_SUPPORTED_GROUPS, &groups_body));
         extensions.extend_from_slice(&stress_extension(EXT_KEY_SHARE, &shares_body));
@@ -3309,6 +3345,44 @@ mod tests {
             parsed.parse_explicit_arena_bytes,
             logical_capacity + std::mem::size_of::<DedupBitset>() + 5 + 32 + HYBRID_SHARE_LEN,
             "duplicate/unknown groups leave only the two fixed candidates in the parse arena"
+        );
+    }
+
+    #[tokio::test]
+    async fn overlong_first_sni_still_makes_a_second_hostname_duplicate_on_wire() {
+        async fn classify_hello(server: RealityServer, hello: &[u8]) -> RealityClientHello {
+            let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
+            let verify_task =
+                tokio::spawn(async move { server.verify_client_hello(Box::new(server_io)).await });
+            client_io
+                .write_all(&wrap_plain_record(TLS_RECORD_HANDSHAKE, hello).unwrap())
+                .await
+                .unwrap();
+            client_io.flush().await.unwrap();
+            verify_task.await.expect("verify task").expect("verify io")
+        }
+
+        let (private, public) = keypair();
+        let control_server = RealityServer::new(&server_config(private)).expect("control server");
+        let control = stress_valid_client_hello(public, 0, 0, 0, false);
+        assert!(
+            matches!(
+                classify_hello(control_server, &control).await,
+                RealityClientHello::Verified { .. }
+            ),
+            "control: the same cryptographic inputs authenticate with one valid SNI"
+        );
+
+        let long_name = vec![b'a'; 254];
+        let sni = sni_extension_body(&[&long_name, SERVER_NAME.as_bytes()]);
+        let mutated = stress_valid_client_hello_with_sni(public, 0, 0, 0, false, &sni);
+        let server = RealityServer::new(&server_config(private)).expect("server");
+        assert!(
+            matches!(
+                classify_hello(server, &mutated).await,
+                RealityClientHello::Cover(_)
+            ),
+            "v1 semantics: an overlong first host_name is still a host_name, so the second entry is a duplicate"
         );
     }
 
