@@ -560,10 +560,15 @@ impl VlessListener {
                     };
 
                     crate::keepalive::apply(&stream, self.tcp_keepalive, &self.name);
+                    // d_hs starts at admission, not at the first poll of the
+                    // spawned task: executor queueing time is part of the
+                    // handshake budget.
+                    let handshake_deadline =
+                        tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT;
                     let listener = Arc::clone(self);
                     conns.spawn(async move {
                         listener
-                            .handle_conn(stream, peer, in_port, handshake_permit)
+                            .handle_conn(stream, peer, in_port, handshake_permit, handshake_deadline)
                             .await;
                         drop(permit);
                     });
@@ -578,11 +583,11 @@ impl VlessListener {
         peer: SocketAddr,
         in_port: u16,
         handshake_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        deadline: tokio::time::Instant,
     ) {
         // TLS/REALITY accept and the bounded VLESS request share ONE
         // absolute deadline. Splitting them would double the time a
         // silent peer can retain a connection slot.
-        let deadline = tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT;
         let accepted = match &self.security {
             SecurityRuntime::StandardTls(server) => {
                 let inner: Box<dyn Stream> = Box::new(stream);
@@ -1185,7 +1190,13 @@ mod tests {
         let client = tokio::net::TcpStream::connect(probe_addr).await.unwrap();
         let (server, peer) = probe.accept().await.unwrap();
         drop(client);
-        let fut = listener.handle_conn(server, peer, 443, None);
+        let fut = listener.handle_conn(
+            server,
+            peer,
+            443,
+            None,
+            tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT,
+        );
         let size = std::mem::size_of_val(&fut);
         eprintln!("handle_conn future size: {size}");
         drop(fut);
@@ -1261,6 +1272,31 @@ mod tests {
         drop(admitted);
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_first_handshake_deadline_counts_executor_scheduling_delay() {
+        let listener = test_reality_listener_with(9, VlessRealityMimicSpec::default());
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe_addr = probe.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(probe_addr).await.unwrap();
+        let (server, peer) = probe.accept().await.unwrap();
+        drop(client);
+        let deadline = tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT;
+        let fut = listener.handle_conn(server, peer, 443, None, deadline);
+
+        // The future exists but is never polled while the executor is
+        // congested.  Advancing the full 15 seconds before that first poll
+        // must expire d_hs because the deadline was fixed at admission.
+        tokio::time::advance(DEFAULT_HANDSHAKE_TIMEOUT).await;
+        fut.await;
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(
+            snapshot.close_total.get(&("read_and_dial", "deadline")),
+            Some(&1),
+            "scheduling delay consumes d_hs: {snapshot:?}"
+        );
+        assert_eq!(snapshot.tcp_connect_started_total, 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
