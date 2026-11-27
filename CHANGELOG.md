@@ -8,6 +8,18 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- Proxy-provider payloads that are not YAML are retried as share-link
+  lists: the body is base64-decoded when needed and each line is parsed as
+  `ss://`, `vmess://`, `vless://`, `trojan://`, `hysteria2://`/`hy2://` or
+  `anytls://`. Airports key their response format on the request's
+  `User-Agent`, so a config setting `global-ua: "mihomo"` used to end up
+  with an empty provider on feeds that answer with links; mihomo reaches
+  the same nodes through `convert.ConvertsV2Ray`. Unsupported schemes and
+  malformed lines are skipped with a warning, and a body with no usable
+  link keeps the provider's last-good generation.
+
 ### Fixed
 
 - `proxy-providers.*.filter` / `exclude-filter` and the group-level fields

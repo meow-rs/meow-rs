@@ -1213,22 +1213,12 @@ impl ProxyProvider {
         // the main config and subscription parsers: a failed merge is a
         // parse failure, so the whole payload is dropped rather than
         // risking nodes losing their chained front hop.
-        let doc: serde_json::Value = crate::parse_yaml_value(content)
-            .map_err(|e| anyhow::anyhow!("provider YAML is malformed: {e}"))?;
-
-        // Accept both `proxies: [...]` wrapper and a bare list. A
-        // `Value::Null` document is an empty or comments-only file — treat
-        // it as an empty provider rather than a parse defect so an editor /
-        // external tool mid-rewrite doesn't hard-fail strict mode
-        // (parity with the missing-file acquisition path, issue #533).
-        let list_val = match doc.get("proxies").cloned().unwrap_or_else(|| doc.clone()) {
-            serde_json::Value::Null => serde_json::Value::Array(Vec::new()),
-            v => v,
-        };
-
-        let mut proxy_maps: Vec<HashMap<String, serde_json::Value>> =
-            serde_json::from_value(list_val)
-                .map_err(|e| anyhow::anyhow!("provider content is not a proxy list: {e}"))?;
+        //
+        // A body that is not a proxy list is retried as a share-link list:
+        // airports answer a `mihomo` User-Agent with base64-encoded
+        // `ss://`/`vmess://`/... links instead of YAML, and mihomo's
+        // provider parser has the same fallback (`convert.ConvertsV2Ray`).
+        let mut proxy_maps = parse_payload_maps(content)?;
 
         // Pre-resolve any DNS-sourced ECH configs into inline base64 — keeps
         // `parse_proxy` itself sync. An `ech-opts.enable: true` node with no
@@ -1988,6 +1978,48 @@ fn warn_initial_load_failure(provider: &ProxyProvider, error: &str) {
     }
 }
 
+/// Provider payload → node maps, with the share-link fallback.
+///
+/// YAML is the primary format: a `proxies:` wrapper or a bare sequence. A
+/// `Value::Null` document is an empty or comments-only file — an empty
+/// provider rather than a parse defect, so an editor or external tool
+/// mid-rewrite does not hard-fail strict mode (parity with the missing-file
+/// acquisition path, issue #533).
+///
+/// Anything else is retried as a share-link list (see
+/// [`crate::provider_payload`]): airports keyed on `User-Agent` answer a
+/// `mihomo` UA with base64-encoded `ss://`/`vmess://`/... links instead of
+/// YAML, and mihomo's provider parser takes the same route
+/// (`convert.ConvertsV2Ray`). When both paths fail the YAML diagnosis is
+/// the one reported — it is the format the feed most likely meant to serve.
+fn parse_payload_maps(
+    content: &str,
+) -> Result<Vec<HashMap<String, serde_json::Value>>, anyhow::Error> {
+    let yaml_error = match crate::parse_yaml_value(content) {
+        Ok(doc) => {
+            let list_val = match doc.get("proxies").cloned().unwrap_or_else(|| doc.clone()) {
+                serde_json::Value::Null => return Ok(Vec::new()),
+                value => value,
+            };
+            if list_val.is_array() {
+                match serde_json::from_value::<Vec<HashMap<String, serde_json::Value>>>(list_val) {
+                    Ok(maps) => return Ok(maps),
+                    Err(e) => format!("provider content is not a proxy list: {e}"),
+                }
+            } else {
+                "provider content is not a proxy list: expected a sequence".to_string()
+            }
+        }
+        Err(e) => format!("provider YAML is malformed: {e}"),
+    };
+    match crate::provider_payload::parse_share_links(content) {
+        Ok(maps) => Ok(maps),
+        Err(link_error) => Err(anyhow::anyhow!(
+            "{yaml_error}; and not a share-link list either: {link_error}"
+        )),
+    }
+}
+
 fn compile_opt_regex(
     pattern: &Option<String>,
     field: &str,
@@ -2619,6 +2651,31 @@ header:
         .unwrap();
         p.refresh().await.unwrap();
         p
+    }
+
+    /// A payload that is not YAML is retried as a base64 share-link list —
+    /// the shape airports serve to a `mihomo` User-Agent (mihomo reaches the
+    /// same nodes through `convert.ConvertsV2Ray`).
+    ///
+    /// Both links are `ss://` on purpose: the `ss`-only CI leg compiles no
+    /// other scheme's adapter, and a node whose type is not in the build is
+    /// dropped with a warning instead of parsed, so a mixed list would make
+    /// this test's expected names depend on the feature set. Per-scheme
+    /// mapping is covered by `provider_payload`'s own tests, which build no
+    /// adapter and therefore run under every feature set.
+    #[tokio::test]
+    async fn provider_payload_accepts_base64_share_links() {
+        use base64::Engine as _;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let links = "ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n\
+                     ss://YWVzLTI1Ni1nY206c2VjcmV0@b.example.com:443#B\n";
+        std::fs::write(
+            tmp.path(),
+            base64::engine::general_purpose::STANDARD.encode(links),
+        )
+        .unwrap();
+        let provider = file_provider(tmp.path()).await;
+        assert_eq!(slot_names(&provider.proxies()), ["A", "B"]);
     }
 
     #[tokio::test]

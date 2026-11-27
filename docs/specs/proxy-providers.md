@@ -248,6 +248,33 @@ Consequently, under `strict: true` a subscription group may `use:` only
 providers declared in the local config; subscription-internal provider names
 fail the strict `use:` check (issue #533 review).
 
+### Payload formats
+
+A provider body is read as YAML first: either a `proxies:` wrapper or a bare
+sequence. A body that is not a proxy list is retried as a **share-link
+list**, which is what airports answer when the request carries a `mihomo`
+`User-Agent`: the text (base64-encoded or plain) is split into lines and each
+line is read as a link.
+
+| Scheme | Notes |
+|--------|-------|
+| `ss://` | SIP002 (`ss://base64(method:password)@host:port`) and the legacy fully-encoded form; SIP003 `plugin=` supports `obfs-local`/`simple-obfs` and `v2ray-plugin` |
+| `vmess://` | v2rayN "v2" JSON: `ws`/`grpc`/`h2` transports, `tls` + `sni` |
+| `vless://` | `security=tls|reality`, `flow`, `pbk`/`sid`, `ws`/`grpc`/`http` transports |
+| `trojan://` | `sni`, `allowInsecure`, `alpn`, `ws`/`grpc` transports |
+| `hysteria2://`, `hy2://` | `obfs`/`obfs-password`, `up`/`down`, `insecure` |
+| `anytls://` | `sni`, `insecure` |
+
+Unsupported schemes (`ssr://`, `tuic://`, ...) and malformed lines are
+skipped with a warning; a body that yields no usable link is a fetch-level
+failure, so the provider keeps its last-good generation — the same treatment
+a malformed YAML body gets.
+
+The fallback exists because the same subscription URL answers with YAML to a
+clash `User-Agent` and with base64 links to `mihomo`, and meow otherwise
+ended up with an empty provider. mihomo takes the same route through
+`convert.ConvertsV2Ray`.
+
 ### Override
 
 `override:` is a free-form map whose keys are proxy config field
