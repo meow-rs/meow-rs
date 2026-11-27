@@ -572,12 +572,16 @@ fn positive_fragments(finished: &[u8]) -> [(&[u8], usize); 2] {
     [(&finished[..13], 5), (&finished[13..], 29)]
 }
 
-fn vless_tcp_request(uuid: &[u8; 16], target: SocketAddr) -> Vec<u8> {
+fn vless_tcp_request(uuid: &[u8; 16], target: SocketAddr, vision_flow: bool) -> Vec<u8> {
     let mut out = vec![0x00];
     out.extend_from_slice(uuid);
-    out.push(18); // addons length
-    out.extend_from_slice(&[0x0a, 0x10]);
-    out.extend_from_slice(b"xtls-rprx-vision");
+    if vision_flow {
+        out.push(18); // addons length
+        out.extend_from_slice(&[0x0a, 0x10]);
+        out.extend_from_slice(b"xtls-rprx-vision");
+    } else {
+        out.push(0); // no addons
+    }
     out.push(0x01); // command TCP
     out.extend_from_slice(&target.port().to_be_bytes());
     match target.ip() {
@@ -621,6 +625,20 @@ async fn start_tcp_echo() -> SocketAddr {
         }
     });
     addr
+}
+
+async fn start_counting_tcp_echo() -> (SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task_accepts = Arc::clone(&accepts);
+    tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            task_accepts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            tokio::spawn(echo_conn(stream));
+        }
+    });
+    (addr, accepts)
 }
 
 fn ext(kind: u16, body: &[u8]) -> Vec<u8> {
@@ -855,7 +873,7 @@ async fn run_positive(name: &str, with_ccs: bool) {
     // request and the first Vision padding frame: had the Finished reader
     // consumed even one byte of it, neither could ever parse.
     let payload = b"controlled finished vision echo payload";
-    let mut app_plaintext = vless_tcp_request(&ALICE, echo);
+    let mut app_plaintext = vless_tcp_request(&ALICE, echo, true);
     app_plaintext.extend_from_slice(&vision_first_frame(&ALICE, payload, 11));
     one_write.extend_from_slice(&session.client_application.seal_with_padding(
         TLS_RECORD_APPLICATION_DATA,
@@ -1123,4 +1141,86 @@ async fn t4_finished_over_65536_wire_bytes_closes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn t4_second_compat_ccs_closes() {
     run_negative("vless-t4-neg-doubleccs-it", NegativeShape::DoubleCcs).await;
+}
+
+// ─── post-hit VLESS authentication negatives ──────────────────────────────
+
+/// The mimic hit is a TLS-layer event: it is counted when the client
+/// Finished verifies, before any VLESS byte is read.  A wrong UUID or a
+/// missing vision flow must still hit, must still have run the dial-first
+/// fixed-target dial, and must never reach VLESS routing — proven by the
+/// counting echo server never accepting a connection.
+async fn run_auth_negative(name: &str, uuid: [u8; 16], vision_flow: bool) {
+    let target = start_mimic_target().await;
+    let (echo, echo_accepts) = start_counting_tcp_echo().await;
+    let (port, listener, task) = start_listener(target, name).await;
+
+    let mut session = controlled_handshake(port).await;
+    let finished = session.client_finished.clone();
+    let fragments = positive_fragments(&finished);
+    let mut one_write = COMPAT_CCS.to_vec();
+    one_write.extend_from_slice(&seal_finished_records(
+        &mut session.client_handshake,
+        &fragments,
+        TLS_RECORD_HANDSHAKE,
+    ));
+    let mut app_plaintext = vless_tcp_request(&uuid, echo, vision_flow);
+    app_plaintext.extend_from_slice(&vision_first_frame(&uuid, b"unreachable echo payload", 7));
+    one_write.extend_from_slice(&session.client_application.seal_with_padding(
+        TLS_RECORD_APPLICATION_DATA,
+        &app_plaintext,
+        0,
+    ));
+    session
+        .stream
+        .write_all(&one_write)
+        .await
+        .expect("write auth-negative wire");
+    session
+        .stream
+        .flush()
+        .await
+        .expect("flush auth-negative wire");
+
+    let snapshot = wait_for_metric(&listener, |s| s.mimic_hit_total == 1).await;
+    assert_eq!(
+        snapshot.dial_started_total, 1,
+        "the dial-first fixed-target dial is independent of VLESS authentication"
+    );
+    // Positive synchronization instead of a settling sleep: the server
+    // closes the connection once VLESS authentication rejects, so the EOF
+    // proves the routing decision has already been made.  Data instead of
+    // EOF would mean the request was routed after all.
+    let mut buf = [0u8; 64];
+    match timeout(T, session.stream.read(&mut buf)).await {
+        Ok(Ok(0)) | Ok(Err(_)) => {}
+        Ok(Ok(n)) => panic!("server answered {n} bytes to a rejected VLESS authentication"),
+        Err(_) => panic!("server neither routed nor closed a rejected VLESS authentication"),
+    }
+    assert_eq!(
+        echo_accepts.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "a rejected VLESS authentication never reaches tunnel routing"
+    );
+    assert!(
+        snapshot.cover_total.is_empty(),
+        "post-hit auth failure never covers: {:?}",
+        snapshot.cover_total
+    );
+    drop(session.stream);
+    task.abort();
+}
+
+/// §9 T4 row: a wrong UUID after a genuine mimic hit produces no VLESS
+/// routing dial — distinct from the dial-first target dial, which did run.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t4_hit_with_wrong_uuid_never_reaches_vless_routing() {
+    run_auth_negative("vless-t4-wronguuid-it", [0x99; 16], true).await;
+}
+
+/// §9 T4 row: a missing vision flow after a genuine mimic hit produces no
+/// VLESS routing dial either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t4_hit_without_vision_flow_never_reaches_vless_routing() {
+    run_auth_negative("vless-t4-noflow-it", ALICE, false).await;
 }
