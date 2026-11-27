@@ -512,3 +512,80 @@ async fn t6b_mode_off_keeps_v1_auth_independent_and_cover_dialing_ordinary() {
     drop(probe);
     let _ = child2.kill().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reality_mimic_config_test_never_dials_cover_target() {
+    let (target, accepts, _bytes) = start_counting_sink().await;
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("config.yaml");
+    std::fs::write(
+        &config,
+        runtime_yaml(free_port(), free_port(), target, "      mimic: {}\n"),
+    )
+    .unwrap();
+
+    let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_meow"));
+    command
+        .arg("-f")
+        .arg(&config)
+        .arg("-d")
+        .arg(dir.path())
+        .arg("-t")
+        .current_dir(dir.path());
+    for variable in [
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "all_proxy",
+    ] {
+        command.env_remove(variable);
+    }
+    let output = timeout(T, command.output())
+        .await
+        .expect("-t must not hang")
+        .expect("run meow -t");
+    assert!(
+        output.status.success(),
+        "valid mimic config must pass -t: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        accepts.load(Ordering::SeqCst),
+        0,
+        "-t must not health-check or dial the cover target"
+    );
+
+    let bad = dir.path().join("bad.yaml");
+    std::fs::write(
+        &bad,
+        runtime_yaml(
+            free_port(),
+            free_port(),
+            target,
+            "      mimic:\n        probe-timeout-ms: 15001\n",
+        ),
+    )
+    .unwrap();
+    let mut bad_command = tokio::process::Command::new(env!("CARGO_BIN_EXE_meow"));
+    bad_command
+        .arg("-f")
+        .arg(&bad)
+        .arg("-d")
+        .arg(dir.path())
+        .arg("-t")
+        .current_dir(dir.path());
+    let output = bad_command.output().await.expect("run bad meow -t");
+    assert!(!output.status.success(), "invalid mimic must fail -t");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("mimic")
+            || String::from_utf8_lossy(&output.stdout).contains("mimic"),
+        "the -t rejection must name mimic: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(accepts.load(Ordering::SeqCst), 0);
+}
