@@ -18,6 +18,7 @@ pub mod ech_dns;
 pub mod external_ui;
 pub mod geodata;
 pub mod internal_http;
+pub mod outbound_registry;
 mod private_file;
 mod provider_payload;
 pub mod proxy_parser;
@@ -3288,6 +3289,17 @@ fn parse_dialered_leaf(
                 "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
                  (strict mode): {chain_err}"
             ))
+        }
+        Err(chain_err) if proxy_parser::external_adapter_type(raw_proxy).is_some() => {
+            let declared = proxy_parser::external_adapter_type(raw_proxy)
+                .expect("registered outbound types cannot be removed");
+            warn!(
+                "proxy '{name}': cannot inject dialer-proxy '{dialer}' ({chain_err}); keeping the name bound to an unavailable node"
+            );
+            Ok(Some((
+                unavailable_placeholder(name, &chain_err, declared),
+                true,
+            )))
         }
         Err(chain_err) => match proxy_parser::parse_static_proxy(
             raw_proxy,

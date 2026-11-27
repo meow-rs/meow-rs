@@ -1205,6 +1205,73 @@ async fn provider_member_delay_resolves_through_proxies_route() {
     assert_eq!(body["message"], "resource not found");
 }
 
+#[tokio::test]
+async fn proxy_api_reports_registered_outbound_type() {
+    use meow_common::{
+        AdapterType, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn,
+    };
+    use meow_config::outbound_registry::register_outbound;
+
+    struct Fixture {
+        name: String,
+        kind: &'static str,
+        health: ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyAdapter for Fixture {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::External(self.kind)
+        }
+
+        fn addr(&self) -> &str {
+            ""
+        }
+
+        fn support_udp(&self) -> bool {
+            false
+        }
+
+        async fn dial_tcp(&self, _: &Metadata) -> meow_common::Result<Box<dyn ProxyConn>> {
+            unreachable!("listing proxies must not dial")
+        }
+
+        async fn dial_udp(&self, _: &Metadata) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+            unreachable!("listing proxies must not dial")
+        }
+
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    register_outbound(
+        "ApiFixture",
+        Arc::new(|ctx| {
+            Ok(Box::new(Fixture {
+                name: ctx.name().into(),
+                kind: ctx.type_name(),
+                health: ProxyHealth::new(),
+            }))
+        }),
+    )
+    .unwrap();
+    let raw =
+        meow_config::parse_raw_yaml("strict: true\nproxies: [{name: fixture, type: ApiFixture}]\n")
+            .unwrap();
+    let state = test_state(raw);
+    let (status, list) = get_json(&state, "/proxies").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["proxies"]["fixture"]["type"], "ApiFixture");
+    let (status, detail) = get_json(&state, "/proxies/fixture").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(detail["type"], "ApiFixture");
+}
+
 /// Names the route table and the providers share resolve the way groups
 /// already treat them: the route-table entry wins, then providers in name
 /// order (the order `include-all` lists them in).

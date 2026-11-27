@@ -138,6 +138,9 @@ impl std::fmt::Display for UdpTarget {
 /// `meow_common::connect_tcp_host()` directly so that `dialer-proxy` can
 /// inject a proxied connection transparently.
 ///
+/// An out-of-tree adapter should use the dialer supplied by its factory
+/// context for the raw transport before applying its protocol handshake.
+///
 /// # Performance note (review M10)
 ///
 /// Every outbound connection pays two extra heap allocations versus the old
@@ -426,6 +429,8 @@ pub struct ProxyDialer {
 }
 
 impl ProxyDialer {
+    /// Create a dialer through a specific proxy or group. Use
+    /// [`scoped_chain_dial`] when this edge may lead back into a chain.
     pub fn new(proxy: Arc<dyn Proxy>) -> Self {
         Self {
             proxy,
@@ -1557,7 +1562,7 @@ impl Drop for SupportsUdpDepth {
 }
 
 /// Run `f` as one nested `dialer-proxy` hop; `over_limit` produces the
-/// caller's error type when the chain exceeds [`MAX_DIALER_CHAIN_DEPTH`].
+/// caller's error type when the chain exceeds the shared maximum depth.
 /// Every by-name dial entry point — [`NamedProxyDialer`]'s TCP and UDP
 /// endpoint paths and `DialerProxyAdapter`'s relay path — funnels through
 /// this so a cycle that only becomes reachable through dynamic group
@@ -1568,7 +1573,10 @@ impl Drop for SupportsUdpDepth {
 /// nested dial pends on the session mutex the outer frame holds and
 /// surfaces as a session-setup timeout instead — bounded, but diagnosed as
 /// a timeout rather than a cycle.
-pub(crate) async fn scoped_chain_dial<F, T, E>(
+///
+/// Out-of-tree adapters that create a chain edge through [`ProxyDialer`]
+/// can use this scope to share the same recursion budget as built-in edges.
+pub async fn scoped_chain_dial<F, T, E>(
     target_name: &str,
     over_limit: impl FnOnce(&str) -> E,
     f: F,

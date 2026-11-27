@@ -91,16 +91,44 @@ where
     F: Future<Output = Result<T>>,
 {
     let deadline = dial_deadline().unwrap_or_else(|| Instant::now() + DIAL_TIMEOUT);
+    enforce_dial_deadline(deadline, fut, || {
+        format!(
+            "dial via {via} exceeded the {}s deadline",
+            DIAL_TIMEOUT.as_secs()
+        )
+    })
+    .await
+}
+
+/// Run a dial under an explicit deadline. Adapter-owned tasks can carry a
+/// deadline across a spawn and use it for nested dialers and TCP candidates.
+/// If a scope is already active, the earlier deadline wins.
+pub async fn with_dial_deadline<F, T>(via: &str, deadline: Instant, fut: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    let deadline = dial_deadline().map_or(deadline, |current| current.min(deadline));
+    enforce_dial_deadline(deadline, fut, || {
+        format!("dial via {via} exceeded its deadline")
+    })
+    .await
+}
+
+async fn enforce_dial_deadline<F, T>(
+    deadline: Instant,
+    fut: F,
+    timeout_message: impl FnOnce() -> String,
+) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
     DIAL_DEADLINE
         .scope(deadline, async {
             match tokio::time::timeout_at(deadline, fut).await {
                 Ok(result) => result,
                 Err(_) => Err(MeowError::Io(io::Error::new(
                     io::ErrorKind::TimedOut,
-                    format!(
-                        "dial via {via} exceeded the {}s deadline",
-                        DIAL_TIMEOUT.as_secs()
-                    ),
+                    timeout_message(),
                 ))),
             }
         })
@@ -180,5 +208,21 @@ mod tests {
             dial_deadline().is_none(),
             "deadline must not leak out of its scope"
         );
+    }
+    #[tokio::test(start_paused = true)]
+    async fn a_spawned_dial_keeps_the_earliest_explicit_deadline() {
+        let start = Instant::now();
+        let deadline = start + Duration::from_secs(2);
+        let task = tokio::spawn(with_dial_deadline("outer", deadline, async move {
+            with_dial_deadline("inner", deadline + Duration::from_secs(1), async {
+                assert_eq!(dial_deadline(), Some(deadline));
+                pending::<Result<()>>().await
+            })
+            .await
+        }));
+        let err = task.await.unwrap().unwrap_err();
+        assert!(matches!(err, MeowError::Io(ref e) if e.kind() == io::ErrorKind::TimedOut));
+        assert_eq!(start.elapsed(), Duration::from_secs(2));
+        assert!(dial_deadline().is_none());
     }
 }

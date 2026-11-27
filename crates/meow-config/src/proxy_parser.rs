@@ -1,3 +1,4 @@
+use crate::outbound_registry::{self, OutboundContext};
 use async_trait::async_trait;
 use meow_common::{
     AdapterType, DelayHistory, GroupDisplay, Metadata, Proxy, ProxyAdapter, ProxyConn, ProxyHealth,
@@ -658,8 +659,8 @@ pub(crate) fn node_needs_missing_plugin(config: &HashMap<String, serde_json::Val
 /// The [`AdapterType`] a failed node's dead placeholder must keep, when
 /// dropping the node would silently reroute its group's traffic: trusttunnel
 /// nodes ([`node_is_trusttunnel`]) and `ss` nodes whose built-in plugin's
-/// cargo feature is compiled out ([`node_needs_missing_plugin`]). `None`
-/// for ordinary parse failures, which stay warn-and-drop.
+/// cargo feature is compiled out ([`node_needs_missing_plugin`]), and
+/// registered out-of-tree nodes. Ordinary parse failures stay warn-and-drop.
 pub(crate) fn placeholder_adapter_type(
     config: &HashMap<String, serde_json::Value>,
 ) -> Option<AdapterType> {
@@ -668,8 +669,16 @@ pub(crate) fn placeholder_adapter_type(
     } else if node_needs_missing_plugin(config) {
         Some(AdapterType::Shadowsocks)
     } else {
-        None
+        external_adapter_type(config)
     }
+}
+
+pub(crate) fn external_adapter_type(
+    config: &HashMap<String, serde_json::Value>,
+) -> Option<AdapterType> {
+    let kind = config.get("type")?.as_str()?;
+    let (type_name, _) = outbound_registry::lookup(kind)?;
+    Some(AdapterType::External(type_name))
 }
 
 /// Whether `config` describes an `ss` node whose `plugin:` names an external
@@ -1114,7 +1123,24 @@ pub fn parse_proxy_with_dialer_and_fp(
                  — lowercase, with no surrounding whitespace"
             ))
         }
-        _ => Err(format!("unsupported proxy type: {proxy_type}")),
+        _ => {
+            let (type_name, factory) = outbound_registry::lookup(proxy_type)
+                .ok_or_else(|| format!("unsupported proxy type: {proxy_type}"))?;
+            let adapter = factory(&OutboundContext::new(
+                type_name, name, config, dialer, dns_cell, ipv6,
+            ))?;
+            if adapter.adapter_type() != AdapterType::External(type_name) {
+                return Err(format!(
+                    "proxy '{name}': factory for '{type_name}' returned adapter type '{}'",
+                    adapter.adapter_type()
+                ));
+            }
+            Ok(Arc::new(
+                WrappedProxy::new(adapter)
+                    .with_node_dialer_opts(node_opts)
+                    .dialing_through(config, dialer),
+            ))
+        }
     }
 }
 
@@ -7453,6 +7479,149 @@ tls: true
         let out = tracing::subscriber::with_default(subscriber, f);
         let captured = sink.0.lock().unwrap();
         (out, String::from_utf8_lossy(&captured).into_owned())
+    }
+
+    struct ExternalFixture {
+        name: String,
+        kind: &'static str,
+        health: ProxyHealth,
+    }
+
+    #[async_trait]
+    impl ProxyAdapter for ExternalFixture {
+        fn name(&self) -> &str {
+            &self.name
+        }
+
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::External(self.kind)
+        }
+
+        fn addr(&self) -> &str {
+            "example.com:443"
+        }
+
+        fn support_udp(&self) -> bool {
+            false
+        }
+
+        async fn dial_tcp(&self, _: &Metadata) -> Result<Box<dyn ProxyConn>> {
+            unreachable!("parsing must not dial")
+        }
+
+        async fn dial_udp(&self, _: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
+            unreachable!("parsing must not dial")
+        }
+
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    #[test]
+    fn registered_outbound_reserves_names_and_uses_normal_config_build() {
+        use crate::outbound_registry::{register_outbound, OutboundFactory, RegisterError};
+
+        let factory: OutboundFactory = Arc::new(|ctx| {
+            assert!(!ctx.ipv6());
+            assert!(ctx.resolver_cell().is_some());
+            if ctx.config().get("private-option").and_then(|v| v.as_str()) != Some("accepted") {
+                return Err("invalid private-option".into());
+            }
+            if ctx.name() == "chained" {
+                assert!(ctx.dialer().is_proxy());
+            }
+            if ctx.name() == "reject-chain" && ctx.dialer().is_proxy() {
+                return Err("could not use supplied chain".into());
+            }
+            Ok(Box::new(ExternalFixture {
+                name: ctx.name().into(),
+                kind: ctx.type_name(),
+                health: ProxyHealth::new(),
+            }))
+        });
+        for kind in [
+            "Ss",
+            "trojan",
+            "vless",
+            "http",
+            "socks5",
+            "direct",
+            "rematch",
+            "Dns",
+            "TrustTunnel",
+            "anytls",
+            "hysteria2",
+            "vmess",
+            "snell",
+            "wireguard",
+            "WireGuard",
+        ] {
+            assert_eq!(
+                register_outbound(kind, Arc::clone(&factory)),
+                Err(RegisterError::BuiltIn(kind))
+            );
+        }
+        register_outbound("SampleOutbound", Arc::clone(&factory)).unwrap();
+        assert_eq!(
+            register_outbound("sampleoutbound", factory),
+            Err(RegisterError::Duplicate("sampleoutbound"))
+        );
+
+        let raw = crate::parse_raw_yaml(
+            "strict: true\nproxies: [{name: wrong-case, type: SAMPLEOUTBOUND, private-option: accepted}]\n",
+        )
+        .unwrap();
+        let Err(error) = crate::rebuild_from_raw(&raw) else {
+            panic!("registered type matching must preserve case");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported proxy type: SAMPLEOUTBOUND"),
+            "{error}"
+        );
+
+        let config = r#"
+ipv6: false
+proxies:
+  - {name: custom, type: SampleOutbound, private-option: accepted}
+  - {name: chained, type: SampleOutbound, private-option: accepted, server: example.com, port: 443, dialer-proxy: DIRECT}
+  - {name: ordinary, type: direct, builtin-typo: true}
+"#;
+        let kind = AdapterType::External("SampleOutbound");
+        let (result, warnings) = capture_warns(|| {
+            let raw = crate::parse_raw_yaml(&format!("strict: true\n{config}")).unwrap();
+            crate::rebuild_from_raw(&raw)
+        });
+        let built = result.unwrap();
+        assert_eq!(built.proxies["custom"].adapter_type(), kind);
+        assert_eq!(built.proxies["chained"].adapter_type(), kind);
+        assert!(built.proxies["chained"].has_configured_dialer());
+        assert!(warnings.contains("builtin-typo"), "{warnings}");
+        assert!(!warnings.contains("private-option"), "{warnings}");
+
+        let config = format!(
+            "{config}  - {{name: broken, type: SampleOutbound}}\n  - {{name: reject-chain, type: SampleOutbound, private-option: accepted, dialer-proxy: DIRECT}}\n"
+        );
+        let raw = crate::parse_raw_yaml(&config).unwrap();
+        let built = crate::rebuild_from_raw(&raw).unwrap();
+        for name in ["custom", "chained"] {
+            assert!(built.proxies[name].alive(), "{name}");
+        }
+        for name in ["broken", "reject-chain"] {
+            assert_eq!(built.proxies[name].adapter_type(), kind);
+            assert!(!built.proxies[name].alive(), "{name}");
+        }
+
+        let raw = crate::parse_raw_yaml(&format!("strict: true\n{config}")).unwrap();
+        let Err(error) = crate::rebuild_from_raw(&raw) else {
+            panic!("strict parsing must reject an invalid external node");
+        };
+        assert!(
+            error.to_string().contains("invalid private-option"),
+            "{error}"
+        );
     }
 
     fn lb_config_with_providers(
