@@ -402,7 +402,7 @@ impl AuthenticatedMirrorContext {
     pub fn mirror_profile(
         &self,
     ) -> std::result::Result<(), crate::reality_mirror::MirrorClientProfileError> {
-        crate::reality_mirror::mirror_profile_view(self)
+        crate::reality_mirror::mirror_profile_context(self)
     }
 }
 
@@ -665,9 +665,11 @@ impl RealityServer {
     pub fn target_flight_scanner<'a>(
         &self,
         context: &'a AuthenticatedMirrorContext,
-    ) -> crate::reality_mirror::TargetFlightScanner<'a> {
-        let certificate_der_len = self.inner.certificate.for_auth_key(&context.auth_key).len();
-        crate::reality_mirror::TargetFlightScanner::new(context, certificate_der_len)
+    ) -> std::result::Result<
+        crate::reality_mirror::TargetFlightScanner<'a>,
+        crate::reality_mirror::MirrorClientProfileError,
+    > {
+        crate::reality_mirror::TargetFlightScanner::new(context, self.inner.certificate.der_len())
     }
 
     /// Prepare mirroring by consuming both the authenticated context and the
@@ -1637,6 +1639,10 @@ impl RealityCertificate {
             .map_err(|e| TransportError::Crypto(format!("REALITY CertificateVerify sign: {e}")))
     }
 
+    pub(crate) fn der_len(&self) -> usize {
+        self.template_der.len()
+    }
+
     pub(crate) fn for_auth_key(&self, auth_key: &[u8; 32]) -> Vec<u8> {
         let mut der = self.template_der.clone();
         let signature_start = der.len() - 64;
@@ -2273,7 +2279,9 @@ mod tests {
 
         // Fragmented feeding: 1-byte slices across the SH header, then a
         // slice crossing a record header boundary, then the remainder.
-        let mut scanner = server.target_flight_scanner(upload.context());
+        let mut scanner = server
+            .target_flight_scanner(upload.context())
+            .expect("wire-authenticated context is mirrorable");
         for byte in &flight[..7] {
             assert_eq!(scanner.push(&[*byte]).unwrap(), TargetScanState::NeedBytes);
         }
@@ -2363,6 +2371,138 @@ mod tests {
         assert_eq!(buf, b"server-to-client seq0");
     }
 
+    /// Real public-order probe peak reconciliation.  The CH is authenticated
+    /// from real client wire, converted through the consuming upload split,
+    /// written to the upload sink, and released before the scanner exists.
+    /// The scanner then owns the near-W target prefix through freeze/prepare.
+    #[tokio::test]
+    async fn probe_prepare_arena_reconciles_with_spec_bprobe_in_real_public_order() {
+        use crate::reality_mirror::{
+            mirrored_flight_len, MirroredRecordPlan, TargetScanState, TARGET_SCAN_PREFIX_CAPACITY,
+            TARGET_SCAN_WIRE_LIMIT,
+        };
+
+        let (private, public) = keypair();
+        let server = RealityServer::new(&server_config(private)).expect("server");
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let verify_task = tokio::spawn({
+            let server = server.clone();
+            async move { server.verify_client_hello(Box::new(server_io)).await }
+        });
+        let layer = RealityTlsLayer::new(&client_config(public, SHORT_ID, true)).expect("layer");
+        let client_task = tokio::spawn(async move { layer.connect(Box::new(client_io)).await });
+        let classified = tokio::time::timeout(Duration::from_secs(2), verify_task)
+            .await
+            .expect("verify timed out")
+            .expect("verify joined")
+            .expect("verify io");
+        client_task.abort();
+        let RealityClientHello::Verified { hello, .. } = classified else {
+            panic!("real hybrid client must authenticate")
+        };
+        let session_id = hello.hello.session_id;
+        let upload = (*hello).into_mirror_upload();
+
+        // Upload/write the exact CH wire before target scanning.  The write
+        // half owns no persistent copy here; `sink` models bytes leaving the
+        // process, and `finish_upload` then releases the upload allocation.
+        let mut sink = tokio::io::sink();
+        sink.write_all(upload.ch_wire()).await.expect("upload sink");
+        sink.flush().await.expect("upload flush");
+        let (context, upload_wire) = upload.finish_upload();
+        let retained_share_capacity = context.key_shares.retained_capacity();
+        drop(upload_wire);
+
+        // A valid hybrid SH followed by application records whose total wire
+        // width is exactly W.  This is the real scanner input shape, not an
+        // internal prepare-only artifact.
+        let mut sh_body = Vec::new();
+        sh_body.extend_from_slice(&[0x03, 0x03]);
+        sh_body.extend_from_slice(&[0x66; 32]);
+        sh_body.push(32);
+        sh_body.extend_from_slice(&session_id);
+        sh_body.extend_from_slice(&0x1301u16.to_be_bytes());
+        sh_body.push(0);
+        let versions = extension_bytes(0x002b, &0x0304u16.to_be_bytes());
+        let mut ks_body = Vec::new();
+        ks_body.extend_from_slice(&0x11ecu16.to_be_bytes());
+        ks_body.extend_from_slice(&1120u16.to_be_bytes());
+        ks_body.resize(ks_body.len() + 1120, 0x5a);
+        let key_share = extension_bytes(0x0033, &ks_body);
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&versions);
+        exts.extend_from_slice(&key_share);
+        sh_body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        sh_body.extend_from_slice(&exts);
+        let mut sh = vec![0x02];
+        sh.extend_from_slice(&(sh_body.len() as u32).to_be_bytes()[1..4]);
+        sh.extend_from_slice(&sh_body);
+        let base = 5 + sh.len();
+        let needed = TARGET_SCAN_WIRE_LIMIT - base;
+        let mut lengths = vec![18usize; 4];
+        let mut extra = needed - 4 * 23;
+        for len in &mut lengths {
+            let add = extra.min(16_401 - 18);
+            *len += add;
+            extra -= add;
+        }
+        assert_eq!(extra, 0, "four records represent the near-W width");
+        let mut flight = Vec::new();
+        flight.extend_from_slice(&[0x16, 0x03, 0x03]);
+        flight.extend_from_slice(&(sh.len() as u16).to_be_bytes());
+        flight.extend_from_slice(&sh);
+        for len in lengths {
+            flight.extend_from_slice(&[0x17, 0x03, 0x03]);
+            flight.extend_from_slice(&(len as u16).to_be_bytes());
+            flight.resize(flight.len() + len, 0x5a);
+        }
+        assert_eq!(flight.len(), TARGET_SCAN_WIRE_LIMIT);
+
+        let mut scanner = server
+            .target_flight_scanner(&context)
+            .expect("wire-authenticated context is mirrorable");
+        assert_eq!(
+            scanner.push(&flight).expect("within scanner window"),
+            TargetScanState::Freezable
+        );
+        let template = scanner.freeze().expect("W-sized candidate freezes");
+        let prefix_capacity = template.target_prefix.capacity();
+        let record_count = template.record_heads.len();
+        let share_output_len = template.share_range.len();
+        let cipher = template.cipher;
+        assert_eq!(
+            prefix_capacity, TARGET_SCAN_PREFIX_CAPACITY,
+            "the scanner's single W+1 allocation moves into the template"
+        );
+        let prepared = server
+            .prepare_mirrored_upload(context, template)
+            .expect("W-shaped template prepares");
+        let (wire, _completion) = prepared.commit().into_wire_and_completion();
+        assert_eq!(wire.len(), TARGET_SCAN_WIRE_LIMIT);
+
+        // Count only allocations that coexist with the W-byte seal output:
+        // the logical plaintext flight, the cloned certificate DER inside it,
+        // the server-share output copied into the SH, the share secret, and
+        // the exact record plan.  KEM encapsulation temporaries are already
+        // dropped before seal output growth and are not mechanically added.
+        let logical_flight = mirrored_flight_len(cipher, server.inner.certificate.der_len());
+        let coexisting_small = logical_flight
+            + server.inner.certificate.der_len()
+            + share_output_len
+            + 64
+            + record_count * std::mem::size_of::<MirroredRecordPlan>();
+        assert!(
+            coexisting_small <= 4096,
+            "small coexisting allocations {coexisting_small} exceed the spec's 4096 temporary allowance"
+        );
+        let explicit_peak = prefix_capacity + wire.capacity() + retained_share_capacity + 4096;
+        assert_eq!(
+            explicit_peak, 136_417,
+            "Bprobe=(W+1)+W+G+4096 in real public order: prefix {prefix_capacity}, seal output {}, G {retained_share_capacity}, small coexisting {coexisting_small}<=4096",
+            wire.capacity()
+        );
+    }
+
     /// The production mirror path enforces the same issuer binding as the
     /// legacy completion API: a context minted by one server instance must
     /// not prepare a flight on another.
@@ -2426,7 +2566,9 @@ mod tests {
             flight.resize(flight.len() + usize::from(len), 0x5a);
         }
 
-        let mut scanner = issuer.target_flight_scanner(&context);
+        let mut scanner = issuer
+            .target_flight_scanner(&context)
+            .expect("controlled context is mirrorable");
         scanner.push(&flight).unwrap();
         let template = scanner
             .freeze()
@@ -4285,7 +4427,7 @@ mod independent_wire_vectors {
             .unwrap_or_else(|| panic!("EOF before {what}"))
     }
 
-    #[derive(Clone, Copy)]
+    #[derive(Clone, Copy, Debug)]
     enum HelloFraming {
         SingleRecord,
         ByteWiseTcp,
@@ -4941,7 +5083,9 @@ mod independent_wire_vectors {
         }
         let prefix = mirror_target_prefix(vector);
         let upload = (*hello).into_mirror_upload();
-        let mut scanner = server.target_flight_scanner(upload.context());
+        let mut scanner = server
+            .target_flight_scanner(upload.context())
+            .expect("wire-authenticated context is mirrorable");
         let scan_state = scanner
             .push(&prefix)
             .unwrap_or_else(|error| panic!("{}: scan push failed: {error}", vector.name));
@@ -5654,11 +5798,12 @@ mod independent_wire_vectors {
     /// transmitted header, even when that header violates the strict shape
     /// the mirrored Finished reader admits.  The rejection then cannot be an
     /// AEAD failure: it is the header policy alone.
-    fn seal_aes128_record_with_header(
+    fn seal_aes128_record_with_header_and_aad(
         key_bytes: &[u8],
         iv: &[u8; 12],
         typ: u8,
         version: [u8; 2],
+        aad: [u8; 5],
         inner_type: u8,
         plaintext: &[u8],
     ) -> Vec<u8> {
@@ -5669,12 +5814,30 @@ mod independent_wire_vectors {
         let mut header = [typ, version[0], version[1], 0, 0];
         header[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
         let tag = cipher
-            .encrypt_in_place_detached(Nonce::from_slice(iv), &header, &mut body)
+            .encrypt_in_place_detached(Nonce::from_slice(iv), &aad, &mut body)
             .expect("test header-mutation seal");
         body.extend_from_slice(&tag);
         let mut out = header.to_vec();
         out.extend_from_slice(&body);
         out
+    }
+
+    fn seal_aes128_record_with_header(
+        key_bytes: &[u8],
+        iv: &[u8; 12],
+        typ: u8,
+        version: [u8; 2],
+        inner_type: u8,
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        let mut body = plaintext.to_vec();
+        body.push(inner_type);
+        let record_len = body.len() + 16;
+        let mut aad = [typ, version[0], version[1], 0, 0];
+        aad[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
+        seal_aes128_record_with_header_and_aad(
+            key_bytes, iv, typ, version, aad, inner_type, plaintext,
+        )
     }
 
     #[tokio::test]
@@ -5784,6 +5947,50 @@ mod independent_wire_vectors {
                 "AEAD-valid record with mutated header must be rejected at admission ({expected}): {error}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mirrored_finished_with_canonical_header_but_wrong_aad_tag_is_aead_rejected() {
+        let vector = &MIRROR_X25519_AES128;
+        assert_eq!(vector.cipher, TLS_AES_128_GCM_SHA256);
+        let (ch_message, patched_sh, tls_dh, auth_key) = oracle_inputs(vector);
+        let oracle = oracle_flight_crypto(vector, &ch_message, &patched_sh, &tls_dh, &auth_key);
+        let iv: [u8; 12] = oracle
+            .client_hs_iv
+            .as_slice()
+            .try_into()
+            .expect("twelve-byte iv");
+        let mut finished = Vec::new();
+        finished.push(HS_FINISHED);
+        finished.extend_from_slice(&(oracle.client_finished_body.len() as u32).to_be_bytes()[1..4]);
+        finished.extend_from_slice(&oracle.client_finished_body);
+        let plaintext_len = finished.len() + 1;
+        let record_len = plaintext_len + 16;
+        // The transmitted header is canonical and passes header admission.
+        // The tag is instead computed for a wrong-AAD input under the same
+        // key and sequence-zero nonce, so rejection must occur in AEAD open.
+        let mut wrong_aad = [TLS_RECORD_APPLICATION_DATA, 0x03, 0x01, 0, 0];
+        wrong_aad[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
+        let record = seal_aes128_record_with_header_and_aad(
+            &oracle.client_hs_key,
+            &iv,
+            TLS_RECORD_APPLICATION_DATA,
+            [0x03, 0x03],
+            wrong_aad,
+            TLS_RECORD_HANDSHAKE,
+            &finished,
+        );
+        let session = open_mirror_vector_session(vector).await;
+        let error = finish_error_after_record(session, &record).await;
+        assert!(
+            error.to_string().contains("decrypt"),
+            "wrong-AAD input must fail AEAD open after header admission: {error}"
+        );
+        assert!(
+            !error.to_string().contains("record type")
+                && !error.to_string().contains("record version"),
+            "wrong-AAD case must not be confused with header admission: {error}"
+        );
     }
 
     /// correct keys seal the record, but the verify_data is computed over a
@@ -6058,7 +6265,7 @@ mod independent_wire_vectors {
         let psk_body = {
             // well-formed minimal pre_shared_key: one identity, one binder
             let mut body = Vec::new();
-            body.extend_from_slice(&8u16.to_be_bytes());
+            body.extend_from_slice(&7u16.to_be_bytes());
             body.extend_from_slice(&1u16.to_be_bytes());
             body.push(0x58);
             body.extend_from_slice(&0u32.to_be_bytes());
@@ -6192,7 +6399,25 @@ mod independent_wire_vectors {
                     framing,
                 )
                 .await;
-                drop(session);
+                let MirrorVectorSession {
+                    mut client_io,
+                    stream,
+                    completion,
+                } = session;
+                client_io
+                    .write_all(&hex_bytes(vector.client_finished_record_hex))
+                    .await
+                    .unwrap();
+                client_io.flush().await.unwrap();
+                tokio::time::timeout(Duration::from_secs(2), completion.finish(stream))
+                    .await
+                    .expect("reframed mirrored Finished timed out")
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{}: reframed {:?} Finished failed: {error}",
+                            vector.name, framing
+                        )
+                    });
             }
         }
     }

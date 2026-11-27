@@ -378,12 +378,17 @@ async fn reality_handshake(
             if let Some(msg) = pop_handshake_message(&mut handshake_buf) {
                 break msg;
             }
-            validate_handshake_reassembly_budget(transcript.len(), &handshake_buf)?;
+            validate_handshake_reassembly_budget(
+                transcript.len(),
+                &handshake_buf,
+                cipher.hash().len() + 4,
+            )?;
             fill_decrypted_handshake(
                 &mut inner,
                 &mut server_hs,
                 &mut handshake_buf,
                 transcript.len(),
+                cipher.hash().len() + 4,
             )
             .await?;
         };
@@ -909,8 +914,20 @@ async fn read_plain_handshake<R: AsyncRead + Unpin>(r: &mut R, expected: u8) -> 
     }
 }
 
-fn validate_handshake_reassembly_budget(transcript_len: usize, out: &VecDeque<u8>) -> Result<()> {
-    if transcript_len + out.len() > MAX_PRE_AUTH_TRANSCRIPT_LEN {
+fn validate_handshake_reassembly_budget(
+    transcript_len: usize,
+    out: &VecDeque<u8>,
+    finished_len: usize,
+) -> Result<()> {
+    // The pre-auth cap is a cap on CertificateVerify's transcript inputs.
+    // Finished is authenticated independently of that cap, so reassembly has
+    // exactly one suite-sized Finished frame of additional room.  This keeps
+    // the v1 boundary where EE+C+CV may occupy the full 64 KiB and Finished
+    // still completes, without allowing an over-large non-Finished message.
+    let hard_remaining = MAX_PRE_AUTH_TRANSCRIPT_LEN
+        .saturating_add(finished_len)
+        .saturating_sub(transcript_len);
+    if out.len() > hard_remaining {
         return Err(TransportError::ResourceLimit(format!(
             "Reality TLS: fragmented handshake reassembly exceeded {MAX_PRE_AUTH_TRANSCRIPT_LEN} bytes"
         )));
@@ -918,7 +935,11 @@ fn validate_handshake_reassembly_budget(transcript_len: usize, out: &VecDeque<u8
     if out.len() >= 4 {
         let header = out.iter().copied().take(4).collect::<Vec<_>>();
         let declared = 4 + read_u24(&header[1..4]);
-        let remaining = MAX_PRE_AUTH_TRANSCRIPT_LEN.saturating_sub(transcript_len);
+        let remaining = if header[0] == HS_FINISHED {
+            hard_remaining
+        } else {
+            MAX_PRE_AUTH_TRANSCRIPT_LEN.saturating_sub(transcript_len)
+        };
         if declared > remaining {
             return Err(TransportError::ResourceLimit(format!(
                 "Reality TLS: fragmented handshake message of {declared} bytes exceeds the remaining pre-auth budget {remaining}"
@@ -933,6 +954,7 @@ async fn fill_decrypted_handshake<R: AsyncRead + Unpin>(
     key: &mut RecordKey,
     out: &mut VecDeque<u8>,
     transcript_len: usize,
+    finished_len: usize,
 ) -> Result<()> {
     loop {
         let record = read_record(r).await?.ok_or_else(|| {
@@ -956,6 +978,7 @@ async fn fill_decrypted_handshake<R: AsyncRead + Unpin>(
         match inner_type {
             TLS_RECORD_HANDSHAKE => {
                 let remaining = MAX_PRE_AUTH_TRANSCRIPT_LEN
+                    .saturating_add(finished_len)
                     .saturating_sub(transcript_len)
                     .saturating_sub(out.len());
                 if plaintext.len() > remaining {
@@ -964,7 +987,7 @@ async fn fill_decrypted_handshake<R: AsyncRead + Unpin>(
                     )));
                 }
                 out.extend(plaintext);
-                validate_handshake_reassembly_budget(transcript_len, out)?;
+                validate_handshake_reassembly_budget(transcript_len, out, finished_len)?;
                 return Ok(());
             }
             TLS_RECORD_ALERT => {
@@ -3170,7 +3193,7 @@ mod tests {
         let mut input = &wire[..];
         let mut out = VecDeque::new();
         for _ in pieces {
-            fill_decrypted_handshake(&mut input, &mut open_key, &mut out, 100)
+            fill_decrypted_handshake(&mut input, &mut open_key, &mut out, 100, 36)
                 .await
                 .expect("legitimate fragmented message fits the remaining budget");
         }
@@ -3197,7 +3220,7 @@ mod tests {
         let mut input = &wire[..];
         let mut out = VecDeque::new();
         for _ in &fragments {
-            fill_decrypted_handshake(&mut input, &mut open_key, &mut out, transcript_len)
+            fill_decrypted_handshake(&mut input, &mut open_key, &mut out, transcript_len, 36)
                 .await
                 .expect("exact remaining budget must stay legal across record fragments");
         }
@@ -3214,9 +3237,10 @@ mod tests {
         let (wire, mut open_key) = sealed_handshake_fragments(&[&header]);
         let mut input = &wire[..];
         let mut out = VecDeque::new();
-        let error = fill_decrypted_handshake(&mut input, &mut open_key, &mut out, transcript_len)
-            .await
-            .expect_err("declared message is larger than the remaining budget");
+        let error =
+            fill_decrypted_handshake(&mut input, &mut open_key, &mut out, transcript_len, 36)
+                .await
+                .expect_err("declared message is larger than the remaining budget");
         assert!(
             error
                 .to_string()
@@ -3226,23 +3250,49 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn encrypted_handshake_reassembly_checks_cumulative_budget_before_append() {
+    async fn encrypted_handshake_reassembly_exact_pre_finished_boundary_still_accepts_finished() {
+        let transcript_len = MAX_PRE_AUTH_TRANSCRIPT_LEN;
+        let body_len = 32usize;
+        let mut finished = vec![HS_FINISHED];
+        finished.extend_from_slice(&(body_len as u32).to_be_bytes()[1..4]);
+        finished.extend_from_slice(&[0x42; 32]);
+        let pieces = [&finished[..2], &finished[2..17], &finished[17..]];
+        let (wire, mut open_key) = sealed_handshake_fragments(&pieces);
+        let mut input = &wire[..];
+        let mut out = VecDeque::new();
+        for _ in pieces {
+            fill_decrypted_handshake(&mut input, &mut open_key, &mut out, transcript_len, 36)
+                .await
+                .expect(
+                    "Finished is independently bounded after the exact v1 pre-Finished boundary",
+                );
+        }
+        assert_eq!(
+            pop_handshake_message(&mut out).expect("finished").raw,
+            finished
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_handshake_reassembly_rejects_non_finished_beyond_v1_transcript_cap() {
         let transcript_len = MAX_PRE_AUTH_TRANSCRIPT_LEN - 10;
-        let mut plaintext = vec![HS_ENCRYPTED_EXTENSIONS, 0, 0, 0];
+        let mut plaintext = vec![HS_CERTIFICATE, 0, 0, 7];
         plaintext.extend_from_slice(&[0xaa; 7]);
         let (wire, mut open_key) = sealed_handshake_fragments(&[&plaintext]);
         let mut input = &wire[..];
         let mut out = VecDeque::new();
-        let error = fill_decrypted_handshake(&mut input, &mut open_key, &mut out, transcript_len)
-            .await
-            .expect_err("eleven plaintext bytes cannot fit a ten-byte remaining budget");
+        let error =
+            fill_decrypted_handshake(&mut input, &mut open_key, &mut out, transcript_len, 36)
+                .await
+                .expect_err(
+                    "eleven-byte Certificate does not fit the ten-byte pre-Finished budget",
+                );
         assert!(
             error
                 .to_string()
                 .contains("exceeds the remaining pre-auth budget"),
             "unexpected error: {error}"
         );
-        assert!(out.is_empty(), "over-budget plaintext is not appended");
     }
 
     /// Drives `reality_handshake` against an in-memory duplex peer that

@@ -9,18 +9,19 @@ use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
 #[cfg(test)]
-use crate::reality_tls::{x25519, x25519_public_from_private};
+use crate::reality_tls::{x25519, x25519_public_from_private, TranscriptHasher};
 
+#[cfg(test)]
+use crate::reality_server::VerifiedHello;
 use crate::reality_server::{
     certificate_message, certificate_verify_input, encapsulate_server_share, handshake_message,
     hybrid_key_share_usable, x25519_public_key_usable, AuthenticatedMirrorContext, ChosenKeyShare,
-    ClientKeyShares, OfferedCipherSuites, RealityCertificate, SupportedGroups, VerifiedHello,
-    SIG_ED25519,
+    RealityCertificate, SIG_ED25519,
 };
 use crate::reality_tls::{
     finished_verify_data_with_hash, put_u16, read_u24, ApplicationKeys, CipherSuite, HandshakeKeys,
-    HashAlg, RecordKey, TranscriptHasher, HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS,
-    HS_FINISHED, TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256,
+    HashAlg, RecordKey, HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED,
+    TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256,
     TLS_RECORD_APPLICATION_DATA, TLS_RECORD_CHANGE_CIPHER_SPEC, TLS_RECORD_HANDSHAKE,
 };
 use crate::{Result as TransportResult, Stream, TransportError};
@@ -153,145 +154,74 @@ impl fmt::Display for MirrorClientProfileError {
 
 impl std::error::Error for MirrorClientProfileError {}
 
-pub(crate) trait MirrorHelloView {
-    fn session_id(&self) -> &[u8; 32];
-    fn cipher_suites(&self) -> &OfferedCipherSuites;
-    fn supported_groups(&self) -> &SupportedGroups;
-    fn key_shares(&self) -> &ClientKeyShares;
-    fn auth_key(&self) -> &[u8; 32];
-    fn transcript_hasher(&self, hash: HashAlg) -> TranscriptHasher;
-    fn profile(&self) -> (bool, bool, Option<u16>, bool, bool);
-}
-
-impl MirrorHelloView for VerifiedHello {
-    fn session_id(&self) -> &[u8; 32] {
-        &self.hello.session_id
-    }
-    fn cipher_suites(&self) -> &OfferedCipherSuites {
-        &self.hello.cipher_suites
-    }
-    fn supported_groups(&self) -> &SupportedGroups {
-        &self.hello.supported_groups
-    }
-    fn key_shares(&self) -> &ClientKeyShares {
-        &self.hello.key_shares
-    }
-    fn auth_key(&self) -> &[u8; 32] {
-        &self.auth_key
-    }
-    fn transcript_hasher(&self, hash: HashAlg) -> TranscriptHasher {
-        // Compatibility shim for the pre-split API.  The production upload
-        // path uses AuthenticatedMirrorContext and does not repeat this scan.
-        let mut out = TranscriptHasher::new(hash);
-        out.update(&self.hello.raw);
-        out
-    }
-    fn profile(&self) -> (bool, bool, Option<u16>, bool, bool) {
-        (
-            self.hello.has_pre_shared_key,
-            self.hello.has_early_data,
-            self.hello.record_size_limit,
-            self.hello.record_size_limit_malformed,
-            self.hello.key_share_malformed,
-        )
+#[cfg(test)]
+fn mirror_context_for_test(verified: &VerifiedHello) -> AuthenticatedMirrorContext {
+    let mut transcript_sha256 = TranscriptHasher::new(HashAlg::Sha256);
+    let mut transcript_sha384 = TranscriptHasher::new(HashAlg::Sha384);
+    transcript_sha256.update(&verified.hello.raw);
+    transcript_sha384.update(&verified.hello.raw);
+    let mut auth_key = [0u8; 32];
+    auth_key.copy_from_slice(&verified.auth_key[..]);
+    AuthenticatedMirrorContext {
+        issuer: std::sync::Arc::clone(&verified.issuer),
+        auth_key: Zeroizing::new(auth_key),
+        session_id: verified.hello.session_id,
+        cipher_suites: verified.hello.cipher_suites,
+        supported_groups: verified.hello.supported_groups,
+        key_shares: verified.hello.key_shares.clone(),
+        has_pre_shared_key: verified.hello.has_pre_shared_key,
+        has_early_data: verified.hello.has_early_data,
+        record_size_limit: verified.hello.record_size_limit,
+        record_size_limit_malformed: verified.hello.record_size_limit_malformed,
+        key_share_malformed: verified.hello.key_share_malformed,
+        transcript_sha256,
+        transcript_sha384,
     }
 }
 
-impl MirrorHelloView for AuthenticatedMirrorContext {
-    fn session_id(&self) -> &[u8; 32] {
-        &self.session_id
-    }
-    fn cipher_suites(&self) -> &OfferedCipherSuites {
-        &self.cipher_suites
-    }
-    fn supported_groups(&self) -> &SupportedGroups {
-        &self.supported_groups
-    }
-    fn key_shares(&self) -> &ClientKeyShares {
-        &self.key_shares
-    }
-    fn auth_key(&self) -> &[u8; 32] {
-        &self.auth_key
-    }
-    fn transcript_hasher(&self, hash: HashAlg) -> TranscriptHasher {
-        match hash {
-            HashAlg::Sha256 => self.transcript_sha256.clone(),
-            HashAlg::Sha384 => self.transcript_sha384.clone(),
-        }
-    }
-    fn profile(&self) -> (bool, bool, Option<u16>, bool, bool) {
-        (
-            self.has_pre_shared_key,
-            self.has_early_data,
-            self.record_size_limit,
-            self.record_size_limit_malformed,
-            self.key_share_malformed,
-        )
-    }
-}
-
-pub(crate) fn mirror_profile_view(
-    view: &dyn MirrorHelloView,
+pub(crate) fn mirror_profile_context(
+    context: &AuthenticatedMirrorContext,
 ) -> std::result::Result<(), MirrorClientProfileError> {
-    let (has_psk, has_early, rsl, rsl_malformed, key_malformed) = view.profile();
-    if has_psk {
+    if context.has_pre_shared_key {
         return Err(MirrorClientProfileError::PreSharedKey);
     }
-    if has_early {
+    if context.has_early_data {
         return Err(MirrorClientProfileError::EarlyData);
     }
-    if rsl_malformed || matches!(rsl, Some(value) if value != EXT_RECORD_SIZE_LIMIT_VALUE) {
+    if context.record_size_limit_malformed
+        || matches!(context.record_size_limit, Some(value) if value != EXT_RECORD_SIZE_LIMIT_VALUE)
+    {
         return Err(MirrorClientProfileError::RecordSizeLimit);
     }
-    if key_malformed {
+    if context.key_share_malformed {
         return Err(MirrorClientProfileError::MalformedKeyShare);
     }
-    let x = client_key_share_usable(view, GROUP_X25519);
-    let hybrid = client_key_share_usable(view, GROUP_X25519_MLKEM768);
+    let x = client_key_share_usable(context, GROUP_X25519);
+    let hybrid = client_key_share_usable(context, GROUP_X25519_MLKEM768);
     if !x && !hybrid {
         return Err(MirrorClientProfileError::NoUsableGroup);
     }
     Ok(())
 }
 
+#[cfg(test)]
 impl VerifiedHello {
-    /// Whether this authenticated ClientHello is eligible for v2 mirroring.
-    /// Authentication has already happened; this check only describes the
-    /// outer TLS profile needed to construct a compatible local flight.
+    /// Test compatibility view of the pre-split mirror profile judgment.
+    /// Production callers use the consuming `AuthenticatedMirrorContext`.
     pub fn mirror_profile(&self) -> std::result::Result<(), MirrorClientProfileError> {
-        if self.hello.has_pre_shared_key {
-            return Err(MirrorClientProfileError::PreSharedKey);
-        }
-        if self.hello.has_early_data {
-            return Err(MirrorClientProfileError::EarlyData);
-        }
-        if self.hello.record_size_limit_malformed
-            || matches!(self.hello.record_size_limit, Some(value) if value != EXT_RECORD_SIZE_LIMIT_VALUE)
-        {
-            return Err(MirrorClientProfileError::RecordSizeLimit);
-        }
-        if self.hello.key_share_malformed {
-            return Err(MirrorClientProfileError::MalformedKeyShare);
-        }
-        let usable = [GROUP_X25519, GROUP_X25519_MLKEM768]
-            .into_iter()
-            .any(|group| client_key_share_usable(self, group));
-        if !usable {
-            return Err(MirrorClientProfileError::NoUsableGroup);
-        }
-        Ok(())
+        mirror_profile_context(&mirror_context_for_test(self))
     }
 }
 
-fn client_key_share_entry(view: &dyn MirrorHelloView, group: u16) -> Option<&[u8]> {
-    view.key_shares().bytes(group)
+fn client_key_share_entry(context: &AuthenticatedMirrorContext, group: u16) -> Option<&[u8]> {
+    context.key_shares.bytes(group)
 }
 
-fn client_key_share_usable(view: &dyn MirrorHelloView, group: u16) -> bool {
-    if !view.supported_groups().declares(group) {
+fn client_key_share_usable(context: &AuthenticatedMirrorContext, group: u16) -> bool {
+    if !context.supported_groups.declares(group) {
         return false;
     }
-    let Some(entry) = client_key_share_entry(view, group) else {
+    let Some(entry) = client_key_share_entry(context, group) else {
         return false;
     };
     match group {
@@ -412,7 +342,7 @@ fn take_sh_u16(input: &[u8], pos: &mut usize) -> Option<u16> {
 }
 
 fn parse_template_server_hello(
-    verified: &dyn MirrorHelloView,
+    verified: &AuthenticatedMirrorContext,
     sh: &[u8],
 ) -> std::result::Result<ParsedServerHello, MirrorTemplateError> {
     if sh.len() < 4 || sh[0] != 0x02 || read_u24(&sh[1..4]) + 4 != sh.len() {
@@ -435,7 +365,7 @@ fn parse_template_server_hello(
     }
     let session_id =
         take_bytes(sh, &mut pos, 32).ok_or(MirrorTemplateError::MalformedServerHello)?;
-    if session_id != verified.session_id() {
+    if session_id != verified.session_id {
         return Err(MirrorTemplateError::SessionIdMismatch);
     }
     let cipher_value =
@@ -446,7 +376,7 @@ fn parse_template_server_hello(
         TLS_CHACHA20_POLY1305_SHA256 => CipherSuite::ChaCha20Poly1305Sha256,
         _ => return Err(MirrorTemplateError::UnsupportedCipher),
     };
-    if !verified.cipher_suites().contains(cipher_value) {
+    if !verified.cipher_suites.contains(cipher_value) {
         return Err(MirrorTemplateError::CipherNotOffered);
     }
     if take_sh_u8(sh, &mut pos) != Some(0) {
@@ -531,10 +461,10 @@ fn parse_template_server_hello(
         _ => return Err(MirrorTemplateError::UnsupportedGroup),
     }
 
-    if !verified.supported_groups().declares(group) {
+    if !verified.supported_groups.declares(group) {
         return Err(MirrorTemplateError::GroupNotOffered);
     }
-    if !verified.key_shares().present(group) {
+    if !verified.key_shares.present(group) {
         return Err(MirrorTemplateError::KeyShareNotProvided);
     }
     if !client_key_share_usable(verified, group) {
@@ -563,16 +493,17 @@ impl MirrorTemplate {
         verified: &VerifiedHello,
         prefix: &[u8],
     ) -> std::result::Result<Self, MirrorTemplateError> {
-        Self::parse_owned(verified, prefix.to_vec())
+        let context = mirror_context_for_test(verified);
+        Self::parse_owned(&context, prefix.to_vec())
     }
 
     #[cfg(test)]
     fn parse_owned(
-        verified: &dyn MirrorHelloView,
+        verified: &AuthenticatedMirrorContext,
         prefix_buf: Vec<u8>,
     ) -> std::result::Result<Self, MirrorTemplateError> {
         let prefix = &prefix_buf[..];
-        mirror_profile_view(verified).map_err(MirrorTemplateError::ClientProfile)?;
+        mirror_profile_context(verified).map_err(MirrorTemplateError::ClientProfile)?;
         if prefix.len() < 5 {
             return Err(MirrorTemplateError::Incomplete);
         }
@@ -645,7 +576,7 @@ impl MirrorTemplate {
             return Err(MirrorTemplateError::MissingApplicationRecords);
         }
 
-        let client_session_id = *verified.session_id();
+        let client_session_id = verified.session_id;
         Ok(Self {
             client_session_id,
             target_prefix: prefix_buf,
@@ -758,7 +689,7 @@ pub(crate) fn mirrored_flight_len(cipher: CipherSuite, certificate_der_len: usiz
 /// the authenticated context: SID echo, cipher/group advertisement, key-share
 /// presence and low-order checks all happen here, not again in `freeze`.
 pub struct TargetFlightScanner<'a> {
-    hello: &'a dyn MirrorHelloView,
+    hello: &'a AuthenticatedMirrorContext,
     certificate_der_len: usize,
     prefix: Vec<u8>,
     cursor: usize,
@@ -774,18 +705,17 @@ pub struct TargetFlightScanner<'a> {
 }
 
 impl<'a> TargetFlightScanner<'a> {
-    pub(crate) fn new(context: &'a AuthenticatedMirrorContext, certificate_der_len: usize) -> Self {
-        Self::new_view(context, certificate_der_len)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_compat(verified: &'a VerifiedHello, certificate_der_len: usize) -> Self {
-        Self::new_view(verified, certificate_der_len)
-    }
-
-    fn new_view(hello: &'a dyn MirrorHelloView, certificate_der_len: usize) -> Self {
-        Self {
-            hello,
+    /// Start scanning for an authenticated context that has already passed
+    /// the mirror entrance profile.  Performing admission here makes the
+    /// later `Freezable` state mean what it says: freeze cannot discover a
+    /// client-profile rejection after target bytes have already been read.
+    pub(crate) fn new(
+        context: &'a AuthenticatedMirrorContext,
+        certificate_der_len: usize,
+    ) -> std::result::Result<Self, MirrorClientProfileError> {
+        mirror_profile_context(context)?;
+        Ok(Self {
+            hello: context,
             certificate_der_len,
             prefix: Vec::with_capacity(TARGET_SCAN_PREFIX_CAPACITY),
             cursor: 0,
@@ -798,7 +728,7 @@ impl<'a> TargetFlightScanner<'a> {
             parsed_server_hello: None,
             record_heads: Vec::with_capacity(MAX_MIRRORED_RECORDS),
             incompatible: None,
-        }
+        })
     }
 
     /// Remaining bytes in the lossless prefix arena, including the one-byte
@@ -813,7 +743,7 @@ impl<'a> TargetFlightScanner<'a> {
     /// the window is zero: ownership should move to cover rather than
     /// continuing to buffer the target.
     pub fn read_window(&self) -> usize {
-        if self.incompatible.is_some() {
+        if matches!(self.state(), TargetScanState::Incompatible(_)) {
             0
         } else {
             self.remaining_capacity()
@@ -891,6 +821,10 @@ impl<'a> TargetFlightScanner<'a> {
                         return;
                     }
                     let len = usize::from(u16::from_be_bytes([self.prefix[3], self.prefix[4]]));
+                    if self.prefix[0] == 0x15 {
+                        self.incompatible = Some(MirrorCoverReason::DestAlert);
+                        return;
+                    }
                     if self.prefix[..3] != [0x16, 0x03, 0x03] || len == 0 || len > 16 * 1024 {
                         self.incompatible = Some(MirrorCoverReason::DestProfile);
                         return;
@@ -1027,13 +961,7 @@ impl<'a> TargetFlightScanner<'a> {
                 scanner: self,
             }));
         }
-        if let Err(profile) = mirror_profile_view(self.hello) {
-            return Err(Box::new(TargetFreezeError {
-                error: MirrorTemplateError::ClientProfile(profile),
-                scanner: self,
-            }));
-        }
-        let client_session_id = *self.hello.session_id();
+        let client_session_id = self.hello.session_id;
         let server_hello_end = self
             .server_hello_end
             .expect("freezable scan has a complete ServerHello");
@@ -1163,7 +1091,7 @@ fn random_mirror_server_random() -> TransportResult<[u8; 32]> {
 
 #[cfg(test)]
 fn fixed_ephemeral_exchange(
-    verified: &dyn MirrorHelloView,
+    verified: &AuthenticatedMirrorContext,
     group: u16,
     fixed: &MirrorCryptoInput,
 ) -> TransportResult<(Vec<u8>, Zeroizing<Vec<u8>>)> {
@@ -1212,7 +1140,7 @@ fn fixed_ephemeral_exchange(
 
 #[cfg(test)]
 fn ephemeral_exchange(
-    verified: &dyn MirrorHelloView,
+    verified: &AuthenticatedMirrorContext,
     group: u16,
     fixed: Option<&MirrorCryptoInput>,
 ) -> TransportResult<(Vec<u8>, Zeroizing<Vec<u8>>)> {
@@ -1224,14 +1152,14 @@ fn ephemeral_exchange(
 
 #[cfg(not(test))]
 fn ephemeral_exchange(
-    verified: &dyn MirrorHelloView,
+    verified: &AuthenticatedMirrorContext,
     group: u16,
 ) -> TransportResult<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     random_ephemeral_exchange(verified, group)
 }
 
 fn random_ephemeral_exchange(
-    verified: &dyn MirrorHelloView,
+    verified: &AuthenticatedMirrorContext,
     group: u16,
 ) -> TransportResult<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     let entry = client_key_share_entry(verified, group)
@@ -1244,20 +1172,23 @@ fn random_ephemeral_exchange(
 
 fn build_mirror_flight(
     certificate: &RealityCertificate,
-    verified: &dyn MirrorHelloView,
+    verified: &AuthenticatedMirrorContext,
     patched_server_hello: &[u8],
     cipher: CipherSuite,
     tls_dh: &[u8],
 ) -> TransportResult<BuiltMirrorFlight> {
     let hash = cipher.hash();
-    let mut transcript = verified.transcript_hasher(hash);
+    let mut transcript = match hash {
+        HashAlg::Sha256 => verified.transcript_sha256.clone(),
+        HashAlg::Sha384 => verified.transcript_sha384.clone(),
+    };
     transcript.update(patched_server_hello);
     let t0 = transcript.finalize_clone();
     let hs = HandshakeKeys::derive_with_transcript_hash(cipher, tls_dh, &t0);
 
     let ee = handshake_message(HS_ENCRYPTED_EXTENSIONS, &[0, 0]);
     transcript.update(&ee);
-    let certificate_der = certificate.for_auth_key(verified.auth_key());
+    let certificate_der = certificate.for_auth_key(&verified.auth_key);
     let certificate_msg = certificate_message(&certificate_der);
     transcript.update(&certificate_msg);
     let t1 = transcript.finalize_clone();
@@ -1420,7 +1351,7 @@ async fn read_mirrored_client_finished(
         bytes: Zeroizing::new([0; 52]),
     };
     for _ in 0..32 {
-        if total_wire >= 65_536 {
+        if 65_536usize.saturating_sub(total_wire) < 5 {
             return Err(TransportError::ResourceLimit(
                 "REALITY mirrored client Finished exceeds 64 KiB".into(),
             ));
@@ -1585,7 +1516,8 @@ pub(crate) fn prepare_mirrored_flight(
     template: MirrorTemplate,
     fixed_crypto: Option<&MirrorCryptoInput>,
 ) -> TransportResult<PreparedFlight> {
-    prepare_mirrored_flight_impl(certificate, verified, &template, fixed_crypto)
+    let context = mirror_context_for_test(verified);
+    prepare_mirrored_flight_impl(certificate, &context, &template, fixed_crypto)
         .map(|prepared| prepared.with_target_prefix(template))
 }
 
@@ -1630,11 +1562,11 @@ pub(crate) fn prepare_mirrored_flight_context(
 #[allow(clippy::needless_pass_by_value)] // ownership is an explicit pre-commit barrier
 fn prepare_mirrored_flight_impl(
     certificate: &RealityCertificate,
-    verified: &dyn MirrorHelloView,
+    verified: &AuthenticatedMirrorContext,
     template: &MirrorTemplate,
     #[cfg(test)] fixed_crypto: Option<&MirrorCryptoInput>,
 ) -> TransportResult<PreparedFlight> {
-    if *verified.session_id() != template.client_session_id {
+    if verified.session_id != template.client_session_id {
         return Err(TransportError::Tls(
             "REALITY mirror template is bound to a different ClientHello".into(),
         ));
@@ -2672,6 +2604,90 @@ mod tests {
         assert!(error.to_string().contains("exceeds 64 KiB"), "{error}");
     }
 
+    struct CountingReadStream {
+        data: Vec<u8>,
+        pos: usize,
+        reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for CountingReadStream {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let n = buf.remaining().min(self.data.len() - self.pos);
+            buf.put_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    impl tokio::io::AsyncWrite for CountingReadStream {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn finished_reader_does_not_start_a_header_when_fewer_than_five_bytes_remain() {
+        let message = finished_message();
+        for remaining in 0..=4usize {
+            let first_three_wire = 3 * 16_406;
+            let fourth_wire = 65_536 - remaining - first_three_wire;
+            assert!((23..=16_406).contains(&fourth_wire));
+            let chunks = [
+                &message[..1],
+                &message[1..2],
+                &message[2..3],
+                &message[3..4],
+            ];
+            // Each one-byte Finished fragment is legal and padded so the four
+            // records end with exactly `remaining` bytes left in the W budget.
+            let wire = seal_finished_wire(&chunks, &[16_383, 16_383, 16_383, fourth_wire - 23]);
+            assert_eq!(wire.len(), 65_536 - remaining);
+            let mut counted_wire = wire;
+            counted_wire.extend_from_slice(&[0x17, 0x03, 0x03, 0x00, 0x12]);
+            let reads = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let stream = CountingReadStream {
+                data: counted_wire,
+                pos: 0,
+                reads: std::sync::Arc::clone(&reads),
+            };
+            let (_seal, mut open) = finished_record_keys();
+            let mut stream: Box<dyn Stream> = Box::new(stream);
+            let error = read_mirrored_client_finished(&mut stream, &mut open, 32)
+                .await
+                .expect_err("header must not start outside the wire budget");
+            assert!(
+                error.to_string().contains("exceeds 64 KiB"),
+                "remaining {remaining}: {error}"
+            );
+            assert_eq!(
+                reads.load(std::sync::atomic::Ordering::SeqCst),
+                8,
+                "remaining {remaining}: exactly four headers and four bodies were read; no fifth header read may start"
+            );
+        }
+    }
+
     fn scanner_certificate_len(hello: &VerifiedHello) -> usize {
         RealityCertificate::generate()
             .expect("test certificate")
@@ -2690,7 +2706,9 @@ mod tests {
         let hello = x25519_verified();
         let sh = valid_x25519_sh(&hello, true);
         let prefix = target_prefix(&sh.message, true, &[25, 3217, 281, 69]);
-        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
+        let context = mirror_context_for_test(&hello);
+        let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+            .expect("test profile admits scanner");
         let split = 5 + sh.message.len() + COMPAT_CCS_RECORD.len() + 5 + 10;
         assert_eq!(
             push_scanner(&mut scanner, &prefix[..split]),
@@ -2723,7 +2741,9 @@ mod tests {
         let hello = x25519_verified();
         let sh = valid_x25519_sh(&hello, false);
 
-        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
+        let context = mirror_context_for_test(&hello);
+        let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+            .expect("test profile admits scanner");
         let repeated = target_prefix(&sh.message, true, &[18])
             .into_iter()
             .take(5 + sh.message.len() + COMPAT_CCS_RECORD.len())
@@ -2737,7 +2757,9 @@ mod tests {
             TargetScanState::Incompatible(MirrorCoverReason::DestProfile)
         );
 
-        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
+        let context = mirror_context_for_test(&hello);
+        let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+            .expect("test profile admits scanner");
         let mut prefix = target_prefix(&sh.message, false, &[16401, 16401, 16401]);
         // A fourth maximum-size header is inside W but its body necessarily
         // ends beyond W.  The scanner must reject as soon as that header is
@@ -2760,7 +2782,9 @@ mod tests {
 
         // If the overflow byte arrives in the same bounded read as the Wth
         // byte, it is retained byte-for-byte for cover as the sentinel.
-        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
+        let context = mirror_context_for_test(&hello);
+        let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+            .expect("test profile admits scanner");
         let mut prefix = target_prefix(&sh.message, false, &[16401, 16401, 16401]);
         let remaining = 65_536 - prefix.len();
         prefix.extend_from_slice(&[0x17, 0x03, 0x03, 0x40, 0x11]);
@@ -2783,7 +2807,9 @@ mod tests {
     #[test]
     fn scanner_push_rejects_input_beyond_read_window_without_consuming() {
         let hello = x25519_verified();
-        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
+        let context = mirror_context_for_test(&hello);
+        let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+            .expect("test profile admits scanner");
         let sh = valid_x25519_sh(&hello, false);
         let prefix = target_prefix(&sh.message, false, &[25]);
         push_scanner(&mut scanner, &prefix[..7]);
@@ -2803,7 +2829,7 @@ mod tests {
     }
 
     #[test]
-    fn scanner_freeze_failure_returns_the_same_target_prefix_for_cover() {
+    fn scanner_constructor_performs_mirror_profile_admission() {
         let hello = verified_hello(
             vec![0x001d],
             vec![(0x001d, x25519_public(0x30))],
@@ -2812,21 +2838,128 @@ mod tests {
             false,
             None,
         );
+        let context = mirror_context_for_test(&hello);
+        assert!(matches!(
+            TargetFlightScanner::new(&context, scanner_certificate_len(&hello)),
+            Err(MirrorClientProfileError::PreSharedKey)
+        ));
+    }
+
+    #[test]
+    fn scanner_freeze_failure_returns_the_same_target_prefix_for_cover() {
+        let hello = x25519_verified();
         let sh = valid_x25519_sh(&hello, false);
         let prefix = target_prefix(&sh.message, false, &[25, 3217, 281, 69]);
-        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
-        push_scanner(&mut scanner, &prefix);
-        assert_eq!(scanner.state(), TargetScanState::Freezable);
-        let error = scanner.freeze().expect_err("PSK profile is not mirrorable");
-        assert!(matches!(
-            error.error(),
-            MirrorTemplateError::ClientProfile(MirrorClientProfileError::PreSharedKey)
-        ));
+        let partial = prefix[..5 + sh.message.len() + 3].to_vec();
+        let context = mirror_context_for_test(&hello);
+        let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+            .expect("test profile admits scanner");
+        push_scanner(&mut scanner, &partial);
+        assert_eq!(scanner.state(), TargetScanState::NeedBytes);
+        let error = scanner.freeze().expect_err("half record is not freezable");
+        assert_eq!(error.error(), MirrorTemplateError::Incomplete);
         assert_eq!(
             error.into_prefix(),
-            prefix,
+            partial,
             "pre-commit failure returns the original target bytes without a copy"
         );
+    }
+
+    #[test]
+    fn scanner_terminal_record_limit_closes_read_window() {
+        let hello = x25519_verified();
+        let sh = valid_x25519_sh(&hello, false);
+        let prefix = target_prefix(&sh.message, false, &[18; MAX_MIRRORED_RECORDS]);
+        let context = mirror_context_for_test(&hello);
+        let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+            .expect("test profile admits scanner");
+        push_scanner(&mut scanner, &prefix);
+        assert_eq!(
+            scanner.state(),
+            TargetScanState::Incompatible(MirrorCoverReason::RecordLimit)
+        );
+        assert_eq!(scanner.read_window(), 0);
+        let error = scanner.push(&[0]).expect_err("terminal scan is closed");
+        assert_eq!(error.window(), 0);
+    }
+
+    #[test]
+    fn scanner_classifies_first_plaintext_alert_as_dest_alert() {
+        let hello = x25519_verified();
+        let context = mirror_context_for_test(&hello);
+        let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+            .expect("test profile admits scanner");
+        push_scanner(&mut scanner, &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]);
+        assert_eq!(
+            scanner.state(),
+            TargetScanState::Incompatible(MirrorCoverReason::DestAlert)
+        );
+        assert_eq!(scanner.read_window(), 0);
+    }
+
+    #[test]
+    fn scanner_half_records_and_exact_capacity_are_not_freezable_before_boundary() {
+        let hello = x25519_verified();
+        let certificate_len = scanner_certificate_len(&hello);
+        let flight_len = mirrored_flight_len(CipherSuite::Aes128GcmSha256, certificate_len);
+        assert!(flight_len <= 16_384);
+        let exact_record_len = u16::try_from(flight_len + 17).expect("test record length");
+        let sh = valid_x25519_sh(&hello, false);
+        let prefix = target_prefix(&sh.message, false, &[exact_record_len]);
+        let context = mirror_context_for_test(&hello);
+        let mut scanner = TargetFlightScanner::new(&context, certificate_len)
+            .expect("test profile admits scanner");
+        let sh_end = 5 + sh.message.len();
+        for extra in 0..5 {
+            let boundary = sh_end + extra;
+            let mut probe = TargetFlightScanner::new(&context, certificate_len)
+                .expect("test profile admits scanner");
+            push_scanner(&mut probe, &prefix[..boundary]);
+            assert_ne!(
+                probe.state(),
+                TargetScanState::Freezable,
+                "half header with {extra} bytes must not freeze"
+            );
+        }
+        push_scanner(&mut scanner, &prefix[..prefix.len() - 1]);
+        assert_ne!(
+            scanner.state(),
+            TargetScanState::Freezable,
+            "exact-capacity record body is not countable while incomplete"
+        );
+        push_scanner(&mut scanner, &prefix[prefix.len() - 1..]);
+        assert_eq!(scanner.state(), TargetScanState::Freezable);
+    }
+
+    #[test]
+    fn production_scanner_rejects_per_record_header_template_mutations() {
+        let hello = x25519_verified();
+        let sh = valid_x25519_sh(&hello, false);
+        let mut bad_version = head(18);
+        bad_version[2] = 0x01;
+        let mut bad_len = head(18);
+        bad_len[4] = 17;
+        for (mutation, name) in [
+            (bad_version, "later record version"),
+            (
+                [0x16, 0x03, 0x03, 0x00, 0x12],
+                "handshake type as application record",
+            ),
+            (bad_len, "sub-minimum record length"),
+        ] {
+            let prefix =
+                target_prefix_with_mutation(&sh.message, false, &[18, 18], Some((1, mutation)));
+            let context = mirror_context_for_test(&hello);
+            let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+                .expect("test profile admits scanner");
+            push_scanner(&mut scanner, &prefix);
+            assert_eq!(
+                scanner.state(),
+                TargetScanState::Incompatible(MirrorCoverReason::DestProfile),
+                "{name}"
+            );
+            assert_eq!(scanner.read_window(), 0, "{name} closes the window");
+        }
     }
 
     #[test]
@@ -2839,7 +2972,8 @@ mod tests {
         let mut scanner = TargetFlightScanner::new(
             upload.context(),
             certificate.for_auth_key(&upload.context().auth_key).len(),
-        );
+        )
+        .expect("mirrorable upload context");
         push_scanner(&mut scanner, &prefix);
         let template = scanner.freeze().expect("freezable shape");
         let (context, upload_wire) = upload.finish_upload();
@@ -2859,7 +2993,9 @@ mod tests {
         let mut sh = valid_x25519_sh(&hello, false).message;
         sh[39] ^= 1;
         let prefix = target_prefix(&sh, false, &[25]);
-        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
+        let context = mirror_context_for_test(&hello);
+        let mut scanner = TargetFlightScanner::new(&context, scanner_certificate_len(&hello))
+            .expect("test profile admits scanner");
         let sh_end = 5 + sh.len();
         push_scanner(&mut scanner, &prefix[..sh_end - 1]);
         assert_eq!(scanner.state(), TargetScanState::NeedBytes);
@@ -2891,67 +3027,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    fn record_lengths_filling_width(base: usize, width: usize) -> Vec<u16> {
-        let needed = width - base;
-        for count in 1..=MAX_MIRRORED_RECORDS {
-            let minimum = count * 23;
-            let maximum = count * 16_406;
-            if !(minimum..=maximum).contains(&needed) {
-                continue;
-            }
-            let mut lengths = vec![18usize; count];
-            let mut extra = needed - minimum;
-            for len in &mut lengths {
-                let add = extra.min(16_401 - 18);
-                *len += add;
-                extra -= add;
-            }
-            assert_eq!(extra, 0);
-            return lengths
-                .into_iter()
-                .map(|len| u16::try_from(len).expect("record length"))
-                .collect();
-        }
-        panic!("width {width} cannot be represented from base {base}")
-    }
-
-    #[test]
-    fn probe_prepare_arena_reconciles_with_spec_bprobe() {
-        let hello = hybrid_verified();
-        let certificate = RealityCertificate::generate().expect("test certificate");
-        let certificate_len = certificate.for_auth_key(&hello.auth_key).len();
-        let sh = valid_hybrid_sh(&hello, false);
-        let base = 5 + sh.message.len();
-        let lengths = record_lengths_filling_width(base, TARGET_SCAN_WIRE_LIMIT);
-        assert!(lengths.len() <= MAX_MIRRORED_RECORDS);
-        let prefix = target_prefix(&sh.message, false, &lengths);
-        assert_eq!(prefix.len(), TARGET_SCAN_WIRE_LIMIT);
-
-        let upload = hello.into_mirror_upload();
-        let retained_share_capacity = upload.context().key_shares.retained_capacity();
-        let mut scanner = TargetFlightScanner::new(upload.context(), certificate_len);
-        push_scanner(&mut scanner, &prefix);
-        assert_eq!(scanner.state(), TargetScanState::Freezable);
-        let template = scanner.freeze().expect("W-sized candidate freezes");
-        let prefix_capacity = template.target_prefix.capacity();
-        assert_eq!(
-            prefix_capacity, TARGET_SCAN_PREFIX_CAPACITY,
-            "the scanner's single W+1 allocation moves into the template"
-        );
-        let (context, upload_wire) = upload.finish_upload();
-        drop(upload_wire);
-        let prepared = prepare_mirrored_flight_context(&certificate, context, template)
-            .expect("W-shaped template prepares");
-        let (wire, _completion) = prepared.commit().into_wire_and_completion();
-        assert_eq!(wire.len(), TARGET_SCAN_WIRE_LIMIT);
-        let explicit_peak = prefix_capacity + wire.capacity() + retained_share_capacity + 4096;
-        assert_eq!(
-            explicit_peak, 136_417,
-            "Bprobe=(W+1)+W+G+4096 by capacity: prefix {prefix_capacity}, seal output {}, G {retained_share_capacity}, temp 4096",
-            wire.capacity()
-        );
     }
 
     /// Exhaustively compare the greedy planner against an independent
