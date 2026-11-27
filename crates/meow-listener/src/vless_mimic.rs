@@ -1183,9 +1183,6 @@ mod tests {
         }
     }
 
-    #[cfg(not(unix))]
-    fn wait_target_readiness(_fd: usize) {}
-
     const PRIVATE: [u8; 32] = [0x42; 32];
     const SHORT: [u8; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
 
@@ -1604,6 +1601,7 @@ mod tests {
         flight
     }
 
+    #[cfg(unix)]
     async fn real_target_pair() -> (TcpStream, TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1612,18 +1610,16 @@ mod tests {
         (target, peer)
     }
 
+    #[cfg(unix)]
     async fn real_precommit_case(eof: bool) -> (RealityV2MetricsSnapshot, Vec<u8>, Vec<u8>) {
         let runtime = runtime();
         let ch = capture_client_hello().await;
         let (client, mut client_peer, writes) = scripted_client(&ch);
         let (target, mut target_peer) = real_target_pair().await;
-        #[cfg(unix)]
         let target_fd = {
             use std::os::fd::AsRawFd;
             target.as_raw_fd()
         };
-        #[cfg(not(unix))]
-        let target_fd = 0usize;
         let (scan_tx, mut scan_rx) = tokio::sync::mpsc::unbounded_channel();
         SCAN_OBSERVER.with(|observer| {
             *observer.borrow_mut() = Some(Box::new(move |event| {
@@ -1692,6 +1688,10 @@ mod tests {
         (snap, written, flight)
     }
 
+    // These two tests exercise the kernel-level pre-commit recv barrier.
+    // Their synchronization hook uses poll(2) on a raw fd, so they are
+    // honestly Unix-only rather than silently weakening the barrier elsewhere.
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn t3_real_loopback_raw_recv_observes_prepare_window_tail_byte() {
         let (snap, written, flight) = real_precommit_case(false).await;
@@ -1706,6 +1706,7 @@ mod tests {
         assert_eq!(written, expected);
     }
 
+    #[cfg(unix)]
     #[tokio::test(start_paused = true)]
     async fn t3_real_loopback_raw_recv_observes_prepare_window_eof() {
         let (snap, written, flight) = real_precommit_case(true).await;
