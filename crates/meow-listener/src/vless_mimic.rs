@@ -1163,6 +1163,7 @@ mod tests {
         inner: DuplexStream,
         steps: Arc<Mutex<VecDeque<TryStep>>>,
         dropped: Arc<std::sync::atomic::AtomicBool>,
+        writes: Arc<Mutex<Vec<u8>>>,
     }
 
     impl Drop for MockTarget {
@@ -1187,7 +1188,11 @@ mod tests {
             cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<io::Result<usize>> {
-            Pin::new(&mut self.inner).poll_write(cx, buf)
+            let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if let Poll::Ready(Ok(n)) = result {
+                self.writes.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+            result
         }
         fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
             Pin::new(&mut self.inner).poll_flush(cx)
@@ -1261,6 +1266,13 @@ mod tests {
     fn mock_target(
         steps: Vec<TryStep>,
     ) -> (MockTarget, DuplexStream, Arc<std::sync::atomic::AtomicBool>) {
+        mock_target_with_log(steps, Arc::new(Mutex::new(Vec::new())))
+    }
+
+    fn mock_target_with_log(
+        steps: Vec<TryStep>,
+        writes: Arc<Mutex<Vec<u8>>>,
+    ) -> (MockTarget, DuplexStream, Arc<std::sync::atomic::AtomicBool>) {
         let (inner, peer) = tokio::io::duplex(256 * 1024);
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         (
@@ -1268,6 +1280,7 @@ mod tests {
                 inner,
                 steps: Arc::new(Mutex::new(steps.into())),
                 dropped: Arc::clone(&dropped),
+                writes,
             },
             peer,
             dropped,
@@ -1424,7 +1437,9 @@ mod tests {
         let runtime = runtime();
         let ch = capture_client_hello().await;
         let (client, _client_peer, writes) = scripted_client(&ch);
-        let (target, mut target_peer, _dropped) = mock_target(vec![]);
+        let target_writes = Arc::new(Mutex::new(Vec::new()));
+        let (target, mut target_peer, _dropped) =
+            mock_target_with_log(vec![], Arc::clone(&target_writes));
         let machine = spawn_machine(
             &runtime,
             client,
@@ -1432,6 +1447,7 @@ mod tests {
             Instant::now() + Duration::from_secs(5),
         );
         let _flight = upload_and_write_flight(&ch, &mut target_peer).await;
+        target_writes.lock().unwrap().clear();
         yields(10).await;
 
         // q = floor(200ms/2) = 100ms.  Half of that interval elapses after
@@ -1440,6 +1456,10 @@ mod tests {
         yields(10).await;
         assert_eq!(snapshot(&runtime).committed_total, 0);
         assert!(writes.lock().unwrap().is_empty());
+        assert!(
+            target_writes.lock().unwrap().is_empty(),
+            "zero target writes before t_last+q"
+        );
 
         // A complete extra application record is target input ready long
         // before the original quiet deadline.  It must be consumed first and
@@ -1455,6 +1475,10 @@ mod tests {
             "the quiet baseline from the earlier flight must have been reset"
         );
         assert!(writes.lock().unwrap().is_empty());
+        assert!(
+            target_writes.lock().unwrap().is_empty(),
+            "zero target writes before reset t_last+q"
+        );
 
         advance(Duration::from_millis(1)).await;
         yields(20).await;
@@ -1464,6 +1488,43 @@ mod tests {
             "commit occurs at the reset t_last+q"
         );
         assert!(!writes.lock().unwrap().is_empty(), "emit follows commit");
+        machine.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_ready_target_bytes_beat_quiet_at_equal_instant() {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, _client_peer, writes) = scripted_client(&ch);
+        let (target, mut target_peer, _dropped) = mock_target(vec![]);
+        let machine = spawn_machine(
+            &runtime,
+            client,
+            target,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let _flight = upload_and_write_flight(&ch, &mut target_peer).await;
+        yields(10).await;
+
+        // Queue a complete extra record while the machine is not scheduled,
+        // then advance exactly to the original quiet deadline.  Readiness and
+        // quiet are therefore observable in the same poll; the read branch's
+        // priority must consume the bytes instead of freezing.
+        target_peer.write_all(&extra_record()).await.unwrap();
+        target_peer.flush().await.unwrap();
+        advance(Duration::from_millis(100)).await;
+        yields(20).await;
+        assert_eq!(snapshot(&runtime).committed_total, 0);
+        assert!(writes.lock().unwrap().is_empty());
+
+        // The reset baseline starts when those bytes are consumed at t=100ms,
+        // so the freeze happens only after another full q.
+        advance(Duration::from_millis(99)).await;
+        yields(10).await;
+        assert_eq!(snapshot(&runtime).committed_total, 0);
+        advance(Duration::from_millis(1)).await;
+        yields(20).await;
+        assert_eq!(snapshot(&runtime).committed_total, 1);
         machine.abort();
     }
 
