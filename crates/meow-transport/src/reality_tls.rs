@@ -515,6 +515,7 @@ impl RealityTlsStream {
             return false;
         }
         self.read_raw_passthrough = true;
+        self.release_drained_read_buf_for_raw();
         tracing::debug!("Reality TLS raw read passthrough enabled");
         true
     }
@@ -538,6 +539,14 @@ impl RealityTlsStream {
         true
     }
 
+    fn release_drained_read_buf_for_raw(&mut self) {
+        if self.read_raw_passthrough && self.plain_pos == self.plain_end {
+            self.plain_pos = 0;
+            self.plain_end = 0;
+            self.read_buf = Vec::new();
+        }
+    }
+
     fn drain_read_plain(&mut self, buf: &mut ReadBuf<'_>) -> bool {
         if self.plain_pos == self.plain_end {
             return false;
@@ -545,6 +554,9 @@ impl RealityTlsStream {
         let n = buf.remaining().min(self.plain_end - self.plain_pos);
         buf.put_slice(&self.read_buf[self.plain_pos..self.plain_pos + n]);
         self.plain_pos += n;
+        if self.plain_pos == self.plain_end {
+            self.release_drained_read_buf_for_raw();
+        }
         true
     }
 
@@ -2563,6 +2575,53 @@ mod tests {
             0,
             "DIRECT releases the write scratch"
         );
+    }
+
+    /// Read-side DIRECT keeps the already opened plaintext ahead of raw
+    /// bytes, but once that plaintext has been delivered the record buffer
+    /// is dead weight for the rest of the raw stream.
+    #[tokio::test]
+    async fn raw_read_switch_releases_record_buffer_after_plaintext_drains() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let secret = [0x5Au8; 32];
+        let plaintext = b"abcdef";
+        let raw_bytes = b"RAW";
+        let mut sender = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        let record = sender
+            .seal(TLS_RECORD_APPLICATION_DATA, plaintext)
+            .expect("seal plaintext record");
+        let (mut wire_peer, inner) = tokio::io::duplex(1024);
+        wire_peer.write_all(&record).await.unwrap();
+        wire_peer.write_all(raw_bytes).await.unwrap();
+        drop(wire_peer);
+
+        let mut stream = RealityTlsStream::new(
+            Box::new(inner),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+        );
+        let mut first = [0u8; 2];
+        stream.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"ab");
+        assert!(
+            stream.read_buf.capacity() > 0,
+            "the opened record must have allocated plaintext storage"
+        );
+
+        assert!(stream.enable_raw_read_passthrough());
+        let mut remaining = [0u8; 4];
+        stream.read_exact(&mut remaining).await.unwrap();
+        assert_eq!(&remaining, b"cdef");
+        assert_eq!(
+            stream.read_buf.capacity(),
+            0,
+            "raw read mode must release the record buffer once plaintext drains"
+        );
+
+        let mut raw = [0u8; 3];
+        stream.read_exact(&mut raw).await.unwrap();
+        assert_eq!(&raw, raw_bytes);
     }
 
     /// C7: the record sequence number must never wrap — at `u64::MAX`

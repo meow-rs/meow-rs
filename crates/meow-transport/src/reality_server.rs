@@ -7,6 +7,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -42,6 +43,7 @@ const REALITY_ACCEPT_TIMEOUT: Duration = Duration::from_secs(15);
 const COVER_BUFFER: usize = 16 * 1024;
 const COVER_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const COVER_MAX_LIFETIME: Duration = Duration::from_secs(600);
+const COVER_LIMITER_GRANULARITY: Duration = Duration::from_millis(10);
 const ED25519_OID: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x70];
 
 type HmacSha512 = Hmac<Sha512>;
@@ -408,11 +410,47 @@ async fn read_client_hello_preflight(
     let mut handshake_bytes = Vec::new();
     for _ in 0..MAX_AUTHED_STREAM_RECORDS {
         let mut header = [0u8; 5];
+        let remaining_budget = MAX_AUTHED_STREAM_BYTES - wire_prefix.len();
+        if remaining_budget < header.len() {
+            // A full header no longer fits.  Only the first byte beyond the
+            // remaining budget is decisive, though: EOF exactly at the cap is
+            // still the historical I/O boundary rather than a resource error.
+            let needed = remaining_budget + 1;
+            let mut pos = 0;
+            while pos < needed {
+                match inner.read(&mut header[pos..needed]).await {
+                    Ok(0) => {
+                        return Err(TransportError::Io(io::Error::new(
+                            io::ErrorKind::UnexpectedEof,
+                            "early eof",
+                        )));
+                    }
+                    Ok(n) => {
+                        pos += n;
+                        if wire_prefix.len() + pos > MAX_AUTHED_STREAM_BYTES {
+                            return Err(TransportError::ResourceLimit(
+                                "REALITY ClientHello pre-read exceeds 64 KiB".into(),
+                            ));
+                        }
+                    }
+                    Err(e) => return Err(TransportError::Io(e)),
+                }
+            }
+        }
         match inner.read_exact(&mut header).await {
             Ok(_) => {}
             Err(e) => return Err(TransportError::Io(e)),
         }
         wire_prefix.extend_from_slice(&header);
+        // Match the pinned TLS server's first-record screen before trusting
+        // the length: only a handshake record with a plausible TLS version
+        // can carry a ClientHello.  Anything else is cover traffic after
+        // exactly the bytes already consumed, regardless of the declared
+        // body length.
+        let record_version = u16::from_be_bytes([header[1], header[2]]);
+        if header[0] != TLS_RECORD_HANDSHAKE || record_version >= 0x1000 {
+            return Ok((inner, Preflight::Cover(wire_prefix)));
+        }
         let len = u16::from_be_bytes([header[3], header[4]]) as usize;
         if len > MAX_PLAINTEXT_RECORD || len == 0 {
             return Err(TransportError::ResourceLimit(
@@ -433,9 +471,6 @@ async fn read_client_hello_preflight(
             return Err(TransportError::Io(e));
         }
         wire_prefix.extend_from_slice(&payload);
-        if header[0] != TLS_RECORD_HANDSHAKE {
-            return Ok((inner, Preflight::Cover(wire_prefix)));
-        }
         handshake_bytes.extend_from_slice(&payload);
         if handshake_bytes.len() >= 4 {
             if handshake_bytes[0] != HS_CLIENT_HELLO {
@@ -727,13 +762,35 @@ struct ChosenKeyShare {
     client_share: Vec<u8>,
 }
 
+fn x25519_public_key_usable(bytes: &[u8]) -> bool {
+    let Ok(public) = <[u8; 32]>::try_from(bytes) else {
+        return false;
+    };
+    // Already-clamped form of scalar 9.  A fixed nonzero scalar is enough
+    // for contributory validation: low-order inputs are precisely the ones
+    // whose X25519 result is zero and therefore unusable for the handshake.
+    let mut probe_private = [0u8; 32];
+    probe_private[0] = 8;
+    probe_private[31] = 64;
+    x25519(&probe_private, &public).is_ok()
+}
+
+fn hybrid_key_share_usable(bytes: &[u8]) -> bool {
+    if bytes.len() != HYBRID_SHARE_LEN {
+        return false;
+    }
+    let (mlkem_public, x25519_public) = bytes.split_at(HYBRID_SHARE_LEN - 32);
+    MlKemPublicKey::from_slice(MlKemAlgorithm::MlKem768, mlkem_public).is_ok()
+        && x25519_public_key_usable(x25519_public)
+}
+
 fn select_key_share(hello: &ClientHello) -> Option<ChosenKeyShare> {
     fn group_allowed(hello: &ClientHello, group: u16) -> bool {
         hello.supported_groups.is_empty() || hello.supported_groups.contains(&group)
     }
     if group_allowed(hello, GROUP_X25519_MLKEM768) {
         if let Some(entry) = hello.key_shares.iter().find(|entry| {
-            entry.group == GROUP_X25519_MLKEM768 && entry.bytes.len() == HYBRID_SHARE_LEN
+            entry.group == GROUP_X25519_MLKEM768 && hybrid_key_share_usable(&entry.bytes)
         }) {
             return Some(ChosenKeyShare {
                 group: GROUP_X25519_MLKEM768,
@@ -745,7 +802,7 @@ fn select_key_share(hello: &ClientHello) -> Option<ChosenKeyShare> {
         if let Some(entry) = hello
             .key_shares
             .iter()
-            .find(|entry| entry.group == GROUP_X25519 && entry.bytes.len() == 32)
+            .find(|entry| entry.group == GROUP_X25519 && x25519_public_key_usable(&entry.bytes))
         {
             return Some(ChosenKeyShare {
                 group: GROUP_X25519,
@@ -1235,27 +1292,36 @@ impl DirectionalLimit {
         }
     }
 
-    async fn wait(&mut self, bytes: usize) {
+    async fn wait_for_allowance(&mut self, bytes: usize) -> usize {
         if self.bytes_per_second == 0 {
-            return;
+            return bytes;
         }
         let mut remaining = bytes as u64;
+        let mut granted = 0u64;
         if self.transferred < self.exempt_bytes {
             let exempt = remaining.min(self.exempt_bytes - self.transferred);
             self.transferred += exempt;
             remaining -= exempt;
+            granted += exempt;
         }
-        self.transferred = self.transferred.saturating_add(remaining);
-        while remaining > 0 {
+        if remaining == 0 {
+            return granted as usize;
+        }
+        loop {
             self.refill();
-            if self.tokens == 0 {
-                let nanos = 1_000_000_000u64 / self.bytes_per_second.max(1);
-                tokio::time::sleep(Duration::from_nanos(nanos.max(1))).await;
-                continue;
+            if self.tokens > 0 {
+                let limited = remaining.min(self.tokens);
+                self.tokens -= limited;
+                self.transferred = self.transferred.saturating_add(limited);
+                granted += limited;
+                return granted as usize;
             }
-            let used = remaining.min(self.tokens);
-            self.tokens -= used;
-            remaining -= used;
+            if granted > 0 {
+                return granted as usize;
+            }
+            let nanos_per_byte = 1_000_000_000u64.div_ceil(self.bytes_per_second.max(1));
+            tokio::time::sleep(Duration::from_nanos(nanos_per_byte).max(COVER_LIMITER_GRANULARITY))
+                .await;
         }
     }
 
@@ -1290,18 +1356,57 @@ impl DirectionalLimit {
             return;
         }
         let room = u128::from(self.capacity - self.tokens);
-        let add = earned.min(room);
+        if earned >= room {
+            // Tokens beyond the bucket's room are discarded, together with
+            // the time that produced them; keeping that time as credit would
+            // let one idle period fund several consecutive bursts.
+            self.tokens = self.capacity;
+            self.refill_at = now;
+            return;
+        }
         // Advance the baseline by the exact time the credited tokens take
-        // to accrue, preserving the sub-token remainder.  `add` is no more
-        // than the whole tokens `elapsed` earns, so `spent` never passes
-        // `now`; the saturating conversion only triggers on multi-century
-        // idles, where pinning to any reachable instant is equivalent.
-        let spent_nanos = add * NANOS_PER_SECOND / u128::from(self.bytes_per_second);
+        // to accrue, preserving the sub-token remainder.  The saturating
+        // conversion only triggers on multi-century idles, where pinning to
+        // any reachable instant is equivalent.
+        let spent_nanos = earned * NANOS_PER_SECOND / u128::from(self.bytes_per_second);
         self.refill_at += Duration::from_nanos(u64::try_from(spent_nanos).unwrap_or(u64::MAX));
-        // `add <= room` came from a u64 difference, so the conversion is
+        // `earned < room` came from a u64 difference, so the conversion is
         // lossless and the sum never exceeds `capacity`.
-        self.tokens += add as u64;
+        self.tokens += earned as u64;
     }
+}
+
+async fn write_shaped<W>(
+    writer: &mut W,
+    bytes: &[u8],
+    limit: &mut DirectionalLimit,
+    activity: &tokio::sync::watch::Sender<()>,
+) -> Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    let mut pos = 0;
+    while pos < bytes.len() {
+        let allowed = limit.wait_for_allowance(bytes.len() - pos).await;
+        debug_assert!(allowed > 0, "a non-empty shaped write must make progress");
+        let end = pos + allowed;
+        while pos < end {
+            let n = writer.write(&bytes[pos..end]).await?;
+            if n == 0 {
+                return Err(TransportError::Io(io::Error::new(
+                    io::ErrorKind::WriteZero,
+                    "REALITY cover relay zero write",
+                )));
+            }
+            pos += n;
+            // Idle means no bytes are crossing the relay.  Refresh on every
+            // accepted partial write, not only after a whole throttled segment
+            // survives kernel backpressure.
+            let _ = activity.send(());
+        }
+        writer.flush().await?;
+    }
+    Ok(())
 }
 
 async fn relay_direction<R, W>(
@@ -1316,14 +1421,11 @@ where
     W: AsyncWrite + Unpin,
 {
     if !initial.is_empty() {
-        limit.wait(initial.len()).await;
-        writer.write_all(&initial).await?;
-        writer.flush().await?;
+        write_shaped(&mut writer, &initial, &mut limit, &activity).await?;
         // The preserved ClientHello can run to 64 KiB; holding it for the
         // relay's lifetime would keep that allocation pinned per cover
         // connection long after its only use.
         drop(initial);
-        let _ = activity.send(());
     }
     let mut buf = [0u8; COVER_BUFFER];
     loop {
@@ -1332,10 +1434,7 @@ where
             writer.shutdown().await?;
             return Ok(());
         }
-        limit.wait(n).await;
-        writer.write_all(&buf[..n]).await?;
-        writer.flush().await?;
-        let _ = activity.send(());
+        write_shaped(&mut writer, &buf[..n], &mut limit, &activity).await?;
     }
 }
 
@@ -1346,6 +1445,8 @@ mod tests {
     use crate::reality_tls::{build_reality_client_hello, RealityTlsLayer};
     use crate::tls::TlsConfig;
     use crate::Transport;
+    use aes_gcm::aead::{AeadInPlace, KeyInit};
+    use aes_gcm::{Aes256Gcm, Nonce};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const SERVER_NAME: &str = "www.example.com";
@@ -1633,6 +1734,241 @@ mod tests {
         .0
     }
 
+    fn manual_valid_hybrid_hello(public: [u8; 32]) -> (Vec<u8>, [u8; 32], [u8; 32]) {
+        let mut client_private = rand::random::<[u8; 32]>();
+        crate::reality_tls::clamp_x25519_private(&mut client_private);
+        let client_public = x25519_public_from_private(&client_private);
+        let shared = x25519(&client_private, &public).unwrap();
+        let (pq_public, _pq_private) =
+            boring::mlkem::MlKemPrivateKey::generate(boring::mlkem::Algorithm::MlKem768)
+                .expect("ML-KEM keygen");
+        let mut hybrid_x_private = rand::random::<[u8; 32]>();
+        crate::reality_tls::clamp_x25519_private(&mut hybrid_x_private);
+        let hybrid_x_public = x25519_public_from_private(&hybrid_x_private);
+        let random = rand::random::<[u8; 32]>();
+        let reality = crate::tls::RealityConfig {
+            public_key: public,
+            short_id: SHORT_ID,
+            support_x25519_mlkem768: true,
+            protocol_clock: Some(fixed_system_time),
+        };
+        let (hello, auth_key) = build_reality_client_hello(
+            SERVER_NAME,
+            &[],
+            &random,
+            &client_public,
+            Some((pq_public.as_bytes(), &hybrid_x_public)),
+            &shared,
+            &reality,
+            crate::reality_hello::HelloProfile::Chrome,
+        )
+        .expect("manual hybrid hello");
+        (hello, random, auth_key)
+    }
+
+    fn key_share_data_range(hello: &[u8], wanted_group: u16) -> Option<std::ops::Range<usize>> {
+        let mut pos = 4 + 2 + 32;
+        let sid_len = *hello.get(pos)? as usize;
+        pos += 1 + sid_len;
+        let suites_len = u16::from_be_bytes([*hello.get(pos)?, *hello.get(pos + 1)?]) as usize;
+        pos += 2 + suites_len;
+        let compression_len = *hello.get(pos)? as usize;
+        pos += 1 + compression_len;
+        let extensions_len = u16::from_be_bytes([*hello.get(pos)?, *hello.get(pos + 1)?]) as usize;
+        pos += 2;
+        let extensions_end = pos.checked_add(extensions_len)?;
+        while pos + 4 <= extensions_end {
+            let typ = u16::from_be_bytes([hello[pos], hello[pos + 1]]);
+            let len = u16::from_be_bytes([hello[pos + 2], hello[pos + 3]]) as usize;
+            pos += 4;
+            let data_end = pos.checked_add(len)?;
+            if data_end > extensions_end || data_end > hello.len() {
+                return None;
+            }
+            if typ == EXT_KEY_SHARE {
+                let data = &hello[pos..data_end];
+                if data.len() < 2 {
+                    return None;
+                }
+                let list_len = u16::from_be_bytes([data[0], data[1]]) as usize;
+                if list_len + 2 != data.len() {
+                    return None;
+                }
+                let mut share_pos = 2;
+                while share_pos + 4 <= data.len() {
+                    let group = u16::from_be_bytes([data[share_pos], data[share_pos + 1]]);
+                    let share_len =
+                        u16::from_be_bytes([data[share_pos + 2], data[share_pos + 3]]) as usize;
+                    share_pos += 4;
+                    let share_end = share_pos.checked_add(share_len)?;
+                    if share_end > data.len() {
+                        return None;
+                    }
+                    if group == wanted_group {
+                        return Some(pos + share_pos..pos + share_end);
+                    }
+                    share_pos = share_end;
+                }
+                return None;
+            }
+            pos = data_end;
+        }
+        None
+    }
+
+    fn reseal_reality_session_id(hello: &mut Vec<u8>, random: &[u8; 32], auth_key: &[u8; 32]) {
+        hello[39..71].fill(0);
+        let mut plaintext = Vec::with_capacity(16);
+        plaintext.extend_from_slice(&[0, 0, 0, 0]);
+        plaintext.extend_from_slice(&(fixed_unix() as u32).to_be_bytes());
+        plaintext.extend_from_slice(&SHORT_ID);
+        assert_eq!(plaintext.len(), 16);
+        let cipher = Aes256Gcm::new_from_slice(auth_key).expect("AES-256-GCM key");
+        let nonce = Nonce::from_slice(&random[20..32]);
+        let tag = cipher
+            .encrypt_in_place_detached(nonce, hello.as_slice(), &mut plaintext)
+            .expect("re-seal REALITY session id");
+        plaintext.extend_from_slice(&tag);
+        hello[39..71].copy_from_slice(&plaintext);
+    }
+
+    fn server_hello_group(message: &[u8]) -> u16 {
+        assert_eq!(message[0], HS_SERVER_HELLO);
+        assert_eq!(message.len(), 4 + read_u24(&message[1..4]));
+        let mut pos = 4 + 2 + 32;
+        let sid_len = message[pos] as usize;
+        pos += 1 + sid_len + 2 + 1;
+        let extensions_len = u16::from_be_bytes([message[pos], message[pos + 1]]) as usize;
+        pos += 2;
+        let extensions_end = pos + extensions_len;
+        while pos + 4 <= extensions_end {
+            let typ = u16::from_be_bytes([message[pos], message[pos + 1]]);
+            let len = u16::from_be_bytes([message[pos + 2], message[pos + 3]]) as usize;
+            pos += 4;
+            if typ == EXT_KEY_SHARE {
+                assert!(len >= 4, "ServerHello key_share carries group and length");
+                return u16::from_be_bytes([message[pos], message[pos + 1]]);
+            }
+            pos += len;
+        }
+        panic!("ServerHello key_share extension missing")
+    }
+
+    /// Selection itself must treat a correctly sized but unparsable ML-KEM
+    /// encapsulation key as unavailable and move on to the usable classical
+    /// share instead of committing to a handshake that cannot be built.
+    #[test]
+    fn unusable_hybrid_key_share_falls_back_to_classical_in_selection() {
+        assert!(!x25519_public_key_usable(&[0u8; 32]));
+        let mut probe_private = rand::random::<[u8; 32]>();
+        crate::reality_tls::clamp_x25519_private(&mut probe_private);
+        assert!(x25519_public_key_usable(&x25519_public_from_private(
+            &probe_private
+        )));
+
+        let mut hybrid = vec![0xff; HYBRID_SHARE_LEN - 32];
+        hybrid.extend_from_slice(&[7u8; 32]);
+        assert!(
+            MlKemPublicKey::from_slice(MlKemAlgorithm::MlKem768, &hybrid[..HYBRID_SHARE_LEN - 32],)
+                .is_err(),
+            "the test mutation must produce an unusable ML-KEM public key"
+        );
+        let classical = vec![9u8; 32];
+        let hello = ClientHello {
+            raw: Vec::new(),
+            random: [0u8; 32],
+            session_id: Vec::new(),
+            server_name: None,
+            cipher_suites: Vec::new(),
+            supported_groups: vec![GROUP_X25519_MLKEM768, GROUP_X25519],
+            key_shares: vec![
+                KeyShareEntry {
+                    group: GROUP_X25519_MLKEM768,
+                    bytes: hybrid,
+                },
+                KeyShareEntry {
+                    group: GROUP_X25519,
+                    bytes: classical.clone(),
+                },
+            ],
+            offers_tls13: true,
+            reality_session_id_layout: true,
+            duplicate_extension: false,
+            sni_malformed: false,
+            key_share_malformed: false,
+        };
+
+        let chosen = select_key_share(&hello).expect("classical fallback remains usable");
+        assert_eq!(chosen.group, GROUP_X25519);
+        assert_eq!(chosen.client_share, classical);
+
+        let (pq_public, _pq_private) =
+            boring::mlkem::MlKemPrivateKey::generate(boring::mlkem::Algorithm::MlKem768)
+                .expect("ML-KEM keygen");
+        let mut usable_hybrid = pq_public.as_bytes().to_vec();
+        usable_hybrid.extend_from_slice(&x25519_public_from_private(&probe_private));
+        let hello = ClientHello {
+            key_shares: vec![
+                KeyShareEntry {
+                    group: GROUP_X25519_MLKEM768,
+                    bytes: usable_hybrid.clone(),
+                },
+                KeyShareEntry {
+                    group: GROUP_X25519,
+                    bytes: classical,
+                },
+            ],
+            ..hello
+        };
+        let chosen = select_key_share(&hello).expect("usable hybrid remains selectable");
+        assert_eq!(chosen.group, GROUP_X25519_MLKEM768);
+        assert_eq!(chosen.client_share, usable_hybrid);
+    }
+
+    /// The same fallback must hold after REALITY authentication: a valid
+    /// session-id proof made with the standalone X25519 share is not thrown
+    /// away merely because the preferred hybrid share cannot encapsulate.
+    #[tokio::test]
+    async fn authenticated_unusable_hybrid_share_falls_back_to_classical_server_share() {
+        let (private, public) = keypair();
+        let server = RealityServer::new(&server_config(private)).expect("server");
+        let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let accept_task = tokio::spawn(async move { server.accept(Box::new(server_io)).await });
+
+        let (mut hello, random, auth_key) = manual_valid_hybrid_hello(public);
+        let share_range = key_share_data_range(&hello, GROUP_X25519_MLKEM768)
+            .expect("hybrid ClientHello carries a hybrid share");
+        assert_eq!(share_range.end - share_range.start, HYBRID_SHARE_LEN);
+        let mlkem_range = share_range.start..share_range.end - 32;
+        hello[mlkem_range.clone()].fill(0xff);
+        assert!(
+            MlKemPublicKey::from_slice(MlKemAlgorithm::MlKem768, &hello[mlkem_range],).is_err(),
+            "the wire mutation must be an unusable ML-KEM public key"
+        );
+        reseal_reality_session_id(&mut hello, &random, &auth_key);
+
+        client_io
+            .write_all(&wrap_plain_record(TLS_RECORD_HANDSHAKE, &hello).unwrap())
+            .await
+            .unwrap();
+        client_io.flush().await.unwrap();
+        let server_hello =
+            tokio::time::timeout(Duration::from_secs(2), read_record(&mut client_io))
+                .await
+                .expect("authenticated fallback must emit a server flight")
+                .expect("server flight record read")
+                .expect("server flight must start with plaintext ServerHello");
+        assert_eq!(server_hello.typ, TLS_RECORD_HANDSHAKE);
+        assert_eq!(
+            server_hello_group(&server_hello.payload),
+            GROUP_X25519,
+            "the unusable hybrid share must fall back to classical X25519"
+        );
+
+        drop(client_io);
+        let _ = tokio::time::timeout(Duration::from_secs(1), accept_task).await;
+    }
+
     #[tokio::test]
     async fn fragmented_client_hello_across_records_authenticates() {
         let (private, public) = keypair();
@@ -1693,6 +2029,84 @@ mod tests {
         drop(client_peer);
         drop(cover_peer);
         let _ = relay_task.await;
+    }
+
+    fn expect_preflight_cover(
+        preflight: Result<(Box<dyn Stream>, Preflight)>,
+    ) -> (Box<dyn Stream>, Vec<u8>) {
+        let (inner, preflight) = preflight.expect("preflight itself must not fail");
+        match preflight {
+            Preflight::Cover(prefix) => (inner, prefix),
+            Preflight::Candidate { .. } => {
+                panic!("implausible record header must not be a candidate")
+            }
+        }
+    }
+
+    /// A record type that cannot carry a ClientHello is already decisive
+    /// after the five-byte header; preflight must not wait for its body.
+    #[tokio::test]
+    async fn non_handshake_record_header_goes_to_cover_without_waiting_for_body() {
+        let header = [TLS_RECORD_APPLICATION_DATA, 0x03, 0x03, 0, 4];
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(&header).await.unwrap();
+        writer.flush().await.unwrap();
+
+        let preflight = tokio::time::timeout(
+            Duration::from_millis(200),
+            read_client_hello_preflight(Box::new(reader)),
+        )
+        .await
+        .expect("the decisive header must classify before the accept timeout");
+        let (_inner, prefix) = expect_preflight_cover(preflight);
+        assert_eq!(prefix, header);
+        drop(writer);
+    }
+
+    /// The impossible-type/version verdict also precedes the resource
+    /// limits: those limits exist for real TLS candidates, not for input
+    /// already known to belong on the cover path.
+    #[tokio::test]
+    async fn implausible_record_header_goes_to_cover_before_length_resource_check() {
+        for header in [
+            [TLS_RECORD_APPLICATION_DATA, 0x03, 0x03, 0x40, 1],
+            [TLS_RECORD_HANDSHAKE, 0xff, 0xff, 0x40, 1],
+        ] {
+            let (mut writer, reader) = tokio::io::duplex(64);
+            writer.write_all(&header).await.unwrap();
+            writer.flush().await.unwrap();
+
+            let preflight = tokio::time::timeout(
+                Duration::from_millis(200),
+                read_client_hello_preflight(Box::new(reader)),
+            )
+            .await
+            .expect("the decisive header must classify promptly");
+            let (_inner, prefix) = expect_preflight_cover(preflight);
+            assert_eq!(prefix, header);
+            drop(writer);
+        }
+    }
+
+    /// Only the bytes actually consumed for the decisive header belong in
+    /// the cover prefix; the unread record body stays on the stream and is
+    /// relayed after that prefix, exactly once and in order.
+    #[tokio::test]
+    async fn cover_after_decisive_header_leaves_record_body_on_stream() {
+        let header = [TLS_RECORD_APPLICATION_DATA, 0x03, 0x03, 0, 4];
+        let body = b"abcd";
+        let (mut writer, reader) = tokio::io::duplex(64);
+        writer.write_all(&header).await.unwrap();
+        writer.write_all(body).await.unwrap();
+        writer.flush().await.unwrap();
+        drop(writer);
+
+        let preflight = read_client_hello_preflight(Box::new(reader)).await;
+        let (mut inner, prefix) = expect_preflight_cover(preflight);
+        assert_eq!(prefix, header);
+        let mut preserved = [0u8; 4];
+        inner.read_exact(&mut preserved).await.unwrap();
+        assert_eq!(&preserved, body);
     }
 
     fn padding_data_offset(hello: &[u8]) -> Option<usize> {
@@ -1863,6 +2277,36 @@ mod tests {
             Err(err) => panic!("64 KiB + 1 of wire hits the resource limit, got: {err:?}"),
             Ok(_) => panic!("one byte past 64 KiB wire must be rejected"),
         }
+
+        // A decisive non-TLS header cannot be used to carry the preserved
+        // prefix past the same cap once the incomplete hello already fills it.
+        let mut input = wire_input(16364);
+        input.extend_from_slice(&[TLS_RECORD_APPLICATION_DATA, 0x03, 0x03, 0, 4]);
+        let (mut writer, reader) = tokio::io::duplex(128 * 1024);
+        writer.write_all(&input).await.unwrap();
+        drop(writer);
+        match read_client_hello_preflight(Box::new(reader)).await {
+            Err(TransportError::ResourceLimit(_)) => {}
+            Err(err) => {
+                panic!("a header beyond the 64 KiB cap hits the resource limit, got: {err:?}")
+            }
+            Ok(_) => panic!("a header beyond 64 KiB wire must not become cover prefix"),
+        }
+
+        // Even a fragment of the next header is decisive once it is the first
+        // byte beyond the cap; truncation after it must not demote the error.
+        let mut input = wire_input(16364);
+        input.push(TLS_RECORD_APPLICATION_DATA);
+        let (mut writer, reader) = tokio::io::duplex(128 * 1024);
+        writer.write_all(&input).await.unwrap();
+        drop(writer);
+        match read_client_hello_preflight(Box::new(reader)).await {
+            Err(TransportError::ResourceLimit(_)) => {}
+            Err(err) => {
+                panic!("one byte beyond the 64 KiB cap hits the resource limit, got: {err:?}")
+            }
+            Ok(_) => panic!("one byte beyond 64 KiB wire must be rejected"),
+        }
     }
 
     /// C6: TLS 1.3 admits exactly one compression method, zero — a REALITY
@@ -1916,6 +2360,22 @@ mod tests {
         );
     }
 
+    /// Once accrued credit saturates the bucket, the excess idle time is
+    /// discarded rather than remaining available to fund another burst.
+    #[test]
+    fn saturated_refill_discards_excess_idle_time() {
+        let mut limit = DirectionalLimit::new(1000, 0, 0);
+        limit.tokens = 0;
+        limit.refill_at = Instant::now() - Duration::from_secs(3);
+        let before_refill = Instant::now();
+        limit.refill();
+        assert_eq!(limit.tokens, limit.capacity);
+        assert!(
+            limit.refill_at >= before_refill,
+            "the saturated refill baseline must be pinned to the refill, not left in the past"
+        );
+    }
+
     /// A full bucket earns nothing further, and once room exists the
     /// normal-rate accrual still credits whole tokens — the saturation
     /// clamp must not eat ordinary refills.
@@ -1941,6 +2401,169 @@ mod tests {
             limit.tokens
         );
         assert!(limit.tokens <= 1000, "never beyond capacity");
+    }
+
+    struct RecordingWriter {
+        writes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl AsyncWrite for RecordingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            self.writes.lock().unwrap().push(buf.to_vec());
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    struct OneByteThenPendingWriter {
+        writes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    }
+
+    impl AsyncWrite for OneByteThenPendingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            if self.writes.lock().unwrap().is_empty() {
+                self.writes.lock().unwrap().push(buf[..1].to_vec());
+                return std::task::Poll::Ready(Ok(1));
+            }
+            std::task::Poll::Pending
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A writer that accepts one byte and then applies backpressure has still
+    /// relayed data: even that partial progress must refresh the idle watchdog.
+    #[tokio::test]
+    async fn shaped_write_reports_partial_write_progress_as_activity() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (activity_tx, mut activity_rx) = tokio::sync::watch::channel(());
+        activity_rx.borrow_and_update();
+        let task = tokio::spawn({
+            let writes = std::sync::Arc::clone(&writes);
+            async move {
+                let mut writer = OneByteThenPendingWriter { writes };
+                let mut limit = DirectionalLimit::new(0, 0, 0);
+                write_shaped(&mut writer, b"abc", &mut limit, &activity_tx).await
+            }
+        });
+
+        let first_write = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if !writes.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(first_write.is_ok(), "the one-byte write must be accepted");
+        assert!(
+            activity_rx.has_changed().expect("activity sender is alive"),
+            "the accepted byte must refresh cover activity before the segment completes"
+        );
+        task.abort();
+    }
+
+    fn spawn_recorded_shaped_prefix(
+        len: usize,
+        writes: std::sync::Arc<std::sync::Mutex<Vec<Vec<u8>>>>,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let (activity_tx, _activity_rx) = tokio::sync::watch::channel(());
+        tokio::spawn(relay_direction(
+            tokio::io::empty(),
+            RecordingWriter { writes },
+            vec![0x5a; len],
+            DirectionalLimit::new(1000, 0, 0),
+            activity_tx,
+        ))
+    }
+
+    /// A throttled prefix must make wire progress with the tokens already
+    /// in the bucket instead of waiting for the whole multi-second block.
+    #[tokio::test]
+    async fn shaped_prefix_progresses_before_whole_prefix_is_throttled() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay = spawn_recorded_shaped_prefix(3000, std::sync::Arc::clone(&writes));
+
+        let first_write = tokio::time::timeout(Duration::from_millis(200), async {
+            loop {
+                if !writes.lock().unwrap().is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(
+            first_write.is_ok(),
+            "the first bucket-sized segment must reach the writer promptly"
+        );
+        relay.abort();
+    }
+
+    /// Rate accounting may span a block larger than the bucket, but the
+    /// wire write must still be segmented at the configured burst size.
+    #[tokio::test]
+    async fn shaped_prefix_never_writes_more_than_bucket_capacity_in_one_burst() {
+        let writes = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let relay = spawn_recorded_shaped_prefix(1001, std::sync::Arc::clone(&writes));
+
+        let completed = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if writes.lock().unwrap().iter().map(Vec::len).sum::<usize>() >= 1001 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        assert!(completed.is_ok(), "the small shaped prefix must complete");
+        let chunks = writes.lock().unwrap().clone();
+        assert!(
+            chunks.iter().all(|chunk| chunk.len() <= 1000),
+            "no write may exceed the 1000-byte bucket capacity: {:?}",
+            chunks.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert!(
+            chunks.len() > 1,
+            "an over-capacity block must be split, got {:?}",
+            chunks.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert_eq!(chunks.concat(), vec![0x5a; 1001]);
+        relay.abort();
     }
 }
 
