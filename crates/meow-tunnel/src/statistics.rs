@@ -933,7 +933,7 @@ impl Statistics {
     /// Request closure of all tracked TCP connections and remove their entries.
     /// Returns the number of closure requests, not completed socket teardowns.
     pub fn close_all_connections_counted(&self) -> usize {
-        self.close_connections_counted_where(|_| true)
+        self.close_connections(None)
     }
 
     /// [`Self::close_all_connections_counted`] with a leaf filter: `should_close`
@@ -946,12 +946,21 @@ impl Statistics {
         &self,
         should_close: impl Fn(Option<&str>) -> bool,
     ) -> usize {
+        self.close_connections(Some(&should_close))
+    }
+
+    // Configuration reloads and process shutdown use the same cancellation
+    // pass. Keep the table walks out of the filter's monomorphizations.
+    #[inline(never)]
+    fn close_connections(&self, should_close: Option<&CloseFilter<'_>>) -> usize {
         let mut closed = 0;
         // Signal and remove under the same shard lock. A separate iteration
         // followed by clear could erase newly inserted, unsignalled entries.
         let mut noted = Vec::new();
         self.connections.retain(|_, info| {
-            if !should_close(info.chains.first().map(std::convert::AsRef::as_ref)) {
+            if should_close
+                .is_some_and(|filter| !filter(info.chains.first().map(std::convert::AsRef::as_ref)))
+            {
                 return true;
             }
             info.counters.close();
@@ -967,7 +976,7 @@ impl Statistics {
         }
         if let Some(connections) = self.headless_connections.get() {
             connections.retain(|_, entry| {
-                if !should_close(entry.leaf.as_deref()) {
+                if should_close.is_some_and(|filter| !filter(entry.leaf.as_deref())) {
                     return true;
                 }
                 entry.counters.close();
@@ -979,6 +988,8 @@ impl Statistics {
         closed
     }
 }
+
+type CloseFilter<'a> = dyn Fn(Option<&str>) -> bool + 'a;
 
 /// A headless (no-API) tracked flow: cancellation counters plus the leaf
 /// name it committed to, so filtered closes see it exactly like a

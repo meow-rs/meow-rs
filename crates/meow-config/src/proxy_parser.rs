@@ -120,6 +120,10 @@ impl WrappedProxy {
 
 #[async_trait]
 impl ProxyAdapter for WrappedProxy {
+    fn diagnostic_counters(&self) -> Option<std::collections::BTreeMap<String, u64>> {
+        self.adapter.diagnostic_counters()
+    }
+
     fn name(&self) -> &str {
         self.adapter.name()
     }
@@ -206,6 +210,10 @@ impl ProxyAdapter for WrappedProxy {
         self.adapter.reset_sessions();
     }
 
+    async fn shutdown(&self) {
+        self.adapter.shutdown().await;
+    }
+
     fn health(&self) -> &ProxyHealth {
         self.adapter.health()
     }
@@ -278,6 +286,10 @@ impl ChainedProxy {
 
 #[async_trait]
 impl ProxyAdapter for ChainedProxy {
+    fn diagnostic_counters(&self) -> Option<std::collections::BTreeMap<String, u64>> {
+        self.inner.diagnostic_counters()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -336,6 +348,10 @@ impl ProxyAdapter for ChainedProxy {
     /// strand the inner adapter's pooled transport sessions.
     fn reset_sessions(&self) {
         self.inner.reset_sessions();
+    }
+
+    async fn shutdown(&self) {
+        self.inner.shutdown().await;
     }
 
     fn health(&self) -> &ProxyHealth {

@@ -726,6 +726,8 @@ struct ProxyInfo {
     alive: bool,
     history: Vec<meow_common::DelayHistory>,
     udp: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diagnostics: Option<std::collections::BTreeMap<String, u64>>,
     /// Group-only: ordered list of member proxy names.
     #[serde(skip_serializing_if = "Option::is_none")]
     all: Option<Vec<String>>,
@@ -781,6 +783,7 @@ impl ProxyInfo {
             alive: proxy.alive(),
             history: proxy.delay_history(),
             udp: proxy.support_udp(),
+            diagnostics: proxy.diagnostic_counters(),
             all: members,
             now: current,
             fixed: proxy

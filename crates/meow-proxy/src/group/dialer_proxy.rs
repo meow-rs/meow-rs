@@ -178,6 +178,10 @@ impl DialerProxyAdapter {
 
 #[async_trait]
 impl ProxyAdapter for DialerProxyAdapter {
+    fn diagnostic_counters(&self) -> Option<std::collections::BTreeMap<String, u64>> {
+        self.inner.diagnostic_counters()
+    }
+
     fn name(&self) -> &str {
         self.inner.name()
     }
@@ -316,6 +320,10 @@ impl ProxyAdapter for DialerProxyAdapter {
     /// built bottom-up, so this cannot recurse into a cycle.
     fn reset_sessions(&self) {
         self.inner.reset_sessions();
+    }
+
+    async fn shutdown(&self) {
+        self.inner.shutdown().await;
     }
 
     fn health(&self) -> &ProxyHealth {

@@ -59,8 +59,8 @@ pub mod yaml;
 
 pub use acl::LanAcl;
 pub use adapter::{
-    reset_sessions_reachable, DelayHistory, GroupDisplay, NodeDialerOpts, ProviderSlot, Proxy,
-    ProxyAdapter, ProxyHealth, ProxySelection, ProxyState, RematchAction,
+    reset_sessions_reachable, shutdown_reachable, DelayHistory, GroupDisplay, NodeDialerOpts,
+    ProviderSlot, Proxy, ProxyAdapter, ProxyHealth, ProxySelection, ProxyState, RematchAction,
 };
 pub use adapter_type::{AdapterType, ConnType};
 pub use auth::{AuthConfig, Credentials};

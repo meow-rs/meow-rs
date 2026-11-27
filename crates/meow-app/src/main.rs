@@ -2661,11 +2661,22 @@ async fn run(
     let by = shutdown.wait().await?;
     info!("Shutting down ({by})...");
     ntp_supervisor.shutdown().await;
+    shutdown_outbounds(&tunnel, &proxy_providers).await;
     meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Requested(by));
     meow_common::traffic_ledger::uninstall();
     drop(controller_file);
 
     Ok(())
+}
+
+// Keep the provider snapshot and shutdown future out of the startup future.
+#[inline(never)]
+async fn shutdown_outbounds(tunnel: &Tunnel, providers: &DashMap<String, Arc<ProxyProvider>>) {
+    let mut members = Vec::new();
+    for provider in providers {
+        members.extend(provider.value().proxies());
+    }
+    tunnel.shutdown_outbounds(members).await;
 }
 
 /// Tell `meow-cli` where this meow's API is, in a file only this user can

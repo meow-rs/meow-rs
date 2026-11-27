@@ -5,7 +5,7 @@ use crate::metadata::Metadata;
 use crate::network::Network;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::SystemTime;
@@ -169,6 +169,12 @@ impl Default for ProxyHealth {
 
 #[async_trait]
 pub trait ProxyAdapter: Send + Sync {
+    /// Optional non-secret counters for the controller API. Reading these
+    /// counters must not start I/O.
+    fn diagnostic_counters(&self) -> Option<BTreeMap<String, u64>> {
+        None
+    }
+
     fn name(&self) -> &str;
     fn adapter_type(&self) -> AdapterType;
     fn addr(&self) -> &str;
@@ -271,6 +277,16 @@ pub trait ProxyAdapter: Send + Sync {
     /// upstream: mihomo has no per-adapter equivalent — `ApplyConfig` swaps
     /// in freshly built adapters and calls `resolver.ResetConnection()`.
     fn reset_sessions(&self) {}
+
+    /// Join adapter-owned background work while the runtime is alive.
+    ///
+    /// Called once per reachable adapter at process shutdown, after the
+    /// session reset pass. Implementations must be idempotent. Transparent
+    /// wrappers forward this hook to the adapter they own.
+    async fn shutdown(&self) {
+        self.reset_sessions();
+    }
+
     /// Per-adapter health handle — owned, infallible. Writers: dashboards
     /// and delay endpoints record probe results through
     /// `health().record_delay`; `DialFailureTracker` escalation dead-marks
@@ -447,8 +463,39 @@ pub fn reset_sessions_reachable<I>(roots: I) -> usize
 where
     I: IntoIterator<Item = Arc<dyn Proxy>>,
 {
-    let mut seen: std::collections::HashSet<*const ()> = std::collections::HashSet::new();
-    let mut stack: Vec<Arc<dyn Proxy>> = roots.into_iter().collect();
+    reset_reachable(&mut roots.into_iter(), None)
+}
+
+/// Reset every distinct reachable adapter before awaiting any shutdown
+/// hook. Uses the same identity and group traversal as
+/// [`reset_sessions_reachable`]. Returns the number of adapters visited.
+pub async fn shutdown_reachable<I>(roots: I) -> usize
+where
+    I: IntoIterator<Item = Arc<dyn Proxy>>,
+{
+    let mut adapters = Vec::new();
+    reset_reachable(&mut roots.into_iter(), Some(&mut adapters));
+    join_shutdown_hooks(adapters).await
+}
+
+#[inline(never)]
+async fn join_shutdown_hooks(adapters: Vec<Arc<dyn Proxy>>) -> usize {
+    let count = adapters.len();
+    for proxy in adapters {
+        proxy.shutdown().await;
+    }
+    count
+}
+
+// Interface changes and shutdown share the same graph walk. Erase the root
+// iterator here so callers do not each generate a copy of the traversal.
+#[inline(never)]
+fn reset_reachable(
+    roots: &mut dyn Iterator<Item = Arc<dyn Proxy>>,
+    mut shutdown_order: Option<&mut Vec<Arc<dyn Proxy>>>,
+) -> usize {
+    let mut seen = HashSet::new();
+    let mut stack: Vec<Arc<dyn Proxy>> = roots.collect();
     while let Some(proxy) = stack.pop() {
         // Thin data pointer: the same object reached through differently
         // typed `Arc<dyn Proxy>` handles must still dedupe.
@@ -458,6 +505,9 @@ where
         proxy.reset_sessions();
         if let Some(members) = proxy.member_proxies() {
             stack.extend(members);
+        }
+        if let Some(order) = &mut shutdown_order {
+            order.push(proxy);
         }
     }
     seen.len()
@@ -472,6 +522,8 @@ mod tests {
     /// are set after construction so tests can build cycles.
     struct CountingProxy {
         resets: std::sync::atomic::AtomicUsize,
+        shutdowns: std::sync::atomic::AtomicUsize,
+        reset_before_shutdown: std::sync::Mutex<Vec<Arc<CountingProxy>>>,
         members: std::sync::Mutex<Option<Vec<Arc<dyn Proxy>>>>,
         health: ProxyHealth,
     }
@@ -480,6 +532,8 @@ mod tests {
         fn new() -> Arc<Self> {
             Arc::new(Self {
                 resets: std::sync::atomic::AtomicUsize::new(0),
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
+                reset_before_shutdown: std::sync::Mutex::new(Vec::new()),
                 members: std::sync::Mutex::new(None),
                 health: ProxyHealth::new(),
             })
@@ -512,6 +566,12 @@ mod tests {
         }
         fn reset_sessions(&self) {
             self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn shutdown(&self) {
+            for proxy in &*self.reset_before_shutdown.lock().unwrap() {
+                assert_eq!(proxy.resets(), 1, "all resets must precede shutdown");
+            }
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
         }
         fn health(&self) -> &ProxyHealth {
             &self.health
@@ -568,6 +628,27 @@ mod tests {
         }
         // Break the cycle so the test does not leak the pair.
         group_x.members.lock().unwrap().take();
+    }
+
+    #[tokio::test]
+    async fn shutdown_reachable_resets_before_joining_each_adapter_once() {
+        let a = CountingProxy::new();
+        let b = CountingProxy::new();
+        let leaf = CountingProxy::new();
+        *a.members.lock().unwrap() = Some(vec![Arc::clone(&b) as _, Arc::clone(&leaf) as _]);
+        *b.members.lock().unwrap() = Some(vec![Arc::clone(&a) as _]);
+        // The last root is visited first. Its shutdown checks that even the
+        // objects reached through the other root have already been reset.
+        *leaf.reset_before_shutdown.lock().unwrap() = vec![Arc::clone(&a), Arc::clone(&b)];
+        assert_eq!(
+            shutdown_reachable([Arc::clone(&a) as _, Arc::clone(&leaf) as _]).await,
+            3
+        );
+        for proxy in [&a, &b, &leaf] {
+            assert_eq!(proxy.resets(), 1);
+            assert_eq!(proxy.shutdowns.load(Ordering::SeqCst), 1);
+        }
+        a.members.lock().unwrap().take();
     }
 
     #[test]

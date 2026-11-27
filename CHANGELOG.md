@@ -38,6 +38,9 @@ the canonical, in-repo source a release is cut from.
   once and falls back to Mozilla + native. Hostname and chain verification
   stay on; outbound proxy TLS is unchanged. (#1031)
 
+- Outbound adapters can join background work during graceful shutdown and
+  publish optional non-secret diagnostics in proxy responses.
+
 ### Fixed
 
 - `proxy-providers.*.filter` / `exclude-filter` and the group-level fields
