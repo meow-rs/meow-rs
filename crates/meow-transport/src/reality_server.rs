@@ -2161,6 +2161,176 @@ mod tests {
         assert!(client_task.await.expect("client task").is_ok());
     }
 
+    /// End-to-end mirrored-flight integration with no cryptographic
+    /// injection: a real hybrid client hello flows preflight -> verify ->
+    /// consuming upload split -> incrementally fragmented target scanner ->
+    /// freeze -> production prepare_mirrored_upload.  The emitted flight is
+    /// fed to the real client implementation, whose successful handshake is
+    /// the independent verification of the patched ServerHello, the real
+    /// ML-KEM encapsulation, the certificate chain and the server Finished;
+    /// the server-side completion then verifies the client Finished and the
+    /// application seq=0 roundtrip runs in both directions.
+    #[tokio::test]
+    async fn mirrored_real_hybrid_end_to_end_no_injection() {
+        use crate::reality_mirror::{TargetFlightScanner, TargetScanState};
+
+        let (private, public) = keypair();
+        let server = RealityServer::new(&server_config(private)).expect("server");
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let verify_task = tokio::spawn({
+            let server = server.clone();
+            async move { server.verify_client_hello(Box::new(server_io)).await }
+        });
+        let layer = RealityTlsLayer::new(&client_config(public, SHORT_ID, true)).expect("layer");
+        let client_task = tokio::spawn(async move { layer.connect(Box::new(client_io)).await });
+
+        let classified = tokio::time::timeout(Duration::from_secs(2), verify_task)
+            .await
+            .expect("verify timed out")
+            .expect("verify joined")
+            .expect("verify io");
+        let RealityClientHello::Verified { mut stream, hello } = classified else {
+            panic!("real hybrid client must authenticate")
+        };
+        let ch_len = hello.ch_wire().len();
+        let session_id = hello.hello.session_id;
+        let upload = (*hello).into_mirror_upload();
+        assert_eq!(
+            upload.ch_wire().len(),
+            ch_len,
+            "upload owns the exact CH wire"
+        );
+
+        // Synthetic target flight shape: hybrid key-share group, a suite the
+        // client offered, session-id echo, one compat CCS and the acceptance
+        // record shape.  Share bytes are filler — prepare patches in the real
+        // encapsulation.
+        let mut sh_body = Vec::new();
+        sh_body.extend_from_slice(&[0x03, 0x03]);
+        sh_body.extend_from_slice(&[0x66; 32]);
+        sh_body.push(32);
+        sh_body.extend_from_slice(&session_id);
+        sh_body.extend_from_slice(&0x1301u16.to_be_bytes());
+        sh_body.push(0);
+        let versions = extension_bytes(0x002b, &0x0304u16.to_be_bytes());
+        let mut ks_body = Vec::new();
+        ks_body.extend_from_slice(&0x11ecu16.to_be_bytes());
+        ks_body.extend_from_slice(&1120u16.to_be_bytes());
+        ks_body.resize(ks_body.len() + 1120, 0x5a);
+        let key_share = extension_bytes(0x0033, &ks_body);
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&versions);
+        exts.extend_from_slice(&key_share);
+        sh_body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        sh_body.extend_from_slice(&exts);
+        let mut sh = vec![0x02];
+        sh.extend_from_slice(&(sh_body.len() as u32).to_be_bytes()[1..4]);
+        sh.extend_from_slice(&sh_body);
+
+        let mut flight = Vec::new();
+        flight.extend_from_slice(&[0x16, 0x03, 0x03]);
+        flight.extend_from_slice(&(sh.len() as u16).to_be_bytes());
+        flight.extend_from_slice(&sh);
+        flight.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+        for len in [25u16, 3217, 281, 69] {
+            flight.extend_from_slice(&[0x17, 0x03, 0x03]);
+            flight.extend_from_slice(&len.to_be_bytes());
+            flight.resize(flight.len() + usize::from(len), 0x5a);
+        }
+
+        // Fragmented feeding: 1-byte slices across the SH header, then a
+        // slice crossing a record header boundary, then the remainder.
+        let mut scanner = TargetFlightScanner::new();
+        for byte in &flight[..7] {
+            assert_eq!(scanner.push(&[*byte]), TargetScanState::NeedBytes);
+        }
+        assert_eq!(scanner.push(&flight[7..40]), TargetScanState::NeedBytes);
+        let mid = scanner.push(&flight[40..flight.len() - 100]);
+        assert!(
+            matches!(
+                mid,
+                TargetScanState::NeedBytes | TargetScanState::CapacityTemporarilyInsufficient
+            ),
+            "mid-flight must not be freezable before record bodies complete: {mid:?}"
+        );
+        let final_state = scanner.push(&flight[flight.len() - 100..]);
+        assert_eq!(
+            final_state,
+            TargetScanState::Freezable,
+            "complete acceptance-shape flight must be freezable"
+        );
+
+        let template = scanner
+            .freeze_context(upload.context())
+            .expect("freeze context");
+        let prepared = server
+            .prepare_mirrored_upload(&upload, template)
+            .expect("no-injection prepare");
+        let (wire, completion) = prepared.into_wire_and_completion();
+        drop(upload);
+
+        // The patched flight must carry a real hybrid server share: parse the
+        // patched SH out of the emitted wire and check the share length.
+        let sh_len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
+        let patched = &wire[5..5 + sh_len];
+        let pos = patched
+            .windows(2)
+            .position(|w| w == [0x11, 0xec])
+            .expect("patched SH keeps hybrid group");
+        let share_len = usize::from(u16::from_be_bytes([patched[pos + 2], patched[pos + 3]]));
+        assert_eq!(share_len, 1120, "real ML-KEM ciphertext || X25519 share");
+
+        stream
+            .write_all(&wire)
+            .await
+            .expect("write mirrored flight");
+        stream.flush().await.expect("flush flight");
+
+        let finish_task = tokio::spawn(async move { completion.finish(stream).await });
+        let client_connected = tokio::time::timeout(Duration::from_secs(5), client_task)
+            .await
+            .expect("client handshake timed out")
+            .expect("client joined")
+            .expect("real client must accept the no-injection mirrored flight");
+        let mut server_stream = tokio::time::timeout(Duration::from_secs(5), finish_task)
+            .await
+            .expect("finish timed out")
+            .expect("finish joined")
+            .expect("client Finished must verify under the mirrored transcript");
+        let mut client_stream = client_connected;
+
+        client_stream
+            .write_all(b"client-to-server seq0")
+            .await
+            .expect("client write");
+        client_stream.flush().await.expect("client flush");
+        let mut buf = vec![0u8; b"client-to-server seq0".len()];
+        tokio::time::timeout(Duration::from_secs(2), server_stream.read_exact(&mut buf))
+            .await
+            .expect("server read timed out")
+            .expect("server read");
+        assert_eq!(buf, b"client-to-server seq0");
+        server_stream
+            .write_all(b"server-to-client seq0")
+            .await
+            .expect("server write");
+        server_stream.flush().await.expect("server flush");
+        let mut buf = vec![0u8; b"server-to-client seq0".len()];
+        tokio::time::timeout(Duration::from_secs(2), client_stream.read_exact(&mut buf))
+            .await
+            .expect("client read timed out")
+            .expect("client read");
+        assert_eq!(buf, b"server-to-client seq0");
+    }
+
+    fn extension_bytes(typ: u16, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + data.len());
+        out.extend_from_slice(&typ.to_be_bytes());
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
     #[tokio::test]
     async fn verified_hello_is_bound_to_issuing_server_instance() {
         let (private, public) = keypair();

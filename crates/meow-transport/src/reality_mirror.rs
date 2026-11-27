@@ -1305,6 +1305,7 @@ async fn read_mirrored_client_finished(
     ))
 }
 
+#[cfg(test)]
 #[allow(clippy::needless_pass_by_value)] // ownership is an explicit pre-commit barrier
 pub(crate) fn prepare_mirrored_flight(
     certificate: &RealityCertificate,

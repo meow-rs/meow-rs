@@ -370,14 +370,20 @@ async fn reality_handshake(
     loop {
         // A record may carry several handshake messages (RFC 8446 §5.1), so
         // drain what is buffered before reading the next record.
-        let msg = match pop_handshake_message(&mut handshake_buf) {
-            Some(msg) => msg,
-            None => {
-                fill_decrypted_handshake(&mut inner, &mut server_hs, &mut handshake_buf).await?;
-                pop_handshake_message(&mut handshake_buf).ok_or_else(|| {
-                    TransportError::Tls("Reality TLS: decrypted empty handshake record".into())
-                })?
+        // TLS records fragment handshake messages arbitrarily (RFC 8446
+        // §5.1); a mirrored flight may carry a message in 1-byte heads, so
+        // keep filling until a whole message is buffered.  The pre-auth
+        // transcript bound caps the buffer: a valid flight never needs more.
+        let msg = loop {
+            if let Some(msg) = pop_handshake_message(&mut handshake_buf) {
+                break msg;
             }
+            if handshake_buf.len() >= MAX_PRE_AUTH_TRANSCRIPT_LEN {
+                return Err(TransportError::Tls(
+                    "Reality TLS: fragmented handshake message exceeds the pre-auth bound".into(),
+                ));
+            }
+            fill_decrypted_handshake(&mut inner, &mut server_hs, &mut handshake_buf).await?;
         };
         match msg.typ {
             HS_ENCRYPTED_EXTENSIONS | HS_CERTIFICATE | HS_CERTIFICATE_VERIFY => {
