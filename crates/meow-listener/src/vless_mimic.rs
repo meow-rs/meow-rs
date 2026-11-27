@@ -1493,15 +1493,30 @@ mod tests {
         target: T,
         deadline: Instant,
     ) -> tokio::task::JoinHandle<Option<Box<dyn Stream>>> {
-        let permit = Arc::clone(&runtime.handshake_slots)
-            .try_acquire_owned()
-            .unwrap();
         let dial = async move {
             Ok::<_, DialFirstDialError>(DialedTarget {
                 stream: target,
                 connect_elapsed: Duration::from_millis(200),
             })
         };
+        spawn_machine_with_dial(runtime, client, deadline, dial)
+    }
+
+    fn spawn_machine_with_dial<T, D>(
+        runtime: &Arc<RealityRuntime>,
+        client: ScriptedClient,
+        deadline: Instant,
+        dial: D,
+    ) -> tokio::task::JoinHandle<Option<Box<dyn Stream>>>
+    where
+        T: TargetIo,
+        D: std::future::Future<Output = Result<DialedTarget<T>, DialFirstDialError>>
+            + Send
+            + 'static,
+    {
+        let permit = Arc::clone(&runtime.handshake_slots)
+            .try_acquire_owned()
+            .unwrap();
         let runtime = Arc::clone(runtime);
         tokio::spawn(async move {
             run_dial_first(
@@ -1602,6 +1617,52 @@ mod tests {
         assert_eq!(snap.cover_total.get("dest_eof"), Some(&1));
         assert_eq!(snap.committed_total, 0);
         assert_eq!(written, flight);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_delayed_dial_can_finish_while_fragmented_ch_is_incomplete() {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, mut client_peer, _client_writes) = scripted_client(&[]);
+        let target_writes = Arc::new(Mutex::new(Vec::new()));
+        let (target, mut target_peer, _dropped) =
+            mock_target_with_log(vec![], Arc::clone(&target_writes));
+        let dial_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let dial_done_in_dial = Arc::clone(&dial_done);
+        let dial = async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            dial_done_in_dial.store(true, Ordering::Relaxed);
+            Ok::<_, DialFirstDialError>(DialedTarget {
+                stream: target,
+                connect_elapsed: Duration::from_millis(80),
+            })
+        };
+        let machine = spawn_machine_with_dial(
+            &runtime,
+            client,
+            Instant::now() + Duration::from_secs(5),
+            dial,
+        );
+
+        yields(5).await;
+        let split = ch.len() / 2;
+        client_peer.write_all(&ch[..split]).await.unwrap();
+        advance(Duration::from_millis(90)).await;
+        yields(10).await;
+        assert!(
+            dial_done.load(Ordering::Relaxed),
+            "fixed-target dial must complete concurrently with incomplete client preflight"
+        );
+        assert!(
+            target_writes.lock().unwrap().is_empty(),
+            "no CH prefix may be uploaded before the complete authenticated CH"
+        );
+
+        client_peer.write_all(&ch[split..]).await.unwrap();
+        let uploaded = read_record(&mut target_peer).await;
+        assert_eq!(uploaded, ch);
+        assert_eq!(snapshot(&runtime).probe_started_total, 1);
+        machine.abort();
     }
 
     #[tokio::test(start_paused = true)]

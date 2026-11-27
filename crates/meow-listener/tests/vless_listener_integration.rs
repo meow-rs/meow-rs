@@ -418,7 +418,7 @@ async fn tls_negative_auth_flow_plaintext_and_tls12() {
 async fn reality_vision_authenticated_echo() {
     let echo = start_tcp_echo().await;
     let tunnel = tunnel_with_rules(&[]);
-    let (port, _listener, _task) = start_listener(
+    let (port, listener, _task) = start_listener(
         reality_spec("127.0.0.1:9", vec![("alice", ALICE)]),
         tunnel,
         "vless-reality-it",
@@ -428,6 +428,12 @@ async fn reality_vision_authenticated_echo() {
     adapter_echo(&adapter, echo, b"reality vision echo")
         .await
         .expect("REALITY-authenticated Vision echo");
+    let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+    assert_eq!(
+        snapshot.dial_started_total, 0,
+        "off mode must not early-dial"
+    );
+    assert_eq!(snapshot.tcp_connect_started_total, 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
