@@ -2190,6 +2190,36 @@ mod tests {
     }
 
     #[test]
+    fn template_rejects_a_second_canonical_ccs_after_a_legal_one() {
+        let hello = x25519_verified();
+        let sh = valid_x25519_sh(&hello, false);
+        // Controls: zero CCS and exactly one canonical CCS both parse, so the
+        // rejection below is caused by duplication alone.
+        let zero = target_prefix(&sh.message, false, &[18]);
+        assert!(
+            MirrorTemplate::parse(&hello, &zero).is_ok(),
+            "zero compatibility CCS"
+        );
+        let one = target_prefix(&sh.message, true, &[18]);
+        assert!(
+            MirrorTemplate::parse(&hello, &one).is_ok(),
+            "one canonical compatibility CCS"
+        );
+
+        // The second CCS is itself canonical — correct type, version, length
+        // and body byte 01 — and follows a legal first CCS.  Rejecting it
+        // therefore isolates duplication rather than a malformed-record rule.
+        let mut two = target_prefix(&sh.message, true, &[18]);
+        let insert_at = 5 + sh.message.len() + COMPAT_CCS_RECORD.len();
+        two.splice(insert_at..insert_at, COMPAT_CCS_RECORD);
+        assert_eq!(
+            MirrorTemplate::parse(&hello, &two),
+            Err(MirrorTemplateError::UnexpectedRecord),
+            "a second canonical CCS must not enter the application-record sequence"
+        );
+    }
+
+    #[test]
     fn template_rejects_bad_ccs_record_sequence_version_and_trailing_shapes() {
         let hello = x25519_verified();
         let sh = valid_x25519_sh(&hello, false);
@@ -2405,13 +2435,64 @@ mod tests {
         );
     }
 
-    #[test]
-    fn small_capacity_plans_match_independent_greedy_enumeration() {
-        let lengths = [18u16, 19, 20, 19];
-        let heads = lengths.map(head);
-        let capacities = lengths.map(|len| usize::from(len) - 17);
-        for m in capacities.len()..=capacities.iter().sum::<usize>() {
-            let plan = plan_mirrored_records(m, &heads).expect("feasible small plan");
+    /// Exhaustively compare the greedy planner against an independent
+    /// allocation enumeration for one small capacity set.  Every M from 0 to
+    /// sum(C)+1 is covered — infeasible M must be rejected as such, feasible M
+    /// must produce contiguous non-overlapping ranges over exactly [0, M) with
+    /// per-bucket headers preserved byte-for-byte, exact padding, and greedy
+    /// per-bucket maximality.
+    fn assert_capacity_set_matches_independent_enumeration(lengths: &[u16]) {
+        let heads = lengths.iter().map(|len| head(*len)).collect::<Vec<_>>();
+        let capacities = lengths
+            .iter()
+            .map(|len| usize::from(*len) - 17)
+            .collect::<Vec<_>>();
+        let n = capacities.len();
+        let sum = capacities.iter().sum::<usize>();
+        for m in 0..=(sum + 1) {
+            let feasible = m >= n && m <= sum;
+            let result = plan_mirrored_records(m, &heads);
+            if !feasible {
+                assert_eq!(
+                    result,
+                    Err(MirrorPlanError::Infeasible),
+                    "lengths {lengths:?} M={m} is outside N..=sum(C) and must be infeasible"
+                );
+                continue;
+            }
+            let plan = result.expect("feasible small plan");
+            assert_eq!(plan.len(), n, "one plan entry per bucket");
+            let mut cursor = 0;
+            for (index, entry) in plan.iter().enumerate() {
+                assert_eq!(
+                    entry.head, heads[index],
+                    "lengths {lengths:?} M={m} bucket {index} header must be the exact input head"
+                );
+                assert_eq!(
+                    entry.range.start, cursor,
+                    "lengths {lengths:?} M={m} bucket {index} range must continue the previous end"
+                );
+                assert!(
+                    entry.range.end > entry.range.start,
+                    "lengths {lengths:?} M={m} bucket {index} must carry at least one byte"
+                );
+                cursor = entry.range.end;
+                let take = entry.range.len();
+                assert!(
+                    take <= capacities[index],
+                    "lengths {lengths:?} M={m} bucket {index} must not exceed capacity"
+                );
+                assert_eq!(
+                    entry.pad,
+                    capacities[index] - take,
+                    "lengths {lengths:?} M={m} bucket {index} padding is exactly the unused capacity"
+                );
+            }
+            assert_eq!(
+                cursor, m,
+                "lengths {lengths:?} M={m} ranges consume exactly the logical bytes, without overlap or gap"
+            );
+
             let takes = plan
                 .iter()
                 .map(|entry| entry.range.len())
@@ -2421,7 +2502,7 @@ mod tests {
             enumerate_allocations(&capacities, m, 0, &mut prefix, &mut allocations);
             assert!(
                 allocations.iter().any(|allocation| allocation == &takes),
-                "planned allocation {takes:?} must be legal for M={m}"
+                "planned allocation {takes:?} must be legal for lengths {lengths:?} M={m}"
             );
             for index in 0..capacities.len() {
                 let max_feasible = allocations
@@ -2432,9 +2513,21 @@ mod tests {
                     .expect("the planned prefix has at least one completion");
                 assert_eq!(
                     takes[index], max_feasible,
-                    "bucket {index} must greedily take the most bytes that still leaves a completion for M={m}"
+                    "lengths {lengths:?} M={m} bucket {index} must greedily take the most bytes that still leaves a completion"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn small_capacity_plans_match_independent_greedy_enumeration() {
+        for lengths in [
+            &[18u16, 19, 20, 19][..], // C=[1,2,3,2]
+            &[18, 18, 18][..],        // C=[1,1,1]: every bucket forced to one byte
+            &[19, 20][..],            // C=[2,3]
+            &[18, 21, 18, 19][..],    // C=[1,4,1,2]
+        ] {
+            assert_capacity_set_matches_independent_enumeration(lengths);
         }
     }
 
