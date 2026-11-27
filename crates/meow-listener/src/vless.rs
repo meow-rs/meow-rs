@@ -777,6 +777,13 @@ fn canonical_endpoint(addr: SocketAddr) -> SocketAddr {
 /// Snapshot local interface addresses for wildcard-bind self-loop checks.
 /// Enumeration failure is conservative: `None` makes a same-port candidate
 /// on a wildcard bind a self-loop.
+#[cfg_attr(
+    not(unix),
+    allow(
+        clippy::unnecessary_wraps,
+        reason = "interface enumeration is only fallible on unix; the non-unix loopback-only approximation is deliberately infallible"
+    )
+)]
 fn local_addr_snapshot() -> Option<HashSet<IpAddr>> {
     #[cfg(unix)]
     {
