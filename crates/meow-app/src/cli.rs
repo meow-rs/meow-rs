@@ -1,24 +1,3 @@
-// dhat heap profiling — only active when compiled with --features dhat-heap.
-// The profiler writes dh_out.json on process exit; parse with dhat-viewer.
-#[cfg(feature = "dhat-heap")]
-#[global_allocator]
-static ALLOC: dhat::Alloc = dhat::Alloc;
-
-// mimalloc global allocator — always on for musl targets (where the stock
-// allocator retains freed pages under periodic churn — health probes,
-// provider rebuilds — and RSS ratchets upward over long uptimes); opt-in
-// elsewhere via --features alloc-mimalloc. The cfg mirrors the split
-// target-gated deps in Cargo.toml: musl carries the dep unconditionally,
-// other linux/android targets only under the feature (RFC 2957 — the
-// feature alone never activates an inactive platform dep).
-#[cfg(all(
-    not(feature = "dhat-heap"),
-    any(target_os = "linux", target_os = "android"),
-    any(feature = "alloc-mimalloc", target_env = "musl")
-))]
-#[global_allocator]
-static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
 use anyhow::Context as _;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -45,25 +24,23 @@ use parking_lot::RwLock;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+// Explicit event targets preserve existing RUST_LOG directives when the CLI
+// runs from the library.
 use tracing::{error, info, warn};
-
-mod ntp;
-#[cfg(target_os = "windows")]
-mod windows_service;
 
 #[cfg(target_os = "linux")]
 const SERVICE_NAME: &str = "meow";
 
 #[derive(Parser)]
 #[command(name = "meow", version = env!("MEOW_VERSION"), about = "A rule-based tunnel in Rust")]
-struct Args {
+pub(super) struct Args {
     /// Path to configuration file
     #[arg(short = 'f', long = "config", default_value = "config.yaml")]
-    config: String,
+    pub(super) config: String,
 
     /// Home directory
     #[arg(short = 'd', long = "directory")]
-    directory: Option<String>,
+    pub(super) directory: Option<String>,
 
     /// Test configuration and exit
     #[arg(short = 't', long = "test")]
@@ -126,11 +103,11 @@ struct Args {
     no_external_plugins: bool,
 
     #[command(subcommand)]
-    command: Option<Command>,
+    pub(super) command: Option<Command>,
 }
 
 #[derive(Subcommand)]
-enum Command {
+pub(super) enum Command {
     /// Send one unicast ARP reply to a selected LAN client (Linux only)
     #[cfg(target_os = "linux")]
     ArpReply {
@@ -167,13 +144,13 @@ enum Command {
     RunService,
 }
 
-enum LogTarget {
+pub(super) enum LogTarget {
     Console,
     #[cfg(target_os = "windows")]
     WindowsService(std::path::PathBuf),
 }
 
-enum ShutdownSignal {
+pub(super) enum ShutdownSignal {
     Console,
     #[cfg(target_os = "windows")]
     WindowsService(tokio::sync::oneshot::Receiver<()>),
@@ -181,7 +158,7 @@ enum ShutdownSignal {
 
 impl ShutdownSignal {
     /// Wait for the stop request; names what asked.
-    async fn wait(self) -> Result<&'static str> {
+    pub(super) async fn wait(self) -> Result<&'static str> {
         match self {
             Self::Console => {
                 #[cfg(unix)]
@@ -214,10 +191,22 @@ struct Logging {
     _file_guard: Option<tracing_appender::non_blocking::WorkerGuard>,
 }
 
-type ReadyCallback = Box<dyn FnOnce() -> Result<()> + Send>;
+pub(super) type ReadyCallback = Box<dyn FnOnce() -> Result<()> + Send>;
 
-fn main() -> Result<()> {
-    // dhat profiler guard — must be the first local, lives for the duration of main().
+/// Run the standard CLI with the current process arguments.
+///
+/// An embedder can perform process setup, such as registering extensions,
+/// before this call parses any configuration.
+///
+/// ```no_run
+/// # fn setup_extensions() -> anyhow::Result<()> { Ok(()) }
+/// fn main() -> anyhow::Result<()> {
+///     setup_extensions()?;
+///     meow_app::run_cli()
+/// }
+/// ```
+pub fn run_cli() -> anyhow::Result<()> {
+    // dhat profiler guard — must be the first local, lives for the duration of run_cli().
     // Writes dh_out.json on drop. Active only when compiled with --features dhat-heap.
     #[cfg(feature = "dhat-heap")]
     let _profiler = dhat::Profiler::new_heap();
@@ -383,7 +372,7 @@ fn log_max_level(filter: &tracing_subscriber::EnvFilter) -> log::LevelFilter {
     }
 }
 
-fn run_application(
+pub(super) fn run_application(
     args: Args,
     log_target: &LogTarget,
     shutdown: ShutdownSignal,
@@ -397,7 +386,7 @@ fn run_application(
     // terminal error. Dropping it afterwards flushes the queued record before
     // the Windows service host reports Stopped to SCM.
     if let Err(error) = &result {
-        error!(error = %format_args!("{error:#}"), "meow-rs stopped with an error");
+        error!(target: "meow", error = %format_args!("{error:#}"), "meow-rs stopped with an error");
         meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Failed(&format!(
             "{error:#}"
         )));
@@ -437,6 +426,7 @@ fn raise_nofile_limit() {
         };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) != 0 {
             warn!(
+                target: "meow",
                 "getrlimit(RLIMIT_NOFILE) failed ({}) — conn-heavy traffic may hit the inherited cap; {NOFILE_REMEDY}",
                 std::io::Error::last_os_error()
             );
@@ -446,11 +436,13 @@ fn raise_nofile_limit() {
         if lim.rlim_cur >= target {
             if lim.rlim_cur < COMFORTABLE {
                 warn!(
+                    target: "meow",
                     "RLIMIT_NOFILE capped at {} by the hard limit — conn-heavy traffic may hit the cap; {NOFILE_REMEDY}",
                     lim.rlim_cur
                 );
             } else {
                 tracing::debug!(
+                    target: "meow",
                     soft = lim.rlim_cur,
                     "RLIMIT_NOFILE soft limit already sufficient"
                 );
@@ -461,6 +453,7 @@ fn raise_nofile_limit() {
         lim.rlim_cur = target;
         if libc::setrlimit(libc::RLIMIT_NOFILE, &lim) != 0 {
             warn!(
+                target: "meow",
                 "setrlimit(RLIMIT_NOFILE, {target}) failed ({}) — conn-heavy traffic may hit the low cap; {NOFILE_REMEDY}",
                 std::io::Error::last_os_error()
             );
@@ -474,21 +467,25 @@ fn raise_nofile_limit() {
         };
         if libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) != 0 {
             tracing::debug!(
+                target: "meow",
                 "getrlimit(RLIMIT_NOFILE) re-check failed ({})",
                 std::io::Error::last_os_error()
             );
         } else if after.rlim_cur < COMFORTABLE {
             warn!(
+                target: "meow",
                 "RLIMIT_NOFILE only reached {} (wanted {target}, hard {}) — conn-heavy traffic may hit the low cap; {NOFILE_REMEDY}",
                 after.rlim_cur, lim.rlim_max
             );
         } else if after.rlim_cur < target {
             info!(
+                target: "meow",
                 "RLIMIT_NOFILE clamped to {} by the OS ceiling (wanted {target}) — still comfortably above the default 256",
                 after.rlim_cur
             );
         } else {
             info!(
+                target: "meow",
                 "raised RLIMIT_NOFILE soft limit {previous} → {}",
                 after.rlim_cur
             );
@@ -502,7 +499,7 @@ fn run_application_inner(
     shutdown: ShutdownSignal,
     on_ready: Option<ReadyCallback>,
 ) -> Result<()> {
-    info!("meow-rs starting...");
+    info!(target: "meow", "meow-rs starting...");
 
     let file_secret = args
         .secret_file
@@ -565,9 +562,9 @@ fn run_application_inner(
             #[cfg(feature = "listener-vless")]
             ensure_vless_security_valid(&config)?;
             if args.config_string.is_some() {
-                info!("Configuration test passed (--config-string)");
+                info!(target: "meow", "Configuration test passed (--config-string)");
             } else {
-                info!("Configuration test passed");
+                info!(target: "meow", "Configuration test passed");
             }
             Ok::<(), anyhow::Error>(())
         })?;
@@ -609,10 +606,11 @@ fn run_application_inner(
             // logging instead of erroring (same set PATCH enforces).
             if meow_api::log_stream::is_valid_log_level(level) {
                 if let Err(e) = meow_api::log_stream::reload_log_level(level) {
-                    warn!("failed to apply log-level '{level}': {e}");
+                    warn!(target: "meow", "failed to apply log-level '{level}': {e}");
                 }
             } else {
                 warn!(
+                    target: "meow",
                     "unknown log-level '{level}' — keeping current filter \
                      (expected one of: debug, info, warning, warn, error, silent)"
                 );
@@ -661,13 +659,13 @@ fn run_application_inner(
             let config = meow_config::build_config(raw, None)
                 .await
                 .map_err(|e| anyhow::anyhow!("--config-string: {e}"))?;
-            info!("Config loaded from --config-string");
+            info!(target: "meow", "Config loaded from --config-string");
             config
         } else {
             early_binding = preinstall_global_route_binding(&raw);
             let cache_dir = meow_config::resource_cache_dir_for_config_path(&config_path);
             let config = meow_config::build_config(raw, Some(cache_dir.as_path())).await?;
-            info!("Config loaded from {}", config_path);
+            info!(target: "meow", "Config loaded from {}", config_path);
             config
         };
 
@@ -678,17 +676,17 @@ fn run_application_inner(
         // Apply CLI overrides to the loaded config.
         if let Some(secret) = file_secret {
             config.api.secret = Some(secret);
-            info!("API secret overridden by --secret-file");
+            info!(target: "meow", "API secret overridden by --secret-file");
         } else if let Some(secret) = args.secret {
             config.api.secret = Some(secret);
-            info!("API secret overridden by --secret");
+            info!(target: "meow", "API secret overridden by --secret");
         }
         if let Some(ref ctl) = args.ext_ctl {
             let addr: std::net::SocketAddr = ctl
                 .parse()
                 .map_err(|e| anyhow::anyhow!("--ext-ctl: invalid address '{ctl}': {e}"))?;
             config.api.external_controller = Some(addr);
-            info!("External controller overridden by --ext-ctl: {addr}");
+            info!(target: "meow", "External controller overridden by --ext-ctl: {addr}");
         }
         apply_ext_controller_overrides(
             args.ext_ctl_tls.as_deref(),
@@ -698,7 +696,7 @@ fn run_application_inner(
         );
         if let Some(ref ui) = args.ext_ui {
             config.api.external_ui = Some(std::path::PathBuf::from(ui));
-            info!("External UI overridden by --ext-ui");
+            info!(target: "meow", "External UI overridden by --ext-ui");
         }
 
         // A declared inbound this build cannot serve must fail startup,
@@ -752,15 +750,15 @@ fn apply_ext_controller_overrides(
 ) {
     if let Some(ctl) = ext_ctl_tls.filter(|s| !s.is_empty()) {
         api.external_controller_tls = Some(ctl.to_owned());
-        info!("External controller TLS overridden by --ext-ctl-tls: {ctl}");
+        info!(target: "meow", "External controller TLS overridden by --ext-ctl-tls: {ctl}");
     }
     if let Some(ctl) = ext_ctl_unix.filter(|s| !s.is_empty()) {
         api.external_controller_unix = Some(ctl.to_owned());
-        info!("External controller unix socket overridden by --ext-ctl-unix: {ctl}");
+        info!(target: "meow", "External controller unix socket overridden by --ext-ctl-unix: {ctl}");
     }
     if let Some(ctl) = ext_ctl_pipe.filter(|s| !s.is_empty()) {
         api.external_controller_pipe = Some(ctl.to_owned());
-        info!("External controller pipe overridden by --ext-ctl-pipe: {ctl}");
+        info!(target: "meow", "External controller pipe overridden by --ext-ctl-pipe: {ctl}");
     }
 }
 
@@ -942,7 +940,7 @@ fn handle_subcommand(cmd: &Command, args: &Args) -> Result<()> {
             sender,
             target_mac,
             target_ip,
-        } => meow_app::arp::send(interface, *sender, target_mac, *target_ip),
+        } => crate::arp::send(interface, *sender, target_mac, *target_ip),
         Command::Install { config } => {
             if args.config_string.is_some() {
                 anyhow::bail!(
@@ -961,7 +959,7 @@ fn handle_subcommand(cmd: &Command, args: &Args) -> Result<()> {
         Command::Uninstall => uninstall_service(),
         Command::Status => service_status(),
         #[cfg(target_os = "windows")]
-        Command::RunService => windows_service::dispatch(),
+        Command::RunService => crate::windows_service::dispatch(),
     }
 }
 
@@ -1074,7 +1072,7 @@ fn convert_ruleset(
 /// when nothing on the path exists at all, fold `.`/`..` lexically over the
 /// absolute path. An over-eager result only trips the guard — the safe
 /// direction. Existing-path-only callers can use the lib crate's
-/// `meow_app::same_resolved_path` instead (canonicalize-and-compare).
+/// `crate::same_resolved_path` instead (canonicalize-and-compare).
 fn resolved_path(path: &std::path::Path) -> std::path::PathBuf {
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cursor = path;
@@ -1248,7 +1246,7 @@ fn install_service(config_override: Option<&str>, args: &Args) -> Result<()> {
         cwd.join(config_rel).to_string_lossy().to_string()
     };
 
-    let unit = meow_app::generate_systemd_unit(&exe_path, &config_path)
+    let unit = crate::generate_systemd_unit(&exe_path, &config_path)
         .context("failed to generate systemd unit")?;
 
     let service_path = format!("/etc/systemd/system/{SERVICE_NAME}.service");
@@ -1326,7 +1324,7 @@ fn service_status() -> Result<()> {
 // --- macOS launchd user agent ---
 
 #[cfg(target_os = "macos")]
-use meow_app::LAUNCHD_LABEL;
+use crate::LAUNCHD_LABEL;
 
 #[cfg(target_os = "macos")]
 fn macos_dirs() -> Result<(std::path::PathBuf, std::path::PathBuf, std::path::PathBuf)> {
@@ -1375,7 +1373,7 @@ fn install_service(config_override: Option<&str>, args: &Args) -> Result<()> {
     // Validate + generate the plist before any fs mutation so a rejected
     // path leaves nothing behind (issue #677).
     let dest_config = app_support.join("config.yaml");
-    let plist = meow_app::generate_launchd_plist(
+    let plist = crate::generate_launchd_plist(
         &exe_path,
         &dest_config.display().to_string(),
         &app_support.display().to_string(),
@@ -1438,7 +1436,7 @@ fn uninstall_service() -> Result<()> {
     // pass as root's home (issue #678).
     if unsafe { libc::geteuid() } == 0
         && !std::env::var("HOME").is_ok_and(|home| {
-            meow_app::same_resolved_path(
+            crate::same_resolved_path(
                 std::path::Path::new(&home),
                 std::path::Path::new("/var/root"),
             )
@@ -1510,17 +1508,17 @@ fn service_status() -> Result<()> {
 
 #[cfg(target_os = "windows")]
 fn install_service(config: Option<&str>, args: &Args) -> Result<()> {
-    windows_service::install(config, args)
+    crate::windows_service::install(config, args)
 }
 
 #[cfg(target_os = "windows")]
 fn uninstall_service() -> Result<()> {
-    windows_service::uninstall()
+    crate::windows_service::uninstall()
 }
 
 #[cfg(target_os = "windows")]
 fn service_status() -> Result<()> {
-    windows_service::status()
+    crate::windows_service::status()
 }
 
 #[cfg(target_os = "linux")]
@@ -1669,7 +1667,7 @@ async fn run(
     // drop order can't strand it; the worker starts after TUN binding
     // settles below, and PUT reconciles it through the API lane
     // (issue #974).
-    let ntp_supervisor = Arc::new(ntp::NtpSupervisor::new(&tunnel));
+    let ntp_supervisor = Arc::new(crate::ntp::NtpSupervisor::new(&tunnel));
     meow_tunnel::nftset::install(
         &tunnel,
         config
@@ -1733,7 +1731,7 @@ async fn run(
         let socket = bound.socket_weak();
         let task = tokio::spawn(async move {
             if let Err(e) = bound.run().await {
-                error!("DNS server error: {}", e);
+                error!(target: "meow", "DNS server error: {}", e);
             }
         });
         *dns_server_handle.write() = Some(meow_api::routes::DnsServerHandle {
@@ -1789,7 +1787,7 @@ async fn run(
         // right dependency set for the prospective-route sweep.
         let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
-            meow_app::subscription_refresh::run_loop(
+            crate::subscription_refresh::run_loop(
                 raw_config,
                 tunnel,
                 config_path,
@@ -1829,7 +1827,7 @@ async fn run(
         // republish sweep's dependency set, as subscription_refresh's.
         let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
-            meow_app::geodata_fetch::missing_geosite_retry_loop(
+            crate::geodata_fetch::missing_geosite_retry_loop(
                 geodata,
                 tunnel,
                 raw_config,
@@ -1857,7 +1855,7 @@ async fn run(
         let cache_dir = geodata_cache_dir;
         let running_listeners = config.listeners.named.clone();
         tokio::spawn(async move {
-            meow_app::geodata_fetch::auto_update_loop(
+            crate::geodata_fetch::auto_update_loop(
                 geodata,
                 geo_needs,
                 tunnel,
@@ -1920,6 +1918,7 @@ async fn run(
             {
                 let _ = cfg;
                 tracing::warn!(
+                    target: "meow",
                     "listener '{}': type tun requires feature 'listener-tun'",
                     nl.name
                 );
@@ -1962,12 +1961,13 @@ async fn run(
                         .with_routing_mark(nl.routing_mark);
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on(socket).await {
-                            error!("Listener error: {}", e);
+                            error!(target: "meow", "Listener error: {}", e);
                         }
                     });
                 }
                 #[cfg(not(feature = "listener-mixed"))]
                 tracing::warn!(
+                    target: "meow",
                     "listener '{}': type {:?} requires feature 'listener-mixed'",
                     nl.name,
                     nl.spec
@@ -2021,7 +2021,7 @@ async fn run(
                     };
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on(socket).await {
-                            error!("TProxy listener error: {}", e);
+                            error!(target: "meow", "TProxy listener error: {}", e);
                         }
                     });
                 }
@@ -2033,6 +2033,7 @@ async fn run(
                     // sets.
                     let _ = (sni, firewall, udp, udp_timeout, transparent);
                     tracing::warn!(
+                        target: "meow",
                         "listener '{}': TProxy requires feature 'listener-tproxy'",
                         nl.name
                     );
@@ -2094,7 +2095,7 @@ async fn run(
                     };
                     tokio::spawn(async move {
                         if let Err(e) = listener.run_on_udp(socket, udp_sock).await {
-                            error!("Shadowsocks listener error: {}", e);
+                            error!(target: "meow", "Shadowsocks listener error: {}", e);
                         }
                     });
                 }
@@ -2102,6 +2103,7 @@ async fn run(
                 {
                     let _ = cfg;
                     tracing::warn!(
+                        target: "meow",
                         "listener '{}': shadowsocks requires feature 'listener-shadowsocks'",
                         nl.name
                     );
@@ -2155,7 +2157,7 @@ async fn run(
                         Ok(guard) => {
                             tokio::spawn(async move {
                                 if let Err(e) = guard.wait().await {
-                                    error!("WireGuard listener error: {e}");
+                                    error!(target: "meow", "WireGuard listener error: {e}");
                                 }
                             });
                         }
@@ -2168,6 +2170,7 @@ async fn run(
                 {
                     let _ = cfg;
                     tracing::warn!(
+                        target: "meow",
                         "listener '{}': wireguard requires feature 'listener-wireguard'",
                         nl.name
                     );
@@ -2249,7 +2252,7 @@ async fn run(
                         let listener = std::sync::Arc::clone(&listener);
                         tokio::spawn(async move {
                             if let Err(e) = listener.run_on(socket).await {
-                                error!("AnyTLS listener error: {}", e);
+                                error!(target: "meow", "AnyTLS listener error: {}", e);
                             }
                         });
                     }
@@ -2337,7 +2340,7 @@ async fn run(
                         let listener = std::sync::Arc::clone(&listener);
                         tokio::spawn(async move {
                             if let Err(e) = listener.run_on(socket).await {
-                                error!("VLESS listener error: {}", e);
+                                error!(target: "meow", "VLESS listener error: {}", e);
                             }
                         });
                     }
@@ -2372,11 +2375,11 @@ async fn run(
     // unsupported-only config would otherwise go silent (issue #974).
     #[cfg(not(unix))]
     if let Some(ref unix_path) = config.api.external_controller_unix {
-        warn!("external-controller-unix '{unix_path}' ignored — Unix sockets are unsupported on this platform");
+        warn!(target: "meow", "external-controller-unix '{unix_path}' ignored — Unix sockets are unsupported on this platform");
     }
     #[cfg(not(windows))]
     if let Some(ref pipe_name) = config.api.external_controller_pipe {
-        warn!("external-controller-pipe '{pipe_name}' ignored — named pipes are Windows-only");
+        warn!(target: "meow", "external-controller-pipe '{pipe_name}' ignored — named pipes are Windows-only");
     }
     // The HTTPS endpoint is a build feature, not just a platform gate:
     // `minimal` leaves it out (ADR-0007) and parses the key as dead
@@ -2384,7 +2387,7 @@ async fn run(
     // (issue #974).
     #[cfg(not(feature = "api-tls"))]
     if let Some(ref tls_addr) = config.api.external_controller_tls {
-        warn!("external-controller-tls '{tls_addr}' ignored — the HTTPS controller is not compiled into this build (feature 'api-tls')");
+        warn!(target: "meow", "external-controller-tls '{tls_addr}' ignored — the HTTPS controller is not compiled into this build (feature 'api-tls')");
     }
     if api_endpoint_servable(&config.api) {
         // `external-ui-url` auto-download is gated behind the optional
@@ -2401,7 +2404,7 @@ async fn run(
                 ))]
                 {
                     if let Err(e) = meow_config::external_ui::download_external_ui(url, dir).await {
-                        warn!("failed to download external-ui from {url}: {e:#}");
+                        warn!(target: "meow", "failed to download external-ui from {url}: {e:#}");
                     }
                 }
                 #[cfg(not(all(
@@ -2410,6 +2413,7 @@ async fn run(
                 )))]
                 {
                     warn!(
+                        target: "meow",
                         "external-ui-url ({url}) is set but auto-download is unavailable in this \
                          build; download and extract the UI into {} manually",
                         dir.display()
@@ -2456,7 +2460,7 @@ async fn run(
             let server = std::sync::Arc::clone(&api_server);
             tokio::spawn(async move {
                 if let Err(e) = server.run_on(socket).await {
-                    error!("API server error: {}", e);
+                    error!(target: "meow", "API server error: {}", e);
                 }
             });
         }
@@ -2473,16 +2477,16 @@ async fn run(
             {
                 Ok(endpoint) => {
                     bound_any = true;
-                    info!("REST API (TLS) listening on https://{}", endpoint.addr());
+                    info!(target: "meow", "REST API (TLS) listening on https://{}", endpoint.addr());
                     let server = std::sync::Arc::clone(&api_server);
                     tokio::spawn(async move {
                         if let Err(e) = server.serve_tls_on(endpoint).await {
-                            error!("API TLS server error: {e}");
+                            error!(target: "meow", "API TLS server error: {e}");
                         }
                     });
                 }
                 Err(e) => {
-                    error!("external-controller-tls {tls_addr}: {e:#} — endpoint skipped");
+                    error!(target: "meow", "external-controller-tls {tls_addr}: {e:#} — endpoint skipped");
                 }
             }
         }
@@ -2491,17 +2495,17 @@ async fn run(
             match meow_api::endpoint::bind_unix(unix_path).await {
                 Ok((endpoint, guard)) => {
                     bound_any = true;
-                    info!("REST API listening on unix://{}", guard.path().display());
+                    info!(target: "meow", "REST API listening on unix://{}", guard.path().display());
                     _unix_socket_guard = Some(guard);
                     let server = std::sync::Arc::clone(&api_server);
                     tokio::spawn(async move {
                         if let Err(e) = server.serve_on(endpoint).await {
-                            error!("API unix server error: {e}");
+                            error!(target: "meow", "API unix server error: {e}");
                         }
                     });
                 }
                 Err(e) => {
-                    error!("external-controller-unix {unix_path}: {e:#} — endpoint skipped");
+                    error!(target: "meow", "external-controller-unix {unix_path}: {e:#} — endpoint skipped");
                 }
             }
         }
@@ -2511,21 +2515,21 @@ async fn run(
             match meow_api::endpoint::bind_pipe(pipe_name) {
                 Ok(endpoint) => {
                     bound_any = true;
-                    info!("REST API listening on named pipe {pipe_name}");
+                    info!(target: "meow", "REST API listening on named pipe {pipe_name}");
                     let server = std::sync::Arc::clone(&api_server);
                     tokio::spawn(async move {
                         if let Err(e) = server.serve_on(endpoint).await {
-                            error!("API pipe server error: {e}");
+                            error!(target: "meow", "API pipe server error: {e}");
                         }
                     });
                 }
                 Err(e) => {
-                    error!("external-controller-pipe '{pipe_name}': {e:#} — endpoint skipped");
+                    error!(target: "meow", "external-controller-pipe '{pipe_name}': {e:#} — endpoint skipped");
                 }
             }
         }
         if !bound_any {
-            error!("external-controller endpoints are configured but no controller is available");
+            error!(target: "meow", "external-controller endpoints are configured but no controller is available");
         }
     }
 
@@ -2555,7 +2559,7 @@ async fn run(
 
             let handle = tokio::spawn(async move {
                 if let Err(e) = listener.run().await {
-                    error!("TUN listener error: {}", e);
+                    error!(target: "meow", "TUN listener error: {}", e);
                 }
             });
 
@@ -2583,9 +2587,10 @@ async fn run(
                 }
                 Ok(Ok(meow_listener::TunReady::Failed(msg))) => {
                     if msg.contains("wintun.dll") {
-                        error!("TUN listener failed to start: {msg}");
+                        error!(target: "meow", "TUN listener failed to start: {msg}");
                     } else {
                         error!(
+                            target: "meow",
                             "TUN listener failed to start: {msg} — \
                              check permissions / admin / CAP_NET_ADMIN"
                         );
@@ -2597,7 +2602,7 @@ async fn run(
                     rollback_tun_enable(&tunnel, &raw_config).await;
                 }
                 Ok(Err(_)) => {
-                    error!("TUN listener readiness signal dropped unexpectedly");
+                    error!(target: "meow", "TUN listener readiness signal dropped unexpectedly");
                     meow_api::routes::tun_failed(
                         "TUN failed to start and was turned off: the listener exited".into(),
                     );
@@ -2606,7 +2611,7 @@ async fn run(
                 }
                 Err(_) => {
                     let timeout = meow_api::TUN_STARTUP_TIMEOUT.as_secs();
-                    error!("TUN listener startup timed out after {timeout} s");
+                    error!(target: "meow", "TUN listener startup timed out after {timeout} s");
                     meow_api::routes::tun_failed(format!(
                         "TUN failed to start and was turned off: timed out after {timeout} s"
                     ));
@@ -2618,7 +2623,7 @@ async fn run(
         #[cfg(not(feature = "listener-tun"))]
         {
             let _ = early_binding;
-            warn!("tun.enable is set but this build lacks the 'listener-tun' feature");
+            warn!(target: "meow", "tun.enable is set but this build lacks the 'listener-tun' feature");
         }
     }
 
@@ -2645,7 +2650,9 @@ async fn run(
         ntp_supervisor.settle();
         match meow_config::resolve_ntp(&raw_config.read()) {
             Ok(ntp) => ntp_supervisor.reconcile(ntp),
-            Err(e) => warn!("startup ntp resolution failed; worker left stopped: {e}"),
+            Err(e) => {
+                warn!(target: "meow", "startup ntp resolution failed; worker left stopped: {e}");
+            }
         }
     }
 
@@ -2655,11 +2662,11 @@ async fn run(
     if let Some(on_ready) = on_ready {
         on_ready()?;
     }
-    info!("meow-rs is running");
+    info!(target: "meow", "meow-rs is running");
 
     // Wait for shutdown signal
     let by = shutdown.wait().await?;
-    info!("Shutting down ({by})...");
+    info!(target: "meow", "Shutting down ({by})...");
     ntp_supervisor.shutdown().await;
     meow_common::logbook::engine_stopped(meow_common::logbook::Stop::Requested(by));
     meow_common::traffic_ledger::uninstall();
@@ -2682,7 +2689,7 @@ fn publish_controller(
     match published {
         Ok(published) => published,
         Err(e) => {
-            warn!("cannot publish the external-controller for meow-cli: {e}");
+            warn!(target: "meow", "cannot publish the external-controller for meow-cli: {e}");
             None
         }
     }
@@ -2697,7 +2704,7 @@ fn publish_controller(
               cfg'd out"
 )]
 fn listener_failed(name: &str, message: &str) {
-    error!("listener '{name}': {message}");
+    error!(target: "meow", "listener '{name}': {message}");
     meow_common::logbook::event(
         meow_common::logbook::kind::LISTENER_START,
         meow_common::logbook::Level::Error,
@@ -2777,7 +2784,7 @@ fn rollback_committed_enable(tunnel: &Tunnel, raw_config: &RwLock<meow_config::r
     }
     if let Some(ref mut tun) = raw_config.write().tun {
         tun.enable = false;
-        warn!("tun.enable rolled back to false (startup failed)");
+        warn!(target: "meow", "tun.enable rolled back to false (startup failed)");
     }
 }
 
@@ -2814,6 +2821,7 @@ async fn publish_tun_if_committed(
     };
     if !still_current {
         warn!(
+            target: "meow",
             "TUN startup finished after the committed config \
              moved on — tearing down the stale device"
         );
@@ -2826,7 +2834,7 @@ async fn publish_tun_if_committed(
         // it would commit `enable: true` over a dead handle and the next
         // same-config PUT would early-return on the unchanged diff —
         // treat it exactly like a startup failure.
-        warn!("TUN listener reported ready then exited before its handle was stored");
+        warn!(target: "meow", "TUN listener reported ready then exited before its handle was stored");
         tunnel.teardown_tun_handle(tun_handle).await;
         rollback_committed_enable(tunnel, raw_config);
         return;
@@ -2867,7 +2875,7 @@ async fn spawn_named_tun(
     let task_name = name.to_string();
     let handle = tokio::spawn(async move {
         if let Err(e) = listener.run().await {
-            error!("TUN listener '{task_name}' error: {e}");
+            error!(target: "meow", "TUN listener '{task_name}' error: {e}");
         }
     });
 
@@ -3604,7 +3612,7 @@ mod tests {
     /// `tun.enable`.
     #[cfg(feature = "listener-tun")]
     mod tun_startup {
-        use crate::{publish_tun_if_committed, rollback_tun_enable};
+        use super::super::{publish_tun_if_committed, rollback_tun_enable};
         use meow_common::DnsMode;
         use meow_config::raw::RawConfig;
         use meow_dns::Resolver;
@@ -3862,7 +3870,7 @@ mod tests {
         any(target_os = "linux", target_os = "macos")
     ))]
     mod early_outbound_binding {
-        use crate::preinstall_global_route_binding;
+        use super::super::preinstall_global_route_binding;
         use meow_config::raw::RawConfig;
 
         /// Loopback exists on every host.

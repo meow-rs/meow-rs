@@ -1,4 +1,4 @@
-use super::{Args, LogTarget, ShutdownSignal};
+use crate::cli::{run_application, Args, LogTarget, ReadyCallback, ShutdownSignal};
 use anyhow::{Context, Result};
 use clap::Parser;
 use parking_lot::{Condvar, Mutex};
@@ -363,7 +363,7 @@ fn run_service() -> Result<()> {
     });
 
     let ready_lifecycle = Arc::clone(&lifecycle);
-    let on_ready: super::ReadyCallback = Box::new(move || {
+    let on_ready: ReadyCallback = Box::new(move || {
         let mut state = ready_lifecycle.state.lock();
         if state.phase != ServicePhase::Starting {
             anyhow::bail!("Windows service stopped before application startup completed");
@@ -376,7 +376,7 @@ fn run_service() -> Result<()> {
         Ok(())
     });
 
-    let result = super::run_application(
+    let result = run_application(
         args,
         &LogTarget::WindowsService(log_dir),
         ShutdownSignal::WindowsService(shutdown_rx),

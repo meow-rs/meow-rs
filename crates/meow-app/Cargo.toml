@@ -155,7 +155,7 @@ full = [
 
 [[bin]]
 name = "meow"
-path = "src/cli.rs"
+path = "src/main.rs"
 
 # cargo-machete false-positive: meow-proxy has no direct src imports but is
 # required here to forward protocol features (`ss`, `trojan`, `vless`, etc.)

@@ -38,6 +38,9 @@ the canonical, in-repo source a release is cut from.
   once and falls back to Mozilla + native. Hostname and chain verification
   stay on; outbound proxy TLS is unchanged. (#1031)
 
+- Embedders can start the standard command-line application through
+  `meow_app::run_cli`.
+
 ### Fixed
 
 - `proxy-providers.*.filter` / `exclude-filter` and the group-level fields

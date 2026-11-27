@@ -1,9 +1,14 @@
 //! CLI and service helpers for the meow-rs proxy kernel.
 //!
-//! Library surface used by the `meow` binary: systemd unit and launchd
-//! plist generation, geodata fetch, and subscription refresh. The binary
-//! wires configuration, the tunnel, listeners, DNS, and the REST API
-//! together.
+//! The `meow` binary and embedders can start the application with
+//! [`run_cli`], which wires configuration, the tunnel, listeners, DNS,
+//! and the REST API together.
+
+mod cli;
+mod ntp;
+#[cfg(target_os = "windows")]
+mod windows_service;
+pub use cli::run_cli;
 
 #[cfg(any(target_os = "linux", test))]
 pub mod arp;
@@ -19,7 +24,7 @@ pub const LAUNCHD_LABEL: &str = "com.meow.proxy";
 /// Used by the macOS `uninstall` guard to admit only a literal
 /// `$HOME` == `/var/root` without a prefix-match bypass like
 /// `/var/root/../Users/x` (issue #678). The binary's clobber guards in
-/// `main.rs` (`resolved_path` + `same_file_on_disk`) generalise this
+/// `cli.rs` (`resolved_path` + `same_file_on_disk`) generalise this
 /// idea to paths that don't exist yet and hard links.
 pub fn same_resolved_path(a: &std::path::Path, b: &std::path::Path) -> bool {
     matches!(

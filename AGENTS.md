@@ -155,11 +155,11 @@ Listeners (HTTP/SOCKS5/Mixed/TProxy/TUN/WireGuard/AnyTLS/VLESS)
 | `meow-listener` | Inbound protocol handlers (Mixed/HTTP/SOCKS5/TProxy, plus feature-gated TUN, WireGuard, AnyTLS and VLESS Vision/REALITY server inbounds) |
 | `meow-config` | YAML configuration parsing into typed structs |
 | `meow-api` | REST API server (Axum) for proxies, rules, connections, configs, traffic, DNS query |
-| `meow-app` | CLI entry point (`main.rs`) — wires config → tunnel → listeners → DNS → API |
+| `meow-app` | CLI implementation (`cli.rs`) — wires config → tunnel → listeners → DNS → API |
 
 ### Startup Flow
 
-`meow-app/src/main.rs` → parse CLI args → `meow_config::load_config()` → create `Tunnel` → spawn DNS server, API server, and every configured listener (Mixed/SOCKS/HTTP/TProxy/TUN plus feature-gated server inbounds) as tokio tasks → await SIGINT/SIGTERM.
+`meow_app::run_cli()` → parse CLI args → `meow_config::load_config()` → create `Tunnel` → spawn DNS server, API server, and every configured listener (Mixed/SOCKS/HTTP/TProxy/TUN plus feature-gated server inbounds) as tokio tasks → await SIGINT/SIGTERM.
 
 ### Server-inbound notes
 
