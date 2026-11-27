@@ -601,6 +601,10 @@ async fn scan_target_flight(
             drop(scratch);
             return cover_from_scanner(scanner, CoverReason::Capacity, false);
         }
+        if state == TargetScanState::Freezable {
+            #[cfg(test)]
+            tests::observe_scan_event(tests::ScanEvent::Freezable);
+        }
         let quiet_at = if state == TargetScanState::Freezable {
             last_byte_observed + quiet
         } else {
@@ -625,7 +629,10 @@ async fn scan_target_flight(
                     }
                     Ok(n) => {
                         last_byte_observed = Instant::now();
-                        match scanner.push(&scratch[..n]) {
+                        let pushed = scanner.push(&scratch[..n]);
+                        #[cfg(test)]
+                        tests::observe_scan_event(tests::ScanEvent::Bytes(n));
+                        match pushed {
                             Ok(TargetScanState::Incompatible(reason)) => {
                                 drop(scratch);
                                 return cover_from_scanner(scanner, CoverReason::from(reason), false);
@@ -1115,9 +1122,18 @@ mod tests {
     use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
     use tokio::time::advance;
 
+    #[derive(Clone, Copy, Debug)]
+    pub(super) enum ScanEvent {
+        Bytes(usize),
+        Freezable,
+    }
+
+    type ScanObserverCell = std::cell::RefCell<Option<Box<dyn FnMut(ScanEvent)>>>;
+
     thread_local! {
         static PRE_COMMIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
             const { std::cell::RefCell::new(None) };
+        static SCAN_OBSERVER: ScanObserverCell = const { std::cell::RefCell::new(None) };
     }
 
     pub(super) fn invoke_pre_commit_hook() {
@@ -1127,6 +1143,45 @@ mod tests {
             }
         });
     }
+
+    pub(super) fn observe_scan_event(event: ScanEvent) {
+        SCAN_OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().as_mut() {
+                observer(event);
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    fn wait_target_readiness(fd: std::os::fd::RawFd) {
+        let mut pollfd = libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        loop {
+            let rc = unsafe { libc::poll(&mut pollfd, 1, 1_000) };
+            if rc > 0 {
+                assert_ne!(
+                    pollfd.revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR),
+                    0,
+                    "target readability poll returned unrelated events: {}",
+                    pollfd.revents
+                );
+                return;
+            }
+            if rc == 0 {
+                panic!("timed out waiting for loopback target readability");
+            }
+            let error = std::io::Error::last_os_error();
+            if error.kind() != std::io::ErrorKind::Interrupted {
+                panic!("target readability poll failed: {error}");
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn wait_target_readiness(_fd: usize) {}
 
     const PRIVATE: [u8; 32] = [0x42; 32];
     const SHORT: [u8; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
@@ -1557,8 +1612,21 @@ mod tests {
     async fn real_precommit_case(eof: bool) -> (RealityV2MetricsSnapshot, Vec<u8>, Vec<u8>) {
         let runtime = runtime();
         let ch = capture_client_hello().await;
-        let (client, _client_peer, writes) = scripted_client(&ch);
+        let (client, mut client_peer, writes) = scripted_client(&ch);
         let (target, mut target_peer) = real_target_pair().await;
+        #[cfg(unix)]
+        let target_fd = {
+            use std::os::fd::AsRawFd;
+            target.as_raw_fd()
+        };
+        #[cfg(not(unix))]
+        let target_fd = 0usize;
+        let (scan_tx, mut scan_rx) = tokio::sync::mpsc::unbounded_channel();
+        SCAN_OBSERVER.with(|observer| {
+            *observer.borrow_mut() = Some(Box::new(move |event| {
+                let _ = scan_tx.send(event);
+            }));
+        });
         let machine = spawn_machine(
             &runtime,
             client,
@@ -1566,38 +1634,58 @@ mod tests {
             Instant::now() + Duration::from_secs(5),
         );
         let flight = upload_and_write_flight(&ch, &mut target_peer).await;
-        // Loopback TCP readiness is real OS work even though the test clock is
-        // paused.  Let the runtime process the already-uploaded flight before
-        // opening the virtual quiet window; blocking this thread would also
-        // block the current-thread state machine, so settle in a blocking task.
-        let (settled_tx, settled_rx) = tokio::sync::oneshot::channel();
-        tokio::task::spawn_blocking(move || {
-            std::thread::sleep(Duration::from_millis(10));
-            let _ = settled_tx.send(());
-        });
-        settled_rx.await.unwrap();
-        yields(10).await;
+
+        // Real loopback IO has no deterministic userspace flush boundary.
+        // Wait for the scan loop's own byte-consumption events and for its
+        // Freezable state; only then can opening the quiet window not race
+        // undelivered or unconsumed flight bytes.
+        let mut consumed = 0usize;
+        let mut freezable = false;
+        let mut scan_events = Vec::new();
+        while !(freezable && consumed == flight.len()) {
+            let event = scan_rx.recv().await.unwrap();
+            scan_events.push(event);
+            match event {
+                ScanEvent::Bytes(n) => consumed += n,
+                ScanEvent::Freezable => freezable = true,
+            }
+            assert!(
+                consumed <= flight.len(),
+                "scanner consumed bytes no test wrote"
+            );
+        }
+
+        let target_peer = Arc::new(target_peer);
+        let hook_peer = Arc::clone(&target_peer);
         PRE_COMMIT_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 if eof {
-                    socket2::SockRef::from(&target_peer)
+                    socket2::SockRef::from(&*hook_peer)
                         .shutdown(std::net::Shutdown::Write)
                         .unwrap();
-                    // FIN delivery is kernel work; keep this inside the
-                    // synchronous prepare-window hook so recv observes the
-                    // already-delivered EOF rather than a timing artifact.
-                    std::thread::sleep(Duration::from_millis(2));
-                    drop(target_peer);
                 } else {
-                    target_peer.try_write(&[0x77]).unwrap();
+                    hook_peer.try_write(&[0x77]).unwrap();
                 }
+                wait_target_readiness(target_fd);
             }));
         });
         advance(Duration::from_millis(100)).await;
-        yields(30).await;
+
+        // Reading the recovered prefix from the client socket is the
+        // synchronization point for handoff: cover accounting is incremented
+        // before the relay can produce these bytes.
+        let expected_len = flight.len() + usize::from(!eof);
+        let mut got = vec![0u8; expected_len];
+        let read_result = client_peer.read_exact(&mut got).await;
         let snap = snapshot(&runtime);
+        assert!(
+            read_result.is_ok(),
+            "cover prefix read failed: {read_result:?}; consumed={consumed} events={scan_events:?} snap={snap:?}"
+        );
         let written = writes.lock().unwrap().clone();
         machine.abort();
+        SCAN_OBSERVER.with(|observer| observer.borrow_mut().take());
+        drop(target_peer);
         (snap, written, flight)
     }
 
@@ -1606,7 +1694,11 @@ mod tests {
         let (snap, written, flight) = real_precommit_case(false).await;
         let mut expected = flight;
         expected.push(0x77);
-        assert_eq!(snap.cover_total.get("late_dest_bytes"), Some(&1));
+        assert_eq!(
+            snap.cover_total.get("late_dest_bytes"),
+            Some(&1),
+            "snap={snap:?}"
+        );
         assert_eq!(snap.committed_total, 0);
         assert_eq!(written, expected);
     }
@@ -1614,7 +1706,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn t3_real_loopback_raw_recv_observes_prepare_window_eof() {
         let (snap, written, flight) = real_precommit_case(true).await;
-        assert_eq!(snap.cover_total.get("dest_eof"), Some(&1));
+        assert_eq!(snap.cover_total.get("dest_eof"), Some(&1), "snap={snap:?}");
         assert_eq!(snap.committed_total, 0);
         assert_eq!(written, flight);
     }
@@ -1863,7 +1955,11 @@ mod tests {
         let (snap, written, flight) = prepare_branch(TryStep::Byte(0x99)).await;
         let mut expected = flight;
         expected.push(0x99);
-        assert_eq!(snap.cover_total.get("late_dest_bytes"), Some(&1));
+        assert_eq!(
+            snap.cover_total.get("late_dest_bytes"),
+            Some(&1),
+            "snap={snap:?}"
+        );
         assert_eq!(snap.committed_total, 0);
         assert_eq!(
             written, expected,
@@ -1874,7 +1970,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn t3_precommit_eof_recovers_exact_prefix_for_half_close_cover() {
         let (snap, written, flight) = prepare_branch(TryStep::Eof).await;
-        assert_eq!(snap.cover_total.get("dest_eof"), Some(&1));
+        assert_eq!(snap.cover_total.get("dest_eof"), Some(&1), "snap={snap:?}");
         assert_eq!(snap.committed_total, 0);
         assert_eq!(
             written, flight,
