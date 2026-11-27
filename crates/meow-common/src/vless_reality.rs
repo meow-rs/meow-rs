@@ -119,12 +119,16 @@ mod tests {
             spec.validate().unwrap();
         }
 
-        let mut inverted = VlessRealityMimicSpec::default();
-        inverted.quiescence_min_ms = 41;
+        let inverted = VlessRealityMimicSpec {
+            quiescence_min_ms: 41,
+            ..VlessRealityMimicSpec::default()
+        };
         assert!(inverted.validate().is_err());
-        let mut touching = VlessRealityMimicSpec::default();
-        touching.probe_timeout_ms = 40;
-        touching.quiescence_max_ms = 40;
+        let touching = VlessRealityMimicSpec {
+            probe_timeout_ms: 40,
+            quiescence_max_ms: 40,
+            ..VlessRealityMimicSpec::default()
+        };
         assert!(touching.validate().is_err());
     }
 }

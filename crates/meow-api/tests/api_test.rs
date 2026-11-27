@@ -764,7 +764,7 @@ fn put_configs_vless_mimic_equivalence_and_restart_warning() {
                 // untouched by all three PUTs: this endpoint only ever reflects
                 // the startup snapshot owned by AppState.
                 assert!(state.listeners.is_empty());
-            })
+            });
     });
 }
 
