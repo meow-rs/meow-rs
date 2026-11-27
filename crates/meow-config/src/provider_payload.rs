@@ -425,7 +425,9 @@ fn parse_vmess(rest: &str) -> Result<HashMap<String, Value>, String> {
         let sni = {
             let sni = field("sni");
             if sni.is_empty() {
-                host.clone()
+                // Last use of `host`: the ws/h2 branches above clone it, so it
+                // can be moved here instead of cloned again.
+                host
             } else {
                 sni
             }

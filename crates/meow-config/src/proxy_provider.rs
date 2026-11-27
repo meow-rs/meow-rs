@@ -2825,7 +2825,7 @@ header:
         )
         .unwrap();
         let provider = file_provider(tmp.path()).await;
-        assert_eq!(slot_names(&provider.proxies()), ["A", "B"]);
+        assert_eq!(slot_names(&provider.slot), ["A", "B"]);
     }
 
     fn override_map(value: serde_json::Value) -> HashMap<String, serde_json::Value> {
@@ -2863,10 +2863,7 @@ header:
             "ip-version": "ipv4"
         })));
         let provider = provider_with_override(tmp.path(), raw).await;
-        assert_eq!(
-            slot_names(&provider.proxies()),
-            ["[Car] US 1 ✈", "[Car] US 2 ✈"]
-        );
+        assert_eq!(slot_names(&provider.slot), ["[Car] US 1 ✈", "[Car] US 2 ✈"]);
     }
 
     /// Upstream order: the name filters run on the names the feed published,
@@ -2882,7 +2879,7 @@ header:
             "additional-prefix": "[X] "
         })));
         let provider = provider_with_override(tmp.path(), raw).await;
-        assert_eq!(slot_names(&provider.proxies()), ["[X] Car 01"]);
+        assert_eq!(slot_names(&provider.slot), ["[X] Car 01"]);
     }
 
     /// A wrongly-typed override is a build error, not a silent skip —
@@ -3022,7 +3019,7 @@ header:
         )
         .unwrap();
         p.refresh().await.unwrap();
-        assert_eq!(slot_names(&p.proxies()), ["US 1"]);
+        assert_eq!(slot_names(&p.slot), ["US 1"]);
     }
 
     // ─── issue #489: provider-sourced nodes honour `dialer-proxy` ─────────
