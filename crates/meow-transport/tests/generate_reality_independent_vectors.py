@@ -22,6 +22,39 @@ import hmac as py_hmac
 from cryptography.hazmat.primitives.asymmetric import ed25519, mlkem, x25519
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM, ChaCha20Poly1305
 from cryptography.hazmat.primitives import serialization
+import cryptography
+
+
+def check_locked_environment():
+    """Fail clearly unless the locked oracle environment is in use.
+
+    The frozen vectors are byte-exact evidence; regenerating them with a
+    different cryptography release could silently shift encodings.  The lock
+    is the 50.x series exercised in CI (50.0.0 at introduction).  Byte
+    equality under `--check` is the cross-environment correctness proof, so
+    the check tolerates any 50.x while rejecting anything else loudly.
+    """
+    if sys.version_info < (3, 11):
+        sys.exit(
+            "error: generate_reality_independent_vectors.py requires Python 3.11+ "
+            f"(running {sys.version.split()[0]})"
+        )
+    major = int(cryptography.__version__.split(".")[0])
+    if major != 50:
+        sys.exit(
+            "error: locked oracle environment is cryptography 50.x "
+            f"(found {cryptography.__version__}); install the locked version "
+            "or update the lock deliberately with fresh byte-exact review"
+        )
+    try:
+        mlkem.MLKEM768PrivateKey  # noqa: B018 - importability probe, not use
+    except AttributeError:
+        sys.exit(
+            "error: cryptography 50.x must expose ML-KEM-768; this build does not"
+        )
+
+
+check_locked_environment()
 
 
 GROUP_X25519 = 0x001D

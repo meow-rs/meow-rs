@@ -539,6 +539,11 @@ impl MirrorTemplate {
     /// input is a scan boundary: a trailing half header or half body is a
     /// shape error here, while the listener's probe loop simply does not ask
     /// for a template until it reaches a complete record boundary.
+    ///
+    /// Test-only compatibility wrapper: production callers must use
+    /// [`MirrorTemplate::parse_context`], which takes ownership of the wire
+    /// bytes through the consuming upload split.
+    #[cfg(test)]
     pub fn parse(
         verified: &VerifiedHello,
         prefix: &[u8],
@@ -713,8 +718,14 @@ impl TargetFlightScanner {
         65_537usize.saturating_sub(self.prefix.len())
     }
 
+    /// Feed target-flight bytes.  Bytes beyond the hard wire budget (W+1,
+    /// 65_537) are never retained: the scanner truncates the input at the
+    /// budget, and once the buffer reaches exactly W+1 bytes the scan is
+    /// `Incompatible(Capacity)` — a flight that long cannot be mirrored, so
+    /// nothing is gained by scanning further.  Callers feeding a stream may
+    /// push arbitrarily large chunks; the truncation contract is part of the
+    /// API, not a caller error.
     pub fn push(&mut self, bytes: &[u8]) -> TargetScanState {
-        debug_assert!(bytes.len() <= self.remaining_capacity());
         let take = bytes.len().min(self.remaining_capacity());
         self.prefix.extend_from_slice(&bytes[..take]);
         self.scan_available();

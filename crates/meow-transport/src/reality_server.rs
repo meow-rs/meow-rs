@@ -628,6 +628,10 @@ impl RealityServer {
     /// and a target template already validated against it.  Nothing is written
     /// by this method; the caller controls commit ordering and then drives the
     /// returned completion state.
+    /// Test-only compatibility wrapper; production uses
+    /// [`RealityServer::prepare_mirrored_upload`], which consumes the upload
+    /// and drops the authenticated wire copy before the flight is built.
+    #[cfg(test)]
     pub fn prepare_mirrored_flight(
         &self,
         hello: &VerifiedHello,
