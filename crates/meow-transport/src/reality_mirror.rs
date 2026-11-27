@@ -9,12 +9,13 @@ use tokio::io::AsyncReadExt;
 
 use crate::reality_server::{
     certificate_message, certificate_verify_input, encapsulate_server_share, handshake_message,
-    hybrid_key_share_usable, x25519_public_key_usable, ChosenKeyShare, RealityCertificate,
-    VerifiedHello, SIG_ED25519,
+    hybrid_key_share_usable, x25519_public_key_usable, AuthenticatedMirrorContext, ChosenKeyShare,
+    ClientKeyShares, OfferedCipherSuites, RealityCertificate, SupportedGroups, VerifiedHello,
+    SIG_ED25519,
 };
 use crate::reality_tls::{
     finished_verify_data_with_hash, put_u16, read_u24, x25519, x25519_public_from_private,
-    ApplicationKeys, CipherSuite, HandshakeKeys, RecordKey, TranscriptHasher,
+    ApplicationKeys, CipherSuite, HandshakeKeys, HashAlg, RecordKey, TranscriptHasher,
     HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, TLS_AES_128_GCM_SHA256,
     TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, TLS_RECORD_APPLICATION_DATA,
     TLS_RECORD_CHANGE_CIPHER_SPEC, TLS_RECORD_HANDSHAKE,
@@ -148,6 +149,107 @@ impl fmt::Display for MirrorClientProfileError {
 
 impl std::error::Error for MirrorClientProfileError {}
 
+pub(crate) trait MirrorHelloView {
+    fn session_id(&self) -> &[u8; 32];
+    fn cipher_suites(&self) -> &OfferedCipherSuites;
+    fn supported_groups(&self) -> &SupportedGroups;
+    fn key_shares(&self) -> &ClientKeyShares;
+    fn auth_key(&self) -> &[u8; 32];
+    fn transcript_hasher(&self, hash: HashAlg) -> TranscriptHasher;
+    fn profile(&self) -> (bool, bool, Option<u16>, bool, bool);
+}
+
+impl MirrorHelloView for VerifiedHello {
+    fn session_id(&self) -> &[u8; 32] {
+        &self.hello.session_id
+    }
+    fn cipher_suites(&self) -> &OfferedCipherSuites {
+        &self.hello.cipher_suites
+    }
+    fn supported_groups(&self) -> &SupportedGroups {
+        &self.hello.supported_groups
+    }
+    fn key_shares(&self) -> &ClientKeyShares {
+        &self.hello.key_shares
+    }
+    fn auth_key(&self) -> &[u8; 32] {
+        &self.auth_key
+    }
+    fn transcript_hasher(&self, hash: HashAlg) -> TranscriptHasher {
+        // Compatibility shim for the pre-split API.  The production upload
+        // path uses AuthenticatedMirrorContext and does not repeat this scan.
+        let mut out = TranscriptHasher::new(hash);
+        out.update(&self.hello.raw);
+        out
+    }
+    fn profile(&self) -> (bool, bool, Option<u16>, bool, bool) {
+        (
+            self.hello.has_pre_shared_key,
+            self.hello.has_early_data,
+            self.hello.record_size_limit,
+            self.hello.record_size_limit_malformed,
+            self.hello.key_share_malformed,
+        )
+    }
+}
+
+impl MirrorHelloView for AuthenticatedMirrorContext {
+    fn session_id(&self) -> &[u8; 32] {
+        &self.session_id
+    }
+    fn cipher_suites(&self) -> &OfferedCipherSuites {
+        &self.cipher_suites
+    }
+    fn supported_groups(&self) -> &SupportedGroups {
+        &self.supported_groups
+    }
+    fn key_shares(&self) -> &ClientKeyShares {
+        &self.key_shares
+    }
+    fn auth_key(&self) -> &[u8; 32] {
+        &self.auth_key
+    }
+    fn transcript_hasher(&self, hash: HashAlg) -> TranscriptHasher {
+        match hash {
+            HashAlg::Sha256 => self.transcript_sha256.clone(),
+            HashAlg::Sha384 => self.transcript_sha384.clone(),
+        }
+    }
+    fn profile(&self) -> (bool, bool, Option<u16>, bool, bool) {
+        (
+            self.has_pre_shared_key,
+            self.has_early_data,
+            self.record_size_limit,
+            self.record_size_limit_malformed,
+            self.key_share_malformed,
+        )
+    }
+}
+
+fn mirror_profile_view(
+    view: &dyn MirrorHelloView,
+) -> std::result::Result<(), MirrorClientProfileError> {
+    let (has_psk, has_early, rsl, rsl_malformed, key_malformed) = view.profile();
+    if has_psk {
+        return Err(MirrorClientProfileError::PreSharedKey);
+    }
+    if has_early {
+        return Err(MirrorClientProfileError::EarlyData);
+    }
+    if rsl_malformed || matches!(rsl, Some(value) if value != EXT_RECORD_SIZE_LIMIT_VALUE) {
+        return Err(MirrorClientProfileError::RecordSizeLimit);
+    }
+    if key_malformed {
+        return Err(MirrorClientProfileError::MalformedKeyShare);
+    }
+    let x = client_key_share_usable(view, GROUP_X25519);
+    let hybrid = client_key_share_usable(view, GROUP_X25519_MLKEM768);
+    if !x && !hybrid {
+        return Err(MirrorClientProfileError::NoUsableGroup);
+    }
+    Ok(())
+}
+
 impl VerifiedHello {
     /// Whether this authenticated ClientHello is eligible for v2 mirroring.
     /// Authentication has already happened; this check only describes the
@@ -169,7 +271,7 @@ impl VerifiedHello {
         }
         let usable = [GROUP_X25519, GROUP_X25519_MLKEM768]
             .into_iter()
-            .any(|group| client_key_share_usable(&self.hello, group));
+            .any(|group| client_key_share_usable(self, group));
         if !usable {
             return Err(MirrorClientProfileError::NoUsableGroup);
         }
@@ -177,15 +279,15 @@ impl VerifiedHello {
     }
 }
 
-fn client_key_share_entry(hello: &crate::reality_server::ClientHello, group: u16) -> Option<&[u8]> {
-    hello.key_shares.bytes(group)
+fn client_key_share_entry(view: &dyn MirrorHelloView, group: u16) -> Option<&[u8]> {
+    view.key_shares().bytes(group)
 }
 
-fn client_key_share_usable(hello: &crate::reality_server::ClientHello, group: u16) -> bool {
-    if !hello.supported_groups.declares(group) {
+fn client_key_share_usable(view: &dyn MirrorHelloView, group: u16) -> bool {
+    if !view.supported_groups().declares(group) {
         return false;
     }
-    let Some(entry) = client_key_share_entry(hello, group) else {
+    let Some(entry) = client_key_share_entry(view, group) else {
         return false;
     };
     match group {
@@ -245,7 +347,8 @@ impl std::error::Error for MirrorTemplateError {}
 #[derive(PartialEq, Eq)]
 pub struct MirrorTemplate {
     pub(crate) client_session_id: [u8; 32],
-    pub(crate) server_hello: Vec<u8>,
+    pub(crate) target_prefix: Vec<u8>,
+    pub(crate) server_hello_range: Range<usize>,
     pub(crate) share_range: Range<usize>,
     pub(crate) group: u16,
     pub(crate) cipher: CipherSuite,
@@ -261,6 +364,12 @@ impl fmt::Debug for MirrorTemplate {
             .field("has_ccs", &self.has_ccs)
             .field("record_count", &self.record_heads.len())
             .finish_non_exhaustive()
+    }
+}
+
+impl MirrorTemplate {
+    pub(crate) fn server_hello(&self) -> &[u8] {
+        &self.target_prefix[self.server_hello_range.clone()]
     }
 }
 
@@ -287,7 +396,7 @@ fn take_sh_u16(input: &[u8], pos: &mut usize) -> Option<u16> {
 }
 
 fn parse_template_server_hello(
-    verified: &VerifiedHello,
+    verified: &dyn MirrorHelloView,
     sh: &[u8],
 ) -> std::result::Result<ParsedServerHello, MirrorTemplateError> {
     if sh.len() < 4 || sh[0] != 0x02 || read_u24(&sh[1..4]) + 4 != sh.len() {
@@ -310,7 +419,7 @@ fn parse_template_server_hello(
     }
     let session_id =
         take_bytes(sh, &mut pos, 32).ok_or(MirrorTemplateError::MalformedServerHello)?;
-    if session_id != verified.hello.session_id {
+    if session_id != verified.session_id() {
         return Err(MirrorTemplateError::SessionIdMismatch);
     }
     let cipher_value =
@@ -321,7 +430,7 @@ fn parse_template_server_hello(
         TLS_CHACHA20_POLY1305_SHA256 => CipherSuite::ChaCha20Poly1305Sha256,
         _ => return Err(MirrorTemplateError::UnsupportedCipher),
     };
-    if !verified.hello.cipher_suites.contains(cipher_value) {
+    if !verified.cipher_suites().contains(cipher_value) {
         return Err(MirrorTemplateError::CipherNotOffered);
     }
     if take_sh_u8(sh, &mut pos) != Some(0) {
@@ -406,13 +515,13 @@ fn parse_template_server_hello(
         _ => return Err(MirrorTemplateError::UnsupportedGroup),
     }
 
-    if !verified.hello.supported_groups.declares(group) {
+    if !verified.supported_groups().declares(group) {
         return Err(MirrorTemplateError::GroupNotOffered);
     }
-    if !verified.hello.key_shares.present(group) {
+    if !verified.key_shares().present(group) {
         return Err(MirrorTemplateError::KeyShareNotProvided);
     }
-    if !client_key_share_usable(&verified.hello, group) {
+    if !client_key_share_usable(verified, group) {
         return Err(MirrorTemplateError::InvalidClientKeyShare);
     }
 
@@ -433,9 +542,22 @@ impl MirrorTemplate {
         verified: &VerifiedHello,
         prefix: &[u8],
     ) -> std::result::Result<Self, MirrorTemplateError> {
-        verified
-            .mirror_profile()
-            .map_err(MirrorTemplateError::ClientProfile)?;
+        Self::parse_owned(verified, prefix.to_vec())
+    }
+
+    pub(crate) fn parse_context(
+        context: &AuthenticatedMirrorContext,
+        prefix: Vec<u8>,
+    ) -> std::result::Result<Self, MirrorTemplateError> {
+        Self::parse_owned(context, prefix)
+    }
+
+    fn parse_owned(
+        verified: &dyn MirrorHelloView,
+        prefix_buf: Vec<u8>,
+    ) -> std::result::Result<Self, MirrorTemplateError> {
+        let prefix = &prefix_buf[..];
+        mirror_profile_view(verified).map_err(MirrorTemplateError::ClientProfile)?;
         if prefix.len() < 5 {
             return Err(MirrorTemplateError::Incomplete);
         }
@@ -508,18 +630,11 @@ impl MirrorTemplate {
             return Err(MirrorTemplateError::MissingApplicationRecords);
         }
 
-        let client_session_id: [u8; 32] =
-            verified
-                .hello
-                .session_id
-                .as_slice()
-                .try_into()
-                .map_err(|_| {
-                    MirrorTemplateError::ClientProfile(MirrorClientProfileError::MalformedKeyShare)
-                })?;
+        let client_session_id = *verified.session_id();
         Ok(Self {
             client_session_id,
-            server_hello: server_hello.to_vec(),
+            target_prefix: prefix_buf,
+            server_hello_range: 5..sh_end,
             share_range: parsed.share_range,
             group: parsed.group,
             cipher: parsed.cipher,
@@ -527,6 +642,296 @@ impl MirrorTemplate {
             record_heads,
         })
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MirrorCoverReason {
+    DestProfile,
+    Hrr,
+    UnsupportedCipher,
+    UnsupportedGroup,
+    UnsupportedExt,
+    RecordLimit,
+    Capacity,
+    DestAlert,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TargetScanState {
+    NeedBytes,
+    CapacityTemporarilyInsufficient,
+    Freezable,
+    Incompatible(MirrorCoverReason),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TargetScanPhase {
+    ServerHelloHeader,
+    ServerHelloBody { end: usize },
+    AfterServerHello,
+    CompatCcs { end: usize },
+    RecordHeader,
+    RecordBody { end: usize, capacity: usize },
+}
+
+/// Incremental, socket-independent scanner for the target prefix.  It owns
+/// only the W+1 byte prefix arena and a monotonically advancing parse cursor;
+/// cryptography and ClientHello binding are deferred to `freeze`.
+pub struct TargetFlightScanner {
+    prefix: Vec<u8>,
+    cursor: usize,
+    phase: TargetScanPhase,
+    has_ccs: bool,
+    record_count: usize,
+    capacity_sum: usize,
+    flight_len: usize,
+    incompatible: Option<MirrorCoverReason>,
+}
+
+impl Default for TargetFlightScanner {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl TargetFlightScanner {
+    pub fn new() -> Self {
+        Self {
+            prefix: Vec::with_capacity(65_537),
+            cursor: 0,
+            phase: TargetScanPhase::ServerHelloHeader,
+            has_ccs: false,
+            record_count: 0,
+            capacity_sum: 0,
+            flight_len: 301,
+            incompatible: None,
+        }
+    }
+
+    pub fn remaining_capacity(&self) -> usize {
+        65_537usize.saturating_sub(self.prefix.len())
+    }
+
+    pub fn push(&mut self, bytes: &[u8]) -> TargetScanState {
+        debug_assert!(bytes.len() <= self.remaining_capacity());
+        let take = bytes.len().min(self.remaining_capacity());
+        self.prefix.extend_from_slice(&bytes[..take]);
+        self.scan_available();
+        self.state()
+    }
+
+    pub fn state(&self) -> TargetScanState {
+        if let Some(reason) = self.incompatible {
+            return TargetScanState::Incompatible(reason);
+        }
+        if self.prefix.len() == 65_537 {
+            return TargetScanState::Incompatible(MirrorCoverReason::Capacity);
+        }
+        if self.record_count == 0 || self.cursor != self.prefix.len() {
+            return TargetScanState::NeedBytes;
+        }
+        if self.capacity_sum < self.flight_len {
+            TargetScanState::CapacityTemporarilyInsufficient
+        } else {
+            TargetScanState::Freezable
+        }
+    }
+
+    fn scan_available(&mut self) {
+        loop {
+            if self.incompatible.is_some() || self.prefix.len() == 65_537 {
+                return;
+            }
+            match self.phase {
+                TargetScanPhase::ServerHelloHeader => {
+                    if self.prefix.len() < 5 {
+                        return;
+                    }
+                    let len = usize::from(u16::from_be_bytes([self.prefix[3], self.prefix[4]]));
+                    if self.prefix[..3] != [0x16, 0x03, 0x03] || len == 0 || len > 16 * 1024 {
+                        self.incompatible = Some(MirrorCoverReason::DestProfile);
+                        return;
+                    }
+                    self.phase = TargetScanPhase::ServerHelloBody { end: 5 + len };
+                }
+                TargetScanPhase::ServerHelloBody { end } => {
+                    if self.prefix.len() < end {
+                        return;
+                    }
+                    match scan_server_hello_shape(&self.prefix[5..end]) {
+                        Ok(m) => self.flight_len = m,
+                        Err(reason) => {
+                            self.incompatible = Some(reason);
+                            return;
+                        }
+                    }
+                    self.cursor = end;
+                    self.phase = TargetScanPhase::AfterServerHello;
+                }
+                TargetScanPhase::AfterServerHello => {
+                    if self.prefix.len() == self.cursor {
+                        return;
+                    }
+                    if self.prefix[self.cursor] == TLS_RECORD_CHANGE_CIPHER_SPEC {
+                        if self.prefix.len() - self.cursor < COMPAT_CCS_RECORD.len() {
+                            return;
+                        }
+                        self.phase = TargetScanPhase::CompatCcs {
+                            end: self.cursor + COMPAT_CCS_RECORD.len(),
+                        };
+                    } else {
+                        self.phase = TargetScanPhase::RecordHeader;
+                    }
+                }
+                TargetScanPhase::CompatCcs { end } => {
+                    if self.prefix.len() < end {
+                        return;
+                    }
+                    if self.prefix[self.cursor..end] != COMPAT_CCS_RECORD {
+                        self.incompatible = Some(MirrorCoverReason::DestProfile);
+                        return;
+                    }
+                    self.has_ccs = true;
+                    self.cursor = end;
+                    self.phase = TargetScanPhase::RecordHeader;
+                }
+                TargetScanPhase::RecordHeader => {
+                    if self.prefix.len() == self.cursor {
+                        return;
+                    }
+                    if self.record_count == MAX_MIRRORED_RECORDS {
+                        self.incompatible = Some(MirrorCoverReason::RecordLimit);
+                        return;
+                    }
+                    if self.prefix.len() - self.cursor < 5 {
+                        return;
+                    }
+                    let pos = self.cursor;
+                    let typ = self.prefix[pos];
+                    let len = usize::from(u16::from_be_bytes([
+                        self.prefix[pos + 3],
+                        self.prefix[pos + 4],
+                    ]));
+                    if typ == 0x15 {
+                        self.incompatible = Some(MirrorCoverReason::DestAlert);
+                        return;
+                    }
+                    if typ != TLS_RECORD_APPLICATION_DATA
+                        || self.prefix[pos + 1..pos + 3] != [0x03, 0x03]
+                        || !(18..=16401).contains(&len)
+                    {
+                        self.incompatible = Some(MirrorCoverReason::DestProfile);
+                        return;
+                    }
+                    self.phase = TargetScanPhase::RecordBody {
+                        end: pos + 5 + len,
+                        capacity: len - 17,
+                    };
+                }
+                TargetScanPhase::RecordBody { end, capacity } => {
+                    if self.prefix.len() < end {
+                        return;
+                    }
+                    self.cursor = end;
+                    self.capacity_sum += capacity;
+                    self.record_count += 1;
+                    self.phase = TargetScanPhase::RecordHeader;
+                }
+            }
+        }
+    }
+
+    pub fn freeze(
+        self,
+        verified: &VerifiedHello,
+    ) -> std::result::Result<MirrorTemplate, MirrorTemplateError> {
+        if self.state() != TargetScanState::Freezable {
+            return Err(MirrorTemplateError::Incomplete);
+        }
+        MirrorTemplate::parse_owned(verified, self.prefix)
+    }
+
+    pub fn freeze_context(
+        self,
+        context: &AuthenticatedMirrorContext,
+    ) -> std::result::Result<MirrorTemplate, MirrorTemplateError> {
+        if self.state() != TargetScanState::Freezable {
+            return Err(MirrorTemplateError::Incomplete);
+        }
+        MirrorTemplate::parse_context(context, self.prefix)
+    }
+}
+
+fn scan_server_hello_shape(sh: &[u8]) -> std::result::Result<usize, MirrorCoverReason> {
+    if sh.len() < 46
+        || sh[0] != 0x02
+        || read_u24(&sh[1..4]) + 4 != sh.len()
+        || sh[4..6] != [0x03, 0x03]
+    {
+        return Err(MirrorCoverReason::DestProfile);
+    }
+    let random = &sh[6..38];
+    if random == HRR_RANDOM {
+        return Err(MirrorCoverReason::Hrr);
+    }
+    if random.ends_with(DOWNGRADE_TLS12) || random.ends_with(DOWNGRADE_PRE_TLS12) {
+        return Err(MirrorCoverReason::DestProfile);
+    }
+    if sh[38] != 32 || sh.len() < 77 || sh[71 + 2] != 0 {
+        return Err(MirrorCoverReason::DestProfile);
+    }
+    let cipher = u16::from_be_bytes([sh[71], sh[72]]);
+    let flight_len = match cipher {
+        TLS_AES_128_GCM_SHA256 | TLS_CHACHA20_POLY1305_SHA256 => 301,
+        TLS_AES_256_GCM_SHA384 => 317,
+        _ => return Err(MirrorCoverReason::UnsupportedCipher),
+    };
+    let ext_len = usize::from(u16::from_be_bytes([sh[74], sh[75]]));
+    if 76 + ext_len != sh.len() {
+        return Err(MirrorCoverReason::DestProfile);
+    }
+    let mut pos = 76;
+    let mut saw_versions = false;
+    let mut saw_key_share = false;
+    while pos < sh.len() {
+        if pos + 4 > sh.len() {
+            return Err(MirrorCoverReason::DestProfile);
+        }
+        let typ = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
+        let len = usize::from(u16::from_be_bytes([sh[pos + 2], sh[pos + 3]]));
+        pos += 4;
+        if pos + len > sh.len() {
+            return Err(MirrorCoverReason::DestProfile);
+        }
+        let data = &sh[pos..pos + len];
+        pos += len;
+        match typ {
+            EXT_SUPPORTED_VERSIONS if !saw_versions && data == TLS13_VERSION_BYTES => {
+                saw_versions = true;
+            }
+            EXT_KEY_SHARE if !saw_key_share && data.len() >= 4 => {
+                saw_key_share = true;
+                let group = u16::from_be_bytes([data[0], data[1]]);
+                let share_len = usize::from(u16::from_be_bytes([data[2], data[3]]));
+                let expected = match group {
+                    GROUP_X25519 => 32,
+                    GROUP_X25519_MLKEM768 => HYBRID_SERVER_SHARE_LEN,
+                    _ => return Err(MirrorCoverReason::UnsupportedGroup),
+                };
+                if share_len != expected || share_len + 4 != data.len() {
+                    return Err(MirrorCoverReason::DestProfile);
+                }
+            }
+            EXT_SUPPORTED_VERSIONS | EXT_KEY_SHARE => {
+                return Err(MirrorCoverReason::UnsupportedExt)
+            }
+            _ => return Err(MirrorCoverReason::UnsupportedExt),
+        }
+    }
+    if !saw_versions || !saw_key_share {
+        return Err(MirrorCoverReason::UnsupportedExt);
+    }
+    Ok(flight_len)
 }
 
 #[derive(Clone)]
@@ -579,11 +984,11 @@ fn mirror_server_random(fixed: Option<&MirrorCryptoInput>) -> TransportResult<[u
 }
 
 fn fixed_ephemeral_exchange(
-    verified: &VerifiedHello,
+    verified: &dyn MirrorHelloView,
     group: u16,
     fixed: &MirrorCryptoInput,
 ) -> TransportResult<(Vec<u8>, Vec<u8>)> {
-    let entry = client_key_share_entry(&verified.hello, group)
+    let entry = client_key_share_entry(verified, group)
         .ok_or_else(|| TransportError::Tls("REALITY mirror client key share disappeared".into()))?;
     let client_x_offset = match group {
         GROUP_X25519 => 0,
@@ -627,14 +1032,14 @@ fn fixed_ephemeral_exchange(
 }
 
 fn ephemeral_exchange(
-    verified: &VerifiedHello,
+    verified: &dyn MirrorHelloView,
     group: u16,
     fixed: Option<&MirrorCryptoInput>,
 ) -> TransportResult<(Vec<u8>, Vec<u8>)> {
     if let Some(fixed) = fixed {
         return fixed_ephemeral_exchange(verified, group, fixed);
     }
-    let entry = client_key_share_entry(&verified.hello, group)
+    let entry = client_key_share_entry(verified, group)
         .ok_or_else(|| TransportError::Tls("REALITY mirror client key share disappeared".into()))?;
     encapsulate_server_share(&ChosenKeyShare {
         group,
@@ -644,21 +1049,20 @@ fn ephemeral_exchange(
 
 fn build_mirror_flight(
     certificate: &RealityCertificate,
-    verified: &VerifiedHello,
+    verified: &dyn MirrorHelloView,
     patched_server_hello: &[u8],
     cipher: CipherSuite,
     tls_dh: &[u8],
 ) -> TransportResult<BuiltMirrorFlight> {
     let hash = cipher.hash();
-    let mut transcript = TranscriptHasher::new(hash);
-    transcript.update(&verified.hello.raw);
+    let mut transcript = verified.transcript_hasher(hash);
     transcript.update(patched_server_hello);
     let t0 = transcript.finalize_clone();
     let hs = HandshakeKeys::derive_with_transcript_hash(cipher, tls_dh, &t0);
 
     let ee = handshake_message(HS_ENCRYPTED_EXTENSIONS, &[0, 0]);
     transcript.update(&ee);
-    let certificate_der = certificate.for_auth_key(&verified.auth_key);
+    let certificate_der = certificate.for_auth_key(verified.auth_key());
     let certificate_msg = certificate_message(&certificate_der);
     transcript.update(&certificate_msg);
     let t1 = transcript.finalize_clone();
@@ -889,13 +1293,34 @@ async fn read_mirrored_client_finished(
     ))
 }
 
+#[allow(clippy::needless_pass_by_value)] // ownership is an explicit pre-commit barrier
 pub(crate) fn prepare_mirrored_flight(
     certificate: &RealityCertificate,
     verified: &VerifiedHello,
-    mut template: MirrorTemplate,
+    template: MirrorTemplate,
     fixed_crypto: Option<&MirrorCryptoInput>,
 ) -> TransportResult<PreparedFlight> {
-    if verified.hello.session_id != template.client_session_id {
+    prepare_mirrored_flight_view(certificate, verified, template, fixed_crypto)
+}
+
+#[allow(clippy::needless_pass_by_value)] // ownership is an explicit pre-commit barrier
+pub(crate) fn prepare_mirrored_flight_context(
+    certificate: &RealityCertificate,
+    verified: &AuthenticatedMirrorContext,
+    template: MirrorTemplate,
+    fixed_crypto: Option<&MirrorCryptoInput>,
+) -> TransportResult<PreparedFlight> {
+    prepare_mirrored_flight_view(certificate, verified, template, fixed_crypto)
+}
+
+#[allow(clippy::needless_pass_by_value)] // consuming the template prevents reuse after commit preparation
+fn prepare_mirrored_flight_view(
+    certificate: &RealityCertificate,
+    verified: &dyn MirrorHelloView,
+    template: MirrorTemplate,
+    fixed_crypto: Option<&MirrorCryptoInput>,
+) -> TransportResult<PreparedFlight> {
+    if *verified.session_id() != template.client_session_id {
         return Err(TransportError::Tls(
             "REALITY mirror template is bound to a different ClientHello".into(),
         ));
@@ -907,32 +1332,17 @@ pub(crate) fn prepare_mirrored_flight(
             "REALITY mirror server share length does not match template".into(),
         ));
     }
-    if template.server_hello.len() < 38 || template.share_range.end > template.server_hello.len() {
+    let template_sh_len = template.server_hello().len();
+    if template_sh_len < 38 || template.share_range.end > template_sh_len {
         return Err(TransportError::Tls(
             "REALITY mirror template patch range is out of bounds".into(),
         ));
     }
-    template.server_hello[6..38].copy_from_slice(&random);
-    template.server_hello[template.share_range.clone()].copy_from_slice(&server_share);
 
-    let built = build_mirror_flight(
-        certificate,
-        verified,
-        &template.server_hello,
-        template.cipher,
-        &tls_dh,
-    )?;
-    let plans =
-        plan_mirrored_records(built.plaintext.len(), &template.record_heads).map_err(|_| {
-            TransportError::ResourceLimit(
-                "REALITY mirror template capacity cannot hold the flight".into(),
-            )
-        })?;
-
-    let sh_len = u16::try_from(template.server_hello.len())
+    let sh_len = u16::try_from(template_sh_len)
         .map_err(|_| TransportError::Tls("REALITY mirror ServerHello length".into()))?;
     let capacity = 5
-        + template.server_hello.len()
+        + template_sh_len
         + usize::from(template.has_ccs) * COMPAT_CCS_RECORD.len()
         + template
             .record_heads
@@ -942,7 +1352,27 @@ pub(crate) fn prepare_mirrored_flight(
     let mut wire = Vec::with_capacity(capacity);
     wire.extend_from_slice(&[0x16, 0x03, 0x03]);
     wire.extend_from_slice(&sh_len.to_be_bytes());
-    wire.extend_from_slice(&template.server_hello);
+    wire.extend_from_slice(template.server_hello());
+    wire[5 + 6..5 + 38].copy_from_slice(&random);
+    let share_out = 5 + template.share_range.start..5 + template.share_range.end;
+    wire[share_out].copy_from_slice(&server_share);
+    let built = {
+        let patched_server_hello = &wire[5..5 + template_sh_len];
+        build_mirror_flight(
+            certificate,
+            verified,
+            patched_server_hello,
+            template.cipher,
+            &tls_dh,
+        )?
+    };
+    let plans =
+        plan_mirrored_records(built.plaintext.len(), &template.record_heads).map_err(|_| {
+            TransportError::ResourceLimit(
+                "REALITY mirror template capacity cannot hold the flight".into(),
+            )
+        })?;
+
     if template.has_ccs {
         wire.extend_from_slice(&COMPAT_CCS_RECORD);
     }
@@ -1260,7 +1690,7 @@ mod tests {
             assert_eq!(template.share_range, sh.share_range);
             assert_eq!(template.share_range.len(), 32);
             assert_eq!(
-                template.server_hello[template.share_range.clone()],
+                template.server_hello()[template.share_range.clone()],
                 x25519_public(0x40)[..]
             );
             assert_eq!(
@@ -1277,7 +1707,7 @@ mod tests {
             assert_eq!(template.share_range, sh.share_range);
             assert_eq!(template.share_range.len(), 1120);
             assert_eq!(
-                template.server_hello[template.share_range.clone()],
+                template.server_hello()[template.share_range.clone()],
                 hybrid_target_share()[..]
             );
         }
@@ -1884,6 +2314,80 @@ mod tests {
         wire.extend_from_slice(&[TLS_RECORD_APPLICATION_DATA, 0x03, 0x03, 0x40, 0x11]);
         let error = run_finished_reader(wire).await.expect_err("wire budget");
         assert!(error.to_string().contains("exceeds 64 KiB"), "{error}");
+    }
+
+    #[test]
+    fn incremental_target_scanner_reaches_freezable_only_at_complete_boundaries() {
+        let hello = x25519_verified();
+        let sh = valid_x25519_sh(&hello, true);
+        let prefix = target_prefix(&sh.message, true, &[25, 3217, 281, 69]);
+        let mut scanner = TargetFlightScanner::new();
+        let split = 5 + sh.message.len() + COMPAT_CCS_RECORD.len() + 5 + 10;
+        assert_eq!(scanner.push(&prefix[..split]), TargetScanState::NeedBytes);
+        let mut saw_capacity_wait = false;
+        for byte in &prefix[split..] {
+            let state = scanner.push(&[*byte]);
+            if state == TargetScanState::CapacityTemporarilyInsufficient {
+                saw_capacity_wait = true;
+            }
+        }
+        assert!(
+            saw_capacity_wait,
+            "small first buckets are temporarily insufficient"
+        );
+        assert_eq!(scanner.state(), TargetScanState::Freezable);
+        let cursor_before_freeze = scanner.cursor;
+        let template = scanner.freeze(&hello).expect("freeze scanner prefix");
+        assert_eq!(template.target_prefix, prefix);
+        assert_eq!(template.server_hello(), sh.message);
+        assert!(
+            cursor_before_freeze > 0,
+            "scan cursor advanced incrementally"
+        );
+    }
+
+    #[test]
+    fn incremental_target_scanner_types_incompatibility_and_w_sentinel() {
+        let hello = x25519_verified();
+        let sh = valid_x25519_sh(&hello, false);
+
+        let mut scanner = TargetFlightScanner::new();
+        let repeated = target_prefix(&sh.message, true, &[18])
+            .into_iter()
+            .take(5 + sh.message.len() + COMPAT_CCS_RECORD.len())
+            .chain(COMPAT_CCS_RECORD)
+            .collect::<Vec<_>>();
+        for chunk in repeated.chunks(7) {
+            scanner.push(chunk);
+        }
+        assert_eq!(
+            scanner.state(),
+            TargetScanState::Incompatible(MirrorCoverReason::DestProfile)
+        );
+
+        let mut scanner = TargetFlightScanner::new();
+        let mut prefix = target_prefix(&sh.message, false, &[16401, 16401, 16401]);
+        let remaining = 65_536 - prefix.len();
+        // Add a fourth maximum-size header and as much of its body as fits in
+        // W.  That body is necessarily incomplete; one further byte is the
+        // lossless cover sentinel and turns the scan into typed capacity
+        // incompatibility rather than a successful freeze.
+        prefix.extend_from_slice(&[0x17, 0x03, 0x03, 0x40, 0x11]);
+        let body_room = remaining - 5;
+        prefix.extend(std::iter::repeat_n(0, body_room));
+        assert_eq!(prefix.len(), 65_536);
+        scanner.push(&prefix);
+        assert_eq!(scanner.state(), TargetScanState::NeedBytes);
+        scanner.push(&[0xaa]);
+        assert_eq!(
+            scanner.state(),
+            TargetScanState::Incompatible(MirrorCoverReason::Capacity)
+        );
+        assert_eq!(
+            scanner.prefix.len(),
+            65_537,
+            "sentinel is retained for cover"
+        );
     }
 
     #[test]

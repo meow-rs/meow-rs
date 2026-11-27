@@ -23,16 +23,16 @@ use crate::reality_hello::{EXT_KEY_SHARE, GROUP_X25519, GROUP_X25519_MLKEM768};
 use crate::reality_tls::{
     finished_verify_data, hkdf_sha256, put_u16, put_u24, read_record, read_u24, take, take_u16,
     take_u8, verify_finished, wrap_plain_record_tls13, x25519, x25519_public_from_private,
-    ApplicationKeys, CipherSuite, HandshakeKeys, RealityTlsStream, HS_CERTIFICATE,
-    HS_CERTIFICATE_VERIFY, HS_CLIENT_HELLO, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, HS_SERVER_HELLO,
-    TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256,
+    ApplicationKeys, CipherSuite, HandshakeKeys, HashAlg, RealityTlsStream, TranscriptHasher,
+    HS_CERTIFICATE, HS_CERTIFICATE_VERIFY, HS_CLIENT_HELLO, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED,
+    HS_SERVER_HELLO, TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256,
     TLS_RECORD_APPLICATION_DATA, TLS_RECORD_CHANGE_CIPHER_SPEC, TLS_RECORD_HANDSHAKE,
 };
 use crate::{Result, Stream, TransportError};
 
 pub use crate::reality_mirror::{
-    MirrorClientProfileError, MirrorTemplate, MirrorTemplateError, MirroredHandshakeCompletion,
-    PreparedFlight,
+    MirrorClientProfileError, MirrorCoverReason, MirrorTemplate, MirrorTemplateError,
+    MirroredHandshakeCompletion, PreparedFlight, TargetFlightScanner, TargetScanState,
 };
 
 const EXT_SERVER_NAME: u16 = 0;
@@ -221,7 +221,7 @@ impl<const N: usize> KeyShareSlot<N> {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub(crate) struct ClientKeyShares {
     x25519: KeyShareSlot<32>,
     hybrid: KeyShareSlot<HYBRID_SHARE_LEN>,
@@ -356,6 +356,44 @@ pub struct VerifiedHello {
     pub(crate) local_key_group: u16,
 }
 
+/// Small authenticated state needed by mirroring after the large logical
+/// ClientHello allocation has been released.  Both transcript states are
+/// advanced over the original logical CH exactly once.
+pub struct AuthenticatedMirrorContext {
+    pub(crate) issuer: Arc<()>,
+    pub(crate) auth_key: [u8; 32],
+    pub(crate) session_id: [u8; 32],
+    pub(crate) cipher_suites: OfferedCipherSuites,
+    pub(crate) supported_groups: SupportedGroups,
+    pub(crate) key_shares: ClientKeyShares,
+    pub(crate) has_pre_shared_key: bool,
+    pub(crate) has_early_data: bool,
+    pub(crate) record_size_limit: Option<u16>,
+    pub(crate) record_size_limit_malformed: bool,
+    pub(crate) key_share_malformed: bool,
+    pub(crate) transcript_sha256: TranscriptHasher,
+    pub(crate) transcript_sha384: TranscriptHasher,
+}
+
+/// Consuming split of a verified ClientHello: the exact wire prefix can be
+/// uploaded and then released while only the small mirror context remains.
+pub struct MirrorHelloUpload {
+    context: AuthenticatedMirrorContext,
+    wire: Vec<u8>,
+}
+
+impl MirrorHelloUpload {
+    pub fn context(&self) -> &AuthenticatedMirrorContext {
+        &self.context
+    }
+    pub fn ch_wire(&self) -> &[u8] {
+        &self.wire
+    }
+    pub fn finish_upload(self) -> (AuthenticatedMirrorContext, Vec<u8>) {
+        (self.context, self.wire)
+    }
+}
+
 impl fmt::Debug for VerifiedHello {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("VerifiedHello").finish_non_exhaustive()
@@ -363,6 +401,41 @@ impl fmt::Debug for VerifiedHello {
 }
 
 impl VerifiedHello {
+    /// Split the authenticated token into a small mirror context plus the
+    /// independently owned upload prefix.  The logical CH arena is dropped by
+    /// this conversion rather than carried through target probing.
+    pub fn into_mirror_upload(self) -> MirrorHelloUpload {
+        let mut transcript_sha256 = TranscriptHasher::new(HashAlg::Sha256);
+        let mut transcript_sha384 = TranscriptHasher::new(HashAlg::Sha384);
+        transcript_sha256.update(&self.hello.raw);
+        transcript_sha384.update(&self.hello.raw);
+        let VerifiedHello {
+            issuer,
+            hello,
+            ch_wire,
+            auth_key,
+            ..
+        } = self;
+        MirrorHelloUpload {
+            context: AuthenticatedMirrorContext {
+                issuer,
+                auth_key,
+                session_id: hello.session_id,
+                cipher_suites: hello.cipher_suites,
+                supported_groups: hello.supported_groups,
+                key_shares: hello.key_shares,
+                has_pre_shared_key: hello.has_pre_shared_key,
+                has_early_data: hello.has_early_data,
+                record_size_limit: hello.record_size_limit,
+                record_size_limit_malformed: hello.record_size_limit_malformed,
+                key_share_malformed: hello.key_share_malformed,
+                transcript_sha256,
+                transcript_sha384,
+            },
+            wire: ch_wire,
+        }
+    }
+
     /// Exact pre-read TCP prefix, including TLS record headers.  This is the
     /// only byte string a dial-first probe may upload or a cover relay may
     /// forward; it is never reconstructed from the parse tree.
@@ -565,6 +638,27 @@ impl RealityServer {
         crate::reality_mirror::prepare_mirrored_flight(
             &self.inner.certificate,
             hello,
+            template,
+            None,
+        )
+    }
+
+    /// Prepare mirroring from the consuming upload/context split.  This path
+    /// does not retain the logical CH or require the wire prefix to remain
+    /// alive while the local flight is constructed.
+    pub fn prepare_mirrored_upload(
+        &self,
+        upload: &MirrorHelloUpload,
+        template: MirrorTemplate,
+    ) -> Result<PreparedFlight> {
+        if !Arc::ptr_eq(&upload.context.issuer, &self.inner.instance) {
+            return Err(TransportError::Tls(
+                "REALITY verified ClientHello belongs to a different server instance".into(),
+            ));
+        }
+        crate::reality_mirror::prepare_mirrored_flight_context(
+            &self.inner.certificate,
+            &upload.context,
             template,
             None,
         )
@@ -2876,6 +2970,12 @@ mod tests {
         assert_eq!(
             measured_peak, 140_517,
             "wire, logical/AAD, bitset, header and both candidate shares exactly fill Bch"
+        );
+        let (context, upload_wire) = hello.into_mirror_upload().finish_upload();
+        let upload_peak = upload_wire.capacity() + context.key_shares.retained_capacity();
+        assert_eq!(
+            upload_peak, 66_784,
+            "after the consuming split only W bytes of CH wire plus G candidate bytes remain"
         );
     }
 
