@@ -386,6 +386,14 @@ pub struct MirrorHelloUpload {
 }
 
 impl MirrorHelloUpload {
+    #[cfg(test)]
+    pub(crate) fn test_from_context(context: AuthenticatedMirrorContext) -> Self {
+        Self {
+            context,
+            wire: Vec::new(),
+        }
+    }
+
     pub fn context(&self) -> &AuthenticatedMirrorContext {
         &self.context
     }
@@ -2321,6 +2329,82 @@ mod tests {
             .expect("client read timed out")
             .expect("client read");
         assert_eq!(buf, b"server-to-client seq0");
+    }
+
+    /// The production mirror path enforces the same issuer binding as the
+    /// legacy completion API: a context minted by one server instance must
+    /// not prepare a flight on another.
+    #[test]
+    fn mirrored_upload_is_bound_to_issuing_server_instance() {
+        use zeroize::Zeroizing;
+        let (private, _public) = keypair();
+        let issuer = RealityServer::new(&server_config(private)).expect("issuer");
+        let other = RealityServer::new(&server_config(private)).expect("other");
+
+        let mut cipher_suites = OfferedCipherSuites::default();
+        cipher_suites.insert(0x1301);
+        let mut supported_groups = SupportedGroups::default();
+        supported_groups.insert(GROUP_X25519);
+        let mut key_shares = ClientKeyShares::default();
+        key_shares.insert(GROUP_X25519, &[0x11; 32]);
+        let context = AuthenticatedMirrorContext {
+            issuer: issuer.inner.instance.clone(),
+            auth_key: Zeroizing::new([0x23; 32]),
+            session_id: [0u8; 32],
+            cipher_suites,
+            supported_groups,
+            key_shares,
+            has_pre_shared_key: false,
+            has_early_data: false,
+            record_size_limit: None,
+            record_size_limit_malformed: false,
+            key_share_malformed: false,
+            transcript_sha256: TranscriptHasher::new(HashAlg::Sha256),
+            transcript_sha384: TranscriptHasher::new(HashAlg::Sha384),
+        };
+
+        let mut sh_body = Vec::new();
+        sh_body.extend_from_slice(&[0x03, 0x03]);
+        sh_body.extend_from_slice(&[0x66; 32]);
+        sh_body.push(32);
+        sh_body.extend_from_slice(&[0u8; 32]);
+        sh_body.extend_from_slice(&0x1301u16.to_be_bytes());
+        sh_body.push(0);
+        let versions = extension_bytes(0x002b, &0x0304u16.to_be_bytes());
+        let mut ks_body = Vec::new();
+        ks_body.extend_from_slice(&0x001du16.to_be_bytes());
+        ks_body.extend_from_slice(&32u16.to_be_bytes());
+        ks_body.extend_from_slice(&[0x40; 32]);
+        let key_share = extension_bytes(0x0033, &ks_body);
+        let mut exts = Vec::new();
+        exts.extend_from_slice(&versions);
+        exts.extend_from_slice(&key_share);
+        sh_body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        sh_body.extend_from_slice(&exts);
+        let mut sh = vec![0x02];
+        sh.extend_from_slice(&(sh_body.len() as u32).to_be_bytes()[1..4]);
+        sh.extend_from_slice(&sh_body);
+        let mut flight = Vec::new();
+        flight.extend_from_slice(&[0x16, 0x03, 0x03]);
+        flight.extend_from_slice(&(sh.len() as u16).to_be_bytes());
+        flight.extend_from_slice(&sh);
+        for len in [25u16, 3217, 281, 69] {
+            flight.extend_from_slice(&[0x17, 0x03, 0x03]);
+            flight.extend_from_slice(&len.to_be_bytes());
+            flight.resize(flight.len() + usize::from(len), 0x5a);
+        }
+
+        let mut scanner = crate::reality_mirror::TargetFlightScanner::new();
+        scanner.push(&flight);
+        let template = scanner
+            .freeze_context(&context)
+            .expect("synthetic flight must freeze for the controlled context");
+
+        let upload = MirrorHelloUpload::test_from_context(context);
+        assert!(
+            other.prepare_mirrored_upload(&upload, template).is_err(),
+            "foreign instance must reject the upload context before any output"
+        );
     }
 
     fn extension_bytes(typ: u16, data: &[u8]) -> Vec<u8> {
