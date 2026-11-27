@@ -99,6 +99,11 @@ pub struct VlessRealitySpec {
     pub max_time_difference_us: u64,
     pub limit_fallback_upload: VlessFallbackLimit,
     pub limit_fallback_download: VlessFallbackLimit,
+    /// REALITY v2 mirror orchestration.  Configuration parsing is a later
+    /// wave; production application wiring currently selects `off`
+    /// explicitly while listener tests can opt into the implemented
+    /// dial-first machine directly.
+    pub mimic: VlessRealityMimicSpec,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -108,18 +113,90 @@ pub struct VlessFallbackLimit {
     pub burst_bytes_per_sec: u64,
 }
 
-enum SecurityRuntime {
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum VlessRealityMimicMode {
+    #[default]
+    DialFirst,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VlessRealityMimicSpec {
+    pub mode: VlessRealityMimicMode,
+    pub probe_timeout_ms: u64,
+    pub quiescence_min_ms: u64,
+    pub quiescence_max_ms: u64,
+    pub max_concurrent_probes: usize,
+}
+
+impl Default for VlessRealityMimicSpec {
+    fn default() -> Self {
+        Self {
+            mode: VlessRealityMimicMode::DialFirst,
+            probe_timeout_ms: 3000,
+            quiescence_min_ms: 15,
+            quiescence_max_ms: 40,
+            max_concurrent_probes: 64,
+        }
+    }
+}
+
+impl VlessRealityMimicSpec {
+    pub fn off() -> Self {
+        Self {
+            mode: VlessRealityMimicMode::Off,
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn probe_timeout(&self) -> Duration {
+        Duration::from_millis(self.probe_timeout_ms)
+    }
+
+    fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let invalid = |message: &str| {
+            Box::new(meow_common::MeowError::Config(format!(
+                "vless REALITY mimic: {message}"
+            ))) as Box<dyn std::error::Error + Send + Sync>
+        };
+        if !(500..=15_000).contains(&self.probe_timeout_ms) {
+            return Err(invalid("probe-timeout-ms outside [500,15000]"));
+        }
+        if !(5..=200).contains(&self.quiescence_min_ms) {
+            return Err(invalid("quiescence-min-ms outside [5,200]"));
+        }
+        if !(10..=500).contains(&self.quiescence_max_ms) {
+            return Err(invalid("quiescence-max-ms outside [10,500]"));
+        }
+        if self.quiescence_min_ms > self.quiescence_max_ms
+            || self.quiescence_max_ms >= self.probe_timeout_ms
+        {
+            return Err(invalid(
+                "requires quiescence-min <= quiescence-max < probe-timeout",
+            ));
+        }
+        if !(1..=256).contains(&self.max_concurrent_probes) {
+            return Err(invalid("max-concurrent-probes outside [1,256]"));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) enum SecurityRuntime {
     StandardTls(TlsServer),
     Reality(RealityRuntime),
 }
 
-struct RealityRuntime {
-    server: RealityServer,
-    dest_host: String,
-    dest_port: u16,
-    cover_limit: CoverBandwidthLimit,
-    handshake_slots: Arc<Semaphore>,
-    cover_slots: Arc<Semaphore>,
+pub(crate) struct RealityRuntime {
+    pub(crate) server: RealityServer,
+    pub(crate) dest_host: String,
+    pub(crate) dest_port: u16,
+    pub(crate) cover_limit: CoverBandwidthLimit,
+    pub(crate) handshake_slots: Arc<Semaphore>,
+    pub(crate) probe_slots: Arc<Semaphore>,
+    pub(crate) cover_slots: Arc<Semaphore>,
+    pub(crate) mimic: VlessRealityMimicSpec,
+    pub(crate) metrics: Arc<crate::vless_mimic::RealityV2Metrics>,
 }
 
 /// Bound endpoints of every live VLESS listener generation in this
@@ -198,6 +275,7 @@ fn build_security_runtime(
             Ok(SecurityRuntime::StandardTls(server))
         }
         VlessSecuritySpec::Reality(spec) => {
+            spec.mimic.validate()?;
             let dest_host = spec.dest_host.clone();
             let dest_port = spec.dest_port;
             let server = RealityServer::new(&RealityServerConfig {
@@ -229,7 +307,10 @@ fn build_security_runtime(
                     burst_bytes,
                 },
                 handshake_slots: Arc::new(Semaphore::new(REALITY_HANDSHAKE_SLOTS)),
+                probe_slots: Arc::new(Semaphore::new(spec.mimic.max_concurrent_probes)),
                 cover_slots: Arc::new(Semaphore::new(REALITY_COVER_SLOTS)),
+                mimic: spec.mimic,
+                metrics: Arc::new(crate::vless_mimic::RealityV2Metrics::new()),
             }))
         }
     }
@@ -342,6 +423,25 @@ impl VlessListener {
         )
     }
 
+    /// Internal fixed-label REALITY v2 counter snapshot.  This is diagnostic
+    /// surface for in-process verification, not a public metrics API.
+    #[doc(hidden)]
+    pub fn reality_v2_metrics_snapshot(
+        &self,
+    ) -> Option<crate::vless_mimic::RealityV2MetricsSnapshot> {
+        let SecurityRuntime::Reality(reality) = &self.security else {
+            return None;
+        };
+        Some(reality.metrics.snapshot(
+            &reality.handshake_slots,
+            REALITY_HANDSHAKE_SLOTS,
+            &reality.probe_slots,
+            reality.mimic.max_concurrent_probes,
+            &reality.cover_slots,
+            REALITY_COVER_SLOTS,
+        ))
+    }
+
     /// Serve on an already-bound socket. Multi-address listeners spawn
     /// one `run_on` per socket on a shared `Arc` and share the same cap,
     /// auth table, TLS/REALITY state and endpoint registry.
@@ -444,6 +544,10 @@ impl VlessListener {
                             match Arc::clone(&reality.handshake_slots).try_acquire_owned() {
                                 Ok(p) => Some(p),
                                 Err(_) => {
+                                    reality.metrics.inc_close(
+                                        crate::vless_mimic::ClosePhase::Admission,
+                                        crate::vless_mimic::CloseReason::HandshakeSaturated,
+                                    );
                                     debug!(
                                         "vless listener '{}' REALITY classification saturated at {} slots; refusing {peer}",
                                         self.name, REALITY_HANDSHAKE_SLOTS
@@ -479,9 +583,9 @@ impl VlessListener {
         // absolute deadline. Splitting them would double the time a
         // silent peer can retain a connection slot.
         let deadline = tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT;
-        let inner: Box<dyn Stream> = Box::new(stream);
         let accepted = match &self.security {
             SecurityRuntime::StandardTls(server) => {
+                let inner: Box<dyn Stream> = Box::new(stream);
                 match tokio::time::timeout_at(deadline, server.accept(inner)).await {
                     Ok(Ok(stream)) => Some(stream),
                     Ok(Err(e)) => {
@@ -497,44 +601,59 @@ impl VlessListener {
                     }
                 }
             }
-            SecurityRuntime::Reality(reality) => {
-                // The classification permit was acquired at admission,
-                // before this task existed; it is held through the
-                // handshake exactly as before and released right after
-                // classification — never for the relay's lifetime.
-                let accepted =
-                    match tokio::time::timeout_at(deadline, reality.server.accept(inner)).await {
-                        Ok(Ok(accept)) => Some(accept),
-                        Ok(Err(e)) => {
-                            debug!(
-                                "vless listener '{}' REALITY accept from {peer}: {e}",
-                                self.name
-                            );
-                            None
-                        }
-                        Err(_) => {
-                            debug!(
-                                "vless listener '{}' REALITY accept from {peer} timed out",
-                                self.name
-                            );
-                            None
-                        }
-                    };
-                drop(handshake_permit);
-                match accepted {
-                    Some(RealityServerAccept::Authenticated(stream)) => Some(stream),
-                    Some(RealityServerAccept::Cover(relay)) => {
-                        // Boxed: the cover relay's two 16 KiB direction
-                        // scratches live across its copy-loop awaits, so
-                        // an unboxed relay future would embed them in
-                        // EVERY connection task's future — including the
-                        // authenticated majority that never covers.
-                        Box::pin(self.run_cover(reality, relay, peer, deadline)).await;
-                        None
-                    }
-                    None => None,
+            SecurityRuntime::Reality(reality) => match reality.mimic.mode {
+                VlessRealityMimicMode::DialFirst => {
+                    let dial = self.dial_first_target(reality);
+                    crate::vless_mimic::run_dial_first(
+                        reality,
+                        stream,
+                        deadline,
+                        handshake_permit,
+                        dial,
+                    )
+                    .await
                 }
-            }
+                VlessRealityMimicMode::Off => {
+                    let inner: Box<dyn Stream> = Box::new(stream);
+                    // The classification permit was acquired at admission,
+                    // before this task existed; it is held through the
+                    // handshake exactly as before and released right after
+                    // classification — never for the relay's lifetime.
+                    let accepted =
+                        match tokio::time::timeout_at(deadline, reality.server.accept(inner)).await
+                        {
+                            Ok(Ok(accept)) => Some(accept),
+                            Ok(Err(e)) => {
+                                debug!(
+                                    "vless listener '{}' REALITY accept from {peer}: {e}",
+                                    self.name
+                                );
+                                None
+                            }
+                            Err(_) => {
+                                debug!(
+                                    "vless listener '{}' REALITY accept from {peer} timed out",
+                                    self.name
+                                );
+                                None
+                            }
+                        };
+                    drop(handshake_permit);
+                    match accepted {
+                        Some(RealityServerAccept::Authenticated(stream)) => Some(stream),
+                        Some(RealityServerAccept::Cover(relay)) => {
+                            // Boxed: the cover relay's two 16 KiB direction
+                            // scratches live across its copy-loop awaits, so
+                            // an unboxed relay future would embed them in
+                            // EVERY connection task's future — including the
+                            // authenticated majority that never covers.
+                            Box::pin(self.run_cover(reality, relay, peer, deadline)).await;
+                            None
+                        }
+                        None => None,
+                    }
+                }
+            },
         };
         let Some(mut stream) = accepted else {
             return;
@@ -704,6 +823,34 @@ impl VlessListener {
             );
         }
         drop(cover_permit);
+    }
+
+    async fn dial_first_target(
+        &self,
+        reality: &RealityRuntime,
+    ) -> Result<crate::vless_mimic::DialedTarget, crate::vless_mimic::DialFirstDialError> {
+        reality.metrics.inc_dial_started();
+        let candidates = meow_common::resolve_host_all(&reality.dest_host, reality.dest_port)
+            .await
+            .map_err(|_| crate::vless_mimic::DialFirstDialError::Resolve)?;
+        let endpoints = self.all_bound_endpoints();
+        let local_addrs = local_addr_snapshot();
+        let Some(addr) = candidates
+            .into_iter()
+            .find(|addr| !endpoint_is_self(*addr, &endpoints, local_addrs.as_ref()))
+        else {
+            return Err(crate::vless_mimic::DialFirstDialError::Resolve);
+        };
+        reality.metrics.inc_tcp_connect_started();
+        let tcp_start = tokio::time::Instant::now();
+        let stream = meow_common::connect_tcp(addr)
+            .await
+            .map_err(|_| crate::vless_mimic::DialFirstDialError::Connect)?;
+        let tcp_ready = tokio::time::Instant::now();
+        Ok(crate::vless_mimic::DialedTarget {
+            stream,
+            connect_elapsed: tcp_ready.saturating_duration_since(tcp_start),
+        })
     }
 
     async fn dial_cover_target(
@@ -1015,6 +1162,7 @@ mod tests {
                 max_time_difference_us: 0,
                 limit_fallback_upload: VlessFallbackLimit::default(),
                 limit_fallback_download: VlessFallbackLimit::default(),
+                mimic: VlessRealityMimicSpec::off(),
             }),
             udp: true,
         };

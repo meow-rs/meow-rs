@@ -9,8 +9,8 @@ use std::time::Duration;
 use meow_common::{Metadata, Network, ProxyAdapter, ProxyPacketConn};
 use meow_dns::Resolver;
 use meow_listener::{
-    VlessFallbackLimit, VlessListener, VlessListenerSpec, VlessRealitySpec, VlessSecuritySpec,
-    VlessUserSpec,
+    VlessFallbackLimit, VlessListener, VlessListenerSpec, VlessRealityMimicSpec, VlessRealitySpec,
+    VlessSecuritySpec, VlessUserSpec,
 };
 use meow_proxy::dialer::DirectDialer;
 use meow_proxy::mux::xudp::{XudpDecoder, XudpFrame};
@@ -119,6 +119,7 @@ fn reality_spec(dest: &str, users: Vec<(&str, [u8; 16])>) -> VlessListenerSpec {
             max_time_difference_us: 120_000_000,
             limit_fallback_upload: VlessFallbackLimit::default(),
             limit_fallback_download: VlessFallbackLimit::default(),
+            mimic: VlessRealityMimicSpec::off(),
         }),
         udp: true,
     }
@@ -1936,4 +1937,205 @@ async fn xudp_end_frame_tears_down_only_its_session() {
         1,
         "no extra flow died"
     );
+}
+
+// ---- REALITY v2 dial-first data-plane fixtures ----
+
+fn mimic_flight(session_id: &[u8; 32]) -> Vec<u8> {
+    fn ext(kind: u16, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&kind.to_be_bytes());
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    let share_secret = x25519_dalek::StaticSecret::from([9u8; 32]);
+    let share = x25519_dalek::PublicKey::from(&share_secret).to_bytes();
+    let mut sh_body = Vec::new();
+    sh_body.extend_from_slice(&[0x03, 0x03]);
+    sh_body.extend_from_slice(&[0x66; 32]);
+    sh_body.push(32);
+    sh_body.extend_from_slice(session_id);
+    sh_body.extend_from_slice(&0x1301u16.to_be_bytes());
+    sh_body.push(0);
+    let versions = ext(0x002b, &0x0304u16.to_be_bytes());
+    let mut key_share_body = Vec::new();
+    key_share_body.extend_from_slice(&0x001du16.to_be_bytes());
+    key_share_body.extend_from_slice(&(share.len() as u16).to_be_bytes());
+    key_share_body.extend_from_slice(&share);
+    let key_share = ext(0x0033, &key_share_body);
+    let mut exts = Vec::new();
+    exts.extend_from_slice(&versions);
+    exts.extend_from_slice(&key_share);
+    sh_body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+    sh_body.extend_from_slice(&exts);
+    let mut sh = vec![0x02];
+    sh.extend_from_slice(&(sh_body.len() as u32).to_be_bytes()[1..4]);
+    sh.extend_from_slice(&sh_body);
+
+    let mut flight = Vec::new();
+    flight.extend_from_slice(&[0x16, 0x03, 0x03]);
+    flight.extend_from_slice(&(sh.len() as u16).to_be_bytes());
+    flight.extend_from_slice(&sh);
+    flight.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+    // Acceptance-shaped application records: enough mirrored plaintext
+    // capacity for the certificate flight while remaining far below W.
+    for len in [25u16, 3217, 281, 69] {
+        flight.extend_from_slice(&[0x17, 0x03, 0x03]);
+        flight.extend_from_slice(&len.to_be_bytes());
+        flight.resize(flight.len() + usize::from(len), 0x5a);
+    }
+    flight
+}
+
+async fn read_one_tls_record(stream: &mut TcpStream) -> Vec<u8> {
+    let mut head = [0u8; 5];
+    stream
+        .read_exact(&mut head)
+        .await
+        .expect("target record head");
+    let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+    let mut body = vec![0u8; len];
+    stream
+        .read_exact(&mut body)
+        .await
+        .expect("target record body");
+    let mut wire = head.to_vec();
+    wire.extend_from_slice(&body);
+    wire
+}
+
+async fn start_mimic_target() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let first = read_one_tls_record(&mut stream).await;
+                assert_eq!(first[0], 0x16, "first uploaded record is a handshake");
+                assert_eq!(first[5], 0x01, "first handshake message is ClientHello");
+                let ch_len =
+                    ((first[6] as usize) << 16) | ((first[7] as usize) << 8) | first[8] as usize;
+                assert_eq!(
+                    first.len() - 5,
+                    4 + ch_len,
+                    "test fixture expects one CH record"
+                );
+                // The logical CH layout fixes session_id to [39,71): type/len
+                // (4), version (2), random (32), session-id length (1).
+                assert_eq!(first[5 + 38], 32);
+                let session_id: [u8; 32] = first[5 + 39..5 + 71].try_into().unwrap();
+                let flight = mimic_flight(&session_id);
+                stream
+                    .write_all(&flight)
+                    .await
+                    .expect("target flight write");
+                stream.flush().await.expect("target flight flush");
+                // A REALITY target must not send post-flight bytes or close
+                // before the mirror commit settles.  Keep the socket open.
+                let mut sink = [0u8; 512];
+                loop {
+                    match stream.read(&mut sink).await {
+                        Ok(0) | Err(_) => break,
+                        Ok(_) => {}
+                    }
+                }
+            });
+        }
+    });
+    addr
+}
+
+fn reality_dial_first_spec(dest: SocketAddr, users: Vec<(&str, [u8; 16])>) -> VlessListenerSpec {
+    let mut spec = reality_spec(&format!("127.0.0.1:{}", dest.port()), users);
+    let VlessSecuritySpec::Reality(reality) = &mut spec.security else {
+        unreachable!()
+    };
+    reality.mimic = VlessRealityMimicSpec::default();
+    spec
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reality_mimic_dial_first_end_to_end_hit_and_metrics() {
+    let target = start_mimic_target().await;
+    let echo = start_tcp_echo().await;
+    let (port, listener, task) = start_listener(
+        reality_dial_first_spec(target, vec![("alice", ALICE)]),
+        tunnel_with_rules(&[]),
+        "vless-reality-mimic-hit-it",
+    )
+    .await;
+    let adapter = vision_reality_adapter(port, ALICE);
+    adapter_echo(&adapter, echo, b"dial-first mirrored vision")
+        .await
+        .expect("mirrored Vision echo");
+
+    let snapshot = listener
+        .reality_v2_metrics_snapshot()
+        .expect("reality metrics");
+    assert_eq!(snapshot.dial_started_total, 1);
+    assert_eq!(snapshot.tcp_connect_started_total, 1);
+    assert_eq!(snapshot.probe_started_total, 1);
+    assert_eq!(snapshot.committed_total, 1);
+    assert_eq!(snapshot.mimic_hit_total, 1);
+    assert!(
+        snapshot.cover_total.is_empty(),
+        "unexpected cover: {:?}",
+        snapshot.cover_total
+    );
+    assert!(
+        snapshot.close_total.is_empty(),
+        "unexpected close: {:?}",
+        snapshot.close_total
+    );
+    assert_eq!(snapshot.active_handshakes, 0);
+    assert_eq!(snapshot.active_probes, 0);
+    assert_eq!(snapshot.active_covers, 0);
+    task.abort();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reality_mimic_ordinary_tls_enters_auth_failed_cover_once() {
+    let (cover, _cover_cert) = start_tls13_echo().await;
+    let (port, listener, task) = start_listener(
+        reality_dial_first_spec(cover, vec![("alice", ALICE)]),
+        tunnel_with_rules(&[]),
+        "vless-reality-mimic-cover-it",
+    )
+    .await;
+
+    let layer = TlsLayer::new(&tls_client_config()).unwrap();
+    let raw: Box<dyn meow_transport::Stream> =
+        Box::new(TcpStream::connect(("127.0.0.1", port)).await.unwrap());
+    let mut tls = timeout(T, layer.connect(raw))
+        .await
+        .expect("cover TLS timeout")
+        .expect("cover TLS handshake through dial-first auth_failed fallback");
+    tls.write_all(b"ordinary tls through mimic cover")
+        .await
+        .unwrap();
+    tls.flush().await.unwrap();
+    let mut got = vec![0u8; b"ordinary tls through mimic cover".len()];
+    timeout(T, tls.read_exact(&mut got))
+        .await
+        .expect("cover echo timeout")
+        .expect("cover echo read");
+    assert_eq!(got, b"ordinary tls through mimic cover");
+
+    let snapshot = listener
+        .reality_v2_metrics_snapshot()
+        .expect("reality metrics");
+    assert_eq!(snapshot.dial_started_total, 1);
+    assert_eq!(snapshot.tcp_connect_started_total, 1);
+    assert_eq!(snapshot.probe_started_total, 0);
+    assert_eq!(snapshot.committed_total, 0);
+    assert_eq!(snapshot.mimic_hit_total, 0);
+    assert_eq!(snapshot.cover_total.get("auth_failed"), Some(&1));
+    assert!(
+        snapshot.close_total.is_empty(),
+        "normal cover EOF is not a close: {:?}",
+        snapshot.close_total
+    );
+    task.abort();
 }

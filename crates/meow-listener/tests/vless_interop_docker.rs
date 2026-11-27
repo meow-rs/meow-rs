@@ -17,8 +17,8 @@ use base64::Engine as _;
 use meow_common::{Metadata, Network, ProxyAdapter};
 use meow_dns::Resolver;
 use meow_listener::{
-    VlessFallbackLimit, VlessListener, VlessListenerSpec, VlessRealitySpec, VlessSecuritySpec,
-    VlessUserSpec,
+    VlessFallbackLimit, VlessListener, VlessListenerSpec, VlessRealityMimicSpec, VlessRealitySpec,
+    VlessSecuritySpec, VlessUserSpec,
 };
 use meow_proxy::dialer::DirectDialer;
 use meow_proxy::Socks5Adapter;
@@ -1401,6 +1401,7 @@ fn reality_spec(dest: &str) -> VlessListenerSpec {
             max_time_difference_us: 120_000_000,
             limit_fallback_upload: VlessFallbackLimit::default(),
             limit_fallback_download: VlessFallbackLimit::default(),
+            mimic: VlessRealityMimicSpec::off(),
         }),
         udp: true,
     }
