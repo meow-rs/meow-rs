@@ -277,33 +277,41 @@ ended up with an empty provider. mihomo takes the same route through
 
 ### Override
 
-`override:` is a free-form map whose keys are proxy config field
-names. After a proxy is loaded from a provider, each key in the
-override map is applied, overwriting the corresponding field in the
-parsed proxy config struct.
+`override:` is mihomo's provider-level node default block
+(`OverrideSchema`). It is applied at parse time, after the name filters and
+before the node is parsed, in mihomo's order: the fields are written into the
+node's mapping unconditionally, then the affixes rewrite its name.
 
-Supported override keys in M1 (a bounded set, not arbitrary):
+| Override key | Type | Effect |
+|--------------|------|--------|
+| `additional-prefix` | string | Prefixed to every member's name |
+| `additional-suffix` | string | Appended to every member's name |
+| `udp` | bool | Node-level `udp` |
+| `tfo` | bool | Node-level `tfo` |
+| `mptcp` | bool | Node-level `mptcp` |
+| `skip-cert-verify` | bool | Node-level `skip-cert-verify` |
+| `up` / `down` | string | Node-level bandwidth hints |
+| `name-cert-verify` | string | Node-level `name-cert-verify` |
+| `interface-name` | string | Node-level `interface-name` |
+| `ip-version` | string | Node-level `ip-version` |
+| `routing-mark` | integer | Node-level `routing-mark` |
+| `dialer-proxy` | string | Rewrites the node's dialer chain (see below) |
+| `udp-over-tcp`, `proxy-name`, `override-expr` | — | Warn and skip: the first is not a meow node field, the other two need upstream's regexp2 / expression evaluator |
+| Any other key | — | Warn and skip (forward compatibility) |
 
-| Override key | Type | Applied to |
-|-------------|------|-----------|
-| `skip-cert-verify` | bool | All TLS-capable proxy types |
-| `udp` | bool | All proxy types |
-| `up-speed` / `down-speed` | integer | Ignored with warn (upstream Hysteria fields; not in scope) |
-| `ip-version` | string | Ignored with warn (upstream preference field; not in scope) |
-| Any unknown key | any | **warn-once, ignore.** Forward-compat. |
+A wrongly-typed value fails the provider build — upstream's YAML unmarshal
+rejects it as well, so a typo is a startup error rather than a silently
+missing default.
 
-Override is applied at parse time, not at dial time — the override
-mutates the parsed `ProxyConfig` struct before it is built into an
-adapter. This avoids per-connection overhead and keeps the override
-logic in one place.
+Because the affixes are applied after filtering, a provider that prefixes its
+node names is still filtered on the names its feed published (upstream order:
+`provider.go` filter → `OverrideSchema.Apply` → `ParseProxy`). The prefixed
+name is what groups and rules must reference.
 
-**Divergence from upstream** — upstream applies overrides at adapter-
-build time with reflection-like field lookup. We apply at config
-parse time to a typed struct, which means only the keys we
-explicitly support are honoured. Unknown keys warn and skip.
-Classification: Class B per ADR-0002 — user's traffic still routes
-correctly through the correct adapter; only unsupported keys are
-silently no-ops (with a warn). The warn makes the gap visible.
+**Divergence from upstream** — upstream resolves the two remaining keys with
+its own regex engine and expression language; this build warns and skips
+them. Classification: Class B per ADR-0002 — routing is unaffected, and the
+warn makes the gap visible.
 
 ## Internal design
 

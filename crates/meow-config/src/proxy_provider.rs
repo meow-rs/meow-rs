@@ -150,6 +150,10 @@ pub struct ProxyProvider {
     /// every node unconditionally; the strongest of the three levels
     /// (override > provider > node) (issue #489).
     override_dialer: Option<String>,
+    /// The rest of mihomo's `override:` block: provider-level node
+    /// defaults plus the name affixes, written into every member's mapping
+    /// after filtering and before parsing (`OverrideSchema.Apply`).
+    node_override: NodeOverride,
     /// Serializes `refresh` so `slot`, `declared_dialers`, and `derived`
     /// can never be populated from different payload generations — the
     /// provider-refresh API endpoint is not serialized by the config
@@ -274,6 +278,136 @@ enum Vehicle {
         /// an on-disk cache; issue #429).
         cache_path: Option<PathBuf>,
     },
+}
+
+/// mihomo's `override:` block on a proxy-provider (`OverrideSchema`),
+/// minus `dialer-proxy` (that one feeds the dialer chain and lives in
+/// [`ProxyProvider::override_dialer`]).
+///
+/// Upstream applies it in `OverrideSchema.Apply`, which writes each field
+/// into the node's mapping unconditionally — a provider-level default that
+/// remote payloads cannot escape. The affixes are name rewrites, applied
+/// after the map fields and in the same order mihomo uses (prefix, then
+/// suffix). `proxy-name` and `override-expr` need upstream's regexp2 and
+/// expression evaluator; they warn at build instead of being silently
+/// ignored.
+#[derive(Default, Debug, Clone)]
+struct NodeOverride {
+    fields: Vec<(&'static str, serde_json::Value)>,
+    prefix: Option<String>,
+    suffix: Option<String>,
+}
+
+impl NodeOverride {
+    /// Fields mihomo writes, with the node-level key each one lands on.
+    const BOOL_FIELDS: [(&'static str, &'static str); 4] = [
+        ("tfo", "tfo"),
+        ("mptcp", "mptcp"),
+        ("udp", "udp"),
+        ("skip-cert-verify", "skip-cert-verify"),
+    ];
+    const STRING_FIELDS: [(&'static str, &'static str); 5] = [
+        ("up", "up"),
+        ("down", "down"),
+        ("name-cert-verify", "name-cert-verify"),
+        ("interface-name", "interface-name"),
+        ("ip-version", "ip-version"),
+    ];
+
+    /// Parse the block. Unknown keys, and the two constructs that need
+    /// machinery meow does not carry, warn; a wrongly-typed value is a
+    /// build error (upstream's YAML unmarshal rejects it too).
+    fn from_raw(provider: &str, raw: &HashMap<String, serde_json::Value>) -> Result<Self, String> {
+        let mut out = Self::default();
+        for (key, value) in raw {
+            match key.as_str() {
+                // Handled by the caller (dialer chain).
+                "dialer-proxy" => {}
+                "additional-prefix" => {
+                    out.prefix = Some(expect_string(provider, key, value)?.to_string());
+                }
+                "additional-suffix" => {
+                    out.suffix = Some(expect_string(provider, key, value)?.to_string());
+                }
+                "routing-mark" => {
+                    let mark = value.as_i64().ok_or_else(|| {
+                        format!(
+                            "proxy-provider '{provider}': override.routing-mark must be an integer"
+                        )
+                    })?;
+                    out.fields
+                        .push(("routing-mark", serde_json::Value::from(mark)));
+                }
+                "udp-over-tcp" | "proxy-name" | "override-expr" => {
+                    warn!(
+                        provider = %provider,
+                        "proxy-provider override key '{key}' is not supported"
+                    );
+                }
+                other => {
+                    if let Some((_, target)) = Self::BOOL_FIELDS
+                        .iter()
+                        .find(|(source, _)| *source == other)
+                    {
+                        let flag = value.as_bool().ok_or_else(|| {
+                            format!(
+                                "proxy-provider '{provider}': override.{other} must be a boolean"
+                            )
+                        })?;
+                        out.fields.push((target, serde_json::Value::Bool(flag)));
+                    } else if let Some((_, target)) = Self::STRING_FIELDS
+                        .iter()
+                        .find(|(source, _)| *source == other)
+                    {
+                        let text = expect_string(provider, other, value)?;
+                        out.fields
+                            .push((target, serde_json::Value::String(text.to_string())));
+                    } else {
+                        warn!(
+                            provider = %provider,
+                            "proxy-provider override key '{other}' is not supported"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.fields.is_empty() && self.prefix.is_none() && self.suffix.is_none()
+    }
+
+    /// Write the defaults into `map` and rewrite its name. Returns the
+    /// effective node name.
+    fn apply(&self, map: &mut HashMap<String, serde_json::Value>) -> String {
+        for (key, value) in &self.fields {
+            map.insert((*key).to_string(), value.clone());
+        }
+        let mut name = map
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Some(prefix) = &self.prefix {
+            name = format!("{prefix}{name}");
+        }
+        if let Some(suffix) = &self.suffix {
+            name = format!("{name}{suffix}");
+        }
+        map.insert("name".to_string(), serde_json::Value::String(name.clone()));
+        name
+    }
+}
+
+fn expect_string<'a>(
+    provider: &str,
+    key: &str,
+    value: &'a serde_json::Value,
+) -> Result<&'a str, String> {
+    value
+        .as_str()
+        .ok_or_else(|| format!("proxy-provider '{provider}': override.{key} must be a string"))
 }
 
 impl ProxyProvider {
@@ -442,18 +576,16 @@ impl ProxyProvider {
             }
         };
 
-        // mihomo `override:` — provider-level node defaults. Only
-        // `dialer-proxy` is honoured; every other key warns so a config
-        // relying on, say, `override.udp` does not silently diverge.
+        // mihomo `override:` — provider-level node defaults. `dialer-proxy`
+        // feeds the dialer chain below; the scalar fields and the name
+        // affixes are collected into `node_override` and written into each
+        // node's mapping at parse time (`OverrideSchema.Apply`).
         // `override.Apply` writes unconditionally — it outranks both the
         // provider-level field and node-level `dialer-proxy`.
         let mut override_dialer = None;
+        let mut node_override = NodeOverride::default();
         if let Some(over) = raw.override_.as_ref() {
-            for key in over.keys() {
-                if key != "dialer-proxy" {
-                    warn!(provider = %name, "proxy-provider override key '{key}' is not supported");
-                }
-            }
+            node_override = NodeOverride::from_raw(name, over)?;
             match over.get("dialer-proxy") {
                 // `""` is the upstream "clear the chain" knob:
                 // `OverrideSchema.Apply` writes the string unconditionally,
@@ -509,6 +641,7 @@ impl ProxyProvider {
             declared_dialers: RwLock::new(Vec::new()),
             provider_dialer,
             override_dialer,
+            node_override,
             refresh_lock: tokio::sync::Mutex::new(()),
             derived: RwLock::new(Vec::new()),
             def: Self::def_identity(raw),
@@ -1271,11 +1404,28 @@ impl ProxyProvider {
                 continue;
             }
 
-            match self.parse_node(raw_map, raw_name, &mut declared) {
+            // mihomo applies `override:` after the name filters and before
+            // parsing (`provider.go`: filter, then `OverrideSchema.Apply`,
+            // then `ParseProxy`), so a provider that prefixes names is still
+            // filtered on the names its feed published.
+            let overridden = if self.node_override.is_empty() {
+                None
+            } else {
+                let mut map = raw_map.clone();
+                self.node_override.apply(&mut map);
+                Some(map)
+            };
+            let node_map = overridden.as_ref().unwrap_or(raw_map);
+            let node_name = node_map
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(raw_name);
+
+            match self.parse_node(node_map, node_name, &mut declared) {
                 Ok(proxy) => result.push(proxy),
                 Err(e) if strict => {
                     return Err(anyhow::anyhow!(
-                        "node '{raw_name}' failed to parse (strict mode): {e}"
+                        "node '{node_name}' failed to parse (strict mode): {e}"
                     ));
                 }
                 // Keep the slot entry as a dead placeholder instead of
@@ -1290,16 +1440,16 @@ impl ProxyProvider {
                 // built-in plugin transport missing from this build, stop
                 // the daemon from starting at all.
                 Err(e) => {
-                    if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_map) {
-                        let label = if raw_name.is_empty() {
+                    if let Some(declared) = proxy_parser::placeholder_adapter_type(node_map) {
+                        let label = if node_name.is_empty() {
                             "<unnamed>"
                         } else {
-                            raw_name
+                            node_name
                         };
                         warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable node so nothing can dial past it");
                         result.push(crate::unavailable_placeholder(label, &e, declared));
                     } else {
-                        warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
+                        warn!(provider = %self.name, proxy = node_name, error = %e, "failed to parse proxy");
                     }
                 }
             }
@@ -2676,6 +2826,86 @@ header:
         .unwrap();
         let provider = file_provider(tmp.path()).await;
         assert_eq!(slot_names(&provider.proxies()), ["A", "B"]);
+    }
+
+    fn override_map(value: serde_json::Value) -> HashMap<String, serde_json::Value> {
+        serde_json::from_value(value).expect("override object")
+    }
+
+    async fn provider_with_override(
+        path: &std::path::Path,
+        raw: RawProxyProvider,
+    ) -> ProxyProvider {
+        let cache_dir = path.parent().expect("temp file has a parent dir");
+        let p = ProxyProvider::new(
+            "car",
+            &raw,
+            Some(cache_dir),
+            true,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn provider_override_applies_fields_and_name_affixes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_provider_file(tmp.path(), &[("US 1", "ss"), ("US 2", "ss")]);
+        let mut raw = raw_file_provider(tmp.path().to_str().unwrap());
+        raw.override_ = Some(override_map(serde_json::json!({
+            "additional-prefix": "[Car] ",
+            "additional-suffix": " ✈",
+            "udp": false,
+            "skip-cert-verify": true,
+            "ip-version": "ipv4"
+        })));
+        let provider = provider_with_override(tmp.path(), raw).await;
+        assert_eq!(
+            slot_names(&provider.proxies()),
+            ["[Car] US 1 ✈", "[Car] US 2 ✈"]
+        );
+    }
+
+    /// Upstream order: the name filters run on the names the feed published,
+    /// then `override` rewrites them. Filtering after the affixes would drop
+    /// every node of a provider that prefixes its names.
+    #[tokio::test]
+    async fn provider_override_filters_on_the_original_name() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_provider_file(tmp.path(), &[("Car 01", "ss"), ("Other 01", "ss")]);
+        let mut raw = raw_file_provider(tmp.path().to_str().unwrap());
+        raw.filter = Some("^Car".to_string());
+        raw.override_ = Some(override_map(serde_json::json!({
+            "additional-prefix": "[X] "
+        })));
+        let provider = provider_with_override(tmp.path(), raw).await;
+        assert_eq!(slot_names(&provider.proxies()), ["[X] Car 01"]);
+    }
+
+    /// A wrongly-typed override is a build error, not a silent skip —
+    /// upstream's YAML unmarshal rejects it before any fetch happens.
+    #[test]
+    fn provider_override_rejects_wrong_type() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut raw = raw_file_provider(tmp.path().to_str().unwrap());
+        raw.override_ = Some(override_map(serde_json::json!({
+            "udp": "yes"
+        })));
+        let cache_dir = tmp.path().parent().expect("temp file has a parent dir");
+        let err = ProxyProvider::new(
+            "car",
+            &raw,
+            Some(cache_dir),
+            true,
+            false,
+            Default::default(),
+        )
+        .err()
+        .expect("a wrongly-typed override must fail the build");
+        assert!(err.contains("must be a boolean"), "unexpected error: {err}");
     }
 
     #[tokio::test]

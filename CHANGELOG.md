@@ -20,6 +20,16 @@ the canonical, in-repo source a release is cut from.
   malformed lines are skipped with a warning, and a body with no usable
   link keeps the provider's last-good generation.
 
+- `proxy-providers.*.override` now applies mihomo's `OverrideSchema` field
+  set instead of only `dialer-proxy`: `additional-prefix`,
+  `additional-suffix`, `udp`, `tfo`, `mptcp`, `skip-cert-verify`,
+  `up`/`down`, `name-cert-verify`, `interface-name`, `ip-version` and
+  `routing-mark` are written into every member's mapping after the name
+  filters and before parsing, so airport configs that prefix node names or
+  force `skip-cert-verify` behave as they do on mihomo. `udp-over-tcp`,
+  `proxy-name` and `override-expr` still warn and skip, and a wrongly-typed
+  value fails the provider build.
+
 ### Fixed
 
 - `proxy-providers.*.filter` / `exclude-filter` and the group-level fields
