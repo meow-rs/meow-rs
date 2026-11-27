@@ -365,6 +365,11 @@ fn parse_patched_server_hello(record: &[u8]) -> (Vec<u8>, [u8; 32], u16) {
     assert_eq!(record.len(), 5 + sh_len, "SH record exact length");
     let sh = record[5..].to_vec();
     assert_eq!(sh[0], 0x02, "handshake type ServerHello");
+    assert_ne!(
+        &sh[4..36],
+        &[0x66; 32],
+        "the mirror patch must replace the fixture target random"
+    );
     let mut pos = 4 + 2 + 32;
     let sid_len = usize::from(sh[pos]);
     pos += 1 + sid_len;

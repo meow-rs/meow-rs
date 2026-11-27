@@ -434,6 +434,9 @@ impl TargetIo for TcpStream {
                 buf.len(),
             )
         };
+        // One retry bounds EINTR rather than looping inside the synchronous
+        // prepare window: a second interruption is returned to the caller,
+        // which already treats it as target I/O failure instead of spinning.
         match socket.recv(uninit) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => socket.recv(uninit),
             result => result,
