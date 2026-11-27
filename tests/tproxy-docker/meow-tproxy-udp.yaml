@@ -1,17 +1,19 @@
-# UDP TPROXY variant (issue #564): the tproxy listener is declared via
+# UDP TPROXY variant (issues #564/#1017): the tproxy listener is declared via
 # `listeners:` with `firewall: false` + `udp: true` — meow installs no
-# nftables state; the test harness owns the TPROXY rules (`ip meow_udp_tproxy`)
-# and the fwmark/policy routing that steer LAN UDP datagrams to :7895. The
-# same listener port also answers TCP REDIRECT'd connections.
+# nftables state; the test harness owns the TPROXY rules and the fwmark/policy
+# routing that steer LAN UDP datagrams to :7895. `[::]` exercises one listener
+# covering both families; the same port also answers TCP REDIRECT'd connections.
+# The fake-ip DNS upstream is the test fixture inside the srv namespace.
 mixed-port: 7890
 routing-mark: 9527
 mode: rule
 log-level: debug
+ipv6: true
 
 listeners:
   - name: udp-tproxy
     type: tproxy
-    listen: 127.0.0.1
+    listen: "::"
     port: 7895
     firewall: false
     udp: true
@@ -19,10 +21,11 @@ listeners:
 
 dns:
   enable: true
-  listen: "127.0.0.1:5353"
-  enhanced-mode: normal
+  listen: "10.77.0.1:5356"
+  enhanced-mode: fake-ip
+  fake-ip-range6: "fdfe:dcba:9876::/64"
   nameserver:
-    - "8.8.8.8"
+    - "[fd89::1]:5353"
 
 proxies:
   - name: "test-ss"
@@ -33,4 +36,5 @@ proxies:
     password: "test-password"
 
 rules:
+  - "DOMAIN,echo6.test,DIRECT"
   - "MATCH,DIRECT"

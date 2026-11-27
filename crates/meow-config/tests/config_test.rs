@@ -2816,12 +2816,56 @@ listeners:
     assert!(err.to_string().contains("udp-timeout"), "got: {err}");
 }
 
-/// IPv6 and dual-stack (`::`) binds are rejected for `udp: true` — the
-/// receive path is IPv4-only (`IP_RECVORIGDSTADDR`) and `::` would
-/// silently accept v6 datagrams it cannot handle.
+/// UDP TPROXY follows the family expressed by `listen`: a specific
+/// unscoped IPv6 address binds IPv6-only, while `::` asks the listener
+/// for the dual-stack pair. The parser keeps the normalized address as
+/// before — socket fan-out is a listener data-plane concern.
 #[tokio::test]
-async fn test_tproxy_udp_rejects_ipv6_listen() {
-    for listen in ["[::1]:5332", "[::]:5332", "[::ffff:1.2.3.4]:5332"] {
+async fn test_tproxy_udp_accepts_unscoped_ipv6_listen() {
+    for (listen, port_line, want_listen) in [
+        ("[::1]:5332", "", "::1"),
+        ("[::]:5332", "", "::"),
+        ("[2001:db8::1]:5332", "", "2001:db8::1"),
+        ("::", "    port: 5332\n", "::"),
+        ("2001:db8::1", "    port: 5332\n", "2001:db8::1"),
+    ] {
+        let yaml = format!(
+            r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: "{listen}"
+{port_line}    firewall: false
+    udp: true
+"#
+        );
+        let config = load_config_from_str(&yaml)
+            .await
+            .unwrap_or_else(|e| panic!("{listen} must be accepted: {e}"));
+        let named = &config.listeners.named[0];
+        assert_eq!(named.listen, want_listen, "listen={listen}");
+        assert_eq!(named.port, 5332, "listen={listen}");
+        assert!(
+            matches!(named.spec, ListenerSpec::TProxy { udp: true, .. }),
+            "listen={listen}"
+        );
+    }
+}
+
+/// The v1 UDP data plane carries no scope zone and uses one socket per
+/// real family: IPv4-mapped, scoped, and link-local listen spellings are
+/// explicit configuration errors rather than silent partial support.
+#[tokio::test]
+async fn test_tproxy_udp_rejects_unsupported_ipv6_listen_shapes() {
+    for (listen, needle) in [
+        ("[::ffff:1.2.3.4]:5332", "IPv4-mapped"),
+        ("::ffff:1.2.3.4", "IPv4-mapped"),
+        ("[fe80::1%1]:5332", "scoped"),
+        ("[2001:db8::1%0]:5332", "scoped"),
+        ("[2001:db8::1%2]:5332", "scoped"),
+        ("[fe80::1]:5332", "link-local"),
+        ("fe80::1", "link-local"),
+    ] {
         let yaml = format!(
             r#"
 listeners:
@@ -2835,8 +2879,33 @@ listeners:
         let err = load_config_from_str(&yaml)
             .await
             .err()
-            .expect("udp: true on IPv6/dual-stack must fail");
-        assert!(err.to_string().contains("IPv4-only"), "got: {err}");
+            .unwrap_or_else(|| panic!("{listen} must be rejected"));
+        assert!(
+            err.to_string().contains(needle),
+            "{listen}: error must contain {needle:?}, got: {err}"
+        );
+    }
+}
+
+/// Without `udp: true`, an IPv6 bind is ordinary TCP listener input —
+/// the UDP-only shape rejections must not leak into the TCP contract.
+#[tokio::test]
+async fn test_tproxy_ipv6_listen_without_udp_is_legal() {
+    for listen in ["[::1]:5332", "[::1%0]:5332"] {
+        let yaml = format!(
+            r#"
+listeners:
+  - name: my-tproxy
+    type: tproxy
+    listen: "{listen}"
+    firewall: false
+"#
+        );
+        let config = load_config_from_str(&yaml).await.unwrap();
+        assert!(matches!(
+            config.listeners.named[0].spec,
+            ListenerSpec::TProxy { udp: false, .. }
+        ));
     }
 }
 

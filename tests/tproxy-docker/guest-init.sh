@@ -14,7 +14,7 @@ fail() { echo "TEST_FAIL:$1"; }
 wait_log() {
     local i
     for i in $(seq 1 20); do
-        grep -qE "$1" "$2" 2>/dev/null && return 0
+        grep -qE -- "$1" "$2" 2>/dev/null && return 0
         sleep 0.5
     done
     return 1
@@ -297,39 +297,45 @@ if nft list table inet meow_ext_fw >/dev/null 2>&1; then
     fail "ext_fw_cleanup"
 fi
 
-# ═══ Phase 3: `udp: true` — external UDP TPROXY (issue #564) ═══
+# ═══ Phase 3: `udp: true` — external UDP TPROXY (issues #564/#1017) ═══
 #
 # UDP TPROXY only intercepts packets on the PREROUTING hook, and the
 # transparent reply socket must bind the ORIGINAL destination — which must
 # therefore not exist on the host. Both client and server are network
 # namespaces; the host is a real router between them, and the deployer
 # half of the TPROXY contract (fwmark → local-table policy routing + the
-# tproxy rule) is installed by hand. TCP REDIRECT on the same listener
-# port proves TCP and UDP coexist.
+# tproxy rule) is installed by hand for both address families. TCP REDIRECT
+# on the same listener port proves TCP and UDP coexist.
 echo ""
 echo "=== UDP TPROXY phase (udp: true) ==="
 
-# LAN client 10.77.0.2 ←veth→ host 10.77.0.1 ←→ srv 10.89.0.254 → server
-# 10.89.0.1. A distinct /24 avoids the host's loopback alias (10.88.0.1/32
-# on lo) shadowing the subnet route.
+# LAN client 10.77.0.2/fd77::2 ←veth→ host 10.77.0.1/fd77::1 ←→ srv
+# 10.89.0.254/fd89::254 → server 10.89.0.1/fd89::1. Distinct subnets avoid
+# the host's loopback alias (10.88.0.1/32 on lo) shadowing the v4 route.
 ip netns add lan
 ip netns add srv
 ip link add veth-host type veth peer name veth-lan
 ip link add veth-srv type veth peer name veth-dest
 ip addr add 10.77.0.1/30 dev veth-host
+ip addr add fd77::1/64 dev veth-host nodad
 ip addr add 10.89.0.254/24 dev veth-srv
+ip addr add fd89::254/64 dev veth-srv nodad
 ip link set veth-host up
 ip link set veth-srv up
 ip link set veth-lan netns lan
 ip link set veth-dest netns srv
 ip netns exec lan ip link set lo up
 ip netns exec lan ip addr add 10.77.0.2/30 dev veth-lan
+ip netns exec lan ip addr add fd77::2/64 dev veth-lan nodad
 ip netns exec lan ip link set veth-lan up
 ip netns exec lan ip route add default via 10.77.0.1
+ip netns exec lan ip -6 route add default via fd77::1
 ip netns exec srv ip link set lo up
 ip netns exec srv ip addr add 10.89.0.1/24 dev veth-dest
+ip netns exec srv ip addr add fd89::1/64 dev veth-dest nodad
 ip netns exec srv ip link set veth-dest up
 ip netns exec srv ip route add default via 10.89.0.254
+ip netns exec srv ip -6 route add default via fd89::254
 
 # fwmark → local delivery table (the deployer's policy-routing half).
 # `ip_forward` is deliberately NOT set: the fwmark→local-table route
@@ -337,13 +343,39 @@ ip netns exec srv ip route add default via 10.89.0.254
 # never takes the forward path — don't "fix" this by enabling it.
 ip rule add fwmark 0x1 lookup 100
 ip route add local 0.0.0.0/0 dev lo table 100
+ip -6 rule add fwmark 0x1 lookup 100
+ip -6 route add local ::/0 dev lo table 100
 
-# UDP echo server on the "real" destination inside srv — netcat-
-# traditional's `-e cat` echoes each received datagram back to its sender.
-(while true; do
-    ip netns exec srv nc -u -l -s 10.89.0.1 -p 9998 -e /bin/cat 2>/dev/null || true
-done) &
-UDP_ECHO_PID=$!
+# IPv6 is mandatory for this phase in CI. Report a missing kernel, netns,
+# address or policy-routing half as a failed test rather than a skip.
+UDP6_KERNEL_OK=1
+[ -r /proc/net/if_inet6 ] || UDP6_KERNEL_OK=0
+ip -6 addr show dev veth-host 2>/dev/null | grep -q 'fd77::1' || UDP6_KERNEL_OK=0
+ip -6 addr show dev veth-srv 2>/dev/null | grep -q 'fd89::254' || UDP6_KERNEL_OK=0
+ip netns exec lan ip -6 addr show dev veth-lan 2>/dev/null | grep -q 'fd77::2' || UDP6_KERNEL_OK=0
+ip netns exec srv ip -6 addr show dev veth-dest 2>/dev/null | grep -q 'fd89::1' || UDP6_KERNEL_OK=0
+ip netns exec lan ip -6 route show 2>/dev/null | grep -q 'default via fd77::1' || UDP6_KERNEL_OK=0
+ip netns exec srv ip -6 route show 2>/dev/null | grep -q 'default via fd89::254' || UDP6_KERNEL_OK=0
+ip -6 rule show 2>/dev/null | grep -q 'fwmark 0x1 lookup 100' || UDP6_KERNEL_OK=0
+ip -6 route show table 100 2>/dev/null | grep -qE '^local (default|::/0)' || UDP6_KERNEL_OK=0
+if [ "$UDP6_KERNEL_OK" -eq 1 ]; then
+    pass "udp6_kernel_support"
+else
+    echo "SETUP FAILURE: IPv6 netns/address/policy-routing preflight failed"
+    fail "udp6_kernel_support"
+fi
+
+# Deterministic UDP echo servers and the DNS fixture live on the real
+# destination inside srv. The helper checks exact reply source identity;
+# netcat remains only for the TCP same-port regression.
+ip netns exec srv /usr/local/bin/tproxy-e2e-helper echo 10.89.0.1 9998 >/tmp/udp4-echo.log 2>&1 &
+UDP4_ECHO_PID=$!
+ip netns exec srv /usr/local/bin/tproxy-e2e-helper echo fd89::1 9998 >/tmp/udp6-echo.log 2>&1 &
+UDP6_ECHO_PID=$!
+ip netns exec srv /usr/local/bin/tproxy-e2e-helper echo fd89::1 9997 >/tmp/udp6only-echo.log 2>&1 &
+UDP6_ONLY_ECHO_PID=$!
+ip netns exec srv /usr/local/bin/tproxy-e2e-helper dns-fixture fd89::1 5353 >/tmp/dns-fixture.log 2>&1 &
+DNS_FIXTURE_PID=$!
 
 # TCP echo server for the same-port regression (matches phase 1's shape).
 (while true; do
@@ -351,20 +383,44 @@ UDP_ECHO_PID=$!
 done) &
 TCP_SRV_ECHO_PID=$!
 
-# Wait for the echo servers to actually bind — otherwise the first
-# datagram is dropped before nc is listening and the test races its own
-# setup.
+# Wait for the echo servers and DNS fixture to actually bind — otherwise
+# the first datagram is dropped before they are listening and the test
+# races its own setup.
+UDP_FIXTURES_READY=0
 for i in $(seq 1 20); do
-    ip netns exec srv ss -uln 2>/dev/null | grep -q ':9998 ' \
-        && ip netns exec srv ss -ltn 2>/dev/null | grep -q ':9999 ' && break
+    NS_UDP="$(ip netns exec srv ss -uln 2>/dev/null)"
+    NS_TCP="$(ip netns exec srv ss -ltn 2>/dev/null)"
+    if [ "$(grep -c ':9998 ' <<<"$NS_UDP" || true)" -ge 2 ] \
+        && grep -q ':9997 ' <<<"$NS_UDP" \
+        && grep -q ':5353 ' <<<"$NS_UDP" \
+        && grep -q ':9999 ' <<<"$NS_TCP" \
+        && kill -0 "$UDP4_ECHO_PID" 2>/dev/null \
+        && kill -0 "$UDP6_ECHO_PID" 2>/dev/null \
+        && kill -0 "$UDP6_ONLY_ECHO_PID" 2>/dev/null \
+        && kill -0 "$DNS_FIXTURE_PID" 2>/dev/null; then
+        UDP_FIXTURES_READY=1
+        break
+    fi
     sleep 0.3
 done
+if [ "$UDP_FIXTURES_READY" -eq 1 ]; then
+    pass "udp_fixture_ready"
+else
+    echo "SETUP FAILURE: UDP echo/DNS fixtures did not bind"
+    echo "--- udp4 echo ---"; cat /tmp/udp4-echo.log 2>/dev/null
+    echo "--- udp6 echo ---"; cat /tmp/udp6-echo.log 2>/dev/null
+    echo "--- udp6-only echo ---"; cat /tmp/udp6only-echo.log 2>/dev/null
+    echo "--- dns fixture ---"; cat /tmp/dns-fixture.log 2>/dev/null
+    fail "udp_fixture_ready"
+fi
 
-# External rules: TPROXY steers LAN UDP datagrams for 10.89.0.1:9998 to
-# meow's :7895, while an output-chain REDIRECT sends host TCP :9999 to the
-# SAME port — the issue's TCP/UDP same-port requirement. The nat chain
-# also pulls in nf_conntrack, which IP_ORIGDSTADDR depends on — removing
-# it would silently empty every cmsg and drop all UDP flows.
+# External rules: TPROXY steers LAN UDP datagrams for the real destinations
+# and the v6 fake-IP pool, while an output-chain REDIRECT sends host TCP
+# :9999 to the SAME dual-stack listener port — the issue's TCP/UDP same-port
+# requirement. The nat output chain is for that TCP regression; UDP
+# original-destination cmsgs describe the received packet and do not depend
+# on NAT/conntrack state. The fake pool rule precedes any broader ULA
+# treatment, mirroring the deployment contract.
 nft -f - <<'NFT'
 table ip meow_udp_tproxy {
   chain pre {
@@ -379,6 +435,14 @@ table ip meow_udp_tproxy {
     tcp dport 9999 redirect to :7895
   }
 }
+table ip6 meow_udp6_tproxy {
+  chain pre {
+    type filter hook prerouting priority mangle; policy accept;
+    ip6 daddr fdfe:dcba:9876::/64 udp dport 9998 tproxy ip6 to [::1]:7895 meta mark set 0x1 accept
+    ip6 daddr fd89::1 udp dport 9998 tproxy ip6 to [::1]:7895 meta mark set 0x1 accept
+    ip6 daddr fd89::1 udp dport 9997 tproxy ip6 to [fd77::1]:7901 meta mark set 0x1 accept
+  }
+}
 NFT
 
 # Preflight: if the ruleset failed to install every UDP assertion below
@@ -387,14 +451,26 @@ if ! nft list table ip meow_udp_tproxy >/dev/null 2>&1; then
     echo "SETUP FAILURE: meow_udp_tproxy nft table not installed"
     fail "udp_nft_installed"
 fi
+if nft list table ip6 meow_udp6_tproxy >/dev/null 2>&1; then
+    pass "udp6_nft_installed"
+else
+    echo "SETUP FAILURE: meow_udp6_tproxy nft table not installed"
+    fail "udp6_nft_installed"
+fi
+
+udp_listening() {
+    ss -uln 2>/dev/null | grep -qF -- "$1"
+}
 
 meow -f /etc/meow-tproxy-udp.yaml > /tmp/meow-udp.log 2>&1 &
 UDP_MEOW_PID=$!
 echo "meow (udp tproxy) started (PID $UDP_MEOW_PID)"
 
+# Socket state, not the startup log, is the readiness signal: redirected
+# stdout is block-buffered while the process is alive.
 UDP_READY=0
 for i in $(seq 1 20); do
-    if grep -q "UDP TPROXY active" /tmp/meow-udp.log 2>/dev/null; then
+    if udp_listening '0.0.0.0:7895' && udp_listening '[::]:7895'; then
         UDP_READY=1
         echo "UDP TPROXY listener ready after $((i * 500))ms"
         break
@@ -411,6 +487,43 @@ if [ "$UDP_READY" -eq 1 ]; then
     pass "udp_tproxy_ready"
 else
     fail "udp_tproxy_ready"
+fi
+
+# A `[::]` UDP listener owns one native wildcard socket per family — v4
+# traffic must never arrive as a mapped address on the v6 socket.
+if udp_listening '0.0.0.0:7895' \
+    && udp_listening '[::]:7895'; then
+    pass "udp_dual_listener_sockets"
+else
+    fail "udp_dual_listener_sockets"
+fi
+
+meow -f /etc/meow-tproxy-udp6-only.yaml > /tmp/meow-udp6only.log 2>&1 &
+UDP6_ONLY_MEOW_PID=$!
+echo "meow (udp6-only tproxy) started (PID $UDP6_ONLY_MEOW_PID)"
+
+UDP6_ONLY_READY=0
+for i in $(seq 1 20); do
+    if udp_listening '[fd77::1]:7901'; then
+        UDP6_ONLY_READY=1
+        echo "UDP6-only TPROXY listener ready after $((i * 500))ms"
+        break
+    fi
+    if ! kill -0 "$UDP6_ONLY_MEOW_PID" 2>/dev/null; then
+        echo "meow (udp6-only tproxy) exited prematurely"
+        break
+    fi
+    sleep 0.5
+done
+
+# A specific IPv6 listen must produce only that exact v6 endpoint, never a
+# sibling wildcard v4 socket.
+if [ "$UDP6_ONLY_READY" -eq 1 ] \
+    && udp_listening '[fd77::1]:7901' \
+    && ! udp_listening '0.0.0.0:7901'; then
+    pass "udp6_only_bind"
+else
+    fail "udp6_only_bind"
 fi
 
 # Test 17: udp_no_managed_table — `firewall: false` still means zero
@@ -437,9 +550,141 @@ else
     fail "udp_flow_relay"
 fi
 
+# Log-dependent assertions are evaluated after the meow processes exit:
+# Rust stdout is block-buffered when redirected to a file, so a grep while
+# they are running can miss both positive evidence and (for the negative
+# controls) evidence that must not exist. SIGTERM flushes it on normal exit.
+
+# Test 20 probe: the same listener port still serves TCP REDIRECT'd traffic
+# (the pass/fail assertion below also requires the tunnel log line).
+TCP_SAME_PORT=""
+TCP_SAME_PORT=$(echo "HELLO" | timeout 5 nc -w 3 10.89.0.1 9999 2>/dev/null) || true
+
+# #1017 matrix: both families send two distinct payloads on one tuple, so
+# the second datagram exercises the already-created flow and reply socket.
+UDP4_TWO_OUT=$(ip netns exec lan /usr/local/bin/tproxy-e2e-helper \
+    client 10.77.0.2 41001 10.89.0.1 9998 V4ONE V4TWO 2>&1)
+UDP4_TWO_RC=$?
+printf '%s\n' "$UDP4_TWO_OUT"
+if [ "$UDP4_TWO_RC" -eq 0 ]; then
+    pass "udp4_two_packet_exact_source"
+else
+    fail "udp4_two_packet_exact_source"
+fi
+
+UDP6_TWO_OUT=$(ip netns exec lan /usr/local/bin/tproxy-e2e-helper \
+    client fd77::2 41002 fd89::1 9998 V6ONE V6TWO 2>&1)
+UDP6_TWO_RC=$?
+printf '%s\n' "$UDP6_TWO_OUT"
+if [ "$UDP6_TWO_RC" -eq 0 ]; then
+    pass "udp6_two_packet_exact_source"
+else
+    fail "udp6_two_packet_exact_source"
+fi
+
+UDP6ONLY_OUT=$(ip netns exec lan /usr/local/bin/tproxy-e2e-helper \
+    client fd77::2 41003 fd89::1 9997 V6ONLY 2>&1)
+UDP6ONLY_RC=$?
+printf '%s\n' "$UDP6ONLY_OUT"
+
+# Fake AAAA: the client query itself allocates a deterministic pool address
+# through meow's DNS listener. The domain rule hit proves reverse
+# mapping, while the helper requires replies to arrive from the fake address
+# and original destination port exactly.
+FAKE_AAAA=""
+DNS_QUERY_OUT=$(ip netns exec lan /usr/local/bin/tproxy-e2e-helper \
+    dns-query 10.77.0.1 5356 echo6.test AAAA 2>&1)
+DNS_QUERY_RC=$?
+printf 'dns-query echo6.test AAAA: %s\n' "$DNS_QUERY_OUT"
+if [ "$DNS_QUERY_RC" -eq 0 ]; then
+    case "$DNS_QUERY_OUT" in
+        fdfe:dcba:9876::*) FAKE_AAAA="$DNS_QUERY_OUT" ;;
+    esac
+fi
+
+UDP6_FAKE_RC=1
+if [ -n "$FAKE_AAAA" ]; then
+    UDP6_FAKE_OUT=$(ip netns exec lan /usr/local/bin/tproxy-e2e-helper \
+        client fd77::2 41004 "$FAKE_AAAA" 9998 FAKEAAAA 2>&1)
+    UDP6_FAKE_RC=$?
+    printf '%s\n' "$UDP6_FAKE_OUT"
+fi
+
+# An in-pool address with no live allocation must be dropped before a flow
+# exists: no reply now, and no rule log once the flushed log is checked below.
+UNMAPPED_OUT=$(ip netns exec lan /usr/local/bin/tproxy-e2e-helper \
+    client-no-reply fd77::2 41005 fdfe:dcba:9876::ffff 9998 NOMAPPED 2>&1)
+UNMAPPED_RC=$?
+printf '%s\n' "$UNMAPPED_OUT"
+
+# Negative control: delete only the real-v6 9998 steering rule, then probe
+# from a fresh tuple. A reply or a new flow log would mean old state or a
+# direct forward path satisfied the assertion. Restore the rule afterwards
+# so the ownership check below still sees the deployer's complete table.
+V6_REAL_HANDLE="$(nft -a list chain ip6 meow_udp6_tproxy pre 2>/dev/null \
+    | awk '/ip6 daddr fd89::1/ && /udp dport 9998/ {print $NF; exit}')"
+V6_REAL_REMOVED=0
+if [[ "$V6_REAL_HANDLE" =~ ^[0-9]+$ ]] \
+    && nft delete rule ip6 meow_udp6_tproxy pre handle "$V6_REAL_HANDLE" 2>/dev/null; then
+    V6_REAL_REMOVED=1
+fi
+
+NEGATIVE_OUT=$(ip netns exec lan /usr/local/bin/tproxy-e2e-helper \
+    client-no-reply fd77::2 41006 fd89::1 9998 NORULE 2>&1)
+NEGATIVE_RC=$?
+printf '%s\n' "$NEGATIVE_OUT"
+if [ "$V6_REAL_REMOVED" -eq 1 ] \
+    && nft add rule ip6 meow_udp6_tproxy pre \
+        ip6 daddr fd89::1 udp dport 9998 tproxy ip6 to '[::1]:7895' meta mark set 0x1 accept 2>/dev/null; then
+    V6_REAL_RESTORED=1
+else
+    V6_REAL_RESTORED=0
+fi
+
+# Test 21: udp_rules_persist — stopping meow must NOT remove the
+# deployer's TPROXY rules or policy routing. Process termination is also
+# what flushes the redirected stdout logs asserted below.
+UDP_MEOW_FORCED=0
+kill -TERM "$UDP_MEOW_PID" 2>/dev/null
+for i in $(seq 1 10); do
+    kill -0 "$UDP_MEOW_PID" 2>/dev/null || break
+    sleep 0.5
+done
+if kill -0 "$UDP_MEOW_PID" 2>/dev/null; then
+    kill -9 "$UDP_MEOW_PID" 2>/dev/null || true
+    UDP_MEOW_FORCED=1
+fi
+wait "$UDP_MEOW_PID" 2>/dev/null || true
+
+UDP6_ONLY_MEOW_FORCED=0
+kill -TERM "$UDP6_ONLY_MEOW_PID" 2>/dev/null
+for i in $(seq 1 10); do
+    kill -0 "$UDP6_ONLY_MEOW_PID" 2>/dev/null || break
+    sleep 0.5
+done
+if kill -0 "$UDP6_ONLY_MEOW_PID" 2>/dev/null; then
+    kill -9 "$UDP6_ONLY_MEOW_PID" 2>/dev/null || true
+    UDP6_ONLY_MEOW_FORCED=1
+fi
+wait "$UDP6_ONLY_MEOW_PID" 2>/dev/null || true
+
+UDP_LOG_COMPLETE=1
+if [ "$UDP_MEOW_FORCED" -ne 0 ] \
+    || ! grep -qF "Shutting down" /tmp/meow-udp.log 2>/dev/null; then
+    echo "SETUP FAILURE: udp meow log is incomplete (forced=$UDP_MEOW_FORCED)"
+    UDP_LOG_COMPLETE=0
+fi
+UDP6_ONLY_LOG_COMPLETE=1
+if [ "$UDP6_ONLY_MEOW_FORCED" -ne 0 ] \
+    || ! grep -qF "Shutting down" /tmp/meow-udp6only.log 2>/dev/null; then
+    echo "SETUP FAILURE: udp6-only meow log is incomplete (forced=$UDP6_ONLY_MEOW_FORCED)"
+    UDP6_ONLY_LOG_COMPLETE=0
+fi
+
 # Test 19: udp_flow_logged — the flow was routed through the rule engine
 # (proves dispatch → resolve_proxy, not a raw socket shortcut)
-if wait_log "UDP 10\.77\.0\.2:[0-9]+ --> 10\.89\.0\.1:9998 match" /tmp/meow-udp.log; then
+if [ "$UDP_LOG_COMPLETE" -eq 1 ] \
+    && grep -qE -- "UDP 10\.77\.0\.2:[0-9]+ --> 10\.89\.0\.1:9998 match" /tmp/meow-udp.log; then
     pass "udp_flow_logged"
 else
     fail "udp_flow_logged"
@@ -447,31 +692,81 @@ fi
 
 # Test 20: udp_tcp_same_port — the same listener port still serves
 # TCP REDIRECT'd traffic (TCP behaviour unchanged)
-TCP_SAME_PORT=""
-TCP_SAME_PORT=$(echo "HELLO" | timeout 5 nc -w 3 10.89.0.1 9999 2>/dev/null) || true
-
 if [ "$TCP_SAME_PORT" = "ECHO_RESPONSE" ] \
-    && wait_log "10\.89\.0\.1:9999" /tmp/meow-udp.log; then
+    && [ "$UDP_LOG_COMPLETE" -eq 1 ] \
+    && grep -qE -- "10\.89\.0\.1:9999" /tmp/meow-udp.log; then
     pass "udp_tcp_same_port"
 else
     fail "udp_tcp_same_port"
 fi
 
-# Test 21: udp_rules_persist — stopping meow must NOT remove the
-# deployer's TPROXY rules or policy routing
-kill -TERM "$UDP_MEOW_PID" 2>/dev/null
-for i in $(seq 1 10); do
-    kill -0 "$UDP_MEOW_PID" 2>/dev/null || break
-    sleep 0.5
-done
-kill -9 "$UDP_MEOW_PID" 2>/dev/null || true
-sleep 1
+# The v4 flow key/log spelling must stay native even though `[::]` owns a
+# sibling v6 socket. TCP lines are outside this assertion: a dual-stack TCP
+# listener may legitimately present v4 peers in mapped form.
+if [ "$UDP_LOG_COMPLETE" -eq 1 ] \
+    && grep -qE -- "UDP 10\.77\.0\.2:41001 --> 10\.89\.0\.1:9998 match" /tmp/meow-udp.log \
+    && ! grep -qE -- "UDP .*::ffff:" /tmp/meow-udp.log; then
+    pass "udp4_log_not_mapped"
+else
+    fail "udp4_log_not_mapped"
+fi
+
+if [ "$UDP_LOG_COMPLETE" -eq 1 ] \
+    && grep -qE -- "UDP \[fd77::2\]:41002 --> \[fd89::1\]:9998 match" /tmp/meow-udp.log; then
+    pass "udp6_flow_logged"
+else
+    fail "udp6_flow_logged"
+fi
+
+if [ "$UDP6ONLY_RC" -eq 0 ] \
+    && [ "$UDP6_ONLY_LOG_COMPLETE" -eq 1 ] \
+    && grep -qE -- "UDP \[fd77::2\]:41003 --> \[fd89::1\]:9997 match" /tmp/meow-udp6only.log; then
+    pass "udp6_only_relay"
+else
+    fail "udp6_only_relay"
+fi
+
+if [ "$UDP6_FAKE_RC" -eq 0 ] && [ -n "$FAKE_AAAA" ] \
+    && [ "$UDP_LOG_COMPLETE" -eq 1 ] \
+    && grep -qF -- "--> [$FAKE_AAAA]:9998 match Domain(echo6.test)" /tmp/meow-udp.log; then
+    pass "udp6_fake_aaaa"
+else
+    fail "udp6_fake_aaaa"
+fi
+
+# Both absence checks are meaningful only after normal-process log flush.
+if [ "$UNMAPPED_RC" -eq 0 ] \
+    && [ "$UDP_LOG_COMPLETE" -eq 1 ] \
+    && ! grep -qF -- "--> [fdfe:dcba:9876::ffff]:9998 match" /tmp/meow-udp.log; then
+    pass "udp6_fake_unmapped_drop"
+else
+    fail "udp6_fake_unmapped_drop"
+fi
+
+if [ "$V6_REAL_REMOVED" -eq 1 ] && [ "$NEGATIVE_RC" -eq 0 ] \
+    && [ "$UDP_LOG_COMPLETE" -eq 1 ] \
+    && ! grep -qF -- "UDP [fd77::2]:41006 " /tmp/meow-udp.log; then
+    pass "udp6_no_rule_no_reply"
+else
+    fail "udp6_no_rule_no_reply"
+fi
 
 if nft list table ip meow_udp_tproxy >/dev/null 2>&1 \
     && ip rule show | grep -q "fwmark 0x1 lookup 100"; then
     pass "udp_rules_persist"
 else
     fail "udp_rules_persist"
+fi
+
+V6_TABLE_DUMP="$(nft list table ip6 meow_udp6_tproxy 2>/dev/null)"
+if [ -n "$V6_TABLE_DUMP" ] \
+    && grep -q 'fd89::1' <<<"$V6_TABLE_DUMP" \
+    && [ "$V6_REAL_RESTORED" -eq 1 ] \
+    && ip -6 rule show 2>/dev/null | grep -q 'fwmark 0x1 lookup 100' \
+    && ip -6 route show table 100 2>/dev/null | grep -qE '^local (default|::/0)'; then
+    pass "udp6_rules_persist"
+else
+    fail "udp6_rules_persist"
 fi
 
 # Dump the live ruleset BEFORE teardown — a failure above needs the
@@ -482,12 +777,15 @@ nft list ruleset 2>/dev/null || echo "(empty)"
 echo "=== end nftables ==="
 
 # The harness owns everything external — tear it down explicitly. Kill
-# the echo loops first so a respawning `ip netns exec` can't busy-spin
-# against a vanishing namespace.
-kill "$UDP_ECHO_PID" "$TCP_SRV_ECHO_PID" 2>/dev/null || true
+# the fixture processes first so they cannot hold the namespaces open.
+kill "$UDP4_ECHO_PID" "$UDP6_ECHO_PID" "$UDP6_ONLY_ECHO_PID" \
+    "$DNS_FIXTURE_PID" "$TCP_SRV_ECHO_PID" 2>/dev/null || true
 nft delete table ip meow_udp_tproxy 2>/dev/null || true
+nft delete table ip6 meow_udp6_tproxy 2>/dev/null || true
 ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
 ip route del local 0.0.0.0/0 dev lo table 100 2>/dev/null || true
+ip -6 rule del fwmark 0x1 lookup 100 2>/dev/null || true
+ip -6 route del local ::/0 dev lo table 100 2>/dev/null || true
 ip netns del lan 2>/dev/null || true
 ip netns del srv 2>/dev/null || true
 ip link del veth-host 2>/dev/null || true
@@ -686,6 +984,10 @@ echo "=== end log ==="
 echo ""
 echo "=== meow log (udp tproxy) ==="
 cat /tmp/meow-udp.log 2>/dev/null || echo "(no log)"
+echo "=== end log ==="
+echo ""
+echo "=== meow log (udp6-only tproxy) ==="
+cat /tmp/meow-udp6only.log 2>/dev/null || echo "(no log)"
 echo "=== end log ==="
 echo ""
 echo "=== meow log (multi-listener, first run) ==="

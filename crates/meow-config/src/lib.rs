@@ -5685,6 +5685,52 @@ pub(crate) fn resolve_listener_bind(
     )
 }
 
+/// Validate the UDP-TPROXY listen contract against the raw `listen`
+/// spelling. This must run before [`resolve_listener_bind`], whose socket
+/// normalization drops `sin6_scope_id` from `[…%N]:port`.
+fn validate_tproxy_udp_listen(listen: &str, name: &str) -> Result<(), anyhow::Error> {
+    let (ip, scope_id) = if let Ok(ip) = listen.parse::<IpAddr>() {
+        (ip, 0)
+    } else if let Ok(addr) = listen.parse::<SocketAddr>() {
+        let scope = match addr {
+            SocketAddr::V6(v6) => v6.scope_id(),
+            SocketAddr::V4(_) => 0,
+        };
+        (addr.ip(), scope)
+    } else {
+        // Not a bind literal at all — `resolve_listener_bind` produces the
+        // canonical invalid-address diagnostic just below.
+        return Ok(());
+    };
+    let IpAddr::V6(ip) = ip else {
+        return Ok(());
+    };
+    if listen.contains('%') || scope_id != 0 {
+        anyhow::bail!(
+            "listeners[{name}]: `udp: true` does not accept scoped IPv6 listen \
+             address '{listen}' — UDP TPROXY v1 supports only unscoped routable \
+             IPv6; use the address without a zone, or `::` for dual-stack"
+        );
+    }
+    if ip.to_ipv4_mapped().is_some() {
+        anyhow::bail!(
+            "listeners[{name}]: `udp: true` does not accept IPv4-mapped IPv6 \
+             listen address '{listen}' — use the IPv4 literal, or `::` for \
+             dual-stack"
+        );
+    }
+    // fe80::/10 — link-local delivery requires a scope zone end to end,
+    // which the v1 UDP data plane deliberately does not carry.
+    if ip.segments()[0] & 0xffc0 == 0xfe80 {
+        anyhow::bail!(
+            "listeners[{name}]: `udp: true` does not accept link-local IPv6 \
+             listen address '{listen}' — use a routable/ULA IPv6 address, or \
+             `::` for dual-stack"
+        );
+    }
+    Ok(())
+}
+
 /// Parse `type:` string from a `listeners:` entry into a `ListenerSpec`.
 /// Hard errors on unknown types (Class A per ADR-0002).
 ///
@@ -5764,10 +5810,10 @@ fn parse_listener_spec(
             })
         }
         "tproxy" => {
-            // #564: `udp` is opt-in and IPv4-only in this release, and the
-            // managed firewall only produces host TCP OUTPUT REDIRECT rules —
-            // it cannot promise LAN UDP TPROXY policy routing, so the
-            // combination is rejected rather than silently TCP-only.
+            // #564: `udp` is opt-in, and the managed firewall only produces
+            // host TCP OUTPUT REDIRECT rules — it cannot promise LAN UDP
+            // TPROXY policy routing, so the combination is rejected rather
+            // than silently TCP-only.
             let udp = raw_l.udp.unwrap_or(false);
             let firewall = raw_l.firewall.unwrap_or_else(default_tproxy_firewall);
             if raw_l.transparent.is_none() {
@@ -7882,6 +7928,12 @@ fn build_named_listeners(
             }
             other => other,
         };
+        // The UDP-TPROXY address-family contract is checked on the raw
+        // spelling first: socket normalization below drops an IPv6 zone
+        // (`[…%N]:port`), and scoped input must fail rather than lose it.
+        if matches!(&spec, ListenerSpec::TProxy { udp: true, .. }) {
+            validate_tproxy_udp_listen(listen_raw, &raw_l.name)?;
+        }
         // The anytls builder already normalized every bind target; its
         // first address plays `NamedListener.listen`/`port` while the
         // full `addresses` list stays on the spec.
@@ -7889,21 +7941,6 @@ fn build_named_listeners(
             ListenerSpec::Anytls(cfg) => (cfg.addresses[0].listen.clone(), cfg.addresses[0].port),
             _ => resolve_listener_bind(listen_raw, raw_l.port)?,
         };
-        // UDP TPROXY is IPv4-only in this release (issue #564): `::` is
-        // dual-stack on Linux and would silently accept v6 datagrams, so
-        // reject it rather than claim partial dual-stack support.
-        if let ListenerSpec::TProxy { udp: true, .. } = spec {
-            let v4 = listen
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_ipv4());
-            if !v4 {
-                anyhow::bail!(
-                    "listeners[{}]: `udp: true` is IPv4-only in this release — \
-                     bind an IPv4 address (`{listen}` resolves to IPv6/dual-stack)",
-                    raw_l.name
-                );
-            }
-        }
         // `listeners[].rule` selects a `sub-rules:` block BY NAME — not a
         // rule-provider and not an `IN-NAME` rule (upstream
         // `WithSpecialRules`). Requiring the block in this same document

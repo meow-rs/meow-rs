@@ -1,0 +1,30 @@
+# Specific-IPv6 UDP TPROXY bind: covers the single-family half of the #1017
+# listen matrix. Runs beside the dual-stack `[::]` instance on a distinct port.
+mixed-port: 7898
+routing-mark: 9527
+mode: rule
+log-level: debug
+ipv6: true
+
+listeners:
+  - name: udp6-only-tproxy
+    type: tproxy
+    listen: "fd77::1"
+    port: 7901
+    firewall: false
+    udp: true
+    udp-timeout: 30
+
+dns:
+  enable: false
+
+proxies:
+  - name: "test-ss"
+    type: ss
+    server: "10.99.0.1"
+    port: 8388
+    cipher: "aes-128-gcm"
+    password: "test-password"
+
+rules:
+  - "MATCH,DIRECT"

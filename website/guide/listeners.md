@@ -53,7 +53,7 @@ listeners:
 | `listen` | string | | per type | Bind IP literal, or `host:port` (e.g. `127.0.0.1:0`); `anytls` also accepts a comma-separated list of them |
 | `tproxy-sni` | bool | | global | (tproxy) deprecated SNI shorthand — prefer [`sniffer`](./sniffer) |
 | `firewall` | bool | | `true` | (tproxy) `false` = external firewall management — no nft/pfctl calls, no cleanup; see [Transparent Proxy](./transparent-proxy) |
-| `udp` | bool | | `false` | (tproxy, Linux/IPv4 only) UDP TPROXY on the same port; requires `firewall: false`; see [Transparent Proxy](./transparent-proxy) |
+| `udp` | bool | | `false` | (tproxy, Linux only) UDP TPROXY on the same port; IPv4 or unscoped, non-link-local IPv6 `listen` (`::` covers both families); requires `firewall: false`; see [Transparent Proxy](./transparent-proxy) |
 | `udp-timeout` | secs | | `60` | (tproxy) UDP flow idle timeout; `0` is an error |
 | `transparent` | bool | | `false` | (tproxy, Linux only) real TCP TPROXY — the accepted socket's local address is the original destination; requires `firewall: false` |
 | `max-connections` | usize | | global | Per-listener concurrency cap; `0` = unlimited |

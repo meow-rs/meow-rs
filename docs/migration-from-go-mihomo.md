@@ -912,15 +912,17 @@ Most common format from public providers. Typical issues:
    it is not the upstream top-level `iptables:` equivalent; the upstream
    `iptables:` block itself (`enable`/`inbound-interface`/`bypass`/
    `dns-redirect`) is likewise ignored.
-5. **UDP TPROXY is opt-in and narrower than upstream.** Upstream's
+5. **UDP TPROXY is opt-in and externally managed.** Upstream's
    `tproxy-port` intercepts TCP **and** UDP; meow-rs's shorthand is TCP-only —
    a migrated deployer steering UDP at it silently blackholes the datagrams
    (they never reach a socket meow owns). To serve UDP, declare a
    `listeners:` tproxy entry with `udp: true`, which requires
    `firewall: false` (the managed firewall only covers host output-chain TCP
    REDIRECT) — upstream's `udp: true` + managed `iptables` combination has no
-   direct equivalent. UDP is also IPv4-only (upstream does v6), Linux-only,
-   and `prerouting`-scoped; see `docs/tproxy-gateway.md`.
+   direct equivalent. UDP is Linux-only and `prerouting`-scoped; IPv4 and
+   unscoped, non-link-local IPv6 listens are supported, and `listen: '::'`
+   binds both families on the same port. The deployer owns each family's
+   TPROXY rules and fwmark/policy routing; see `docs/tproxy-gateway.md`.
 
 ### Type 4: Proxy provider subscription (`proxy-providers:`)
 
