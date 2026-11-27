@@ -562,6 +562,7 @@ fn run_application_inner(
             // An inbound this build did not compile would be
             // warn-skipped at startup — that must not pass a config test.
             ensure_inbounds_supported(&config)?;
+            #[cfg(feature = "listener-vless")]
             ensure_vless_security_valid(&config)?;
             if args.config_string.is_some() {
                 info!("Configuration test passed (--config-string)");
@@ -894,10 +895,8 @@ fn vless_security_spec(security: &meow_config::VlessSecurity) -> meow_listener::
 /// a certificate pair is runtime material whose syntax and key match cannot
 /// be checked from the YAML shape alone. It still binds nothing, resolves no
 /// cover target, and makes no network connection.
+#[cfg(feature = "listener-vless")]
 fn ensure_vless_security_valid(config: &meow_config::Config) -> anyhow::Result<()> {
-    #[cfg(not(feature = "listener-vless"))]
-    let _ = config;
-    #[cfg(feature = "listener-vless")]
     for nl in &config.listeners.named {
         if let meow_config::ListenerSpec::Vless(cfg) = &nl.spec {
             meow_listener::validate_vless_security_spec(vless_security_spec(&cfg.security))

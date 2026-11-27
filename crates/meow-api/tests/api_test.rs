@@ -97,6 +97,7 @@ fn test_state_with_backing(raw: RawConfig, config_path: Option<String>) -> Arc<A
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        listener_gate: None,
         cors: Default::default(),
     })
 }
@@ -139,6 +140,7 @@ fn test_state_with_route(raw: RawConfig, named: Vec<(&str, Arc<dyn Proxy>)>) -> 
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        listener_gate: None,
         cors: Default::default(),
     })
 }
@@ -188,6 +190,7 @@ fn test_state_with_secret(secret: &str) -> Arc<AppState> {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        listener_gate: None,
         cors: Default::default(),
     })
 }
@@ -276,6 +279,265 @@ async fn listeners_endpoint_discloses_tproxy_firewall_mode() {
     assert!(body[1].get("udp-timeout").is_none());
 }
 
+fn vless_reality_document() -> &'static str {
+    concat!(
+        "mode: rule\n",
+        "listeners:\n",
+        "  - name: vision-in\n",
+        "    type: vless\n",
+        "    listen: 127.0.0.1\n",
+        "    port: 0\n",
+        "    reality-config:\n",
+        "      dest: \"www.example.com:443\"\n",
+        "      private-key: \"dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo\"\n",
+        "      short-id: [\"0123456789abcdef\"]\n",
+        "      server-names: [\"www.example.com\"]\n",
+        "    users:\n",
+        "      - username: alice\n",
+        "        uuid: \"11111111-1111-4111-8111-111111111111\"\n",
+        "        flow: xtls-rprx-vision\n",
+        "rules:\n",
+        "  - MATCH,DIRECT\n",
+    )
+}
+
+fn missing_vless_listener_gate(spec: &meow_config::ListenerSpec) -> Option<&'static str> {
+    matches!(spec, meow_config::ListenerSpec::Vless(_)).then_some("listener-vless")
+}
+
+/// `type: vless` is one of the persistence-hard feature gates: even
+/// `?force=true` must not write a listener this binary cannot serve,
+/// because the next startup would fail its unservable-inbound check.
+#[tokio::test]
+async fn put_configs_force_rejects_vless_when_listener_feature_is_missing() {
+    use base64::Engine as _;
+
+    let mut state = test_state_default();
+    let config_path = state.config_path.clone().unwrap();
+    Arc::get_mut(&mut state).unwrap().listener_gate = Some(missing_vless_listener_gate);
+    let payload = base64::engine::general_purpose::STANDARD.encode(vless_reality_document());
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs?force=true")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "payload": payload }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_json(resp).await;
+    let message = body["message"].as_str().unwrap();
+    assert!(
+        message.contains("type vless") && message.contains("listener-vless"),
+        "unexpected rejection: {message}"
+    );
+    assert!(
+        state.raw_config.read().listeners.is_none(),
+        "the rejected candidate must not mutate the live raw config"
+    );
+    assert!(
+        !std::path::Path::new(&config_path).exists(),
+        "the force path must not persist an unservable vless listener"
+    );
+}
+
+fn vless_reality_named_listener(
+    name: &str,
+    first_port: u16,
+    second_port: Option<u16>,
+) -> meow_config::NamedListener {
+    use meow_config::{
+        ListenerBind, ListenerSpec, NamedListener, RealityLimitFallback, VlessListenerConfig,
+        VlessRealityConfig, VlessSecurity, VlessUser,
+    };
+
+    let mut addresses = vec![ListenerBind {
+        listen: "127.0.0.1".into(),
+        port: first_port,
+    }];
+    if let Some(port) = second_port {
+        addresses.push(ListenerBind {
+            listen: "127.0.0.2".into(),
+            port,
+        });
+    }
+    NamedListener {
+        name: name.into(),
+        spec: ListenerSpec::Vless(VlessListenerConfig {
+            users: vec![VlessUser {
+                username: "alice".into(),
+                uuid: [
+                    0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x41, 0x11, 0x81, 0x11, 0x11, 0x11, 0x11,
+                    0x11, 0x11, 0x11,
+                ],
+            }],
+            security: VlessSecurity::Reality(VlessRealityConfig {
+                dest: "www.example.com:443".into(),
+                private_key: [0x42; 32],
+                short_ids: vec![[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]],
+                server_names: vec!["www.example.com".into()],
+                max_time_difference_us: 120_000_000,
+                limit_fallback_upload: RealityLimitFallback::default(),
+                limit_fallback_download: RealityLimitFallback::default(),
+            }),
+            udp: true,
+            addresses,
+        }),
+        port: first_port,
+        listen: "127.0.0.1".into(),
+        max_connections: 256,
+        route_override: None,
+        routing_mark: None,
+    }
+}
+
+/// `GET /listeners` is an endpoint snapshot, not a config dump: VLESS
+/// credentials (`users[].uuid`, REALITY `private-key` and `short-id`) must
+/// never cross the API boundary, while multi-bind entries disclose only
+/// their bound endpoints.
+#[tokio::test]
+async fn listeners_endpoint_redacts_vless_credentials() {
+    use base64::Engine as _;
+
+    let mut state = test_state_default();
+    Arc::get_mut(&mut state).unwrap().listeners =
+        vec![vless_reality_named_listener("vision-in", 18443, None)];
+    let resp = create_router(state)
+        .oneshot(
+            Request::get("/listeners")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_string(resp).await;
+    let reality_key = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode([0x42; 32]);
+    for leaked in [
+        "11111111-1111-4111-8111-111111111111",
+        "0123456789abcdef",
+        reality_key.as_str(),
+        "private-key",
+        "short-id",
+        "users",
+        "uuid",
+    ] {
+        assert!(
+            !body.contains(leaked),
+            "GET /listeners leaked {leaked}: {body}"
+        );
+    }
+    let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let mut keys = json[0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(keys, ["listen", "name", "port", "type"]);
+}
+
+/// The startup path rewrites `port: 0` to every OS-assigned endpoint
+/// before constructing this snapshot (meow-app's multi-bind publish).
+/// The API must report that complete snapshot without collapsing the
+/// multi-address entry back to one address or exposing the configured zero.
+#[tokio::test]
+async fn listeners_endpoint_publishes_vless_ephemeral_multi_bind_snapshot() {
+    let mut state = test_state_default();
+    Arc::get_mut(&mut state).unwrap().listeners = vec![vless_reality_named_listener(
+        "vision-in",
+        32443,
+        Some(32444),
+    )];
+    let resp = create_router(state)
+        .oneshot(
+            Request::get("/listeners")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = body_json(resp).await;
+    assert_eq!(body[0]["port"], 32443);
+    assert_ne!(body[0]["port"], 0);
+    assert_eq!(
+        body[0]["addresses"],
+        serde_json::json!([
+            { "listen": "127.0.0.1", "port": 32443 },
+            { "listen": "127.0.0.2", "port": 32444 },
+        ])
+    );
+}
+
+/// A committed document can carry REALITY private key material. The
+/// end-to-end API persistence path must therefore land owner-only both
+/// the replacement config and the backup of the file it replaced.
+#[cfg(unix)]
+#[tokio::test]
+async fn put_configs_persists_vless_secrets_with_owner_only_file_modes() {
+    use base64::Engine as _;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state_default();
+    let config_path = std::path::PathBuf::from(state.config_path.clone().unwrap());
+    std::fs::write(&config_path, "mode: rule\n").unwrap();
+    std::fs::set_permissions(&config_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let payload = base64::engine::general_purpose::STANDARD.encode(vless_reality_document());
+    let resp = create_router(Arc::clone(&state))
+        .oneshot(
+            Request::builder()
+                .method("PUT")
+                .uri("/configs")
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from(
+                    serde_json::json!({ "payload": payload }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let resp = create_router(state)
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/config/save")
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        std::fs::read_to_string(&config_path)
+            .unwrap()
+            .contains("dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo"),
+        "the test document must really persist secret-bearing material"
+    );
+    for path in [config_path.clone(), config_path.with_extension("yaml.bak")] {
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "{} must be owner-only",
+            path.display()
+        );
+    }
+    assert_eq!(
+        std::fs::read_to_string(config_path.with_extension("yaml.bak")).unwrap(),
+        "mode: rule\n"
+    );
+}
+
 #[tokio::test]
 async fn ui_wildcard_serves_same_html() {
     let state = test_state_default();
@@ -340,6 +602,7 @@ async fn external_ui_serves_static_directory() {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        listener_gate: None,
         cors: Default::default(),
     });
     let app = create_router(state);
@@ -5266,6 +5529,7 @@ mod delay_support {
             traffic_feed: Default::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            listener_gate: None,
             cors: Default::default(),
         })
     }
@@ -5327,6 +5591,7 @@ mod delay_support {
             traffic_feed: Default::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            listener_gate: None,
             cors: Default::default(),
         })
     }
@@ -6715,6 +6980,7 @@ fn test_state_with_hosts_entry() -> Arc<AppState> {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        listener_gate: None,
         cors: Default::default(),
     })
 }
@@ -6884,6 +7150,7 @@ async fn get_dns_query_txt_relays_upstream_sections_and_flags() {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        listener_gate: None,
         cors: Default::default(),
     });
 

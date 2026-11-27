@@ -147,6 +147,11 @@ pub struct AppState {
     /// `external-controller-cors` resolved at startup — every transport
     /// (TCP/TLS/unix/pipe) serves this one policy (issue #974).
     pub cors: meow_config::ApiCorsConfig,
+    /// Per-state listener-feature gate override. Production state leaves
+    /// this `None` and uses the process-wide gate installed by the
+    /// embedder; tests can scope a missing-feature gate to one router
+    /// instead of poisoning the process-global `OnceLock` for siblings.
+    pub listener_gate: Option<crate::ListenerGate>,
 }
 
 /// Handle to the running standalone DNS server (config `dns.listen`).
@@ -281,6 +286,10 @@ pub static CONFIG_MUTATION: Mutex<()> = Mutex::const_new(());
 impl AppState {
     fn auth_required(&self) -> bool {
         self.secret.as_deref().is_some_and(|s| !s.is_empty())
+    }
+
+    fn listener_gate(&self) -> crate::ListenerGate {
+        self.listener_gate.unwrap_or_else(crate::listener_gate)
     }
 }
 
@@ -5274,7 +5283,7 @@ async fn put_configs(
     // serve fails the NEXT boot's `ensure_inbounds_supported` hard-check, so
     // committing it is a Class-A defect like malformed shape — reject it
     // identically even under `?force`.
-    let gate = crate::listener_gate();
+    let gate = state.listener_gate();
     if let Some(l) = named_listeners.iter().find(|l| {
         matches!(
             l.spec,
@@ -5967,7 +5976,7 @@ async fn put_configs(
     // environment property `force` degrades like the other rebuild
     // failures. Listeners are still a startup snapshot (no hot-reload),
     // this only gates persistence.
-    if let Err(e) = crate::ensure_listeners_supported(&named_listeners, crate::listener_gate()) {
+    if let Err(e) = crate::ensure_listeners_supported(&named_listeners, state.listener_gate()) {
         if force {
             tracing::error!("config reload forced despite listeners config error: {e}");
             forced.push(format!("listeners config error: {e}"));
@@ -7701,6 +7710,7 @@ mod outbound_flush_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            listener_gate: None,
             cors: Default::default(),
         })
     }
@@ -8030,6 +8040,7 @@ mod global_route_binding_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            listener_gate: None,
             cors: Default::default(),
         })
     }
@@ -8478,6 +8489,7 @@ mod anytls_listeners_api_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            listener_gate: None,
             cors: Default::default(),
         })
     }

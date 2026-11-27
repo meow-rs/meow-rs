@@ -7,7 +7,7 @@
 //! wrapped in the server Vision codec and routed through
 //! [`route_inbound_tcp`] with the authenticated username in
 //! `Metadata.in_user`; Mux commands run the XUDP association in
-//! [`crate::vless_xudp`] over the same codec in XUDP mode. REALITY
+//! `vless_xudp` over the same codec in XUDP mode. REALITY
 //! classification failures are transparently relayed to the configured
 //! cover target; authenticated REALITY flows never dial that target.
 

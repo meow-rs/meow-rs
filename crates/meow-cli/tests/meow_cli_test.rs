@@ -85,6 +85,7 @@ impl Meow {
             traffic_feed: Default::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            listener_gate: None,
             cors: Default::default(),
         });
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

@@ -63,6 +63,7 @@ fn test_state(cors: meow_config::ApiCorsConfig, secret: Option<&str>) -> Arc<App
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        listener_gate: None,
         cors,
     })
 }
@@ -1370,6 +1371,7 @@ async fn get_configs_never_echoes_controller_tls_keys() {
         traffic_feed: Default::default(),
         dns_server: Default::default(),
         ui_storage: Default::default(),
+        listener_gate: None,
         cors: Default::default(),
     });
     let resp = create_router(state)
