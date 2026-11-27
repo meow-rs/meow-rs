@@ -169,6 +169,11 @@ tokio-rustls = { workspace = true }
 hex = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
+hmac = { workspace = true }
+# vless_reality_mimic_finished.rs: the controlled client-Finished tests
+# re-seal TLS 1.3 records with independently derived keys (the whole point
+# is a client-side key schedule that shares no code with the transport's).
+aes-gcm = { workspace = true }
 tempfile = { workspace = true }
 
 # listener-tun: the Wintun adapter's addresses are assigned through IP
