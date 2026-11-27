@@ -544,12 +544,15 @@ impl VlessListener {
                             match Arc::clone(&reality.handshake_slots).try_acquire_owned() {
                                 Ok(p) => Some(p),
                                 Err(_) => {
-                                    reality.metrics.inc_close(
-                                        crate::vless_mimic::ClosePhase::Admission,
-                                        crate::vless_mimic::CloseReason::HandshakeSaturated,
-                                    );
+                                    if matches!(reality.mimic.mode, VlessRealityMimicMode::DialFirst)
+                                    {
+                                        reality.metrics.inc_close(
+                                            crate::vless_mimic::ClosePhase::Admission,
+                                            crate::vless_mimic::CloseReason::HandshakeSaturated,
+                                        );
+                                    }
                                     debug!(
-                                        "vless listener '{}' REALITY classification saturated at {} slots; refusing {peer}",
+                                        "vless listener '{}' REALITY classification saturated at {} slots; refusing a peer",
                                         self.name, REALITY_HANDSHAKE_SLOTS
                                     );
                                     continue;

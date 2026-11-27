@@ -2108,11 +2108,11 @@ where
 {
     if !initial.is_empty() {
         write_shaped(&mut writer, &initial, &mut limit, &activity).await?;
-        // The preserved ClientHello can run to 64 KiB; holding it for the
-        // relay's lifetime would keep that allocation pinned per cover
-        // connection long after its only use.
-        drop(initial);
     }
+    // The preserved ClientHello can run to 64 KiB; holding it for the relay's
+    // lifetime would keep that allocation pinned per cover connection long
+    // after its only use.
+    drop(initial);
     let mut buf = [0u8; COVER_BUFFER];
     loop {
         let n = reader.read(&mut buf).await?;
