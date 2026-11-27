@@ -378,12 +378,14 @@ async fn reality_handshake(
             if let Some(msg) = pop_handshake_message(&mut handshake_buf) {
                 break msg;
             }
-            if handshake_buf.len() >= MAX_PRE_AUTH_TRANSCRIPT_LEN {
-                return Err(TransportError::Tls(
-                    "Reality TLS: fragmented handshake message exceeds the pre-auth bound".into(),
-                ));
-            }
-            fill_decrypted_handshake(&mut inner, &mut server_hs, &mut handshake_buf).await?;
+            validate_handshake_reassembly_budget(transcript.len(), &handshake_buf)?;
+            fill_decrypted_handshake(
+                &mut inner,
+                &mut server_hs,
+                &mut handshake_buf,
+                transcript.len(),
+            )
+            .await?;
         };
         match msg.typ {
             HS_ENCRYPTED_EXTENSIONS | HS_CERTIFICATE | HS_CERTIFICATE_VERIFY => {
@@ -907,10 +909,30 @@ async fn read_plain_handshake<R: AsyncRead + Unpin>(r: &mut R, expected: u8) -> 
     }
 }
 
+fn validate_handshake_reassembly_budget(transcript_len: usize, out: &VecDeque<u8>) -> Result<()> {
+    if transcript_len + out.len() > MAX_PRE_AUTH_TRANSCRIPT_LEN {
+        return Err(TransportError::ResourceLimit(format!(
+            "Reality TLS: fragmented handshake reassembly exceeded {MAX_PRE_AUTH_TRANSCRIPT_LEN} bytes"
+        )));
+    }
+    if out.len() >= 4 {
+        let header = out.iter().copied().take(4).collect::<Vec<_>>();
+        let declared = 4 + read_u24(&header[1..4]);
+        let remaining = MAX_PRE_AUTH_TRANSCRIPT_LEN.saturating_sub(transcript_len);
+        if declared > remaining {
+            return Err(TransportError::ResourceLimit(format!(
+                "Reality TLS: fragmented handshake message of {declared} bytes exceeds the remaining pre-auth budget {remaining}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 async fn fill_decrypted_handshake<R: AsyncRead + Unpin>(
     r: &mut R,
     key: &mut RecordKey,
     out: &mut VecDeque<u8>,
+    transcript_len: usize,
 ) -> Result<()> {
     loop {
         let record = read_record(r).await?.ok_or_else(|| {
@@ -933,7 +955,16 @@ async fn fill_decrypted_handshake<R: AsyncRead + Unpin>(
         let (inner_type, plaintext) = key.open(&record.header, &record.payload)?;
         match inner_type {
             TLS_RECORD_HANDSHAKE => {
+                let remaining = MAX_PRE_AUTH_TRANSCRIPT_LEN
+                    .saturating_sub(transcript_len)
+                    .saturating_sub(out.len());
+                if plaintext.len() > remaining {
+                    return Err(TransportError::ResourceLimit(format!(
+                        "Reality TLS: encrypted handshake fragment exceeds the remaining pre-auth budget {remaining}"
+                    )));
+                }
                 out.extend(plaintext);
+                validate_handshake_reassembly_budget(transcript_len, out)?;
                 return Ok(());
             }
             TLS_RECORD_ALERT => {
@@ -3108,6 +3139,110 @@ mod tests {
         put_u24(body.len(), &mut hello);
         hello.extend_from_slice(&body);
         hello
+    }
+
+    fn sealed_handshake_fragments(fragments: &[&[u8]]) -> (Vec<u8>, RecordKey) {
+        let secret = vec![0x31; 32];
+        let mut seal_key = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        let open_key = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        let mut wire = Vec::new();
+        for fragment in fragments {
+            wire.extend_from_slice(
+                &seal_key
+                    .seal(TLS_RECORD_HANDSHAKE, fragment)
+                    .expect("seal fragment"),
+            );
+        }
+        (wire, open_key)
+    }
+
+    #[tokio::test]
+    async fn encrypted_handshake_reassembly_accepts_legitimate_multi_record_fragmentation() {
+        let mut message = vec![HS_CERTIFICATE, 0, 0, 20];
+        message.extend_from_slice(&[0xa5; 20]);
+        let pieces = [
+            &message[..1],
+            &message[1..4],
+            &message[4..11],
+            &message[11..],
+        ];
+        let (wire, mut open_key) = sealed_handshake_fragments(&pieces);
+        let mut input = &wire[..];
+        let mut out = VecDeque::new();
+        for _ in pieces {
+            fill_decrypted_handshake(&mut input, &mut open_key, &mut out, 100)
+                .await
+                .expect("legitimate fragmented message fits the remaining budget");
+        }
+        let popped = pop_handshake_message(&mut out).expect("complete fragmented message");
+        assert_eq!(popped.raw, message);
+    }
+
+    #[tokio::test]
+    async fn encrypted_handshake_reassembly_accepts_exact_remaining_budget_across_records() {
+        let transcript_len = 100usize;
+        let message_len = MAX_PRE_AUTH_TRANSCRIPT_LEN - transcript_len;
+        let body_len = message_len - 4;
+        let mut message = vec![HS_CERTIFICATE];
+        message.extend_from_slice(&(body_len as u32).to_be_bytes()[1..4]);
+        message.resize(message_len, 0x5a);
+        let mut fragments = Vec::new();
+        let mut pos = 0usize;
+        while pos < message.len() {
+            let end = (pos + 16_384).min(message.len());
+            fragments.push(&message[pos..end]);
+            pos = end;
+        }
+        let (wire, mut open_key) = sealed_handshake_fragments(&fragments);
+        let mut input = &wire[..];
+        let mut out = VecDeque::new();
+        for _ in &fragments {
+            fill_decrypted_handshake(&mut input, &mut open_key, &mut out, transcript_len)
+                .await
+                .expect("exact remaining budget must stay legal across record fragments");
+        }
+        assert_eq!(out.len(), message_len);
+    }
+
+    #[tokio::test]
+    async fn encrypted_handshake_reassembly_rejects_oversize_declaration_once_header_is_known() {
+        let transcript_len = 100usize;
+        let remaining = MAX_PRE_AUTH_TRANSCRIPT_LEN - transcript_len;
+        let body_len = remaining - 4 + 1;
+        let mut header = vec![HS_CERTIFICATE];
+        header.extend_from_slice(&(body_len as u32).to_be_bytes()[1..4]);
+        let (wire, mut open_key) = sealed_handshake_fragments(&[&header]);
+        let mut input = &wire[..];
+        let mut out = VecDeque::new();
+        let error = fill_decrypted_handshake(&mut input, &mut open_key, &mut out, transcript_len)
+            .await
+            .expect_err("declared message is larger than the remaining budget");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the remaining pre-auth budget"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_handshake_reassembly_checks_cumulative_budget_before_append() {
+        let transcript_len = MAX_PRE_AUTH_TRANSCRIPT_LEN - 10;
+        let mut plaintext = vec![HS_ENCRYPTED_EXTENSIONS, 0, 0, 0];
+        plaintext.extend_from_slice(&[0xaa; 7]);
+        let (wire, mut open_key) = sealed_handshake_fragments(&[&plaintext]);
+        let mut input = &wire[..];
+        let mut out = VecDeque::new();
+        let error = fill_decrypted_handshake(&mut input, &mut open_key, &mut out, transcript_len)
+            .await
+            .expect_err("eleven plaintext bytes cannot fit a ten-byte remaining budget");
+        assert!(
+            error
+                .to_string()
+                .contains("exceeds the remaining pre-auth budget"),
+            "unexpected error: {error}"
+        );
+        assert!(out.is_empty(), "over-budget plaintext is not appended");
     }
 
     /// Drives `reality_handshake` against an in-memory duplex peer that
