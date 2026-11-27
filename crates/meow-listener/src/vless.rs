@@ -1304,10 +1304,18 @@ mod tests {
         let task = tokio::spawn(async move {
             let _ = task_listener.run_on(socket).await;
         });
-        let _overflowed = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        let mut overflowed = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut byte = [0u8; 1];
+        let rejected = matches!(
+            tokio::time::timeout(Duration::from_secs(2), overflowed.read(&mut byte)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        assert!(
+            rejected,
+            "off-mode overflow socket must be refused, not parked"
+        );
         let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
         assert_eq!(
             snapshot
