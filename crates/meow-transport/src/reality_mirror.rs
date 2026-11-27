@@ -5,6 +5,7 @@ use std::ops::Range;
 
 use crate::reality_hello::{GROUP_X25519, GROUP_X25519_MLKEM768};
 use subtle::ConstantTimeEq;
+use tokio::io::AsyncReadExt;
 
 use crate::reality_server::{
     certificate_message, certificate_verify_input, encapsulate_server_share, handshake_message,
@@ -12,11 +13,11 @@ use crate::reality_server::{
     VerifiedHello, SIG_ED25519,
 };
 use crate::reality_tls::{
-    finished_verify_data_with_hash, put_u16, read_record, read_u24, x25519,
-    x25519_public_from_private, ApplicationKeys, CipherSuite, HandshakeKeys, RecordKey,
-    TranscriptHasher, HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED,
-    TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256,
-    TLS_RECORD_APPLICATION_DATA, TLS_RECORD_CHANGE_CIPHER_SPEC, TLS_RECORD_HANDSHAKE,
+    finished_verify_data_with_hash, put_u16, read_u24, x25519, x25519_public_from_private,
+    ApplicationKeys, CipherSuite, HandshakeKeys, RecordKey, TranscriptHasher,
+    HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, TLS_AES_128_GCM_SHA256,
+    TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, TLS_RECORD_APPLICATION_DATA,
+    TLS_RECORD_CHANGE_CIPHER_SPEC, TLS_RECORD_HANDSHAKE,
 };
 use crate::{Result as TransportResult, Stream, TransportError};
 
@@ -737,12 +738,13 @@ impl MirroredHandshakeCompletion {
     /// fresh application record keys on the original client stream.
     pub async fn finish(self, mut inner: Box<dyn Stream>) -> TransportResult<Box<dyn Stream>> {
         let mut client_handshake = self.client_handshake;
-        let verify_data = read_mirrored_client_finished(
+        let finished = read_mirrored_client_finished(
             &mut inner,
             &mut client_handshake,
             self.cipher.hash().len(),
         )
         .await?;
+        let verify_data = &finished.bytes[4..finished.len];
         if verify_data.len() != self.expected_client_finished.len()
             || !bool::from(verify_data.ct_eq(&self.expected_client_finished))
         {
@@ -761,35 +763,88 @@ impl MirroredHandshakeCompletion {
     }
 }
 
+#[derive(Debug)]
+struct MirroredFinishedMessage {
+    len: usize,
+    bytes: [u8; 52],
+}
+
 async fn read_mirrored_client_finished(
     inner: &mut Box<dyn Stream>,
     key: &mut RecordKey,
     finished_len: usize,
-) -> TransportResult<Vec<u8>> {
+) -> TransportResult<MirroredFinishedMessage> {
     let mut total_wire = 0usize;
     let mut ignored_ccs = false;
-    let mut handshake = Vec::with_capacity(4 + finished_len);
+    let mut body = Vec::with_capacity(16401);
+    let mut handshake = MirroredFinishedMessage {
+        len: 0,
+        bytes: [0; 52],
+    };
     for _ in 0..32 {
-        let Some(record) = read_record(inner).await? else {
-            return Err(TransportError::Tls(
-                "EOF before REALITY mirrored client Finished".into(),
-            ));
-        };
-        total_wire = total_wire
-            .checked_add(5 + record.payload.len())
-            .ok_or_else(|| {
-                TransportError::ResourceLimit("REALITY Finished wire overflow".into())
-            })?;
+        let mut header = [0u8; 5];
+        inner.read_exact(&mut header).await.map_err(|e| {
+            if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                TransportError::Tls("EOF before REALITY mirrored client Finished".into())
+            } else {
+                TransportError::Io(e)
+            }
+        })?;
+        total_wire = total_wire.checked_add(5).ok_or_else(|| {
+            TransportError::ResourceLimit("REALITY Finished wire overflow".into())
+        })?;
         if total_wire > 65_536 {
             return Err(TransportError::ResourceLimit(
                 "REALITY mirrored client Finished exceeds 64 KiB".into(),
             ));
         }
-        if record.typ == TLS_RECORD_CHANGE_CIPHER_SPEC {
-            if ignored_ccs
-                || record.header != [0x14, 0x03, 0x03, 0x00, 0x01]
-                || record.payload != [1]
-            {
+        let record_len = usize::from(u16::from_be_bytes([header[3], header[4]]));
+        if total_wire
+            .checked_add(record_len)
+            .ok_or_else(|| TransportError::ResourceLimit("REALITY Finished wire overflow".into()))?
+            > 65_536
+        {
+            return Err(TransportError::ResourceLimit(
+                "REALITY mirrored client Finished exceeds 64 KiB".into(),
+            ));
+        }
+
+        // Header-level admission happens before the body allocation is filled
+        // or copied.  In particular, a second CCS and an over-budget length
+        // are rejected without reading their payload bytes.
+        if header[0] == TLS_RECORD_CHANGE_CIPHER_SPEC {
+            if ignored_ccs || header != [0x14, 0x03, 0x03, 0x00, 0x01] || record_len != 1 {
+                return Err(TransportError::Tls(
+                    "REALITY mirrored client Finished carries a non-canonical CCS".into(),
+                ));
+            }
+        } else {
+            if header[0] != TLS_RECORD_APPLICATION_DATA {
+                return Err(TransportError::Tls(
+                    "REALITY mirrored client Finished record type".into(),
+                ));
+            }
+            if header[1..3] != [0x03, 0x03] {
+                return Err(TransportError::Tls(
+                    "REALITY mirrored client Finished record version".into(),
+                ));
+            }
+            if !(18..=16401).contains(&record_len) {
+                return Err(TransportError::Tls(
+                    "REALITY mirrored client Finished record length".into(),
+                ));
+            }
+        }
+
+        body.clear();
+        body.resize(record_len, 0);
+        inner
+            .read_exact(&mut body)
+            .await
+            .map_err(TransportError::Io)?;
+        total_wire += record_len;
+        if header[0] == TLS_RECORD_CHANGE_CIPHER_SPEC {
+            if body != [1] {
                 return Err(TransportError::Tls(
                     "REALITY mirrored client Finished carries a non-canonical CCS".into(),
                 ));
@@ -797,49 +852,35 @@ async fn read_mirrored_client_finished(
             ignored_ccs = true;
             continue;
         }
-        if record.typ != TLS_RECORD_APPLICATION_DATA {
-            return Err(TransportError::Tls(
-                "REALITY mirrored client Finished record type".into(),
-            ));
-        }
-        if record.header[1..3] != [0x03, 0x03] {
-            return Err(TransportError::Tls(
-                "REALITY mirrored client Finished record version".into(),
-            ));
-        }
-        let record_len = record.payload.len();
-        if !(18..=16401).contains(&record_len) {
-            return Err(TransportError::Tls(
-                "REALITY mirrored client Finished record length".into(),
-            ));
-        }
-        let mut payload = record.payload;
-        let (inner_type, len) = key.open_in_place(&record.header, &mut payload)?;
-        payload.truncate(len);
-        if inner_type != TLS_RECORD_HANDSHAKE || payload.is_empty() {
+
+        let (inner_type, len) = key.open_in_place(&header, &mut body)?;
+        body.truncate(len);
+        if inner_type != TLS_RECORD_HANDSHAKE || body.is_empty() {
             return Err(TransportError::Tls(
                 "REALITY mirrored client Finished inner record type".into(),
             ));
         }
-        if handshake.is_empty() && payload[0] != HS_FINISHED {
+        if handshake.len == 0 && body[0] != HS_FINISHED {
             return Err(TransportError::Tls(
                 "REALITY mirrored client handshake message is not Finished".into(),
             ));
         }
-        handshake.extend_from_slice(&payload);
-        if handshake.len() > 4 + finished_len {
+        if handshake.len + body.len() > 4 + finished_len {
             return Err(TransportError::Tls(
                 "REALITY bytes after mirrored client Finished".into(),
             ));
         }
-        if handshake.len() >= 4 {
-            if handshake[0] != HS_FINISHED || read_u24(&handshake[1..4]) != finished_len {
+        handshake.bytes[handshake.len..handshake.len + body.len()].copy_from_slice(&body);
+        handshake.len += body.len();
+        if handshake.len >= 4 {
+            if handshake.bytes[0] != HS_FINISHED || read_u24(&handshake.bytes[1..4]) != finished_len
+            {
                 return Err(TransportError::Tls(
                     "REALITY mirrored client Finished length".into(),
                 ));
             }
-            if handshake.len() == 4 + finished_len {
-                return Ok(handshake[4..].to_vec());
+            if handshake.len == 4 + finished_len {
+                return Ok(handshake);
             }
         }
     }
@@ -1749,6 +1790,100 @@ mod tests {
             MirrorTemplate::parse(&hello, &bad_ccs),
             Err(MirrorTemplateError::InvalidChangeCipherSpec)
         );
+    }
+
+    fn finished_record_keys() -> (RecordKey, RecordKey) {
+        let key = [0x42; 16];
+        let iv = [0x24; 12];
+        (
+            RecordKey::from_key_iv(CipherSuite::Aes128GcmSha256, &key, &iv),
+            RecordKey::from_key_iv(CipherSuite::Aes128GcmSha256, &key, &iv),
+        )
+    }
+
+    fn finished_message() -> Vec<u8> {
+        let mut out = Vec::with_capacity(36);
+        out.push(HS_FINISHED);
+        out.extend_from_slice(&[0, 0, 32]);
+        out.extend_from_slice(&[0x5a; 32]);
+        out
+    }
+
+    async fn run_finished_reader(wire: Vec<u8>) -> TransportResult<MirroredFinishedMessage> {
+        use tokio::io::AsyncWriteExt;
+        let (mut tx, rx) = tokio::io::duplex(128 * 1024);
+        tx.write_all(&wire).await.expect("write Finished test wire");
+        drop(tx);
+        let (_seal, mut open) = finished_record_keys();
+        let mut stream: Box<dyn Stream> = Box::new(rx);
+        read_mirrored_client_finished(&mut stream, &mut open, 32).await
+    }
+
+    fn seal_finished_wire(chunks: &[&[u8]], pads: &[usize]) -> Vec<u8> {
+        let (mut seal, _open) = finished_record_keys();
+        let mut wire = Vec::new();
+        for (chunk, pad) in chunks.iter().zip(pads) {
+            seal.seal_with_padding_into(&mut wire, TLS_RECORD_HANDSHAKE, chunk, *pad)
+                .expect("seal Finished test record");
+        }
+        wire
+    }
+
+    #[tokio::test]
+    async fn finished_reader_accepts_zero_or_one_compat_ccs_and_max_padding() {
+        let message = finished_message();
+        let wire = seal_finished_wire(&[&message], &[0]);
+        let finished = run_finished_reader(wire).await.expect("no-CCS Finished");
+        assert_eq!(&finished.bytes[..finished.len], message);
+
+        let mut one_ccs = COMPAT_CCS_RECORD.to_vec();
+        one_ccs.extend_from_slice(&seal_finished_wire(&[&message], &[16348]));
+        let finished = run_finished_reader(one_ccs)
+            .await
+            .expect("one canonical CCS and maximum padding");
+        assert_eq!(&finished.bytes[..finished.len], message);
+    }
+
+    #[tokio::test]
+    async fn finished_reader_rejects_repeated_ccs_before_reading_its_body() {
+        let mut wire = COMPAT_CCS_RECORD.to_vec();
+        // Only the second CCS header is present.  Reaching this error proves
+        // the header-level repeated-CCS decision happened before a body read;
+        // a body-first implementation hits EOF instead.
+        wire.extend_from_slice(&COMPAT_CCS_RECORD[..5]);
+        let error = run_finished_reader(wire).await.expect_err("repeated CCS");
+        assert!(error.to_string().contains("non-canonical CCS"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn finished_reader_rejects_empty_and_trailing_plaintext() {
+        let empty = seal_finished_wire(&[&[]], &[1]);
+        let error = run_finished_reader(empty)
+            .await
+            .expect_err("empty inner plaintext");
+        assert!(error.to_string().contains("inner record type"), "{error}");
+
+        let mut trailing = finished_message();
+        trailing.push(0xaa);
+        let wire = seal_finished_wire(&[&trailing], &[0]);
+        let error = run_finished_reader(wire)
+            .await
+            .expect_err("trailing bytes after Finished");
+        assert!(error.to_string().contains("bytes after"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn finished_reader_enforces_wire_budget_before_reading_over_budget_body() {
+        let message = finished_message();
+        let chunks = [&message[..1], &message[1..2], &message[2..3]];
+        // Three maximum-length valid records are below the cap.  The fourth
+        // maximum-length header already proves that its body would exceed W;
+        // omitting that body makes a body-first implementation fail with EOF,
+        // while the required implementation reports the budget error first.
+        let mut wire = seal_finished_wire(&chunks, &[16382, 16382, 16382]);
+        wire.extend_from_slice(&[TLS_RECORD_APPLICATION_DATA, 0x03, 0x03, 0x40, 0x11]);
+        let error = run_finished_reader(wire).await.expect_err("wire budget");
+        assert!(error.to_string().contains("exceeds 64 KiB"), "{error}");
     }
 
     #[test]
