@@ -1306,9 +1306,12 @@ mod tests {
     async fn dial_first_cover_saturation_closes_without_cover_or_probe_counters() {
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_port = target.local_addr().unwrap().port();
+        let target_accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target_accepts_task = Arc::clone(&target_accepts);
         tokio::spawn(async move {
             let mut held = Vec::new();
             while let Ok((stream, _)) = target.accept().await {
+                target_accepts_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 held.push(stream);
             }
         });
@@ -1362,6 +1365,11 @@ mod tests {
         assert_eq!(snapshot.close_total.values().sum::<usize>(), 1);
         assert_eq!(snapshot.active_handshakes, 0);
         assert_eq!(snapshot.active_probes, 0);
+        assert_eq!(
+            target_accepts.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "C saturation must close on the single already-started target connection"
+        );
         drop(held_permits);
         task.abort();
     }

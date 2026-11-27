@@ -3,7 +3,7 @@
 
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use meow_common::{Metadata, Network, ProxyAdapter, ProxyPacketConn};
@@ -2047,6 +2047,222 @@ async fn start_mimic_target() -> SocketAddr {
     addr
 }
 
+#[derive(Debug, Default, Clone)]
+struct OracleConn {
+    upload: Vec<u8>,
+    download: Vec<u8>,
+}
+
+#[derive(Clone)]
+struct TargetOracle {
+    addr: SocketAddr,
+    accepts: Arc<AtomicUsize>,
+    conns: Arc<Mutex<Vec<Arc<Mutex<OracleConn>>>>>,
+    events: Arc<Mutex<Vec<String>>>,
+}
+
+#[derive(Clone)]
+enum OracleBehavior {
+    Silent,
+    Alert,
+    PartialThenEof,
+    Pipe(SocketAddr),
+}
+
+fn oracle_conn_snapshot(oracle: &TargetOracle, index: usize) -> OracleConn {
+    oracle.conns.lock().unwrap()[index].lock().unwrap().clone()
+}
+
+fn occurrence_count(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+    haystack
+        .windows(needle.len())
+        .filter(|window| *window == needle)
+        .count()
+}
+
+fn first_tls_record_bytes(bytes: &[u8]) -> Option<Vec<u8>> {
+    if bytes.len() < 5 {
+        return None;
+    }
+    let len = usize::from(u16::from_be_bytes([bytes[3], bytes[4]]));
+    (bytes.len() >= 5 + len).then(|| bytes[..5 + len].to_vec())
+}
+
+async fn wait_for_oracle(
+    oracle: &TargetOracle,
+    mut predicate: impl FnMut(&TargetOracle) -> bool,
+    what: &str,
+) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if predicate(oracle) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        sleep(Duration::from_millis(5)).await;
+    }
+}
+
+async fn oracle_pipe_direction<R, W>(
+    mut reader: R,
+    mut writer: W,
+    conn: Arc<Mutex<OracleConn>>,
+    upload: bool,
+) where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; 8192];
+    loop {
+        match reader.read(&mut buf).await {
+            Ok(0) => {
+                let _ = writer.shutdown().await;
+                return;
+            }
+            Ok(n) => {
+                {
+                    let mut conn = conn.lock().unwrap();
+                    if upload {
+                        conn.upload.extend_from_slice(&buf[..n]);
+                    } else {
+                        conn.download.extend_from_slice(&buf[..n]);
+                    }
+                }
+                if writer.write_all(&buf[..n]).await.is_err() {
+                    return;
+                }
+            }
+            Err(_) => return,
+        }
+    }
+}
+
+async fn oracle_pump_to_eof(stream: &mut TcpStream, conn: &Arc<Mutex<OracleConn>>) {
+    let mut buf = [0u8; 8192];
+    loop {
+        match stream.read(&mut buf).await {
+            Ok(0) | Err(_) => return,
+            Ok(n) => conn.lock().unwrap().upload.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
+async fn start_oracle_target(behavior: OracleBehavior) -> TargetOracle {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let oracle = TargetOracle {
+        addr,
+        accepts: Arc::new(AtomicUsize::new(0)),
+        conns: Arc::new(Mutex::new(Vec::new())),
+        events: Arc::new(Mutex::new(Vec::new())),
+    };
+    let spawned = oracle.clone();
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let behavior = behavior.clone();
+            let spawned = spawned.clone();
+            tokio::spawn(async move {
+                let id = spawned.accepts.fetch_add(1, Ordering::Relaxed);
+                spawned.events.lock().unwrap().push(format!("accept:{id}"));
+                let conn = Arc::new(Mutex::new(OracleConn::default()));
+                spawned.conns.lock().unwrap().push(Arc::clone(&conn));
+                match behavior {
+                    OracleBehavior::Pipe(backend) => {
+                        if let Ok(backend_stream) = TcpStream::connect(backend).await {
+                            let (client_rd, client_wr) = stream.into_split();
+                            let (backend_rd, backend_wr) = backend_stream.into_split();
+                            let up = tokio::spawn(oracle_pipe_direction(
+                                client_rd,
+                                backend_wr,
+                                Arc::clone(&conn),
+                                true,
+                            ));
+                            let down = tokio::spawn(oracle_pipe_direction(
+                                backend_rd,
+                                client_wr,
+                                Arc::clone(&conn),
+                                false,
+                            ));
+                            let _ = up.await;
+                            let _ = down.await;
+                        }
+                    }
+                    direct => {
+                        if let Ok(first) = timeout(T, read_one_tls_record(&mut stream)).await {
+                            conn.lock().unwrap().upload.extend_from_slice(&first);
+                            match direct {
+                                OracleBehavior::Silent => {}
+                                OracleBehavior::Alert => {
+                                    let alert = [0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28];
+                                    conn.lock().unwrap().download.extend_from_slice(&alert);
+                                    let _ = stream.write_all(&alert).await;
+                                    let _ = stream.flush().await;
+                                }
+                                OracleBehavior::PartialThenEof => {
+                                    let partial = [0x16, 0x03];
+                                    conn.lock().unwrap().download.extend_from_slice(&partial);
+                                    let _ = stream.write_all(&partial).await;
+                                    let _ = stream.flush().await;
+                                    let _ = stream.shutdown().await;
+                                }
+                                OracleBehavior::Pipe(_) => unreachable!(),
+                            }
+                            oracle_pump_to_eof(&mut stream, &conn).await;
+                        }
+                    }
+                }
+                spawned.events.lock().unwrap().push(format!("close:{id}"));
+            });
+        }
+    });
+    oracle
+}
+
+fn assert_single_connection_oracle(oracle: &TargetOracle) {
+    assert_eq!(
+        oracle.accepts.load(Ordering::Relaxed),
+        1,
+        "fixed target must be dialed exactly once; events {:?}",
+        oracle.events.lock().unwrap()
+    );
+    assert_eq!(oracle.conns.lock().unwrap().len(), 1);
+    let events = oracle.events.lock().unwrap();
+    let closes = events
+        .iter()
+        .filter(|event| event.as_str() == "close:0")
+        .count();
+    assert!(closes <= 1, "connection close duplicated: {events:?}");
+    assert!(
+        events.iter().position(|event| event == "accept:0")
+            < events
+                .iter()
+                .position(|event| event == "close:0")
+                .or(Some(usize::MAX)),
+        "accept must precede close: {events:?}"
+    );
+}
+
+fn assert_no_replayed_tls_records(conn: &OracleConn) {
+    if let Some(ch) = first_tls_record_bytes(&conn.upload) {
+        assert!(
+            occurrence_count(&conn.upload, &ch) <= 1,
+            "ClientHello byte sequence replayed on target connection"
+        );
+    }
+    if let Some(first) = first_tls_record_bytes(&conn.download) {
+        assert!(
+            occurrence_count(&conn.download, &first) <= 1,
+            "target download prefix replayed to client"
+        );
+    }
+}
+
 fn reality_dial_first_spec(dest: SocketAddr, users: Vec<(&str, [u8; 16])>) -> VlessListenerSpec {
     let mut spec = reality_spec(&format!("127.0.0.1:{}", dest.port()), users);
     let VlessSecuritySpec::Reality(reality) = &mut spec.security else {
@@ -2098,8 +2314,9 @@ async fn reality_mimic_dial_first_end_to_end_hit_and_metrics() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reality_mimic_ordinary_tls_enters_auth_failed_cover_once() {
     let (cover, _cover_cert) = start_tls13_echo().await;
+    let oracle = start_oracle_target(OracleBehavior::Pipe(cover)).await;
     let (port, listener, task) = start_listener(
-        reality_dial_first_spec(cover, vec![("alice", ALICE)]),
+        reality_dial_first_spec(oracle.addr, vec![("alice", ALICE)]),
         tunnel_with_rules(&[]),
         "vless-reality-mimic-cover-it",
     )
@@ -2121,6 +2338,17 @@ async fn reality_mimic_ordinary_tls_enters_auth_failed_cover_once() {
         .expect("large cover echo timeout")
         .expect("large cover echo read");
     assert_eq!(got, payload, "1 MiB cover transfer is byte exact");
+    drop(tls);
+    wait_for_oracle(
+        &oracle,
+        |oracle| oracle.accepts.load(Ordering::Relaxed) == 1,
+        "single auth_failed target accept",
+    )
+    .await;
+    assert_single_connection_oracle(&oracle);
+    let conn = oracle_conn_snapshot(&oracle, 0);
+    assert!(!conn.upload.is_empty() && !conn.download.is_empty());
+    assert_no_replayed_tls_records(&conn);
 
     let snapshot = listener
         .reality_v2_metrics_snapshot()
@@ -2146,32 +2374,6 @@ async fn start_silent_mimic_target() -> SocketAddr {
         while let Ok((mut stream, _)) = listener.accept().await {
             tokio::spawn(async move {
                 let mut buf = [0u8; 8192];
-                loop {
-                    match stream.read(&mut buf).await {
-                        Ok(0) | Err(_) => break,
-                        Ok(_) => {}
-                    }
-                }
-            });
-        }
-    });
-    addr
-}
-
-async fn start_alert_mimic_target() -> SocketAddr {
-    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener.accept().await {
-            tokio::spawn(async move {
-                let _first = read_one_tls_record(&mut stream).await;
-                // fatal alert: TLS alert record, handshake-failure-ish body
-                stream
-                    .write_all(&[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28])
-                    .await
-                    .expect("alert write");
-                stream.flush().await.expect("alert flush");
-                let mut buf = [0u8; 512];
                 loop {
                     match stream.read(&mut buf).await {
                         Ok(0) | Err(_) => break,
@@ -2218,8 +2420,8 @@ fn dial_first_spec_with(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reality_mimic_probe_timeout_hands_off_once_and_releases_probe() {
-    let target = start_silent_mimic_target().await;
-    let spec = dial_first_spec_with(target, |reality| {
+    let oracle = start_oracle_target(OracleBehavior::Silent).await;
+    let spec = dial_first_spec_with(oracle.addr, |reality| {
         reality.mimic.probe_timeout_ms = 500;
     });
     let (port, listener, task) =
@@ -2246,15 +2448,22 @@ async fn reality_mimic_probe_timeout_hands_off_once_and_releases_probe() {
         "cover handoff is not a close: {:?}",
         snapshot.close_total
     );
+    assert_single_connection_oracle(&oracle);
+    let conn = oracle_conn_snapshot(&oracle, 0);
+    assert!(
+        !conn.upload.is_empty(),
+        "cover must continue on the already-dialed target connection"
+    );
+    assert_no_replayed_tls_records(&conn);
     dial.abort();
     task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reality_mimic_dest_alert_recovers_prefix_into_cover_once() {
-    let target = start_alert_mimic_target().await;
+    let oracle = start_oracle_target(OracleBehavior::Alert).await;
     let (port, listener, task) = start_listener(
-        reality_dial_first_spec(target, vec![("alice", ALICE)]),
+        reality_dial_first_spec(oracle.addr, vec![("alice", ALICE)]),
         tunnel_with_rules(&[]),
         "vless-mimic-dest-alert-it",
     )
@@ -2278,14 +2487,22 @@ async fn reality_mimic_dest_alert_recovers_prefix_into_cover_once() {
         "typed incompatibility is cover, not close: {:?}",
         snapshot.close_total
     );
+    assert_single_connection_oracle(&oracle);
+    let conn = oracle_conn_snapshot(&oracle, 0);
+    assert_eq!(
+        occurrence_count(&conn.download, &[0x15, 0x03, 0x03, 0x00, 0x02, 0x02, 0x28]),
+        1,
+        "target alert prefix is relayed exactly once"
+    );
+    assert_no_replayed_tls_records(&conn);
     dial.abort();
     task.abort();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reality_mimic_probe_quota_falls_back_before_upload_and_keeps_single_probe() {
-    let target = start_silent_mimic_target().await;
-    let spec = dial_first_spec_with(target, |reality| {
+    let oracle = start_oracle_target(OracleBehavior::Silent).await;
+    let spec = dial_first_spec_with(oracle.addr, |reality| {
         reality.mimic.max_concurrent_probes = 1;
         reality.mimic.probe_timeout_ms = 5_000;
     });
@@ -2323,6 +2540,15 @@ async fn reality_mimic_probe_quota_falls_back_before_upload_and_keeps_single_pro
         "P fallback is cover, not close: {:?}",
         snapshot.close_total
     );
+    assert_eq!(
+        oracle.accepts.load(Ordering::Relaxed),
+        2,
+        "exactly one fixed-target dial per client connection, with no redial"
+    );
+    assert_eq!(oracle.conns.lock().unwrap().len(), 2);
+    for index in 0..2 {
+        assert_no_replayed_tls_records(&oracle_conn_snapshot(&oracle, index));
+    }
     first.abort();
     second.abort();
     task.abort();
@@ -2396,26 +2622,9 @@ async fn reality_mimic_connect_failure_closes_without_local_tls_or_redial() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reality_mimic_probe_eof_enters_half_close_aware_cover_once() {
-    let listener_tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let target = listener_tcp.local_addr().unwrap();
-    tokio::spawn(async move {
-        while let Ok((mut stream, _)) = listener_tcp.accept().await {
-            tokio::spawn(async move {
-                let _first = read_one_tls_record(&mut stream).await;
-                // Two incomplete record-header bytes are consumed into the
-                // scanner prefix without typing incompatibility; EOF then
-                // selects the half-close-preserving dest_eof handoff.
-                stream
-                    .write_all(&[0x16, 0x03])
-                    .await
-                    .expect("partial target write");
-                stream.flush().await.expect("partial target flush");
-                drop(stream);
-            });
-        }
-    });
+    let oracle = start_oracle_target(OracleBehavior::PartialThenEof).await;
     let (port, listener, task) = start_listener(
-        reality_dial_first_spec(target, vec![("alice", ALICE)]),
+        reality_dial_first_spec(oracle.addr, vec![("alice", ALICE)]),
         tunnel_with_rules(&[]),
         "vless-mimic-dest-eof-it",
     )
@@ -2434,6 +2643,13 @@ async fn reality_mimic_probe_eof_enters_half_close_aware_cover_once() {
         "EOF fallback is cover, not close: {:?}",
         snapshot.close_total
     );
+    assert_single_connection_oracle(&oracle);
+    let conn = oracle_conn_snapshot(&oracle, 0);
+    assert!(
+        !conn.download.is_empty(),
+        "EOF cover preserves the recovered target prefix"
+    );
+    assert_no_replayed_tls_records(&conn);
     dial.abort();
     task.abort();
 }
