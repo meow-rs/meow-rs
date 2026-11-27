@@ -50,32 +50,32 @@ use tokio_util::sync::PollSender;
 
 // --- Wire constants (xray common/mux/frame.go) ------------------------------
 
-const STATUS_NEW: u8 = 0x01;
-const STATUS_KEEP: u8 = 0x02;
-const STATUS_END: u8 = 0x03;
-const STATUS_KEEPALIVE: u8 = 0x04;
+pub(crate) const STATUS_NEW: u8 = 0x01;
+pub(crate) const STATUS_KEEP: u8 = 0x02;
+pub(crate) const STATUS_END: u8 = 0x03;
+pub(crate) const STATUS_KEEPALIVE: u8 = 0x04;
 
-const OPTION_DATA: u8 = 0x01;
-const OPTION_ERROR: u8 = 0x02;
+pub(crate) const OPTION_DATA: u8 = 0x01;
+pub(crate) const OPTION_ERROR: u8 = 0x02;
 
-const NETWORK_TCP: u8 = 0x01;
-const NETWORK_UDP: u8 = 0x02;
+pub(crate) const NETWORK_TCP: u8 = 0x01;
+pub(crate) const NETWORK_UDP: u8 = 0x02;
 
-const ATYPE_IPV4: u8 = 0x01;
-const ATYPE_DOMAIN: u8 = 0x02;
-const ATYPE_IPV6: u8 = 0x03;
+pub(crate) const ATYPE_IPV4: u8 = 0x01;
+pub(crate) const ATYPE_DOMAIN: u8 = 0x02;
+pub(crate) const ATYPE_IPV6: u8 = 0x03;
 
 /// Session id used on keepalive frames (not bound to any stream).
 const KEEPALIVE_SESSION_ID: u16 = 0;
 
 /// Payload cap per data frame - xray splits stream writes at 8 KiB
 /// (common/mux/writer.go::WriteMultiBuffer), keeping frame latency bounded.
-const MAX_PAYLOAD: usize = 8 * 1024;
+pub(crate) const MAX_PAYLOAD: usize = 8 * 1024;
 
 /// Xray's PacketReader (common/mux/reader.go) rejects UDP payloads larger
 /// than common/buf.Size — the same 8 KiB `MAX_PAYLOAD` derives from — and
 /// aborts the entire mux session. Reject them before queuing a frame.
-const MAX_UDP_PAYLOAD: usize = MAX_PAYLOAD;
+pub(crate) const MAX_UDP_PAYLOAD: usize = MAX_PAYLOAD;
 
 /// Per-stream inbound queue depth (frames, not bytes).  A stalled consumer
 /// applies session-wide flow control: the driver parks the overflowing
@@ -91,7 +91,7 @@ const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Meta length cap — xray FrameMetadata::Unmarshal rejects meta_len > 512;
 /// capping also bounds the per-frame allocation on garbage input.
-const MAX_META: usize = 512;
+pub(crate) const MAX_META: usize = 512;
 
 // --- Frame codec (pure, no I/O - byte-tested below) -------------------------
 
@@ -163,7 +163,7 @@ fn encode_data_frame(sid: u16, data: &[u8], dest: Option<(&str, u16)>) -> io::Re
 /// Encode a Keep+Data frame carrying a per-datagram UDP destination from
 /// raw IP octets - the hot UDP write path, no string round-trip through
 /// put_address.
-fn encode_udp_data_frame(sid: u16, data: &[u8], ip: IpAddr, port: u16) -> Bytes {
+pub(crate) fn encode_udp_data_frame(sid: u16, data: &[u8], ip: IpAddr, port: u16) -> Bytes {
     let mut out = BytesMut::with_capacity(32 + data.len());
     out.put_u16(0); // meta_len placeholder, patched below
     out.put_u16(sid);
@@ -1335,11 +1335,16 @@ impl ProxyPacketConn for PacketConn {
                                 continue;
                             }
                             if bytes.len() > buf.len() {
-                                return Err(MeowError::Proxy(format!(
-                                    "mux.cool: UDP packet ({} bytes) exceeds read buffer ({} bytes)",
-                                    bytes.len(),
-                                    buf.len()
-                                )));
+                                // The datagram is already fully consumed
+                                // (the channel carries whole reassembled
+                                // datagrams; this one drops with the
+                                // error), so the conn stays usable — the
+                                // matchable variant lets the caller drop
+                                // just this packet.
+                                return Err(MeowError::UdpPacketTooLarge {
+                                    packet_len: bytes.len(),
+                                    buffer_len: buf.len(),
+                                });
                             }
                             buf[..bytes.len()].copy_from_slice(&bytes);
                             let src = dest.map_or(self.bound, |(dest, port)| {

@@ -147,6 +147,11 @@ pub struct AppState {
     /// `external-controller-cors` resolved at startup — every transport
     /// (TCP/TLS/unix/pipe) serves this one policy (issue #974).
     pub cors: meow_config::ApiCorsConfig,
+    /// Per-state listener-feature gate override. Production state leaves
+    /// this `None` and uses the process-wide gate installed by the
+    /// embedder; tests can scope a missing-feature gate to one router
+    /// instead of poisoning the process-global `OnceLock` for siblings.
+    pub listener_gate: Option<crate::ListenerGate>,
 }
 
 /// Handle to the running standalone DNS server (config `dns.listen`).
@@ -281,6 +286,10 @@ pub static CONFIG_MUTATION: Mutex<()> = Mutex::const_new(());
 impl AppState {
     fn auth_required(&self) -> bool {
         self.secret.as_deref().is_some_and(|s| !s.is_empty())
+    }
+
+    fn listener_gate(&self) -> crate::ListenerGate {
+        self.listener_gate.unwrap_or_else(crate::listener_gate)
     }
 }
 
@@ -5250,9 +5259,10 @@ async fn put_configs(
     // persisted document): the lan ACL and the `listeners:` shape —
     // duplicate names/ports, `rule:` blocks, the one-TUN checks —
     // are properties of the document itself, so they must never be
-    // committed malformed the way an environment failure may. The
-    // feature gate stays degradable later: whether THIS build serves a
-    // listener type is environment, not shape.
+    // committed malformed the way an environment failure may. Feature
+    // gates are split below: gates that only decide whether this build can
+    // bind right now stay degradable, while anytls/vless are hard-rejected
+    // because persisting an unservable entry breaks the next startup.
     if let Err(e) = meow_config::resolve_lan_acl(&raw_config) {
         return reload_rejected(
             StatusCode::BAD_REQUEST,
@@ -5268,26 +5278,43 @@ async fn put_configs(
             )
         }
     };
-    // The `type: anytls` feature gate is unbypassable, unlike the
-    // degradable gate below: a persisted entry this build cannot serve
-    // fails the NEXT boot's `ensure_inbounds_supported` hard-check, so
+    // The `type: anytls`/`type: vless` feature gates are unbypassable,
+    // unlike the degradable gate below: a persisted entry this build cannot
+    // serve fails the NEXT boot's `ensure_inbounds_supported` hard-check, so
     // committing it is a Class-A defect like malformed shape — reject it
     // identically even under `?force`.
-    let gate = crate::listener_gate();
-    if let Some(l) = named_listeners
-        .iter()
-        .find(|l| matches!(l.spec, meow_config::ListenerSpec::Anytls(_)) && gate(&l.spec).is_some())
-    {
+    let gate = state.listener_gate();
+    if let Some(l) = named_listeners.iter().find(|l| {
+        matches!(
+            l.spec,
+            meow_config::ListenerSpec::Anytls(_) | meow_config::ListenerSpec::Vless(_)
+        ) && gate(&l.spec).is_some()
+    }) {
         let feature = gate(&l.spec).expect("find() already selected a missing feature");
         return reload_rejected(
             StatusCode::BAD_REQUEST,
             &format!(
-                "listener '{}' (type anytls) requires cargo feature '{feature}', \
+                "listener '{}' (type {}) requires cargo feature '{feature}', \
                  which this build lacks — refusing to persist a config the next \
                  startup could not serve",
-                l.name
+                l.name,
+                l.spec.type_name()
             ),
         );
+    }
+    // VLESS security identity is a startup snapshot too: validate the same
+    // certificate/key pair and REALITY parameters before commit, without
+    // binding sockets or contacting the cover. `force` cannot waive this —
+    // unlike an environment failure, a bad identity can never boot as written.
+    for l in &named_listeners {
+        if let meow_config::ListenerSpec::Vless(cfg) = &l.spec {
+            if let Err(e) = meow_config::validate_vless_security_identity(&cfg.security) {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    &format!("listener '{}': invalid vless security: {e}", l.name),
+                );
+            }
+        }
     }
     // A `listeners[].proxy` target the document itself never declares —
     // not a `proxies:`/`proxy-groups:` name or a built-in — is a
@@ -5963,7 +5990,7 @@ async fn put_configs(
     // environment property `force` degrades like the other rebuild
     // failures. Listeners are still a startup snapshot (no hot-reload),
     // this only gates persistence.
-    if let Err(e) = crate::ensure_listeners_supported(&named_listeners, crate::listener_gate()) {
+    if let Err(e) = crate::ensure_listeners_supported(&named_listeners, state.listener_gate()) {
         if force {
             tracing::error!("config reload forced despite listeners config error: {e}");
             forced.push(format!("listeners config error: {e}"));
@@ -6944,15 +6971,19 @@ async fn get_listeners(State(state): State<Arc<AppState>>) -> Json<serde_json::V
                 item["port"] = serde_json::json!(l.port);
                 item["listen"] = serde_json::json!(l.listen);
             }
-            // A multi-address `type: anytls` reports every bound target
-            // in declaration order — `listen`/`port` above stay the
-            // first entry for single-address parity. Only `listen`/
-            // `port` is emitted: user digests, certificate material and
-            // the private key never appear in API output.
-            if let meow_config::ListenerSpec::Anytls(cfg) = &l.spec {
-                if cfg.addresses.len() > 1 {
-                    item["addresses"] = serde_json::json!(cfg
-                        .addresses
+            // Multi-address AnyTLS/VLESS entries report every bound target
+            // in declaration order — `listen`/`port` above stay the first
+            // entry for single-address parity. Only `listen`/`port` is
+            // emitted: credentials, certificate material and private keys
+            // never appear in API output.
+            let multi_addresses = match &l.spec {
+                meow_config::ListenerSpec::Anytls(cfg) => Some(&cfg.addresses),
+                meow_config::ListenerSpec::Vless(cfg) => Some(&cfg.addresses),
+                _ => None,
+            };
+            if let Some(addresses) = multi_addresses {
+                if addresses.len() > 1 {
+                    item["addresses"] = serde_json::json!(addresses
                         .iter()
                         .map(|a| serde_json::json!({
                             "listen": a.listen,
@@ -7693,6 +7724,7 @@ mod outbound_flush_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            listener_gate: None,
             cors: Default::default(),
         })
     }
@@ -8022,6 +8054,7 @@ mod global_route_binding_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            listener_gate: None,
             cors: Default::default(),
         })
     }
@@ -8470,6 +8503,7 @@ mod anytls_listeners_api_tests {
             traffic_feed: TrafficFeed::default(),
             dns_server: Default::default(),
             ui_storage: Default::default(),
+            listener_gate: None,
             cors: Default::default(),
         })
     }

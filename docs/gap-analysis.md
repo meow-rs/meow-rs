@@ -116,7 +116,7 @@ Upstream lives in `listener/`. Rust listeners live in `crates/meow-listener/src/
 | Shadowsocks (inbound) | Yes | No | Gap — SS server mode |
 | Trojan (inbound)      | Yes | No | Gap |
 | VMess (inbound)       | Yes | No | Gap |
-| VLESS (inbound)       | Yes | No | Gap |
+| VLESS (inbound)       | Yes | Yes | OK — Vision-only server (`listeners: type: vless`, feature `listener-vless`, `full` not `minimal`): standard TLS 1.3 or REALITY, multi-user, multi-address atomic bind, TCP + XUDP routing; see [specs/listener-vless.md](specs/listener-vless.md) |
 | Hysteria2 (inbound)   | Yes | No | Gap |
 | TUIC (inbound)        | Yes | No | Gap |
 | AnyTLS (inbound)      | Yes | Yes | OK — BoringSSL/plaintext modes, multi-user, multi-address atomic bind, TCP + UoT v2 routing; see [specs/listener-anytls.md](specs/listener-anytls.md) |

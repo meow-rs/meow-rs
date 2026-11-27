@@ -287,6 +287,14 @@ pub enum ListenerSpec {
     /// flow, UoT v2 as UDP. Always parses; servability is gated by the
     /// `listener-anytls` build feature.
     Anytls(AnytlsListenerConfig),
+    /// VLESS server inbound (`type: vless`, mihomo-compatible) with the
+    /// XTLS `xtls-rprx-vision` flow: an outer TLS 1.3 termination —
+    /// either a standard certificate pair or a REALITY server — carrying
+    /// UUID-authenticated VLESS TCP flows, plus XUDP over Mux.Cool when
+    /// `udp` is on. Always parses; servability is gated by the
+    /// `listener-vless` build feature — the same pattern as
+    /// `type: anytls` vs. `listener-anytls`.
+    Vless(VlessListenerConfig),
 }
 
 /// Per-listener config for the `anytls` inbound (`ListenerSpec::Anytls`).
@@ -374,6 +382,303 @@ mod digest_serde {
         }
         Ok(out)
     }
+}
+
+/// Per-listener config for the `vless` inbound (`ListenerSpec::Vless`).
+///
+/// Built by `build_vless_listener_spec`, the single semantic entry point
+/// shared by startup, `-t` and `PUT /configs` — no file I/O happens here;
+/// certificate material stays as-written (PEM literal or path) for the
+/// app's bind-time resolution, REALITY key material stays decoded but is
+/// never logged (hand-rolled redacting [`Debug`]).
+/// Redaction lives in the nested types (`VlessUser`, `VlessSecurity`), so
+/// the derive is safe here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VlessListenerConfig {
+    /// User table in declaration order — always non-empty after a
+    /// successful build. Usernames unique, UUIDs unique post-normalization,
+    /// every flow the literal `xtls-rprx-vision` (invariant, not stored).
+    pub users: Vec<VlessUser>,
+    /// The outer-transport security mode: exactly one of standard TLS
+    /// (certificate pair) or REALITY. There is no plaintext mode.
+    pub security: VlessSecurity,
+    /// `udp` — default `true`; `false` rejects Mux/XUDP (`command=0x03`)
+    /// at the VLESS header layer.
+    pub udp: bool,
+    /// Every normalized bind target in declaration order — `listen` may
+    /// carry a comma-separated list; the listener binds them atomically.
+    /// Always non-empty after a successful build.
+    pub addresses: Vec<ListenerBind>,
+}
+
+/// One `users:` entry of a `type: vless` listener: the username (never on
+/// the wire — it feeds `Metadata.in_user` for `IN-USER` rules) plus the
+/// 16-byte wire credential pre-decoded at build time.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VlessUser {
+    pub username: String,
+    #[serde(with = "uuid_serde")]
+    pub uuid: [u8; 16],
+}
+
+impl std::fmt::Debug for VlessUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The UUID is the bearer credential — the reality spec's redaction
+        // list keeps it out of Debug exactly like the private key; the
+        // username (not a wire value) is enough to identify the entry.
+        f.debug_struct("VlessUser")
+            .field("username", &self.username)
+            .field("uuid", &"[REDACTED]")
+            .finish()
+    }
+}
+
+/// The outer-transport security mode of a `type: vless` listener —
+/// exactly one per entry; the flat certificate pair and `reality-config`
+/// are mutually exclusive and there is no plaintext mode.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VlessSecurity {
+    /// Standard TLS 1.3 termination on a certificate pair.
+    StandardTls {
+        /// `certificate` — PEM literal or path, as written.
+        certificate: String,
+        /// `private-key` — same dual form, same form as `certificate`.
+        private_key: String,
+        /// `alpn` — validated printable-ASCII protocol list, empty when
+        /// absent: no ALPN is negotiated then. An explicit list selects
+        /// in server order; a client offering no overlap fails the
+        /// handshake, a client offering no ALPN still connects. ALPN is
+        /// only a TLS negotiation value here — it enables neither HTTP/2
+        /// nor any camouflage promise.
+        alpn: Vec<String>,
+    },
+    /// REALITY server termination (see [`VlessRealityConfig`]).
+    Reality(VlessRealityConfig),
+}
+
+impl std::fmt::Debug for VlessSecurity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::StandardTls {
+                certificate,
+                private_key: _,
+                alpn,
+            } => f
+                .debug_struct("StandardTls")
+                .field("certificate", &certificate)
+                // Key material when the value is a PEM literal — redact
+                // unconditionally rather than only in that form.
+                .field("private_key", &"[REDACTED]")
+                .field("alpn", &alpn)
+                .finish(),
+            Self::Reality(cfg) => f.debug_tuple("Reality").field(cfg).finish(),
+        }
+    }
+}
+
+/// The `reality-config` block of a `type: vless` listener — the REALITY
+/// server parameters, validated at build time. `dest` stays as-written
+/// (host may be a domain resolved per cover dial); the private key is
+/// stored decoded and never logged.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VlessRealityConfig {
+    /// Cover target `host:port` as written — shape-validated (port
+    /// 1..=65535, bracketed IPv6), never resolved at build time.
+    pub dest: String,
+    /// Host half of [`Self::dest`], split once by the config validator so
+    /// the runtime does not need its own copy of the shape parser.
+    pub dest_host: String,
+    /// Port half of [`Self::dest`], likewise prevalidated in `1..=65535`.
+    pub dest_port: u16,
+    /// X25519 static private key, 32 bytes. Never logged.
+    #[serde(with = "reality_key_serde")]
+    pub private_key: [u8; 32],
+    /// Accepted short IDs, each right-zero-padded to 8 bytes and deduped
+    /// by padded value; empty strings and all-zero values are rejected
+    /// at build time.
+    #[serde(with = "short_ids_serde")]
+    pub short_ids: Vec<[u8; 8]>,
+    /// Exact-match SNI allowlist — validated ASCII DNS A-labels, no
+    /// wildcards/IPs/trailing dots, deduped case-insensitively.
+    pub server_names: Vec<String>,
+    /// ClientHello freshness window in microseconds — the default is
+    /// 120 seconds (`120_000_000`); `0` disables the freshness check.
+    pub max_time_difference_us: u64,
+    /// Cover-direction rate limits (upload/download independent). Zero
+    /// fields disable the corresponding limiter.
+    pub limit_fallback_upload: RealityLimitFallback,
+    pub limit_fallback_download: RealityLimitFallback,
+}
+
+impl std::fmt::Debug for VlessRealityConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Private key and short IDs are both on the reality spec's
+        // redaction list — only their presence/count may surface.
+        f.debug_struct("VlessRealityConfig")
+            .field("dest", &self.dest)
+            .field("private_key", &"[REDACTED]")
+            .field(
+                "short_ids",
+                &format_args!("[{} entries]", self.short_ids.len()),
+            )
+            .field("server_names", &self.server_names)
+            .field("max_time_difference_us", &self.max_time_difference_us)
+            .field("limit_fallback_upload", &self.limit_fallback_upload)
+            .field("limit_fallback_download", &self.limit_fallback_download)
+            .finish()
+    }
+}
+
+/// One direction of the REALITY cover-branch rate limit —
+/// `after-bytes`/`bytes-per-sec`/`burst-bytes-per-sec`, all zero when
+/// unset. `bytes_per_sec: 0` never engages the limiter; a burst not
+/// exceeding the base rate is treated as the base rate by the runtime
+/// (the config layer only validates shape, not the token bucket).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RealityLimitFallback {
+    pub after_bytes: u64,
+    pub bytes_per_sec: u64,
+    pub burst_bytes_per_sec: u64,
+}
+
+/// `[u8; 16]` UUID serde as the canonical dashed lowercase string —
+/// keeps `PUT /configs` round-trips and API diagnostics in the form
+/// operators recognize without ever carrying dashes on the wire.
+mod uuid_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(uuid: &[u8; 16], s: S) -> Result<S::Ok, S::Error> {
+        format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            uuid[0], uuid[1], uuid[2], uuid[3], uuid[4], uuid[5], uuid[6], uuid[7], uuid[8],
+            uuid[9], uuid[10], uuid[11], uuid[12], uuid[13], uuid[14], uuid[15],
+        )
+        .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 16], D::Error> {
+        let s = String::deserialize(d)?;
+        crate::parse_strict_uuid(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// `[u8; 32]` REALITY private-key serde as unpadded URL-safe base64 —
+/// the same spelling the operator writes under `reality-config`, so a
+/// persisted spec reads like the input document.
+mod reality_key_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(key: &[u8; 32], s: S) -> Result<S::Ok, S::Error> {
+        use base64::Engine;
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(key)
+            .serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<[u8; 32], D::Error> {
+        use base64::Engine;
+        let s = String::deserialize(d)?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(s.as_bytes())
+            .map_err(serde::de::Error::custom)?;
+        <[u8; 32]>::try_from(bytes.as_slice())
+            .map_err(|_| serde::de::Error::custom("reality private key must decode to 32 bytes"))
+    }
+}
+
+/// `Vec<[u8; 8]>` short-ID serde as hex strings — each entry the padded
+/// 8-byte form (16 lowercase hex chars), matching how operators write
+/// the (shorter) input while staying unambiguous on round-trip.
+mod short_ids_serde {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(ids: &[[u8; 8]], s: S) -> Result<S::Ok, S::Error> {
+        let hex: Vec<String> = ids
+            .iter()
+            .map(|id| {
+                let mut out = String::with_capacity(16);
+                for b in id {
+                    use std::fmt::Write as _;
+                    let _ = write!(out, "{b:02x}");
+                }
+                out
+            })
+            .collect();
+        hex.serialize(s)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<[u8; 8]>, D::Error> {
+        let hexes = Vec::<String>::deserialize(d)?;
+        hexes
+            .iter()
+            .map(|h| crate::decode_padded_short_id(h).map_err(serde::de::Error::custom))
+            .collect()
+    }
+}
+
+/// Parse a UUID string in exactly the two spellings the VLESS inbound
+/// accepts — the canonical hyphenated form (`8-4-4-4-12` hex groups,
+/// hyphens ONLY at those positions) or 32 bare hex digits; case is
+/// insignificant. Unlike the outbound node's lenient parser, arbitrary
+/// hyphen placement is rejected: the inbound pre-decodes holder
+/// credentials and an ambiguous spelling is a configuration bug, not a
+/// variant to accommodate.
+pub(crate) fn parse_strict_uuid(s: &str) -> Result<[u8; 16], String> {
+    let hex_digits = if s.len() == 36 {
+        // Hyphenated form: dashes exactly at 8/13/18/23, hex elsewhere.
+        for (i, c) in s.char_indices() {
+            let expect_dash = matches!(i, 8 | 13 | 18 | 23);
+            if expect_dash != (c == '-') {
+                return Err(
+                    "invalid uuid: hyphens must sit exactly at the 8-4-4-4-12 group boundaries"
+                        .to_string(),
+                );
+            }
+        }
+        s.chars().filter(|c| *c != '-').collect::<String>()
+    } else if s.len() == 32 {
+        if s.contains('-') {
+            return Err(
+                "invalid uuid: use the canonical hyphenated form or 32 bare hex digits".to_string(),
+            );
+        }
+        s.to_string()
+    } else {
+        return Err(format!(
+            "invalid uuid: expected 32 hex chars (with or without hyphens), got {} chars",
+            s.len()
+        ));
+    };
+    // len is 32 in both arms by construction (36 - 4 hyphens). The
+    // candidate is never echoed into the error — UUIDs are credentials
+    // and parse errors are on the redaction list.
+    let mut bytes = [0u8; 16];
+    for (i, chunk) in hex_digits.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let pair = std::str::from_utf8(chunk).map_err(|_| "invalid uuid".to_string())?;
+        bytes[i] =
+            u8::from_str_radix(pair, 16).map_err(|_| "invalid uuid: non-hex digits".to_string())?;
+    }
+    Ok(bytes)
+}
+
+/// Decode a REALITY short-id entry: even-length hex of at most 16 chars
+/// (8 bytes), right-zero-padded to the fixed 8-byte comparison form —
+/// the padding mihomo applies, which is why `"ab"` and `"ab00"` collide.
+pub(crate) fn decode_padded_short_id(s: &str) -> Result<[u8; 8], String> {
+    // The candidate is never echoed — short IDs are on the reality
+    // spec's redaction list even when malformed (a typo'd real one).
+    if !s.len().is_multiple_of(2) || s.len() > 16 {
+        return Err("must be an even number of hex digits, at most 16 chars".to_string());
+    }
+    if s.is_empty() {
+        return Err("empty".to_string());
+    }
+    let mut out = [0u8; 8];
+    for (i, chunk) in s.as_bytes().as_chunks::<2>().0.iter().enumerate() {
+        let pair = std::str::from_utf8(chunk).map_err(|_| "not utf8".to_string())?;
+        out[i] = u8::from_str_radix(pair, 16).map_err(|_| "non-hex digits".to_string())?;
+    }
+    Ok(out)
 }
 
 /// Per-listener config for the `shadowsocks` inbound (`ListenerSpec::Shadowsocks`).
@@ -535,6 +840,7 @@ impl ListenerSpec {
             Self::WireGuard(_) => "wireguard",
             Self::Tun(_) => "tun",
             Self::Anytls(_) => "anytls",
+            Self::Vless(_) => "vless",
         }
     }
 }
@@ -5884,8 +6190,25 @@ fn parse_listener_spec(
         // the real spec via `build_anytls_listener_spec`, which needs the
         // (possibly comma-listed) `listen` context.
         "anytls" => Ok(ListenerSpec::Anytls(AnytlsListenerConfig::default())),
+        // Same placeholder pattern — `build_vless_listener_spec` runs in
+        // `build_named_listeners` with the `listen`/bind context and either
+        // replaces this wholesale or errors the build; the placeholder is
+        // never observed.
+        "vless" => Ok(ListenerSpec::Vless(VlessListenerConfig {
+            users: Vec::new(),
+            security: VlessSecurity::StandardTls {
+                certificate: String::new(),
+                private_key: String::new(),
+                alpn: Vec::new(),
+            },
+            udp: true,
+            addresses: vec![ListenerBind {
+                listen: String::new(),
+                port: 0,
+            }],
+        })),
         other => anyhow::bail!(
-            "unknown listener type '{other}'; expected mixed, http, socks, socks5, tproxy, redir, shadowsocks, wireguard, anytls, or tun"
+            "unknown listener type '{other}'; expected mixed, http, socks, socks5, tproxy, redir, shadowsocks, wireguard, anytls, vless, or tun"
         ),
     }
 }
@@ -6273,6 +6596,50 @@ fn anytls_front_layer_enabled(
     }
 }
 
+/// Resolve the multi-address `listen` contract shared by TCP server
+/// inbounds: comma-separated segments, the entry `port` merge rules, IP
+/// literal validation, and canonical duplicate detection.
+fn resolve_multi_listener_binds(
+    raw_l: &raw::RawListener,
+    default_bind: &str,
+) -> Result<Vec<ListenerBind>, anyhow::Error> {
+    let listen_raw = raw_l.listen.as_deref().unwrap_or(default_bind);
+    let mut addresses: Vec<ListenerBind> = Vec::new();
+    for segment in listen_raw.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            anyhow::bail!(
+                "listeners[{}].listen: empty address in comma-separated list '{listen_raw}'",
+                raw_l.name
+            );
+        }
+        let (listen, port) = resolve_listener_bind(segment, raw_l.port)
+            .map_err(|e| anyhow::anyhow!("listeners[{}].listen: {e}", raw_l.name))?;
+        addresses.push(ListenerBind { listen, port });
+    }
+    // `::1` and `0:0:0:0:0:0:0:1` are the same bind; comparison goes
+    // through `IpAddr` so non-canonical spellings still collide.
+    let mut seen = std::collections::HashSet::new();
+    for b in &addresses {
+        let ip = b.listen.parse::<IpAddr>().map_err(|_| {
+            anyhow::anyhow!(
+                "listeners[{}].listen: '{}' is not an IP literal",
+                raw_l.name,
+                b.listen
+            )
+        })?;
+        if !seen.insert((ip, b.port)) {
+            anyhow::bail!(
+                "listeners[{}].listen: duplicate bind address '{}':{}",
+                raw_l.name,
+                b.listen,
+                b.port
+            );
+        }
+    }
+    Ok(addresses)
+}
+
 /// Build a validated [`AnytlsListenerConfig`] from a raw `listeners:`
 /// entry — the single semantic entry point for `type: anytls`, reached
 /// identically by startup, `-t` and `PUT /configs` via
@@ -6434,12 +6801,23 @@ fn build_anytls_listener_spec(
     // (upstream's reject-all state): startup proceeds but warns once.
     // Usernames and passwords stay verbatim — no trimming, no
     // normalization — and empty values, duplicate keys and duplicate
-    // password digests are hard errors.
+    // password digests are hard errors. The LIST shape is `type: vless`'s
+    // user table — a mapping is the only legal form here.
+    let user_pairs: &[(String, String)] = match raw_l.users.as_ref() {
+        None => &[],
+        Some(raw::RawListenerUsers::Mapping(pairs)) => pairs,
+        Some(raw::RawListenerUsers::List(_)) => anyhow::bail!(
+            "listeners[{}].users: `type: anytls` takes a username → password MAPPING \
+             (e.g. `users: {{alice: secret}}`); the list-of-entries shape belongs to \
+             `type: vless` — reshape the key for the listener type you mean",
+            raw_l.name
+        ),
+    };
     let mut digest_seen: std::collections::HashMap<[u8; 32], String> =
         std::collections::HashMap::new();
     let mut name_seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
     let mut users: Vec<AnytlsUser> = Vec::new();
-    for (user, password) in raw_l.users.as_deref().unwrap_or(&[]) {
+    for (user, password) in user_pairs {
         if user.is_empty() {
             anyhow::bail!(
                 "listeners[{}].users: empty username is not allowed",
@@ -6513,46 +6891,7 @@ fn build_anytls_listener_spec(
         }
     }
 
-    // ── `listen` — one YAML string, possibly comma-separated; each
-    // segment normalizes in declaration order via the shared bind
-    // resolver. An empty segment between commas is a shape error.
-    let listen_raw = raw_l.listen.as_deref().unwrap_or(default_bind);
-    let mut addresses: Vec<ListenerBind> = Vec::new();
-    for segment in listen_raw.split(',') {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            anyhow::bail!(
-                "listeners[{}].listen: empty address in comma-separated list '{listen_raw}'",
-                raw_l.name
-            );
-        }
-        let (listen, port) = resolve_listener_bind(segment, raw_l.port)
-            .map_err(|e| anyhow::anyhow!("listeners[{}].listen: {e}", raw_l.name))?;
-        addresses.push(ListenerBind { listen, port });
-    }
-    // Reject duplicate resolved targets — `::1` and `0:0:0:0:0:0:0:1`
-    // are the same bind and a second TcpListener::bind on it fails
-    // anyway; fail the config HERE with a clear diagnostic instead of a
-    // partial bind (F11). Comparison goes through `IpAddr`, not the
-    // string, so non-canonical spellings still collide.
-    let mut seen = std::collections::HashSet::new();
-    for b in &addresses {
-        let ip = b.listen.parse::<IpAddr>().map_err(|_| {
-            anyhow::anyhow!(
-                "listeners[{}].listen: '{}' is not an IP literal",
-                raw_l.name,
-                b.listen
-            )
-        })?;
-        if !seen.insert((ip, b.port)) {
-            anyhow::bail!(
-                "listeners[{}].listen: duplicate bind address '{}':{}",
-                raw_l.name,
-                b.listen,
-                b.port
-            );
-        }
-    }
+    let addresses = resolve_multi_listener_binds(raw_l, default_bind)?;
 
     Ok(AnytlsListenerConfig {
         users,
@@ -6567,6 +6906,971 @@ fn build_anytls_listener_spec(
             .as_deref()
             .filter(|s| !s.is_empty())
             .map(str::to_string),
+        addresses,
+    })
+}
+
+/// Validate a REALITY `dest` string's shape: `host:port` with the port in
+/// `1..=65535`, IPv6 bracketed, no URL/userinfo/path syntax. The host is
+/// NOT charset-validated beyond separators — it may be a domain resolved
+/// at cover-dial time, and startup/`-t` never resolve it. Returns the
+/// host part and the port for the self-loop check.
+fn parse_reality_dest(dest: &str, ctx: &str) -> Result<(String, u16), anyhow::Error> {
+    if dest.is_empty() {
+        anyhow::bail!("{ctx}: must not be empty — a REALITY server needs a cover target");
+    }
+    if dest.contains("://") {
+        anyhow::bail!(
+            "{ctx}: '{dest}' looks like a URL — use bare `host:port` (e.g. `www.example.com:443`)"
+        );
+    }
+    if dest.contains('@') || dest.contains('/') {
+        anyhow::bail!(
+            "{ctx}: userinfo/path syntax is not valid here — use bare `host:port` \
+             (e.g. `www.example.com:443`)"
+        );
+    }
+    let (host, port_str) = if let Some(rest) = dest.strip_prefix('[') {
+        // Bracketed IPv6: `]` then `:port`, nothing else.
+        let Some((host, tail)) = rest.split_once(']') else {
+            anyhow::bail!("{ctx}: bracketed IPv6 must close as `[addr]:port`");
+        };
+        let Some(port_str) = tail.strip_prefix(':') else {
+            anyhow::bail!("{ctx}: bracketed IPv6 must be followed by `:port`");
+        };
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            anyhow::bail!("{ctx}: '{host}' inside the brackets is not an IPv6 literal");
+        }
+        (host.to_string(), port_str)
+    } else {
+        // Unbracketed: exactly one colon separates host and port — more
+        // means an unbracketed IPv6 literal, none means a missing port.
+        let Some((host, port_str)) = dest.rsplit_once(':') else {
+            anyhow::bail!("{ctx}: missing `:port` — use `host:port`");
+        };
+        if host.contains(':') {
+            anyhow::bail!("{ctx}: IPv6 destinations must be bracketed — `[addr]:port`");
+        }
+        (host.to_string(), port_str)
+    };
+    if host.is_empty() {
+        anyhow::bail!("{ctx}: the host part must not be empty");
+    }
+    if host.chars().any(char::is_whitespace) {
+        anyhow::bail!("{ctx}: the host must not contain whitespace");
+    }
+    if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
+        anyhow::bail!("{ctx}: port must be decimal digits in 1..=65535");
+    }
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| anyhow::anyhow!("{ctx}: port must be in 1..=65535"))?;
+    if port == 0 {
+        anyhow::bail!("{ctx}: port 0 is not a dialable cover target — use 1..=65535");
+    }
+    Ok((host, port))
+}
+
+/// Split a REALITY cover `dest` with the same shape rules the config
+/// builder enforces. Exposed for the runtime listener conversion so the
+/// wire-format parser has one owner; no DNS or network I/O happens here.
+pub fn parse_vless_reality_dest(dest: &str) -> Result<(String, u16), anyhow::Error> {
+    parse_reality_dest(dest, "reality-config.dest")
+}
+
+const MAX_TLS_IDENTITY_FILE_BYTES: u64 = 1 << 20;
+
+fn read_tls_identity_file(path: &std::path::Path, what: &str) -> Result<Vec<u8>, anyhow::Error> {
+    use std::io::Read as _;
+
+    let meta = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("{what}: cannot stat {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("{what}: {} is not a regular file", path.display());
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
+    let file = opts
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("{what}: cannot open {}: {e}", path.display()))?;
+    let mut buf = Vec::new();
+    file.take(MAX_TLS_IDENTITY_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| anyhow::anyhow!("{what}: cannot read {}: {e}", path.display()))?;
+    if buf.len() as u64 > MAX_TLS_IDENTITY_FILE_BYTES {
+        anyhow::bail!(
+            "{what}: {} exceeds {} bytes",
+            path.display(),
+            MAX_TLS_IDENTITY_FILE_BYTES
+        );
+    }
+    Ok(buf)
+}
+
+/// Load a listener certificate/private-key pair exactly as the TLS-server
+/// inbounds do: both inline PEM or both home-contained regular files, each
+/// file capped well below any plausible certificate chain.
+pub fn load_tls_identity_pair(
+    cert: &str,
+    key: &str,
+    protocol: &str,
+) -> Result<(Vec<u8>, Vec<u8>), anyhow::Error> {
+    let cert_inline = is_pem_literal(cert);
+    let key_inline = is_pem_literal(key);
+    if cert_inline != key_inline {
+        anyhow::bail!(
+            "{protocol} certificate and private-key must be both inline PEM or both file paths"
+        );
+    }
+    if cert_inline {
+        return Ok((cert.as_bytes().to_vec(), key.as_bytes().to_vec()));
+    }
+    let cert_path = resolve_home_contained(std::path::Path::new(cert))
+        .map_err(|e| anyhow::anyhow!("{protocol} certificate: {e}"))?;
+    let key_path = resolve_home_contained(std::path::Path::new(key))
+        .map_err(|e| anyhow::anyhow!("{protocol} private-key: {e}"))?;
+    Ok((
+        read_tls_identity_file(&cert_path, &format!("{protocol} certificate"))?,
+        read_tls_identity_file(&key_path, &format!("{protocol} private-key"))?,
+    ))
+}
+
+/// Read a required string out of a `reality-config`-style captured map.
+/// `null` counts as missing — YAML writes it for a keyless `dest:` line,
+/// and a null is never the string the operator means.
+fn reality_required_string<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    ctx: &str,
+) -> Result<&'a str, anyhow::Error> {
+    match map.get(key) {
+        Some(serde_json::Value::String(s)) if !s.is_empty() => Ok(s),
+        Some(serde_json::Value::String(_)) => {
+            anyhow::bail!("{ctx}.{key}: must not be empty")
+        }
+        Some(_) => anyhow::bail!("{ctx}.{key}: must be a string"),
+        None => anyhow::bail!("{ctx}.{key}: required — a REALITY server cannot operate without it"),
+    }
+}
+
+/// Read a required non-empty list of strings out of a captured map.
+fn reality_required_string_list<'a>(
+    map: &'a serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    ctx: &str,
+) -> Result<&'a [serde_json::Value], anyhow::Error> {
+    match map.get(key) {
+        Some(serde_json::Value::Array(list)) if !list.is_empty() => Ok(list),
+        Some(serde_json::Value::Array(_)) => {
+            anyhow::bail!("{ctx}.{key}: must not be an empty list")
+        }
+        Some(_) => anyhow::bail!("{ctx}.{key}: must be a list of strings"),
+        None => anyhow::bail!("{ctx}.{key}: required (a non-empty list of strings)"),
+    }
+}
+
+/// Validate one `server-names` entry as an exact-match ASCII DNS A-label
+/// name: no wildcard, no IP literal, no trailing/leading dot, non-empty
+/// labels of `[A-Za-z0-9-]` without leading/trailing hyphens, total
+/// length within the DNS wire limit.
+fn validate_server_name(name: &str, ctx: &str) -> Result<(), anyhow::Error> {
+    if name.is_empty() {
+        anyhow::bail!("{ctx}: entries must not be empty");
+    }
+    if !name.is_ascii() {
+        anyhow::bail!(
+            "{ctx}: non-ASCII names are not accepted — write the punycode A-label \
+             (e.g. `xn--…`) instead"
+        );
+    }
+    if name.contains('*') {
+        anyhow::bail!(
+            "{ctx}: wildcards are not supported — server-names is an exact-match \
+             allowlist; list every name explicitly"
+        );
+    }
+    if name.ends_with('.') || name.starts_with('.') {
+        anyhow::bail!("{ctx}: trailing/leading dots are not accepted — use the bare DNS name");
+    }
+    if name.parse::<IpAddr>().is_ok() {
+        anyhow::bail!(
+            "{ctx}: IP literals are not valid server-names entries — the allowlist \
+             matches ClientHello SNI hostnames"
+        );
+    }
+    if name.len() > 253 {
+        anyhow::bail!("{ctx}: name exceeds the 253-byte DNS limit");
+    }
+    for label in name.split('.') {
+        if label.is_empty() {
+            anyhow::bail!("{ctx}: empty label (double dot) is not a valid DNS name");
+        }
+        if label.len() > 63 {
+            anyhow::bail!("{ctx}: a label exceeds the 63-byte DNS limit");
+        }
+        if !label
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            anyhow::bail!("{ctx}: labels may only contain ASCII letters, digits and hyphens");
+        }
+        if label.starts_with('-') || label.ends_with('-') {
+            anyhow::bail!("{ctx}: labels must not start or end with a hyphen");
+        }
+    }
+    Ok(())
+}
+
+/// Validate the config-dependent parts of a VLESS listener security
+/// identity without binding sockets, resolving names, or contacting the
+/// REALITY cover. Standard TLS runs the same BoringSSL certificate/key
+/// pairing check as the server acceptor; REALITY checks the parsed cover
+/// endpoint, cardinality, and SNI names that acceptor construction gates.
+pub fn validate_vless_security_identity(security: &VlessSecurity) -> Result<(), anyhow::Error> {
+    match security {
+        VlessSecurity::StandardTls {
+            certificate,
+            private_key,
+            alpn,
+        } => {
+            let (certificate_chain_pem, private_key_pem) =
+                load_tls_identity_pair(certificate, private_key, "vless")?;
+            meow_transport::tls::server::TlsServer::new(
+                &meow_transport::tls::server::TlsServerConfig {
+                    certificate_chain_pem,
+                    private_key_pem,
+                    alpn: alpn.clone(),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("vless TLS: {e}"))?;
+        }
+        VlessSecurity::Reality(reality) => {
+            let (dest_host, dest_port) = parse_vless_reality_dest(&reality.dest)?;
+            if dest_host != reality.dest_host || dest_port != reality.dest_port {
+                anyhow::bail!(
+                    "reality-config.dest: structured cover host/port do not match the dest string"
+                );
+            }
+            if reality.short_ids.is_empty() || reality.short_ids.len() > 64 {
+                anyhow::bail!("reality-config.short-id: must contain 1..=64 entries");
+            }
+            if reality.server_names.is_empty() || reality.server_names.len() > 64 {
+                anyhow::bail!("reality-config.server-names: must contain 1..=64 entries");
+            }
+            for (i, name) in reality.server_names.iter().enumerate() {
+                validate_server_name(name, &format!("reality-config.server-names[{i}]"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate one `limit-fallback-{upload,download}` sub-map: optional
+/// keys `after-bytes`/`bytes-per-sec`/`burst-bytes-per-sec`, non-negative
+/// integers; unknown keys hard-error.
+fn parse_limit_fallback(
+    value: Option<&serde_json::Value>,
+    ctx: &str,
+) -> Result<RealityLimitFallback, anyhow::Error> {
+    let mut out = RealityLimitFallback::default();
+    let Some(value) = value else {
+        return Ok(out);
+    };
+    if value.is_null() {
+        return Ok(out);
+    }
+    let Some(obj) = value.as_object() else {
+        anyhow::bail!(
+            "{ctx}: must be a mapping of `after-bytes`/`bytes-per-sec`/`burst-bytes-per-sec`"
+        );
+    };
+    for (key, val) in obj {
+        let slot = match key.as_str() {
+            "after-bytes" => &mut out.after_bytes,
+            "bytes-per-sec" => &mut out.bytes_per_sec,
+            "burst-bytes-per-sec" => &mut out.burst_bytes_per_sec,
+            other => anyhow::bail!(
+                "{ctx}.{other}: unknown key — the limiter only takes \
+                 `after-bytes`/`bytes-per-sec`/`burst-bytes-per-sec`"
+            ),
+        };
+        match val {
+            serde_json::Value::Number(n) => {
+                let Some(v) = n.as_u64() else {
+                    anyhow::bail!("{ctx}.{key}: must be a non-negative integer (bytes)");
+                };
+                *slot = v;
+            }
+            _ => anyhow::bail!("{ctx}.{key}: must be a non-negative integer (bytes)"),
+        }
+    }
+    Ok(out)
+}
+
+/// Build the `reality-config` block of a `type: vless` listener. Every
+/// key rule follows the mihomo `RealityConfig` shape as the spec
+/// adjudicates it: `dest`/`private-key`/`short-id`/`server-names`
+/// required, `max-time-difference` optional microseconds, the
+/// limit-fallback pair optional, everything else a hard error — unknown,
+/// Xray-only (`xver`, client-version pins, `show`, `masterKeyLog`), the
+/// outbound spelling, or the unsupported nested `proxy`.
+fn build_vless_reality_config(
+    raw_l: &raw::RawListener,
+    value: &serde_json::Value,
+) -> Result<VlessRealityConfig, anyhow::Error> {
+    let ctx = format!("listeners[{}].reality-config", raw_l.name);
+    let Some(obj) = value.as_object() else {
+        anyhow::bail!("{ctx}: must be a mapping — see the `type: vless` REALITY example");
+    };
+    if obj.is_empty() {
+        anyhow::bail!(
+            "{ctx}: an empty map is not a REALITY config — either fill in \
+             `dest`/`private-key`/`short-id`/`server-names`, or drop the key and use \
+             the `certificate` + `private-key` pair (standard TLS)"
+        );
+    }
+
+    // Unknown-key gate FIRST: a typo'd key must surface before any
+    // required-key complaint, or the operator fixes the wrong problem.
+    // Known Xray/outbound-only spellings get their migration hint.
+    for key in obj.keys() {
+        match key.as_str() {
+            "dest"
+            | "private-key"
+            | "short-id"
+            | "server-names"
+            | "max-time-difference"
+            | "limit-fallback-upload"
+            | "limit-fallback-download" => {}
+            "target" => anyhow::bail!(
+                "{ctx}.target: Xray's spelling — meow follows mihomo: rename it to `dest`"
+            ),
+            "proxy" => anyhow::bail!(
+                "{ctx}.proxy: dialing the cover through a proxy is not supported — \
+                 the cover `dest` is always dialed directly; remove the key"
+            ),
+            "xver" => anyhow::bail!(
+                "{ctx}.xver: PROXY-protocol handoff to the cover target is not \
+                 supported — remove the key"
+            ),
+            "min-client-ver" | "max-client-ver" | "minClientVer" | "maxClientVer" => {
+                anyhow::bail!(
+                    "{ctx}.{key}: client-version pinning is not supported — remove the key"
+                )
+            }
+            "show" | "masterKeyLog" | "master-key-log" | "mldsa65" | "mldsa65-verify"
+            | "server-name" | "short_ids" | "short-ids" => anyhow::bail!(
+                "{ctx}.{key}: not a meow REALITY server key — supported keys are \
+                 `dest`, `private-key`, `short-id`, `server-names`, \
+                 `max-time-difference`, `limit-fallback-upload`, `limit-fallback-download`"
+            ),
+            other => anyhow::bail!(
+                "{ctx}.{other}: unknown key — supported keys are `dest`, `private-key`, \
+                 `short-id`, `server-names`, `max-time-difference`, \
+                 `limit-fallback-upload`, `limit-fallback-download`"
+            ),
+        }
+    }
+
+    // ── dest — shape only; never resolved here (startup/`-t` do no
+    // network I/O), and a literal self-loop is checked by the caller once
+    // the listener's own binds are known.
+    let dest = reality_required_string(obj, "dest", &ctx)?;
+    let (dest_host, dest_port) = parse_reality_dest(dest, &format!("{ctx}.dest"))?;
+
+    // ── private-key — unpadded URL-safe base64, exactly 32 bytes of
+    // X25519 private key; never a PEM block or a path.
+    let private_key_str = reality_required_string(obj, "private-key", &ctx)?;
+    let private_key = {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(private_key_str.as_bytes())
+            .map_err(|_| {
+                anyhow::anyhow!(
+                    "{ctx}.private-key: must be unpadded URL-safe base64 of the 32-byte \
+                     X25519 private key (as `xray x25519` prints it) — not PEM, hex, \
+                     or a file path"
+                )
+            })?;
+        <[u8; 32]>::try_from(bytes.as_slice()).map_err(|_| {
+            anyhow::anyhow!(
+                "{ctx}.private-key: must decode to exactly 32 bytes (an X25519 private key)"
+            )
+        })?
+    };
+
+    // ── short-id — non-empty string list; each even hex, at most 16
+    // chars, right-zero-padded to the 8-byte comparison form. Empty
+    // strings and all-zero values are rejected rather than turned into
+    // implicit credentials; duplicates are judged on the padded form, so
+    // `ab` and `ab00` collide. Values are never echoed into errors —
+    // short IDs are on the reality spec's redaction list.
+    let mut short_ids: Vec<[u8; 8]> = Vec::new();
+    let mut seen_ids: std::collections::HashSet<[u8; 8]> = std::collections::HashSet::new();
+    for (i, entry) in reality_required_string_list(obj, "short-id", &ctx)?
+        .iter()
+        .enumerate()
+    {
+        let serde_json::Value::String(s) = entry else {
+            anyhow::bail!("{ctx}.short-id[{i}]: must be a hex string (quote it)");
+        };
+        if s.is_empty() {
+            anyhow::bail!(
+                "{ctx}.short-id[{i}]: empty string is not a wildcard — meow does not \
+                 mint implicit credentials; use a real hex short-id"
+            );
+        }
+        let padded =
+            decode_padded_short_id(s).map_err(|e| anyhow::anyhow!("{ctx}.short-id[{i}]: {e}"))?;
+        if padded == [0u8; 8] {
+            anyhow::bail!(
+                "{ctx}.short-id[{i}]: the all-zero value is not accepted — meow does \
+                 not mint implicit credentials; use a real hex short-id"
+            );
+        }
+        if !seen_ids.insert(padded) {
+            anyhow::bail!(
+                "{ctx}.short-id[{i}]: duplicates an earlier entry after zero-padding \
+                 (e.g. \"ab\" and \"ab00\" are the same id) — keep one"
+            );
+        }
+        short_ids.push(padded);
+    }
+    if short_ids.len() > 64 {
+        anyhow::bail!(
+            "{ctx}.short-id: at most 64 entries — the REALITY acceptor cannot serve more"
+        );
+    }
+
+    // ── server-names — the exact-match SNI allowlist.
+    let mut server_names: Vec<String> = Vec::new();
+    let mut seen_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (i, entry) in reality_required_string_list(obj, "server-names", &ctx)?
+        .iter()
+        .enumerate()
+    {
+        let serde_json::Value::String(name) = entry else {
+            anyhow::bail!("{ctx}.server-names[{i}]: must be a string");
+        };
+        validate_server_name(name, &format!("{ctx}.server-names[{i}]"))?;
+        if !seen_names.insert(name.to_ascii_lowercase()) {
+            anyhow::bail!("{ctx}.server-names[{i}]: '{name}' duplicates an earlier entry");
+        }
+        server_names.push(name.clone());
+    }
+    if server_names.len() > 64 {
+        anyhow::bail!(
+            "{ctx}.server-names: at most 64 entries — the REALITY acceptor cannot serve more"
+        );
+    }
+
+    // ── max-time-difference — optional microseconds; absent defaults to
+    // 120 s, explicit 0 disables the freshness check. Negative or
+    // non-integer values hard-error.
+    let max_time_difference_us = match obj.get("max-time-difference") {
+        None | Some(serde_json::Value::Null) => 120_000_000,
+        Some(serde_json::Value::Number(n)) => match n.as_u64() {
+            Some(v) => v,
+            None => anyhow::bail!(
+                "{ctx}.max-time-difference: must be a non-negative integer of \
+                 microseconds (0 disables the freshness check)"
+            ),
+        },
+        Some(_) => anyhow::bail!(
+            "{ctx}.max-time-difference: must be a non-negative integer of \
+             microseconds (0 disables the freshness check)"
+        ),
+    };
+
+    let limit_fallback_upload = parse_limit_fallback(
+        obj.get("limit-fallback-upload"),
+        &format!("{ctx}.limit-fallback-upload"),
+    )?;
+    let limit_fallback_download = parse_limit_fallback(
+        obj.get("limit-fallback-download"),
+        &format!("{ctx}.limit-fallback-download"),
+    )?;
+
+    Ok(VlessRealityConfig {
+        dest: dest.to_string(),
+        dest_host,
+        dest_port,
+        private_key,
+        short_ids,
+        server_names,
+        max_time_difference_us,
+        limit_fallback_upload,
+        limit_fallback_download,
+    })
+}
+
+/// Build a validated [`VlessListenerConfig`] from a raw `listeners:`
+/// entry — the single semantic entry point for `type: vless`, reached
+/// identically by startup, `-t` and `PUT /configs` via
+/// `build_named_listeners`. Performs NO file I/O and NO DNS resolution:
+/// certificate material stays as-written, `reality-config.dest` stays
+/// as-written (shape-checked only).
+///
+/// The contract, per the vision-inbound spec's key-by-key adjudication:
+///
+/// - The outer security mode is a union: a flat `certificate` +
+///   `private-key` pair (standard TLS 1.3) XOR a non-empty
+///   `reality-config`. Neither present, any half pair, or both present
+///   are hard errors — there is NO plaintext VLESS.
+/// - `users` is a non-empty LIST of `{username, uuid, flow}` entries;
+///   every field required, `flow` exactly `xtls-rprx-vision` (the
+///   `-udp443` suffix is client-local and meaningless on a server),
+///   usernames/UUIDs unique, UUID format strict (canonical hyphens or
+///   32 bare hex), all-zero UUID rejected.
+/// - `decryption` absent/`""`/`none` only; `encryption` (outbound key)
+///   hard-errors with a hint.
+/// - `client-auth-type`/`client-auth-cert`/`ech-key` absent or empty;
+///   `allow-insecure` absent or `false` (never `true` — no plaintext).
+/// - Deferred upstream keys (`ws-path`, `xhttp-config`,
+///   `grpc-service-name`, `shadow-tls`, `res-tls`, `jls-config`,
+///   `mux-option`) hard-error when non-null — including empty maps —
+///   rather than silently degrading to bare TCP.
+/// - Keys that are not mihomo `VlessOption` fields (`tls`,
+///   `certificates`, `fallback(s)`, `network`, top-level `flow`,
+///   `reality-opts`) hard-error with migration hints; every other
+///   unknown key hard-errors — this listener terminates credentials, so
+///   a silently-dead key is a security event, not forward-compat.
+/// - `udp` defaults `true`; `false` rejects Mux/XUDP at the VLESS header.
+/// - `alpn` is a standard-TLS-only list of printable-ASCII strings
+///   (1–255 B each, unique, at most 16); non-empty under REALITY errors.
+fn build_vless_listener_spec(
+    raw_l: &raw::RawListener,
+    default_bind: &str,
+) -> Result<VlessListenerConfig, anyhow::Error> {
+    // Diagnostic order: the security-mode SHAPE first — whether TLS
+    // exists at all and in which form decides how every other key reads.
+
+    // ── reality-config presence — explicit null is absent; anything
+    // else (even an empty map) is a REALITY request. Judged before the
+    // certificate pair so the exclusivity verdict below names the real
+    // defect (two security modes at once) instead of a half pair's.
+    let reality_value = raw_l
+        .reality_config
+        .as_ref()
+        .map(|v| &v.0)
+        .filter(|v| !v.is_null());
+
+    // ── mutual exclusivity: ANY flat certificate field with REALITY is
+    // a hard error (even a half pair — the spec refuses to guess whether
+    // the operator meant TLS or REALITY).
+    if reality_value.is_some() && (raw_l.certificate.is_some() || raw_l.private_key.is_some()) {
+        anyhow::bail!(
+            "listeners[{}]: `reality-config` is mutually exclusive with the flat \
+             `certificate`/`private-key` pair — the outer transport is either a \
+             standard TLS certificate pair or REALITY; remove one of them",
+            raw_l.name
+        );
+    }
+
+    // ── certificate/private-key pairing shape — the pair is validated
+    // for FORM only (non-empty, same spelling); the bytes are loaded and
+    // verified at bind time, where the identity is actually consumed.
+    let cert_pair = match (raw_l.certificate.as_deref(), raw_l.private_key.as_deref()) {
+        (Some(cert), Some(key)) => {
+            if cert.trim().is_empty() || key.trim().is_empty() {
+                anyhow::bail!(
+                    "listeners[{}]: `certificate`/`private-key` must not be empty",
+                    raw_l.name
+                );
+            }
+            if is_pem_literal(cert) != is_pem_literal(key) {
+                anyhow::bail!(
+                    "listeners[{}]: `certificate`/`private-key` must use the same \
+                     form — both inline PEM or both filesystem paths, not mixed",
+                    raw_l.name
+                );
+            }
+            Some((cert.to_string(), key.to_string()))
+        }
+        (None, None) => None,
+        _ => anyhow::bail!(
+            "listeners[{}]: `certificate` and `private-key` must be provided \
+             together",
+            raw_l.name
+        ),
+    };
+
+    // ── no-security gate: there is no plaintext VLESS.
+    if reality_value.is_none() && cert_pair.is_none() {
+        anyhow::bail!(
+            "listeners[{}]: `type: vless` has no plaintext mode — configure either a \
+             `certificate` + `private-key` pair (standard TLS 1.3) or a \
+             `reality-config` block",
+            raw_l.name
+        );
+    }
+
+    // ── REALITY mode: validate the block now so a malformed one errors
+    // ahead of unrelated fields.
+    let reality = match reality_value {
+        Some(value) => Some(build_vless_reality_config(raw_l, value)?),
+        None => None,
+    };
+
+    // ── mTLS / ECH — any non-empty raw value is a hard error; a
+    // whitespace-only string still counts as a request meow cannot
+    // honour (the anytls rule).
+    for (key, value) in [
+        ("client-auth-type", raw_l.client_auth_type.as_deref()),
+        ("client-auth-cert", raw_l.client_auth_cert.as_deref()),
+        ("ech-key", raw_l.ech_key.as_deref()),
+    ] {
+        if value.is_some_and(|v| !v.is_empty()) {
+            anyhow::bail!(
+                "listeners[{}].{key}: `{key}` is not supported by meow's \
+                 `type: vless` inbound — remove it",
+                raw_l.name
+            );
+        }
+    }
+
+    // ── `allow-insecure` — never a plaintext escape hatch here: only
+    // absent or `false` is legal, even with a certificate pair present.
+    if raw_l.allow_insecure == Some(true) {
+        anyhow::bail!(
+            "listeners[{}].allow-insecure: `true` is invalid on `type: vless` — the \
+             inbound has no plaintext mode (VLESS credentials inside cleartext are \
+             trivially harvestable); remove the key and keep TLS",
+            raw_l.name
+        );
+    }
+
+    // ── `decryption` — absent/`""`/`none` equivalent; anything else
+    // asks for VLESS encryption meow does not serve.
+    if let Some(decryption) = raw_l.decryption.as_deref() {
+        if !decryption.is_empty() && decryption != "none" {
+            anyhow::bail!(
+                "listeners[{}].decryption: value is not supported — meow's VLESS \
+                 inbound serves only `decryption: none` (the outer TLS/REALITY layer \
+                 is the encryption); remove the key or set `none`",
+                raw_l.name
+            );
+        }
+    }
+
+    // ── deferred upstream keys — non-null configuration hard-errors
+    // (including empty maps): silently dropping them would degrade the
+    // listener to bare TCP while the operator believes a transport or
+    // front layer is in place. Explicit nulls carry no intent and pass.
+    for (key, value) in [
+        ("shadow-tls", raw_l.shadow_tls.as_ref()),
+        ("res-tls", raw_l.res_tls.as_ref()),
+        ("jls-config", raw_l.jls_config.as_ref()),
+        ("mux-option", raw_l.mux_option.as_ref()),
+    ] {
+        if let Some(value) = value.filter(|v| !v.is_null()) {
+            let _ = value;
+            anyhow::bail!(
+                "listeners[{}].{key}: `{key}` is a mihomo VLESS listener key meow \
+                 does not serve in this release — the inbound runs on native TCP \
+                 only; remove it (there is no silent fallback)",
+                raw_l.name
+            );
+        }
+    }
+
+    // ── unknown/misplaced keys. Everything in `extra` is a hard error
+    // on vless; the recognized misfits get their migration hint first.
+    // Sorted for determinism; only the first defect is reported — the
+    // unconditional bail below means the loop shape would never iterate
+    // twice, so an explicit `first` keeps the intent obvious.
+    let mut extra_keys: Vec<&String> = raw_l.extra.keys().collect();
+    extra_keys.sort();
+    if let Some(key) = extra_keys.first() {
+        let key = key.as_str();
+        let hint = match key {
+            "encryption" => "`encryption` is the OUTBOUND direction's key — on a \
+                 `type: vless` listener the inbound selector is `decryption`, and \
+                 the only served value is `none`"
+                .to_string(),
+            "reality-opts" => "`reality-opts` is the outbound spelling — the \
+                 inbound REALITY block is `reality-config`"
+                .to_string(),
+            "tls" | "certificates" => format!(
+                "`{key}` is not a mihomo VLESS listener key — TLS is enabled by the \
+                 flat `certificate` + `private-key` pair (or `reality-config`)"
+            ),
+            "fallback" | "fallbacks" => format!(
+                "`{key}` is not served: meow's VLESS inbound has no fallback — \
+                 unauthenticated connections get no VLESS response (REALITY mode \
+                 relays them to the cover `dest` instead)"
+            ),
+            "network" => "`network` is not served: meow's VLESS inbound runs on \
+                 native TCP only (no ws/grpc/xhttp)"
+                .to_string(),
+            "flow" => "`flow` is a per-user key here — write it inside each \
+                 `users` entry, not at the listener level"
+                .to_string(),
+            "ws-path" | "xhttp-config" | "grpc-service-name" => format!(
+                "`{key}` is a mihomo VLESS listener key meow does not serve in this \
+                 release — the inbound runs on native TCP only; remove it"
+            ),
+            other => {
+                // Near-misses of served keys get named before the
+                // generic verdict.
+                let near = match other {
+                    "user" | "username" => Some("did you mean `users`?"),
+                    "privatekey" | "private_key" => Some("did you mean `private-key`?"),
+                    "reality" | "realityconfig" => Some("did you mean `reality-config`?"),
+                    "short-id" | "short-ids" | "server-names" | "dest" => {
+                        Some("REALITY keys nest under `reality-config`, not the listener")
+                    }
+                    _ => None,
+                };
+                match near {
+                    Some(near) => format!("unknown key — {near}"),
+                    None => "unknown key — meow's `type: vless` listener rejects keys it \
+                         does not know rather than silently ignoring them (a dead key \
+                         on a credential-terminating inbound hides config bugs)"
+                        .to_string(),
+                }
+            }
+        };
+        anyhow::bail!("listeners[{}].{key}: {hint}", raw_l.name);
+    }
+
+    // ── `users` — a non-empty LIST of strict `{username, uuid, flow}`
+    // entries. The mapping shape is anytls's — a different protocol.
+    let entries: &[serde_json::Value] = match raw_l.users.as_ref() {
+        Some(raw::RawListenerUsers::List(entries)) if !entries.is_empty() => entries,
+        Some(raw::RawListenerUsers::List(_)) => anyhow::bail!(
+            "listeners[{}].users: must not be empty — a VLESS listener without users \
+             authenticates nothing; add at least one `{{username, uuid, flow}}` entry",
+            raw_l.name
+        ),
+        Some(raw::RawListenerUsers::Mapping(_)) => anyhow::bail!(
+            "listeners[{}].users: `type: vless` takes a LIST of \
+             `{{username, uuid, flow}}` entries — the username → password mapping \
+             shape belongs to `type: anytls`",
+            raw_l.name
+        ),
+        None => anyhow::bail!(
+            "listeners[{}]: `type: vless` requires a non-empty `users` list of \
+             `{{username, uuid, flow}}` entries — the UUID is the bearer credential \
+             every client authenticates with",
+            raw_l.name
+        ),
+    };
+    let mut users: Vec<VlessUser> = Vec::with_capacity(entries.len());
+    let mut name_seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut uuid_seen: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+    for (i, entry) in entries.iter().enumerate() {
+        let ctx = format!("listeners[{}].users[{i}]", raw_l.name);
+        let Some(obj) = entry.as_object() else {
+            anyhow::bail!("{ctx}: each user entry must be a mapping of `username`, `uuid`, `flow`");
+        };
+        for key in obj.keys() {
+            if !matches!(key.as_str(), "username" | "uuid" | "flow") {
+                anyhow::bail!(
+                    "{ctx}.{key}: unknown key — a vless user entry is exactly \
+                     `username`, `uuid`, `flow`"
+                );
+            }
+        }
+        let username = match obj.get("username") {
+            Some(serde_json::Value::String(s)) if !s.is_empty() => s.clone(),
+            Some(serde_json::Value::String(_)) => {
+                anyhow::bail!("{ctx}.username: must not be empty — it feeds `IN-USER` rules")
+            }
+            Some(_) => anyhow::bail!("{ctx}.username: must be a string"),
+            None => anyhow::bail!(
+                "{ctx}.username: required — upstream tolerates its absence, meow does \
+                 not: the username is what `IN-USER` rules match on"
+            ),
+        };
+        if !name_seen.insert(username.clone()) {
+            anyhow::bail!("{ctx}.username: '{username}' duplicates an earlier entry");
+        }
+        // The UUID is never echoed into the error — parse errors are on
+        // the redaction list too.
+        let uuid_str = match obj.get("uuid") {
+            Some(serde_json::Value::String(s)) => s,
+            Some(_) => anyhow::bail!("{ctx}.uuid: must be a string"),
+            None => anyhow::bail!("{ctx}.uuid: required — the bearer credential"),
+        };
+        let uuid = parse_strict_uuid(uuid_str).map_err(|_| {
+            anyhow::anyhow!(
+                "{ctx}.uuid: invalid UUID — use the canonical hyphenated form \
+                 (8-4-4-4-12 hex groups) or 32 bare hex digits"
+            )
+        })?;
+        if uuid == [0u8; 16] {
+            anyhow::bail!(
+                "{ctx}.uuid: the all-zero UUID is not a credential — generate a real \
+                 one (e.g. `xray uuid`)"
+            );
+        }
+        if !uuid_seen.insert(uuid) {
+            anyhow::bail!(
+                "{ctx}.uuid: duplicates an earlier user's UUID — credentials must be \
+                 distinct per user"
+            );
+        }
+        match obj.get("flow") {
+            Some(serde_json::Value::String(flow)) if flow == "xtls-rprx-vision" => {}
+            Some(serde_json::Value::String(flow)) if flow == "xtls-rprx-vision-udp443" => {
+                anyhow::bail!(
+                    "{ctx}.flow: `xtls-rprx-vision-udp443` is client-local syntax — on \
+                     the wire the flow is always the 16-char `xtls-rprx-vision` and \
+                     UDP/443 gating is purely the client's own policy; write plain \
+                     `xtls-rprx-vision` here"
+                )
+            }
+            Some(serde_json::Value::String(flow)) if flow.starts_with("xtls-rprx-vision") => {
+                anyhow::bail!(
+                    "{ctx}.flow: only the literal `xtls-rprx-vision` is accepted — \
+                     suffixes are client-local syntax and never reach the wire"
+                )
+            }
+            Some(serde_json::Value::String(flow)) if flow.is_empty() => {
+                anyhow::bail!(
+                    "{ctx}.flow: empty flow means plaintext VLESS without vision \
+                     padding — meow's inbound serves only `xtls-rprx-vision`"
+                )
+            }
+            Some(serde_json::Value::String(flow)) => {
+                anyhow::bail!(
+                    "{ctx}.flow: '{flow}' is not supported — meow's VLESS inbound \
+                     serves only `xtls-rprx-vision` (there is no plain/legacy flow)"
+                )
+            }
+            Some(_) => anyhow::bail!("{ctx}.flow: must be a string"),
+            None => anyhow::bail!(
+                "{ctx}.flow: required — upstream tolerates its absence, meow does \
+                 not: the only served value is `xtls-rprx-vision`"
+            ),
+        }
+        users.push(VlessUser { username, uuid });
+    }
+
+    // ── `alpn` — standard-TLS only; a list of printable-ASCII strings,
+    // 1–255 bytes each, unique, at most 16 entries. An empty list is the
+    // same as absent on both modes.
+    let mut alpn: Vec<String> = Vec::new();
+    if let Some(raw_alpn) = raw_l.alpn.as_ref().map(|v| &v.0).filter(|v| !v.is_null()) {
+        let ctx = format!("listeners[{}].alpn", raw_l.name);
+        let Some(list) = raw_alpn.as_array() else {
+            anyhow::bail!("{ctx}: must be a list of protocol strings (e.g. `[h2, http/1.1]`)");
+        };
+        if list.len() > 16 {
+            anyhow::bail!("{ctx}: at most 16 entries — the TLS ALPN extension is small");
+        }
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for (i, entry) in list.iter().enumerate() {
+            let serde_json::Value::String(proto) = entry else {
+                anyhow::bail!("{ctx}[{i}]: must be a string");
+            };
+            if proto.is_empty() {
+                anyhow::bail!("{ctx}[{i}]: must not be empty");
+            }
+            if proto.len() > 255 {
+                anyhow::bail!("{ctx}[{i}]: exceeds the 255-byte ALPN protocol limit");
+            }
+            if !proto.bytes().all(|b| (0x20..=0x7e).contains(&b)) {
+                anyhow::bail!(
+                    "{ctx}[{i}]: must be printable ASCII (no control or non-ASCII bytes)"
+                );
+            }
+            if !seen.insert(proto.as_str()) {
+                anyhow::bail!("{ctx}[{i}]: '{proto}' duplicates an earlier entry");
+            }
+            alpn.push(proto.clone());
+        }
+    }
+    if !alpn.is_empty() && reality.is_some() {
+        anyhow::bail!(
+            "listeners[{}].alpn: not configurable in REALITY mode — the cover branch's \
+             ALPN belongs to the probe client and the target alone, and the REALITY \
+             handshake offers no local override; remove it",
+            raw_l.name
+        );
+    }
+
+    // ── `udp` — default `true`; `false` rejects Mux/XUDP at the VLESS
+    // header layer. Both spellings are meaningful, so neither warns.
+    let udp = raw_l.udp.unwrap_or(true);
+
+    // ── keys consumed by other listener types land here only by
+    // mistake — schema-known, so warn-ignore (the unknown ones in
+    // `extra` already hard-errored above).
+    for (key, set) in [
+        ("cipher", raw_l.cipher.is_some()),
+        ("password", raw_l.password.is_some()),
+        ("simple-obfs", raw_l.simple_obfs.is_some()),
+        ("kcp-tun", raw_l.kcp_tun.is_some()),
+        ("padding-scheme", raw_l.padding_scheme.is_some()),
+    ] {
+        if set {
+            warn!(
+                "listeners[{}].{key}: `{key}` is not meaningful on `type: vless`, \
+                 ignored; remove it to suppress this warning",
+                raw_l.name
+            );
+        }
+    }
+
+    let addresses = resolve_multi_listener_binds(raw_l, default_bind)?;
+
+    // ── REALITY self-loop static gate — the certain cases only: the
+    // cover `dest` is an IP literal that provably lands back on THIS
+    // listener (same address, or a wildcard/loopback combination).
+    // Domain dests and non-local literals are the runtime dial guard's
+    // job (it checks resolution results against every listener); an
+    // ephemeral `port: 0` bind can never match statically.
+    if let Some(reality_cfg) = &reality {
+        if let Ok(dest_ip) = reality_cfg.dest_host.parse::<IpAddr>() {
+            for bind in &addresses {
+                if bind.port != reality_cfg.dest_port || bind.port == 0 {
+                    continue;
+                }
+                let Ok(bind_ip) = bind.listen.parse::<IpAddr>() else {
+                    continue;
+                };
+                let exact = bind_ip == dest_ip;
+                // Dialing a wildcard or loopback reaches a local socket
+                // on every host; a wildcard bind covers loopback too.
+                let wildcard_covers =
+                    bind_ip.is_unspecified() && (dest_ip.is_loopback() || dest_ip.is_unspecified());
+                let loopback_pair = bind_ip.is_loopback()
+                    && (dest_ip.is_loopback() || dest_ip.is_unspecified())
+                    && bind_ip.is_ipv4() == dest_ip.is_ipv4();
+                if exact || wildcard_covers || loopback_pair {
+                    anyhow::bail!(
+                        "listeners[{}].reality-config.dest: points back at this \
+                         listener's own bind `{bind_ip}:{port}` — every cover relay \
+                         would loop into the REALITY classifier itself; pick a real \
+                         cover site (a TLS server the probe client can be relayed to)",
+                        raw_l.name,
+                        port = bind.port
+                    );
+                }
+            }
+        }
+    }
+
+    let security = match (cert_pair, reality) {
+        (Some((certificate, private_key)), None) => VlessSecurity::StandardTls {
+            certificate,
+            private_key,
+            alpn,
+        },
+        (None, Some(reality_cfg)) => VlessSecurity::Reality(reality_cfg),
+        // Both/neither already hard-errored above; the compiler cannot
+        // see through the early bail without this arm.
+        _ => unreachable!("security-mode exclusivity is enforced before this point"),
+    };
+
+    Ok(VlessListenerConfig {
+        users,
+        security,
+        udp,
         addresses,
     })
 }
@@ -7676,6 +8980,9 @@ fn build_named_listeners(
                 ("ech-key", raw_l.ech_key.is_some()),
                 ("allow-insecure", raw_l.allow_insecure.is_some()),
                 ("padding-scheme", raw_l.padding_scheme.is_some()),
+                ("decryption", raw_l.decryption.is_some()),
+                ("alpn", raw_l.alpn.is_some()),
+                ("reality-config", raw_l.reality_config.is_some()),
             ] {
                 if set {
                     warn!(
@@ -7717,9 +9024,12 @@ fn build_named_listeners(
         }
         let spec = parse_listener_spec(raw_l, global_tproxy_sni, sniffer_declared)?;
         // `type: wireguard` entries already warned their extra keys inside
-        // `build_wg_listener_spec` (peer extras too); on every other type the
-        // extras would drop silently — classify-and-warn here (issue #974).
-        if !matches!(spec, ListenerSpec::WireGuard(_)) {
+        // `build_wg_listener_spec` (peer extras too); `type: vless`
+        // hard-errors every extra key inside its own builder (unknown keys
+        // are fatal there, so the warn pass would be pure noise); on every
+        // other type the extras would drop silently — classify-and-warn
+        // here (issue #974).
+        if !matches!(spec, ListenerSpec::WireGuard(_) | ListenerSpec::Vless(_)) {
             validation::warn_extra(&format!("listener '{}'", raw_l.name), &raw_l.extra);
             if let Some(obfs) = &raw_l.simple_obfs {
                 validation::warn_extra(
@@ -7762,10 +9072,11 @@ fn build_named_listeners(
                 raw_l.name
             ),
         }
-        // `udp` is meaningful on tproxy (issue #564), shadowsocks and
-        // wireguard; `type: anytls` diagnoses the key itself inside
-        // `build_anytls_listener_spec` (`true` redundant, `false` a hard
-        // error). Any other listener type ignoring it is warned about.
+        // `udp` is meaningful on tproxy (issue #564), shadowsocks,
+        // wireguard and vless (XUDP gate); `type: anytls` diagnoses the
+        // key itself inside `build_anytls_listener_spec` (`true`
+        // redundant, `false` a hard error). Any other listener type
+        // ignoring it is warned about.
         if raw_l.udp.is_some()
             && !matches!(
                 spec,
@@ -7773,10 +9084,11 @@ fn build_named_listeners(
                     | ListenerSpec::Shadowsocks(_)
                     | ListenerSpec::WireGuard(_)
                     | ListenerSpec::Anytls(_)
+                    | ListenerSpec::Vless(_)
             )
         {
             warn!(
-                "listeners[{}].udp: only meaningful on `type: tproxy`/`shadowsocks`/`wireguard`, \
+                "listeners[{}].udp: only meaningful on `type: tproxy`/`shadowsocks`/`wireguard`/`vless`, \
                  ignored; remove it to suppress this warning",
                 raw_l.name
             );
@@ -7785,13 +9097,16 @@ fn build_named_listeners(
         // the same shape as the `firewall`/`tproxy-sni` checks above
         // (`type: tun` consumed them in its own arm above and never
         // reaches here).
-        // `private-key` is shared with `type: anytls` (TLS material) —
-        // `mtu`/`peers` remain WG/TUN-only and warn there too.
+        // `private-key` is shared with `type: anytls`/`vless` (TLS
+        // material) — `mtu`/`peers` remain WG/TUN-only and warn there too.
         if raw_l.private_key.is_some()
-            && !matches!(spec, ListenerSpec::WireGuard(_) | ListenerSpec::Anytls(_))
+            && !matches!(
+                spec,
+                ListenerSpec::WireGuard(_) | ListenerSpec::Anytls(_) | ListenerSpec::Vless(_)
+            )
         {
             warn!(
-                "listeners[{}].private-key: only meaningful on `type: wireguard`/`anytls`, ignored; \
+                "listeners[{}].private-key: only meaningful on `type: wireguard`/`anytls`/`vless`, ignored; \
                  remove it to suppress this warning",
                 raw_l.name
             );
@@ -7808,9 +9123,10 @@ fn build_named_listeners(
                 );
             }
         }
-        // AnyTLS-only fields set on another listener type warn — same
-        // shape as the wireguard check above (`enable` is also consumed
-        // by `type: tun`... its arm errors before reaching here).
+        // AnyTLS/VLESS-shared TLS-identity fields set on another listener
+        // type warn — same shape as the wireguard check above. `users` and
+        // the certificate pair are consumed by both types (in their own
+        // shapes); `padding-scheme` stays AnyTLS-only.
         for (key, set) in [
             ("users", raw_l.users.is_some()),
             ("certificate", raw_l.certificate.is_some()),
@@ -7818,11 +9134,35 @@ fn build_named_listeners(
             ("client-auth-cert", raw_l.client_auth_cert.is_some()),
             ("ech-key", raw_l.ech_key.is_some()),
             ("allow-insecure", raw_l.allow_insecure.is_some()),
-            ("padding-scheme", raw_l.padding_scheme.is_some()),
         ] {
+            if set && !matches!(spec, ListenerSpec::Anytls(_) | ListenerSpec::Vless(_)) {
+                warn!(
+                    "listeners[{}].{key}: only meaningful on `type: anytls`/`vless`, ignored; \
+                     remove it to suppress this warning",
+                    raw_l.name
+                );
+            }
+        }
+        for (key, set) in [("padding-scheme", raw_l.padding_scheme.is_some())] {
             if set && !matches!(spec, ListenerSpec::Anytls(_)) {
                 warn!(
                     "listeners[{}].{key}: only meaningful on `type: anytls`, ignored; \
+                     remove it to suppress this warning",
+                    raw_l.name
+                );
+            }
+        }
+        // VLESS-only fields set on another listener type warn — same
+        // shape. (`type: vless` validates these keys inside its own
+        // builder; every other type has no use for them.)
+        for (key, set) in [
+            ("decryption", raw_l.decryption.is_some()),
+            ("alpn", raw_l.alpn.is_some()),
+            ("reality-config", raw_l.reality_config.is_some()),
+        ] {
+            if set && !matches!(spec, ListenerSpec::Vless(_)) {
+                warn!(
+                    "listeners[{}].{key}: only meaningful on `type: vless`, ignored; \
                      remove it to suppress this warning",
                     raw_l.name
                 );
@@ -7926,6 +9266,9 @@ fn build_named_listeners(
             ListenerSpec::Anytls(_) => {
                 ListenerSpec::Anytls(build_anytls_listener_spec(raw_l, default_bind)?)
             }
+            ListenerSpec::Vless(_) => {
+                ListenerSpec::Vless(build_vless_listener_spec(raw_l, default_bind)?)
+            }
             other => other,
         };
         // The UDP-TPROXY address-family contract is checked on the raw
@@ -7934,11 +9277,12 @@ fn build_named_listeners(
         if matches!(&spec, ListenerSpec::TProxy { udp: true, .. }) {
             validate_tproxy_udp_listen(listen_raw, &raw_l.name)?;
         }
-        // The anytls builder already normalized every bind target; its
-        // first address plays `NamedListener.listen`/`port` while the
+        // The anytls/vless builders already normalized every bind target;
+        // the first address plays `NamedListener.listen`/`port` while the
         // full `addresses` list stays on the spec.
         let (listen, port) = match &spec {
             ListenerSpec::Anytls(cfg) => (cfg.addresses[0].listen.clone(), cfg.addresses[0].port),
+            ListenerSpec::Vless(cfg) => (cfg.addresses[0].listen.clone(), cfg.addresses[0].port),
             _ => resolve_listener_bind(listen_raw, raw_l.port)?,
         };
         // `listeners[].rule` selects a `sub-rules:` block BY NAME — not a
@@ -7998,10 +9342,11 @@ fn build_named_listeners(
             );
         }
         let max_connections = raw_l.max_connections.unwrap_or(global_max_conns);
-        // Every port a multi-address `type: anytls` binds must join the
-        // duplicate-port registry, not just the primary one.
+        // Every port a multi-address `type: anytls`/`type: vless` binds
+        // must join the duplicate-port registry, not just the primary one.
         let extra_ports: Vec<u16> = match &spec {
             ListenerSpec::Anytls(cfg) => cfg.addresses[1..].iter().map(|a| a.port).collect(),
+            ListenerSpec::Vless(cfg) => cfg.addresses[1..].iter().map(|a| a.port).collect(),
             _ => Vec::new(),
         };
         add(
@@ -14869,5 +16214,651 @@ mod listener_surface_tests {
             "{ANYTLS_USERS}{ANYTLS_INSECURE}    cipher: aes-256-gcm\n    kcp-tun: {{}}\n"
         ))
         .unwrap();
+    }
+
+    // ── `type: vless` listener spec ──────────────────────────────────
+    //
+    // The vision-inbound spec's config matrix: users list shape and
+    // strictness, the TLS/REALITY security-mode union, deferred-key and
+    // unknown-key rejection, ALPN, `decryption`, multi-address `listen`
+    // and the static REALITY self-loop gate.
+
+    const VLESS_USER_A: &str =
+        "      - username: alice\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision\n";
+    const VLESS_CERT: &str =
+        "    certificate: \"-----BEGIN CERTIFICATE-----\\nMIIB\\n-----END CERTIFICATE-----\"\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nMIIB\\n-----END PRIVATE KEY-----\"\n";
+    // RFC 7748 Alice scalar — a real X25519 private key, unpadded
+    // URL-safe base64 exactly as `xray x25519` prints it.
+    const REALITY_KEY: &str = "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo";
+    const REALITY_BLOCK: &str = "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo\"\n      short-id: [\"0123456789abcdef\"]\n      server-names: [\"example.com\"]\n";
+
+    fn vless_yaml(extra: &str) -> String {
+        format!("listeners:\n  - name: v\n    type: vless\n    port: 0\n{extra}")
+    }
+
+    fn vless_named(extra: &str) -> Result<Vec<NamedListener>, anyhow::Error> {
+        let raw: raw::RawConfig = crate::parse_raw_yaml(&vless_yaml(extra))?;
+        build_named_listeners(&raw, "127.0.0.1", false)
+    }
+
+    fn vless_named_err(extra: &str) -> String {
+        vless_named(extra)
+            .map(|l| format!("BUILT {l:?}"))
+            .unwrap_err()
+            .to_string()
+    }
+
+    fn vless_tls_yaml() -> String {
+        format!("{VLESS_CERT}    users:\n{VLESS_USER_A}")
+    }
+
+    fn vless_reality_yaml() -> String {
+        format!("{REALITY_BLOCK}    users:\n{VLESS_USER_A}")
+    }
+
+    #[test]
+    fn vless_users_and_security_happy_paths() {
+        // Standard TLS mode.
+        let listeners = vless_named(&vless_tls_yaml()).unwrap();
+        let ListenerSpec::Vless(cfg) = &listeners[0].spec else {
+            panic!("expected vless spec");
+        };
+        assert_eq!(cfg.users.len(), 1);
+        assert_eq!(cfg.users[0].username, "alice");
+        assert_ne!(cfg.users[0].uuid, [0u8; 16]);
+        assert!(cfg.udp, "udp defaults to true");
+        assert_eq!(cfg.addresses.len(), 1);
+        let VlessSecurity::StandardTls {
+            certificate, alpn, ..
+        } = &cfg.security
+        else {
+            panic!("expected standard TLS mode");
+        };
+        assert!(certificate.contains("BEGIN CERTIFICATE"));
+        assert!(alpn.is_empty(), "alpn defaults to empty");
+
+        // REALITY mode — defaults filled.
+        let listeners = vless_named(&vless_reality_yaml()).unwrap();
+        let ListenerSpec::Vless(cfg) = &listeners[0].spec else {
+            panic!("expected vless spec");
+        };
+        let VlessSecurity::Reality(rc) = &cfg.security else {
+            panic!("expected REALITY mode");
+        };
+        assert_eq!(rc.dest, "www.example.com:443");
+        assert_eq!(rc.short_ids.len(), 1);
+        assert_eq!(rc.short_ids[0], {
+            let mut id = [0u8; 8];
+            id[..8].copy_from_slice(&[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]);
+            id
+        });
+        assert_eq!(rc.server_names, ["example.com"]);
+        assert_eq!(rc.max_time_difference_us, 120_000_000);
+        assert_eq!(rc.limit_fallback_upload, RealityLimitFallback::default());
+
+        // `type_name` and the named-listener endpoint pair.
+        assert_eq!(listeners[0].spec.type_name(), "vless");
+        assert_eq!(listeners[0].listen, "127.0.0.1");
+    }
+
+    #[test]
+    fn vless_no_plaintext_and_mode_exclusivity() {
+        // Neither TLS nor REALITY → hard error naming both escapes.
+        let err = vless_named_err(&format!("    users:\n{VLESS_USER_A}"));
+        assert!(err.contains("no plaintext mode"), "{err}");
+        assert!(err.contains("certificate"), "{err}");
+        assert!(err.contains("reality-config"), "{err}");
+
+        // REALITY + any flat certificate field → hard error, even a half pair.
+        let err = vless_named_err(&format!(
+            "{REALITY_BLOCK}    certificate: \"-----BEGIN CERTIFICATE-----\\nM\\n-----END CERTIFICATE-----\"\n    users:\n{VLESS_USER_A}"
+        ));
+        assert!(err.contains("mutually exclusive"), "{err}");
+
+        // Half pairs alone → hard error.
+        let err = vless_named_err(&format!(
+            "    certificate: \"-----BEGIN CERTIFICATE-----\\nM\\n-----END CERTIFICATE-----\"\n    users:\n{VLESS_USER_A}"
+        ));
+        assert!(err.contains("provided together"), "{err}");
+
+        // Mixed PEM/path forms → hard error.
+        let err = vless_named_err(&format!(
+            "    certificate: /etc/cert.pem\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nM\\n-----END PRIVATE KEY-----\"\n    users:\n{VLESS_USER_A}"
+        ));
+        assert!(err.contains("same"), "{err}");
+
+        // `allow-insecure: true` is never a plaintext escape — even with TLS.
+        let err = vless_named_err(&format!(
+            "{VLESS_CERT}    allow-insecure: true\n    users:\n{VLESS_USER_A}"
+        ));
+        assert!(err.contains("allow-insecure"), "{err}");
+        assert!(err.contains("no plaintext"), "{err}");
+        // …but `false` is accepted as the explicit default.
+        vless_named(&format!(
+            "{VLESS_CERT}    allow-insecure: false\n    users:\n{VLESS_USER_A}"
+        ))
+        .unwrap();
+
+        // mTLS / ECH non-empty values hard-error; empty strings pass.
+        for key in ["client-auth-type", "client-auth-cert", "ech-key"] {
+            let err = vless_named_err(&format!(
+                "{VLESS_CERT}    {key}: present\n    users:\n{VLESS_USER_A}"
+            ));
+            assert!(err.contains(key), "{err}");
+        }
+        vless_named(&format!(
+            "{VLESS_CERT}    ech-key: \"\"\n    users:\n{VLESS_USER_A}"
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn vless_users_strictness_matrix() {
+        let base = VLESS_CERT;
+        // Absent users / empty list → hard error.
+        let err = vless_named_err(VLESS_CERT);
+        assert!(err.contains("users"), "{err}");
+        let err = vless_named_err(&format!("{base}    users: []\n"));
+        assert!(err.contains("must not be empty"), "{err}");
+        // The anytls mapping shape on vless → hard error with the hint.
+        let err = vless_named_err(&format!("{base}    users: {{alice: pw}}\n"));
+        assert!(err.contains("LIST"), "{err}");
+
+        // Missing fields.
+        let err = vless_named_err(&format!(
+            "{base}    users:\n      - uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision\n"
+        ));
+        assert!(err.contains("username"), "{err}");
+        let err = vless_named_err(&format!(
+            "{base}    users:\n      - username: a\n        flow: xtls-rprx-vision\n"
+        ));
+        assert!(err.contains("uuid"), "{err}");
+        let err = vless_named_err(&format!(
+            "{base}    users:\n      - username: a\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n"
+        ));
+        assert!(err.contains("flow"), "{err}");
+
+        // Unknown user sub-key → hard error.
+        let err = vless_named_err(&format!(
+            "{base}    users:\n      - username: a\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision\n        email: x@y\n"
+        ));
+        assert!(err.contains("unknown key"), "{err}");
+
+        // Duplicate username / duplicate normalized UUID (dashed vs bare).
+        let dup = format!("{base}    users:\n{VLESS_USER_A}{VLESS_USER_A}");
+        let err = vless_named_err(&dup);
+        assert!(err.contains("duplicates an earlier entry"), "{err}");
+        let err = vless_named_err(&format!(
+            "{base}    users:\n      - username: a\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision\n      - username: b\n        uuid: \"71884BD4D6A04E1998953E1D8B469317\"\n        flow: xtls-rprx-vision\n"
+        ));
+        assert!(err.contains("duplicates an earlier user"), "{err}");
+
+        // UUID strictness: bare 32-hex accepted; all-zero rejected;
+        // misplaced hyphens / bad chars / wrong length rejected.
+        vless_named(&format!(
+            "{base}    users:\n      - username: a\n        uuid: \"71884bd4d6a04e1998953e1d8b469317\"\n        flow: xtls-rprx-vision\n"
+        ))
+        .unwrap();
+        for bad in [
+            "00000000-0000-0000-0000-000000000000",
+            "71884bd4-d6a04-e19-9895-3e1d8b469317",
+            "71884bd4-d6a0-4e19-9895-3e1d8b46931",
+            "zz884bd4-d6a0-4e19-9895-3e1d8b469317",
+        ] {
+            let err = vless_named_err(&format!(
+                "{base}    users:\n      - username: a\n        uuid: \"{bad}\"\n        flow: xtls-rprx-vision\n"
+            ));
+            assert!(err.contains("uuid"), "{err} for {bad}");
+        }
+
+        // Flow strictness: only the literal; the udp443 suffix and other
+        // flows are rejected with their explanations.
+        let err = vless_named_err(&format!(
+            "{base}    users:\n      - username: a\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision-udp443\n"
+        ));
+        assert!(err.contains("client-local"), "{err}");
+        let err = vless_named_err(&format!(
+            "{base}    users:\n      - username: a\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: \"\"\n"
+        ));
+        assert!(err.contains("empty flow"), "{err}");
+        let err = vless_named_err(&format!(
+            "{base}    users:\n      - username: a\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-direct\n"
+        ));
+        assert!(err.contains("xtls-rprx-vision"), "{err}");
+    }
+
+    #[test]
+    fn vless_decryption_and_deferred_keys() {
+        let users = format!("    users:\n{VLESS_USER_A}");
+        // decryption absent/""/none pass; anything else errors.
+        vless_named(&format!("{VLESS_CERT}{users}    decryption: none\n")).unwrap();
+        vless_named(&format!("{VLESS_CERT}{users}    decryption: \"\"\n")).unwrap();
+        let secret = "xray_inbound_private_key_9f8e7d6c5b4a";
+        let err = vless_named_err(&format!("{VLESS_CERT}{users}    decryption: {secret}\n"));
+        assert!(err.contains("decryption"), "{err}");
+        assert!(err.contains("`none`"), "{err}");
+        assert!(
+            !err.contains(secret),
+            "decryption value leaked into the config error: {err}"
+        );
+
+        // `encryption` (outbound key) errors with the decryption hint.
+        let err = vless_named_err(&format!("{VLESS_CERT}{users}    encryption: none\n"));
+        assert!(err.contains("decryption"), "{err}");
+
+        // Deferred upstream keys hard-error even as empty maps.
+        for key in ["shadow-tls", "res-tls", "jls-config", "mux-option"] {
+            let err = vless_named_err(&format!("{VLESS_CERT}{users}    {key}: {{}}\n"));
+            assert!(err.contains(key), "{err}");
+            let err = vless_named_err(&format!(
+                "{VLESS_CERT}{users}    {key}: {{enable: false}}\n"
+            ));
+            assert!(err.contains("native TCP"), "{err}");
+        }
+        for key in ["ws-path", "xhttp-config", "grpc-service-name"] {
+            let err = vless_named_err(&format!("{VLESS_CERT}{users}    {key}: x\n"));
+            assert!(err.contains("native TCP"), "{err}");
+        }
+
+        // Migration-hint keys: tls/certificates/fallback/network/flow/reality-opts.
+        for (key, hint) in [
+            ("tls", "flat `certificate`"),
+            ("fallback", "no fallback"),
+            ("network", "native TCP"),
+            ("flow", "per-user"),
+            ("reality-opts", "reality-config"),
+        ] {
+            let err = vless_named_err(&format!("{VLESS_CERT}{users}    {key}: true\n"));
+            assert!(err.contains(hint), "{err} for {key}");
+        }
+
+        // Truly unknown keys hard-error — no silent ignore on this inbound.
+        let err = vless_named_err(&format!("{VLESS_CERT}{users}    obfs: tls\n"));
+        assert!(err.contains("unknown key"), "{err}");
+    }
+
+    #[test]
+    fn vless_alpn_rules() {
+        let users = format!("    users:\n{VLESS_USER_A}");
+        // Valid list under standard TLS.
+        let listeners = vless_named(&format!(
+            "{VLESS_CERT}{users}    alpn: [h2, \"http/1.1\"]\n"
+        ))
+        .unwrap();
+        let ListenerSpec::Vless(cfg) = &listeners[0].spec else {
+            panic!("expected vless spec");
+        };
+        let VlessSecurity::StandardTls { alpn, .. } = &cfg.security else {
+            panic!("expected standard TLS");
+        };
+        assert_eq!(alpn, &["h2", "http/1.1"]);
+
+        // Shape violations.
+        for (alpn_yaml, hint) in [
+            ("    alpn: h2\n", "list"),
+            ("    alpn: [\"\"]\n", "empty"),
+            ("    alpn: [h2, h2]\n", "duplicates"),
+            ("    alpn: [5]\n", "string"),
+            ("    alpn: [\"h2é\"]\n", "printable ASCII"),
+        ] {
+            let err = vless_named_err(&format!("{VLESS_CERT}{users}{alpn_yaml}"));
+            assert!(err.contains(hint), "{err} for {alpn_yaml}");
+        }
+        // Over 16 entries.
+        let many = (0..17)
+            .map(|i| format!("p{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = vless_named_err(&format!("{VLESS_CERT}{users}    alpn: [{many}]\n"));
+        assert!(err.contains("16"), "{err}");
+
+        // Non-empty ALPN under REALITY errors; empty passes.
+        let err = vless_named_err(&format!("{REALITY_BLOCK}{users}    alpn: [h2]\n"));
+        assert!(err.contains("REALITY"), "{err}");
+        vless_named(&format!("{REALITY_BLOCK}{users}    alpn: []\n")).unwrap();
+    }
+
+    #[test]
+    fn vless_reality_config_matrix() {
+        let users = format!("    users:\n{VLESS_USER_A}");
+        // Empty map → hard error.
+        let err = vless_named_err(&format!("    reality-config: {{}}\n{users}"));
+        assert!(err.contains("empty map"), "{err}");
+        // Non-map shape → hard error.
+        let err = vless_named_err(&format!("    reality-config: 5\n{users}"));
+        assert!(err.contains("mapping"), "{err}");
+
+        // Missing required keys.
+        for missing in ["dest", "private-key", "short-id", "server-names"] {
+            let block = format!(
+                "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n"
+            );
+            // Remove the line for `missing`.
+            let block: String = block
+                .lines()
+                .filter(|l| !l.trim_start().starts_with(&format!("{missing}:")))
+                .map(|l| format!("{l}\n"))
+                .collect();
+            let err = vless_named_err(&format!("{block}{users}"));
+            assert!(err.contains(missing), "{err} for missing {missing}");
+        }
+
+        // `target` errors with the dest migration hint; xver/minClientVer
+        // and nested proxy are explicit rejections.
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      target: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n{users}"
+        ));
+        assert!(err.contains("dest"), "{err}");
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n      xver: 1\n{users}"
+        ));
+        assert!(err.contains("xver"), "{err}");
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n      proxy: out\n{users}"
+        ));
+        assert!(err.contains("proxy"), "{err}");
+
+        // dest shape matrix.
+        for (dest, hint) in [
+            ("www.example.com", "missing `:port`"),
+            ("www.example.com:0", "port 0"),
+            ("www.example.com:99999", "1..=65535"),
+            ("https://www.example.com:443", "URL"),
+            ("::1:443", "bracketed"),
+            ("[::1", "close"),
+        ] {
+            let err = vless_named_err(&format!(
+                "    reality-config:\n      dest: \"{dest}\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n{users}"
+            ));
+            assert!(err.contains(hint), "{err} for dest {dest}");
+        }
+        // Bracketed IPv6 passes shape validation.
+        vless_named(&format!(
+            "    reality-config:\n      dest: \"[2001:db8::1]:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n{users}"
+        ))
+        .unwrap();
+
+        // private-key shape: padded/base64-standard/short all rejected.
+        for bad in [
+            "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo=", // padded
+            "MDEyMzQ1Njc4OTAxMjM0NQ",                       // 16 bytes
+            "not base64!!!",
+        ] {
+            let err = vless_named_err(&format!(
+                "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{bad}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n{users}"
+            ));
+            assert!(err.contains("private-key"), "{err} for key {bad}");
+        }
+
+        // short-id matrix: odd length, >16 chars, non-hex, empty,
+        // all-zero, padded-duplicate all rejected.
+        for (id, hint) in [
+            ("abc", "even"),
+            ("0123456789abcdef00", "at most 16"),
+            ("zz", "hex"),
+        ] {
+            let err = vless_named_err(&format!(
+                "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"{id}\"]\n      server-names: [\"example.com\"]\n{users}"
+            ));
+            assert!(err.contains(hint), "{err} for short-id {id}");
+        }
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"\"]\n      server-names: [\"example.com\"]\n{users}"
+        ));
+        assert!(err.contains("empty string"), "{err}");
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"00\"]\n      server-names: [\"example.com\"]\n{users}"
+        ));
+        assert!(err.contains("all-zero"), "{err}");
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\", \"ab00\"]\n      server-names: [\"example.com\"]\n{users}"
+        ));
+        assert!(err.contains("zero-padding"), "{err}");
+
+        // server-names matrix: wildcard, IP, trailing dot, uppercase
+        // duplicate, non-ASCII all rejected.
+        for (name, hint) in [
+            ("*.example.com", "wildcards"),
+            ("1.2.3.4", "IP literals"),
+            ("example.com.", "trailing"),
+            ("-bad.com", "hyphen"),
+        ] {
+            let err = vless_named_err(&format!(
+                "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"{name}\"]\n{users}"
+            ));
+            assert!(err.contains(hint), "{err} for server-name {name}");
+        }
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\", \"EXAMPLE.com\"]\n{users}"
+        ));
+        assert!(err.contains("duplicates"), "{err}");
+
+        // max-time-difference: negative/float rejected, 0 disables,
+        // large values accepted.
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n      max-time-difference: -5\n{users}"
+        ));
+        assert!(err.contains("non-negative integer"), "{err}");
+        let listeners = vless_named(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n      max-time-difference: 0\n{users}"
+        ))
+        .unwrap();
+        let ListenerSpec::Vless(cfg) = &listeners[0].spec else {
+            panic!("expected vless spec");
+        };
+        let VlessSecurity::Reality(rc) = &cfg.security else {
+            panic!("expected REALITY");
+        };
+        assert_eq!(rc.max_time_difference_us, 0);
+
+        // limit-fallback sub-keys validate; unknown sub-key errors.
+        let listeners = vless_named(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n      limit-fallback-upload:\n        after-bytes: 1024\n        bytes-per-sec: 512\n      limit-fallback-download: {{}}\n{users}"
+        ))
+        .unwrap();
+        let ListenerSpec::Vless(cfg) = &listeners[0].spec else {
+            panic!("expected vless spec");
+        };
+        let VlessSecurity::Reality(rc) = &cfg.security else {
+            panic!("expected REALITY");
+        };
+        assert_eq!(rc.limit_fallback_upload.after_bytes, 1024);
+        assert_eq!(rc.limit_fallback_upload.bytes_per_sec, 512);
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n      limit-fallback-upload: {{rate: 5}}\n{users}"
+        ));
+        assert!(err.contains("unknown key"), "{err}");
+    }
+
+    #[test]
+    fn vless_reality_runtime_cardinality_is_config_shape() {
+        let users = format!("    users:\n{VLESS_USER_A}");
+        // 64 legal entries pass; the 65th is a hard error even though every
+        // item is individually valid.
+        let ids64 = (1..=64)
+            .map(|i| format!("\"{i:02x}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        vless_named(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [{ids64}]\n      server-names: [\"example.com\"]\n{users}"
+        ))
+        .unwrap();
+        let ids65 = (1..=65)
+            .map(|i| format!("\"{i:02x}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [{ids65}]\n      server-names: [\"example.com\"]\n{users}"
+        ));
+        assert!(err.contains("short-id"), "{err}");
+        assert!(err.contains("64"), "{err}");
+
+        let names65 = (1..=65)
+            .map(|i| format!("\"n{i}.example.com\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [{names65}]\n{users}"
+        ));
+        assert!(err.contains("server-names"), "{err}");
+        assert!(err.contains("64"), "{err}");
+    }
+
+    #[test]
+    fn vless_reality_nonfinite_numbers_never_become_null_defaults() {
+        let users = format!("    users:\n{VLESS_USER_A}");
+        for block in [
+            "      max-time-difference: .nan\n",
+            "      max-time-difference: .inf\n",
+            "      max-time-difference: 1e999\n",
+            "      limit-fallback-upload: .nan\n",
+            "      limit-fallback-download: .inf\n",
+        ] {
+            let err = vless_named_err(&format!(
+                "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n{block}{users}"
+            ));
+            assert!(err.contains("non-finite"), "{err} for {block}");
+        }
+
+        // Explicit null remains the documented absent-equivalent spelling.
+        let listeners = vless_named(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n      max-time-difference: null\n      limit-fallback-upload: null\n{users}"
+        ))
+        .unwrap();
+        let ListenerSpec::Vless(cfg) = &listeners[0].spec else {
+            panic!("expected vless spec");
+        };
+        let VlessSecurity::Reality(rc) = &cfg.security else {
+            panic!("expected REALITY");
+        };
+        assert_eq!(rc.max_time_difference_us, 120_000_000);
+        assert_eq!(rc.limit_fallback_upload, RealityLimitFallback::default());
+    }
+
+    #[test]
+    fn vless_reality_self_loop_static_gate() {
+        let users = format!("    users:\n{VLESS_USER_A}");
+        // dest at the listener's own bind (exact loopback match).
+        let err = vless_named_err(&format!(
+            "    listen: \"127.0.0.1:8443\"\n    reality-config:\n      dest: \"127.0.0.1:8443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n{users}"
+        ));
+        assert!(err.contains("self"), "{err}");
+        // Wildcard bind + loopback dest at the same port.
+        let err = vless_named_err(&format!(
+            "    listen: \"0.0.0.0:8443\"\n    reality-config:\n      dest: \"127.0.0.1:8443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n{users}"
+        ));
+        assert!(err.contains("cover"), "{err}");
+        // Different port → not a loop, passes.
+        vless_named(&format!(
+            "    listen: \"127.0.0.1:8443\"\n    reality-config:\n      dest: \"127.0.0.1:9443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n{users}"
+        ))
+        .unwrap();
+        // Domain dest never triggers the static gate (runtime's job).
+        vless_named(&vless_reality_yaml()).unwrap();
+    }
+
+    #[test]
+    fn vless_multi_address_and_foreign_keys() {
+        // Comma-separated listen shares the AnyTLS resolution contract in
+        // order and keeps canonical IPv6 spellings distinct only when they
+        // really are distinct addresses.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: v\n    type: vless\n    port: 1080\n    listen: \"127.0.0.1,::1\"\n    certificate: \"-----BEGIN CERTIFICATE-----\\nM\\n-----END CERTIFICATE-----\"\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nM\\n-----END PRIVATE KEY-----\"\n    users:\n      - username: a\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        let ListenerSpec::Vless(cfg) = &listeners[0].spec else {
+            panic!("expected vless spec");
+        };
+        assert_eq!(cfg.addresses.len(), 2);
+        assert_eq!(cfg.addresses[0].listen, "127.0.0.1");
+        assert_eq!(cfg.addresses[1].listen, "::1");
+        assert!(cfg.addresses.iter().all(|a| a.port == 1080));
+
+        let err = vless_named_err(&format!(
+            "{VLESS_CERT}    listen: \"::1,0:0:0:0:0:0:0:1\"\n    users:\n{VLESS_USER_A}"
+        ));
+        assert!(err.contains("duplicate bind address"), "{err}");
+        let err = vless_named_err(&format!(
+            "{VLESS_CERT}    listen: \"127.0.0.1:1,,0.0.0.0:2\"\n    users:\n{VLESS_USER_A}"
+        ));
+        assert!(err.contains("empty address"), "{err}");
+
+        // Comma-separated listen like anytls; ports join the registry.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: v\n    type: vless\n    port: 1080\n    listen: \"127.0.0.1,::1\"\n    certificate: \"-----BEGIN CERTIFICATE-----\\nM\\n-----END CERTIFICATE-----\"\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nM\\n-----END PRIVATE KEY-----\"\n    users:\n      - username: a\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision\n  - name: m\n    type: mixed\n    port: 1080\n",
+        )
+        .unwrap();
+        let err = build_named_listeners(&raw, "127.0.0.1", false)
+            .map(|l| format!("BUILT {l:?}"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1080"), "{err}");
+
+        // `udp: false` is stored (XUDP gate); default stays true.
+        let listeners = vless_named(&format!(
+            "{VLESS_CERT}    udp: false\n    users:\n{VLESS_USER_A}"
+        ))
+        .unwrap();
+        let ListenerSpec::Vless(cfg) = &listeners[0].spec else {
+            panic!("expected vless spec");
+        };
+        assert!(!cfg.udp);
+
+        // Schema-known foreign keys warn-and-ignore instead of erroring.
+        vless_named(&format!(
+            "{VLESS_CERT}    cipher: aes-256-gcm\n    mtu: 1400\n    users:\n{VLESS_USER_A}"
+        ))
+        .unwrap();
+
+        // vless keys on a non-vless listener warn, not error.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: m\n    type: mixed\n    port: 0\n    decryption: none\n    alpn: [h2]\n    reality-config: {}\n",
+        )
+        .unwrap();
+        build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+    }
+
+    #[test]
+    fn vless_users_roundtrip_and_redaction() {
+        // The typed spec round-trips through serde with credentials intact
+        // (persistence), while Debug redacts them (diagnostics).
+        let listeners = vless_named(&vless_reality_yaml()).unwrap();
+        let spec = listeners[0].spec.clone();
+        let json = serde_json::to_string(&spec).unwrap();
+        let back: ListenerSpec = serde_json::from_str(&json).unwrap();
+        assert_eq!(spec, back);
+
+        let debug = format!("{:?}", listeners[0].spec);
+        assert!(
+            !debug.contains("71884bd4"),
+            "uuid leaked into Debug: {debug}"
+        );
+        assert!(
+            !debug.contains("dwdtCnMY"),
+            "private key leaked into Debug: {debug}"
+        );
+        assert!(
+            !debug.contains("0123456789abcdef"),
+            "short-id leaked into Debug: {debug}"
+        );
+        assert!(debug.contains("REDACTED"), "{debug}");
+        // Usernames are not wire secrets — they stay visible.
+        assert!(debug.contains("alice"), "{debug}");
+    }
+
+    #[test]
+    fn strict_uuid_errors_never_echo_the_candidate() {
+        for candidate in [
+            "71884bd4d6a0-4e19-9895-3e1d8b469317-",
+            "71884bd4-d6a04e19-9895-3e1d8b469317",
+            "71884bd4-d6a0-4e19-9895-3e1d8b46931",
+        ] {
+            let err = parse_strict_uuid(candidate).unwrap_err();
+            assert!(
+                !err.contains(candidate),
+                "uuid candidate leaked into parse error: {err}"
+            );
+        }
     }
 }

@@ -137,7 +137,7 @@ process rules — not even `*` or `^$`.
 | `NETWORK` | `NETWORK,udp,DIRECT` | `TCP` or `UDP` |
 | `DSCP` | `DSCP,46,Proxy` | IP DSCP field 0–63 (TProxy only) |
 | `IN-NAME` | `IN-NAME,corp,DIRECT` | Name of the inbound [listener](./listeners) |
-| `IN-TYPE` | `IN-TYPE,SOCKS5,Proxy` | Inbound type: `HTTP`/`HTTPS`/`SOCKS5`/`TPROXY`/`INNER` |
+| `IN-TYPE` | `IN-TYPE,SOCKS5,Proxy` | Inbound type: `HTTP`/`HTTPS`/`SOCKS5`/`TPROXY`/`INNER`/`ANYTLS`/`VLESS` |
 | `IN-USER` | `IN-USER,alice,Proxy` | Authenticated inbound username |
 
 `IN-TYPE,HTTP` matches both plaintext HTTP and HTTPS; use `HTTPS` for TLS only. `DSCP`

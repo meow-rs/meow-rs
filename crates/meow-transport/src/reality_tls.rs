@@ -15,6 +15,7 @@ use aes_gcm::{
 use boring::aead::{AeadCtx, Algorithm};
 use hmac::{Hmac, Mac};
 use sha2::{Digest, Sha256, Sha384, Sha512};
+use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 use crate::{
@@ -30,23 +31,22 @@ type HmacSha256 = Hmac<Sha256>;
 type HmacSha384 = Hmac<Sha384>;
 type HmacSha512 = Hmac<Sha512>;
 
-const TLS_RECORD_HANDSHAKE: u8 = 22;
-const TLS_RECORD_APPLICATION_DATA: u8 = 23;
-const TLS_RECORD_ALERT: u8 = 21;
-const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 20;
+pub(crate) const TLS_RECORD_HANDSHAKE: u8 = 22;
+pub(crate) const TLS_RECORD_APPLICATION_DATA: u8 = 23;
+pub(crate) const TLS_RECORD_ALERT: u8 = 21;
+pub(crate) const TLS_RECORD_CHANGE_CIPHER_SPEC: u8 = 20;
 
-#[cfg(test)]
-const HS_CLIENT_HELLO: u8 = 1;
-const HS_SERVER_HELLO: u8 = 2;
+pub(crate) const HS_CLIENT_HELLO: u8 = 1;
+pub(crate) const HS_SERVER_HELLO: u8 = 2;
 const HS_NEW_SESSION_TICKET: u8 = 4;
-const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
-const HS_CERTIFICATE: u8 = 11;
-const HS_CERTIFICATE_VERIFY: u8 = 15;
-const HS_FINISHED: u8 = 20;
+pub(crate) const HS_ENCRYPTED_EXTENSIONS: u8 = 8;
+pub(crate) const HS_CERTIFICATE: u8 = 11;
+pub(crate) const HS_CERTIFICATE_VERIFY: u8 = 15;
+pub(crate) const HS_FINISHED: u8 = 20;
 
-const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
-const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
-const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+pub(crate) const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+pub(crate) const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+pub(crate) const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
 
 const MLKEM768_CIPHERTEXT_BYTES: usize = 1088;
 /// REALITY ClientVer sent in the auth payload: the Xray-core release an
@@ -178,7 +178,7 @@ impl Transport for RealityTlsLayer {
     }
 }
 
-struct RealityConnected {
+pub(crate) struct RealityConnected {
     inner: Box<dyn Stream>,
     read_key: RecordKey,
     write_key: RecordKey,
@@ -365,6 +365,7 @@ async fn reality_handshake(
 
     let mut handshake_buf = VecDeque::new();
     let mut leaf_cert = None;
+    let mut certificate_verify = None;
     let mut flight = ServerFlightGuard::default();
     let server_finished;
 
@@ -382,9 +383,19 @@ async fn reality_handshake(
         };
         match msg.typ {
             HS_ENCRYPTED_EXTENSIONS | HS_CERTIFICATE | HS_CERTIFICATE_VERIFY => {
+                // CertificateVerify signs the transcript through Certificate;
+                // capture that hash before the CV itself enters the transcript.
+                let cv_transcript_hash =
+                    (msg.typ == HS_CERTIFICATE_VERIFY).then(|| cipher.hash().digest(&transcript));
                 flight.admit(&mut transcript, &msg)?;
                 if msg.typ == HS_CERTIFICATE {
                     leaf_cert = Some(parse_leaf_certificate(&msg.body)?);
+                }
+                if msg.typ == HS_CERTIFICATE_VERIFY {
+                    certificate_verify = Some(parse_certificate_verify(
+                        &msg.body,
+                        cv_transcript_hash.expect("captured above"),
+                    )?);
                 }
             }
             HS_FINISHED => {
@@ -417,7 +428,14 @@ async fn reality_handshake(
 
     let leaf_cert =
         leaf_cert.ok_or_else(|| TransportError::Tls("Reality TLS: missing certificate".into()))?;
-    verify_reality_certificate(&leaf_cert, &reality_auth_key)?;
+    let ed25519_pubkey = verify_reality_certificate(&leaf_cert, &reality_auth_key)?;
+    let certificate_verify = certificate_verify
+        .ok_or_else(|| TransportError::Tls("Reality TLS: missing CertificateVerify".into()))?;
+    verify_certificate_verify_ed25519(
+        &ed25519_pubkey,
+        &certificate_verify.transcript_hash,
+        &certificate_verify.signature,
+    )?;
 
     transcript.extend_from_slice(&server_finished);
     let app = ApplicationKeys::derive(cipher, &hs.master_secret, &transcript);
@@ -455,11 +473,18 @@ pub(crate) struct RealityTlsStream {
     plain_pos: usize,
     plain_end: usize,
     read_state: StreamReadState,
-    write_pending: Option<StreamPendingWrite>,
+    /// Sealed ciphertext of the in-flight write batch; the bytes not yet
+    /// handed to the inner transport are `write_frame[write_pos..]`.
+    /// The buffer survives a completed drain — it is cleared in place and
+    /// its capacity reused by the next batch — so after the first write
+    /// the steady state seals without allocating.  Invariant: the buffer
+    /// is empty exactly when no write is pending.
+    write_frame: Vec<u8>,
+    write_pos: usize,
 }
 
 impl RealityTlsStream {
-    fn new(inner: Box<dyn Stream>, read_key: RecordKey, write_key: RecordKey) -> Self {
+    pub(crate) fn new(inner: Box<dyn Stream>, read_key: RecordKey, write_key: RecordKey) -> Self {
         Self {
             inner,
             read_key,
@@ -473,18 +498,53 @@ impl RealityTlsStream {
                 buf: [0; 5],
                 pos: 0,
             },
-            write_pending: None,
+            write_frame: Vec::new(),
+            write_pos: 0,
         }
     }
 
-    pub(crate) fn enable_raw_read_passthrough(&mut self) {
+    pub(crate) fn enable_raw_read_passthrough(&mut self) -> bool {
+        // This record layer never read-aheads beyond the record it is
+        // completing, but a caller can still switch halfway through that
+        // record.  Plaintext left from a completed record is safe: it drains
+        // before the first raw byte.  Partial ciphertext is not — it cannot
+        // be put back into the transport.
+        let clean_boundary = matches!(self.read_state, StreamReadState::Header { pos: 0, .. });
+        if !clean_boundary {
+            tracing::warn!("Reality TLS raw read switch refused: partial record buffered");
+            return false;
+        }
         self.read_raw_passthrough = true;
+        self.release_drained_read_buf_for_raw();
         tracing::debug!("Reality TLS raw read passthrough enabled");
+        true
     }
 
-    pub(crate) fn enable_raw_write_passthrough(&mut self) {
+    pub(crate) fn enable_raw_write_passthrough(&mut self) -> bool {
+        // Undrained ciphertext does not block the switch: poll_write,
+        // poll_flush and poll_shutdown all drain the pending frame before
+        // any further byte reaches the transport, and the pending bytes
+        // are already-sealed records, so the wire order — the final TLS
+        // ciphertext first, the raw bytes after it — holds structurally
+        // (issue #974).
         self.write_raw_passthrough = true;
+        if self.write_frame.is_empty() && self.write_frame.capacity() > 0 {
+            // Nothing left to drain: no drain will ever run again, so the
+            // scratch release in `drain_pending_write` cannot fire — drop
+            // the capacity here instead.  With ciphertext still pending
+            // the release happens when that drain completes.
+            self.write_frame = Vec::new();
+        }
         tracing::debug!("Reality TLS raw write passthrough enabled");
+        true
+    }
+
+    fn release_drained_read_buf_for_raw(&mut self) {
+        if self.read_raw_passthrough && self.plain_pos == self.plain_end {
+            self.plain_pos = 0;
+            self.plain_end = 0;
+            self.read_buf = Vec::new();
+        }
     }
 
     fn drain_read_plain(&mut self, buf: &mut ReadBuf<'_>) -> bool {
@@ -494,16 +554,19 @@ impl RealityTlsStream {
         let n = buf.remaining().min(self.plain_end - self.plain_pos);
         buf.put_slice(&self.read_buf[self.plain_pos..self.plain_pos + n]);
         self.plain_pos += n;
+        if self.plain_pos == self.plain_end {
+            self.release_drained_read_buf_for_raw();
+        }
         true
     }
 
     fn drain_pending_write(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let Some(pending) = &mut self.write_pending else {
+        if self.write_frame.is_empty() {
             return Poll::Ready(Ok(()));
-        };
+        }
 
-        while pending.pos < pending.frame.len() {
-            match Pin::new(&mut self.inner).poll_write(cx, &pending.frame[pending.pos..])? {
+        while self.write_pos < self.write_frame.len() {
+            match Pin::new(&mut self.inner).poll_write(cx, &self.write_frame[self.write_pos..])? {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(0) => {
                     return Poll::Ready(Err(io::Error::new(
@@ -511,11 +574,22 @@ impl RealityTlsStream {
                         "reality tls: zero write",
                     )));
                 }
-                Poll::Ready(n) => pending.pos += n,
+                Poll::Ready(n) => self.write_pos += n,
             }
         }
 
-        self.write_pending.take().expect("pending checked above");
+        self.write_pos = 0;
+        if self.write_raw_passthrough {
+            // DIRECT never seals again, so the scratch capacity is dead
+            // weight for the rest of the connection — release it rather
+            // than hold one batch-sized allocation per raw stream.
+            self.write_frame = Vec::new();
+        } else {
+            // Cleared in place, the batch-sized capacity is reused by the
+            // next seal: the non-DIRECT steady state allocates the frame
+            // buffer once after the handshake, not once per write.
+            self.write_frame.clear();
+        }
         Poll::Ready(Ok(()))
     }
 }
@@ -530,11 +604,6 @@ enum StreamReadState {
         header: [u8; 5],
         pos: usize,
     },
-}
-
-struct StreamPendingWrite {
-    frame: Vec<u8>,
-    pos: usize,
 }
 
 impl AsyncRead for RealityTlsStream {
@@ -634,7 +703,7 @@ impl AsyncWrite for RealityTlsStream {
         // rather than reporting the *old* record's length against the
         // new buffer (AsyncWrite does not guarantee the same buffer is
         // presented after a Pending).
-        if self.write_pending.is_some() {
+        if !self.write_frame.is_empty() {
             match self.drain_pending_write(cx) {
                 Poll::Pending => return Poll::Pending,
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -656,13 +725,19 @@ impl AsyncWrite for RealityTlsStream {
         // `MAX_WRITE_BATCH` of plaintext is sealed into one buffer.
         let chunk_len = buf.len().min(MAX_WRITE_BATCH);
         let records = chunk_len.div_ceil(MAX_RECORD_PLAINTEXT);
-        let mut frame = Vec::with_capacity(chunk_len + records * RECORD_OVERHEAD);
+        // The frame is empty here (drained above), so this reserve only
+        // grows the scratch when a batch is the largest seen so far;
+        // same-size-or-smaller later writes seal into the existing
+        // capacity without allocating.
+        let this = self.as_mut().get_mut();
+        this.write_frame
+            .reserve(chunk_len + records * RECORD_OVERHEAD);
         for record in buf[..chunk_len].chunks(MAX_RECORD_PLAINTEXT) {
-            self.write_key
-                .seal_into(&mut frame, TLS_RECORD_APPLICATION_DATA, record)
+            this.write_key
+                .seal_into(&mut this.write_frame, TLS_RECORD_APPLICATION_DATA, record)
                 .map_err(transport_io_error)?;
         }
-        self.write_pending = Some(StreamPendingWrite { frame, pos: 0 });
+        debug_assert_eq!(self.write_pos, 0, "drained frame restarts at zero");
         // The records are buffered; report chunk_len immediately whether
         // or not the drain completes now.  The next poll_write /
         // poll_flush / poll_shutdown drains them.  Returning Pending here
@@ -693,7 +768,7 @@ impl AsyncWrite for RealityTlsStream {
     }
 }
 
-fn spawn_reality_stream(state: RealityConnected) -> Box<dyn Stream> {
+pub(crate) fn spawn_reality_stream(state: RealityConnected) -> Box<dyn Stream> {
     Box::new(RealityTlsStream::new(
         state.inner,
         state.read_key,
@@ -714,7 +789,7 @@ fn transport_io_error(e: TransportError) -> io::Error {
     clippy::too_many_arguments,
     reason = "each argument is an independent handshake input (SNI, ALPN, random, both key shares, auth key, config, profile)"
 )]
-fn build_reality_client_hello(
+pub(crate) fn build_reality_client_hello(
     server_name: &str,
     alpn: &[String],
     random: &[u8; 32],
@@ -777,16 +852,29 @@ fn build_reality_client_hello(
     Ok((hello, aead_key))
 }
 
-fn wrap_plain_record(typ: u8, payload: &[u8]) -> Result<Vec<u8>> {
+fn wrap_plain_record_version(typ: u8, payload: &[u8], version: [u8; 2]) -> Result<Vec<u8>> {
     if payload.len() > u16::MAX as usize {
         return Err(TransportError::Tls("TLS record payload too large".into()));
     }
     let mut out = Vec::with_capacity(5 + payload.len());
     out.push(typ);
-    out.extend_from_slice(&[0x03, 0x01]);
+    out.extend_from_slice(&version);
     put_u16(payload.len() as u16, &mut out);
     out.extend_from_slice(payload);
     Ok(out)
+}
+
+/// TLS 1.3 permits 0x0301 on the first ClientHello record for middlebox
+/// compatibility, so the client-side writer keeps that legacy shape.
+pub(crate) fn wrap_plain_record(typ: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    wrap_plain_record_version(typ, payload, [0x03, 0x01])
+}
+
+/// Server responses use the TLS 1.3 record version. uTLS clients reject a
+/// ServerHello flight wrapped as 0x0301 even though they accept that version
+/// on an inbound ClientHello.
+pub(crate) fn wrap_plain_record_tls13(typ: u8, payload: &[u8]) -> Result<Vec<u8>> {
+    wrap_plain_record_version(typ, payload, [0x03, 0x03])
 }
 
 async fn read_plain_handshake<R: AsyncRead + Unpin>(r: &mut R, expected: u8) -> Result<Vec<u8>> {
@@ -855,13 +943,13 @@ async fn fill_decrypted_handshake<R: AsyncRead + Unpin>(
     }
 }
 
-struct TlsRecord {
-    header: [u8; 5],
-    typ: u8,
-    payload: Vec<u8>,
+pub(crate) struct TlsRecord {
+    pub(crate) header: [u8; 5],
+    pub(crate) typ: u8,
+    pub(crate) payload: Vec<u8>,
 }
 
-async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<TlsRecord>> {
+pub(crate) async fn read_record<R: AsyncRead + Unpin>(r: &mut R) -> Result<Option<TlsRecord>> {
     let mut header = [0u8; 5];
     match r.read_exact(&mut header).await {
         Ok(_) => {}
@@ -1104,7 +1192,7 @@ fn parse_leaf_certificate(body: &[u8]) -> Result<Vec<u8>> {
     Ok(cert)
 }
 
-fn verify_reality_certificate(cert_der: &[u8], auth_key: &[u8; 32]) -> Result<()> {
+fn verify_reality_certificate(cert_der: &[u8], auth_key: &[u8; 32]) -> Result<[u8; 32]> {
     let Some((ed25519_pubkey, cert_signature)) = extract_ed25519_cert_parts(cert_der) else {
         return Err(TransportError::Tls(
             "Reality authentication failed: leaf certificate is not Ed25519".into(),
@@ -1115,10 +1203,65 @@ fn verify_reality_certificate(cert_der: &[u8], auth_key: &[u8; 32]) -> Result<()
     h.update(&ed25519_pubkey);
     let expected = h.finalize().into_bytes();
     if expected.as_slice() == cert_signature.as_slice() {
-        Ok(())
+        Ok(ed25519_pubkey)
     } else {
         Err(TransportError::Tls(
             "Reality authentication failed: certificate signature HMAC mismatch".into(),
+        ))
+    }
+}
+
+struct ParsedCertificateVerify {
+    transcript_hash: Vec<u8>,
+    signature: Vec<u8>,
+}
+
+fn parse_certificate_verify(
+    body: &[u8],
+    transcript_hash: Vec<u8>,
+) -> Result<ParsedCertificateVerify> {
+    let mut pos = 0;
+    let scheme = take_u16(body, &mut pos)?;
+    let sig_len = take_u16(body, &mut pos)? as usize;
+    let signature = take(body, &mut pos, sig_len)?.to_vec();
+    if pos != body.len() || scheme != 0x0807 || signature.len() != 64 {
+        return Err(TransportError::Tls(
+            "Reality TLS: CertificateVerify is not a canonical Ed25519 signature".into(),
+        ));
+    }
+    Ok(ParsedCertificateVerify {
+        transcript_hash,
+        signature,
+    })
+}
+
+fn verify_certificate_verify_ed25519(
+    public_key: &[u8; 32],
+    transcript_hash: &[u8],
+    signature: &[u8],
+) -> Result<()> {
+    // SubjectPublicKeyInfo for Ed25519: SEQ(SEQ(OID 1.3.101.112), BITSTRING key).
+    let mut spki = Vec::with_capacity(44);
+    spki.extend_from_slice(&[
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ]);
+    spki.extend_from_slice(public_key);
+    let key = boring::pkey::PKey::public_key_from_der(&spki)
+        .map_err(|e| TransportError::Tls(format!("Reality Ed25519 public key: {e}")))?;
+    let mut signed = vec![0x20; 64];
+    signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+    signed.push(0);
+    signed.extend_from_slice(transcript_hash);
+    let mut verifier = boring::sign::Verifier::new_without_digest(&key)
+        .map_err(|e| TransportError::Tls(format!("Reality CertificateVerify verifier: {e}")))?;
+    let valid = verifier
+        .verify_oneshot(signature, &signed)
+        .map_err(|e| TransportError::Tls(format!("Reality CertificateVerify verification: {e}")))?;
+    if valid {
+        Ok(())
+    } else {
+        Err(TransportError::Tls(
+            "Reality TLS: CertificateVerify Ed25519 signature mismatch".into(),
         ))
     }
 }
@@ -1205,27 +1348,27 @@ fn der_read<'a>(input: &'a [u8], pos: &mut usize) -> Option<DerNode<'a>> {
 
 /// Transcript hash / HKDF hash of a TLS 1.3 cipher suite.
 #[derive(Clone, Copy)]
-enum HashAlg {
+pub(crate) enum HashAlg {
     Sha256,
     Sha384,
 }
 
 impl HashAlg {
-    fn len(self) -> usize {
+    pub(crate) fn len(self) -> usize {
         match self {
             Self::Sha256 => 32,
             Self::Sha384 => 48,
         }
     }
 
-    fn digest(self, data: &[u8]) -> Vec<u8> {
+    pub(crate) fn digest(self, data: &[u8]) -> Vec<u8> {
         match self {
             Self::Sha256 => Sha256::digest(data).to_vec(),
             Self::Sha384 => Sha384::digest(data).to_vec(),
         }
     }
 
-    fn hmac(self, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+    pub(crate) fn hmac(self, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
         match self {
             Self::Sha256 => {
                 let mut h =
@@ -1251,14 +1394,14 @@ impl HashAlg {
 /// picks, so all of them have to complete (a Go peer without AES
 /// hardware prefers ChaCha20-Poly1305).
 #[derive(Clone, Copy)]
-enum CipherSuite {
+pub(crate) enum CipherSuite {
     Aes128GcmSha256,
     Aes256GcmSha384,
     ChaCha20Poly1305Sha256,
 }
 
 impl CipherSuite {
-    fn try_from(value: u16) -> Result<Self> {
+    pub(crate) fn try_from(value: u16) -> Result<Self> {
         match value {
             TLS_AES_128_GCM_SHA256 => Ok(Self::Aes128GcmSha256),
             TLS_AES_256_GCM_SHA384 => Ok(Self::Aes256GcmSha384),
@@ -1276,7 +1419,7 @@ impl CipherSuite {
         }
     }
 
-    fn hash(self) -> HashAlg {
+    pub(crate) fn hash(self) -> HashAlg {
         match self {
             Self::Aes128GcmSha256 | Self::ChaCha20Poly1305Sha256 => HashAlg::Sha256,
             Self::Aes256GcmSha384 => HashAlg::Sha384,
@@ -1284,16 +1427,16 @@ impl CipherSuite {
     }
 }
 
-struct HandshakeKeys {
-    client: RecordKey,
-    server: RecordKey,
-    client_secret: Vec<u8>,
-    server_secret: Vec<u8>,
-    master_secret: Vec<u8>,
+pub(crate) struct HandshakeKeys {
+    pub(crate) client: RecordKey,
+    pub(crate) server: RecordKey,
+    pub(crate) client_secret: Vec<u8>,
+    pub(crate) server_secret: Vec<u8>,
+    pub(crate) master_secret: Vec<u8>,
 }
 
 impl HandshakeKeys {
-    fn derive(cipher: CipherSuite, shared_secret: &[u8], transcript: &[u8]) -> Self {
+    pub(crate) fn derive(cipher: CipherSuite, shared_secret: &[u8], transcript: &[u8]) -> Self {
         let hash = cipher.hash();
         let zero = vec![0u8; hash.len()];
         let empty_hash = hash.digest(&[]);
@@ -1317,13 +1460,13 @@ impl HandshakeKeys {
     }
 }
 
-struct ApplicationKeys {
-    client: RecordKey,
-    server: RecordKey,
+pub(crate) struct ApplicationKeys {
+    pub(crate) client: RecordKey,
+    pub(crate) server: RecordKey,
 }
 
 impl ApplicationKeys {
-    fn derive(cipher: CipherSuite, master_secret: &[u8], transcript: &[u8]) -> Self {
+    pub(crate) fn derive(cipher: CipherSuite, master_secret: &[u8], transcript: &[u8]) -> Self {
         let hash = cipher.hash();
         let transcript_hash = hash.digest(transcript);
         let client_secret = derive_secret(hash, master_secret, b"c ap traffic", &transcript_hash);
@@ -1349,7 +1492,7 @@ const MAX_WRITE_BATCH: usize = 4 * MAX_RECORD_PLAINTEXT;
 /// byte relayed over REALITY passes through here, and generic Rust cipher
 /// code compiled at the release profile's `opt-level = "z"` runs an order of
 /// magnitude behind BoringSSL's assembly (see `meow-proxy`'s `aead` module).
-struct RecordKey {
+pub(crate) struct RecordKey {
     aead: AeadCtx,
     iv: [u8; 12],
     seq: u64,
@@ -1357,7 +1500,7 @@ struct RecordKey {
 
 impl RecordKey {
     /// `secret` is a traffic secret of the suite's hash length.
-    fn new(cipher_suite: CipherSuite, secret: &[u8]) -> Self {
+    pub(crate) fn new(cipher_suite: CipherSuite, secret: &[u8]) -> Self {
         let hash = cipher_suite.hash();
         let key = hkdf_expand_label(hash, secret, b"key", &[], cipher_suite.key_len());
         let iv = hkdf_expand_label(hash, secret, b"iv", &[], 12);
@@ -1377,7 +1520,7 @@ impl RecordKey {
     }
 
     /// Seal `plaintext` as one TLS 1.3 record: header, ciphertext, tag.
-    fn seal(&mut self, inner_type: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn seal(&mut self, inner_type: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
         let mut out = Vec::with_capacity(RECORD_OVERHEAD + plaintext.len());
         self.seal_into(&mut out, inner_type, plaintext)?;
         Ok(out)
@@ -1392,13 +1535,16 @@ impl RecordKey {
                 "TLS record exceeds u16 length: {record_len}"
             )));
         };
+        // The nonce is consumed before `out` is mutated: a failure here
+        // (sequence exhaustion is fatal) must not leave unencrypted
+        // plaintext appended to the frame.
+        let nonce = self.next_nonce()?;
         let start = out.len();
         out.extend_from_slice(&[TLS_RECORD_APPLICATION_DATA, 0x03, 0x03]);
         out.extend_from_slice(&record_len16.to_be_bytes());
         out.extend_from_slice(plaintext);
         out.push(inner_type);
         out.resize(start + 5 + record_len, 0);
-        let nonce = self.next_nonce();
         let (header, body) = out[start..].split_at_mut(5);
         let (data, tag) = body.split_at_mut(body_len);
         self.aead
@@ -1408,7 +1554,7 @@ impl RecordKey {
     }
 
     /// Open a record's `ciphertext || tag` into a fresh plaintext buffer.
-    fn open(&mut self, header: &[u8; 5], ciphertext: &[u8]) -> Result<(u8, Vec<u8>)> {
+    pub(crate) fn open(&mut self, header: &[u8; 5], ciphertext: &[u8]) -> Result<(u8, Vec<u8>)> {
         let mut body = ciphertext.to_vec();
         let (inner_type, len) = self.open_in_place(header, &mut body)?;
         body.truncate(len);
@@ -1418,11 +1564,15 @@ impl RecordKey {
     /// Open a record's `ciphertext || tag` in place.  Returns the inner
     /// content type and the plaintext length; the plaintext is
     /// `payload[..len]`.
-    fn open_in_place(&mut self, header: &[u8; 5], payload: &mut [u8]) -> Result<(u8, usize)> {
+    pub(crate) fn open_in_place(
+        &mut self,
+        header: &[u8; 5],
+        payload: &mut [u8],
+    ) -> Result<(u8, usize)> {
         let Some(split) = payload.len().checked_sub(RECORD_TAG_LEN) else {
             return Err(TransportError::Tls("TLS ciphertext too short".into()));
         };
-        let nonce = self.next_nonce();
+        let nonce = self.next_nonce()?;
         let (data, tag) = payload.split_at_mut(split);
         self.aead
             .open_in_place(&nonce, data, tag, header)
@@ -1436,29 +1586,46 @@ impl RecordKey {
         Ok((data[pos], pos))
     }
 
-    fn next_nonce(&mut self) -> [u8; 12] {
+    fn next_nonce(&mut self) -> Result<[u8; 12]> {
+        // RFC 8446 §5.3: the sequence number must not wrap.  Without rekey
+        // support the only compliant end of the keystream is a fatal
+        // error, taken before `u64::MAX` is ever used as a sequence value.
+        if self.seq == u64::MAX {
+            return Err(TransportError::Tls(
+                "TLS record sequence number exhausted".into(),
+            ));
+        }
         let mut nonce = self.iv;
         let seq = self.seq.to_be_bytes();
         for (dst, src) in nonce[4..].iter_mut().zip(seq) {
             *dst ^= src;
         }
         self.seq += 1;
-        nonce
+        Ok(nonce)
     }
 }
 
-fn verify_finished(hash: HashAlg, secret: &[u8], transcript: &[u8], received: &[u8]) -> Result<()> {
+pub(crate) fn verify_finished(
+    hash: HashAlg,
+    secret: &[u8],
+    transcript: &[u8],
+    received: &[u8],
+) -> Result<()> {
     let expected = finished_verify_data(hash, secret, transcript);
-    if expected.as_slice() == received {
+    // verify_data authenticates the peer's key material, so the comparison
+    // is constant-time.  The length is public — fixed by the suite's hash —
+    // and is checked first: `ct_eq` on uneven slices would still return
+    // unequal, but only after timing that depends on the mismatch shape.
+    if expected.len() == received.len() && bool::from(expected.as_slice().ct_eq(received)) {
         Ok(())
     } else {
         Err(TransportError::Tls(
-            "Reality TLS: server Finished verify_data mismatch".into(),
+            "Reality TLS: Finished verify_data mismatch".into(),
         ))
     }
 }
 
-fn finished_verify_data(hash: HashAlg, secret: &[u8], transcript: &[u8]) -> Vec<u8> {
+pub(crate) fn finished_verify_data(hash: HashAlg, secret: &[u8], transcript: &[u8]) -> Vec<u8> {
     let finished_key = hkdf_expand_label(hash, secret, b"finished", &[], hash.len());
     hash.hmac(&finished_key, &[&hash.digest(transcript)])
 }
@@ -1484,7 +1651,7 @@ fn hkdf_expand_label(
     hkdf_expand(hash, secret, &info, len)
 }
 
-fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+pub(crate) fn hkdf_sha256(secret: &[u8], salt: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     let prk = hkdf_extract(HashAlg::Sha256, salt, secret);
     hkdf_expand(HashAlg::Sha256, &prk, info, len)
 }
@@ -1506,17 +1673,17 @@ fn hkdf_expand(hash: HashAlg, prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
     okm
 }
 
-fn clamp_x25519_private(private: &mut [u8; 32]) {
+pub(crate) fn clamp_x25519_private(private: &mut [u8; 32]) {
     private[0] &= 248;
     private[31] &= 127;
     private[31] |= 64;
 }
 
-fn x25519_public_from_private(private: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn x25519_public_from_private(private: &[u8; 32]) -> [u8; 32] {
     x25519_dalek::x25519(*private, x25519_dalek::X25519_BASEPOINT_BYTES)
 }
 
-fn x25519(private: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32]> {
+pub(crate) fn x25519(private: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32]> {
     let out = x25519_dalek::x25519(*private, *peer_public);
     // An all-zero shared secret means the peer sent a low-order point; BoringSSL's
     // `X25519` reports that as a failure and RFC 7748 §6.1 requires rejecting it.
@@ -1526,7 +1693,7 @@ fn x25519(private: &[u8; 32], peer_public: &[u8; 32]) -> Result<[u8; 32]> {
     Ok(out)
 }
 
-fn take<'a>(input: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
+pub(crate) fn take<'a>(input: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
     let end = pos
         .checked_add(len)
         .ok_or_else(|| TransportError::Tls("TLS parser offset overflow".into()))?;
@@ -1537,29 +1704,29 @@ fn take<'a>(input: &'a [u8], pos: &mut usize, len: usize) -> Result<&'a [u8]> {
     Ok(out)
 }
 
-fn take_u8(input: &[u8], pos: &mut usize) -> Result<u8> {
+pub(crate) fn take_u8(input: &[u8], pos: &mut usize) -> Result<u8> {
     Ok(take(input, pos, 1)?[0])
 }
 
-fn take_u16(input: &[u8], pos: &mut usize) -> Result<u16> {
+pub(crate) fn take_u16(input: &[u8], pos: &mut usize) -> Result<u16> {
     let b = take(input, pos, 2)?;
     Ok(u16::from_be_bytes([b[0], b[1]]))
 }
 
-fn take_u24(input: &[u8], pos: &mut usize) -> Result<usize> {
+pub(crate) fn take_u24(input: &[u8], pos: &mut usize) -> Result<usize> {
     let b = take(input, pos, 3)?;
     Ok(read_u24(b))
 }
 
-fn read_u24(b: &[u8]) -> usize {
+pub(crate) fn read_u24(b: &[u8]) -> usize {
     ((b[0] as usize) << 16) | ((b[1] as usize) << 8) | b[2] as usize
 }
 
-fn put_u16(value: u16, out: &mut Vec<u8>) {
+pub(crate) fn put_u16(value: u16, out: &mut Vec<u8>) {
     out.extend_from_slice(&value.to_be_bytes());
 }
 
-fn put_u24(value: usize, out: &mut Vec<u8>) {
+pub(crate) fn put_u24(value: usize, out: &mut Vec<u8>) {
     out.push(((value >> 16) & 0xff) as u8);
     out.push(((value >> 8) & 0xff) as u8);
     out.push((value & 0xff) as u8);
@@ -2179,7 +2346,7 @@ mod tests {
 
         // The pending record is buffered (not fully drained).
         assert!(
-            stream.write_pending.is_some(),
+            !stream.write_frame.is_empty(),
             "record buffered after Pending drain"
         );
 
@@ -2194,8 +2361,324 @@ mod tests {
         // The pending record from the second write should also be
         // drainable (inner accepts everything now).
         assert!(
-            stream.write_pending.is_none(),
+            stream.write_frame.is_empty(),
             "second record drained on this call"
+        );
+    }
+
+    // ─── Raw write passthrough ordering and write-scratch reuse (issue #974) ──
+
+    use std::sync::{Arc, Mutex};
+
+    /// Inner stream scripting a backpressure interleaving: the first
+    /// `poll_write` accepts only `accept_first` bytes, the second returns
+    /// `Pending` once (self-waking), and everything after that is accepted
+    /// in full.  Every accepted byte lands in `written` in wire order.
+    struct BackpressuredWriter {
+        written: Arc<Mutex<Vec<u8>>>,
+        accept_first: usize,
+        writes: usize,
+    }
+
+    impl AsyncRead for BackpressuredWriter {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+            _buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl AsyncWrite for BackpressuredWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            self.writes += 1;
+            match self.writes {
+                1 => {
+                    let n = self.accept_first.min(buf.len());
+                    self.written.lock().unwrap().extend_from_slice(&buf[..n]);
+                    Poll::Ready(Ok(n))
+                }
+                2 => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
+                _ => {
+                    self.written.lock().unwrap().extend_from_slice(buf);
+                    Poll::Ready(Ok(buf.len()))
+                }
+            }
+        }
+        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Unpin for BackpressuredWriter {}
+
+    /// A4: with ciphertext still pending at the TLS layer — the state a
+    /// vision DIRECT frame leaves behind whenever the transport applies
+    /// backpressure — the raw write switch must succeed, and the bytes
+    /// that later reach the wire must be the rest of the sealed record
+    /// first, the raw bytes after it.
+    #[test]
+    fn raw_write_switch_with_pending_ciphertext_preserves_wire_order() {
+        let secret = [0x5Au8; 32];
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut stream = RealityTlsStream::new(
+            Box::new(BackpressuredWriter {
+                written: Arc::clone(&written),
+                accept_first: 3,
+                writes: 0,
+            }),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+        );
+
+        use tokio::io::AsyncWriteExt;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        // 27 bytes of plaintext seal into one 49-byte record
+        // (5 header + 27 + 1 inner type + 16 tag); the scripted
+        // backpressure leaves most of it pending.
+        let tls_plaintext = b"vision DIRECT frame payload";
+        assert_eq!(tls_plaintext.len(), 27);
+        rt.block_on(async {
+            let n = stream.write(tls_plaintext).await.unwrap();
+            assert_eq!(n, tls_plaintext.len());
+        });
+        assert!(
+            !stream.write_frame.is_empty(),
+            "ciphertext must still be pending after the partial drain"
+        );
+        assert_eq!(
+            written.lock().unwrap().len(),
+            3,
+            "only the first write landed"
+        );
+
+        // The switch must not be refused over the pending ciphertext.
+        assert!(
+            stream.enable_raw_write_passthrough(),
+            "raw write switch must accept pending ciphertext (A4)"
+        );
+
+        let raw_bytes = b"raw application bytes after the DIRECT switch";
+        rt.block_on(async {
+            stream.write_all(raw_bytes).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let wire = written.lock().unwrap().clone();
+        // One application-data record: `17 03 03` + u16 length, then the
+        // ciphertext body.  The plaintext fit a single record.
+        let record_len = tls_plaintext.len() + 1 + 16;
+        let ciphertext_len = 5 + record_len;
+        assert!(
+            wire.len() >= ciphertext_len + raw_bytes.len(),
+            "wire holds ciphertext then raw bytes"
+        );
+        assert_eq!(&wire[..3], &[0x17, 0x03, 0x03], "TLS appdata record header");
+        assert_eq!(
+            u16::from_be_bytes([wire[3], wire[4]]) as usize,
+            record_len,
+            "sealed record length"
+        );
+        // The sealed record decrypts, under a fresh key at sequence zero,
+        // to exactly the pre-switch plaintext — proving the ciphertext on
+        // the wire is the DIRECT frame, not a re-framed duplicate.
+        let mut receiver = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        let header: [u8; 5] = wire[..5].try_into().unwrap();
+        let (inner_type, plaintext) = receiver
+            .open(&header, &wire[5..ciphertext_len])
+            .expect("wire ciphertext must open under the write key");
+        assert_eq!(inner_type, TLS_RECORD_APPLICATION_DATA);
+        assert_eq!(plaintext, tls_plaintext);
+        // And after the final ciphertext byte the raw bytes follow
+        // verbatim — no TLS byte is ordered behind them.
+        assert_eq!(
+            &wire[ciphertext_len..ciphertext_len + raw_bytes.len()],
+            raw_bytes,
+            "raw bytes must follow the drained ciphertext in wire order"
+        );
+        assert_eq!(wire.len(), ciphertext_len + raw_bytes.len());
+    }
+
+    /// A7: the sealed-frame scratch is cleared in place when a drain
+    /// completes, so same-size-or-smaller later writes reuse its capacity
+    /// instead of allocating a fresh Vec per batch — and after the DIRECT
+    /// switch the buffer is released entirely, since no record is ever
+    /// sealed again.
+    #[test]
+    fn write_frame_capacity_is_reused_and_released_after_direct() {
+        let secret = [0x5Au8; 32];
+        let mut stream = RealityTlsStream::new(
+            Box::new(BackpressuredWriter {
+                written: Arc::new(Mutex::new(Vec::new())),
+                accept_first: usize::MAX,
+                writes: 0,
+            }),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+        );
+
+        use tokio::io::AsyncWriteExt;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        rt.block_on(async {
+            stream.write_all(&[0xAA; 1000]).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        assert!(stream.write_frame.is_empty(), "drain clears the frame");
+        let capacity = stream.write_frame.capacity();
+        let ptr = stream.write_frame.as_ptr();
+        assert!(
+            capacity >= 1000 + RECORD_OVERHEAD,
+            "scratch keeps batch capacity"
+        );
+
+        // A smaller write must reuse the allocation: same pointer, same
+        // capacity.
+        rt.block_on(async {
+            stream.write_all(&[0xBB; 100]).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        assert_eq!(
+            stream.write_frame.capacity(),
+            capacity,
+            "capacity unchanged"
+        );
+        assert_eq!(stream.write_frame.as_ptr(), ptr, "same allocation reused");
+
+        // After the DIRECT switch and the final drain the scratch is
+        // released — a raw stream must not pin batch-sized capacity.
+        assert!(stream.enable_raw_write_passthrough());
+        rt.block_on(async {
+            stream.write_all(b"raw").await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        assert_eq!(
+            stream.write_frame.capacity(),
+            0,
+            "DIRECT releases the write scratch"
+        );
+    }
+
+    /// Read-side DIRECT keeps the already opened plaintext ahead of raw
+    /// bytes, but once that plaintext has been delivered the record buffer
+    /// is dead weight for the rest of the raw stream.
+    #[tokio::test]
+    async fn raw_read_switch_releases_record_buffer_after_plaintext_drains() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let secret = [0x5Au8; 32];
+        let plaintext = b"abcdef";
+        let raw_bytes = b"RAW";
+        let mut sender = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        let record = sender
+            .seal(TLS_RECORD_APPLICATION_DATA, plaintext)
+            .expect("seal plaintext record");
+        let (mut wire_peer, inner) = tokio::io::duplex(1024);
+        wire_peer.write_all(&record).await.unwrap();
+        wire_peer.write_all(raw_bytes).await.unwrap();
+        drop(wire_peer);
+
+        let mut stream = RealityTlsStream::new(
+            Box::new(inner),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+            RecordKey::new(CipherSuite::Aes128GcmSha256, &secret),
+        );
+        let mut first = [0u8; 2];
+        stream.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"ab");
+        assert!(
+            stream.read_buf.capacity() > 0,
+            "the opened record must have allocated plaintext storage"
+        );
+
+        assert!(stream.enable_raw_read_passthrough());
+        let mut remaining = [0u8; 4];
+        stream.read_exact(&mut remaining).await.unwrap();
+        assert_eq!(&remaining, b"cdef");
+        assert_eq!(
+            stream.read_buf.capacity(),
+            0,
+            "raw read mode must release the record buffer once plaintext drains"
+        );
+
+        let mut raw = [0u8; 3];
+        stream.read_exact(&mut raw).await.unwrap();
+        assert_eq!(&raw, raw_bytes);
+    }
+
+    /// C7: the record sequence number must never wrap — at `u64::MAX`
+    /// both directions fail fatally instead of reusing a nonce.
+    #[test]
+    fn record_key_sequence_exhaustion_is_fatal() {
+        let secret = [0x2bu8; 32];
+
+        // u64::MAX - 1 is the last usable sequence value; the next seal
+        // hits the guard.
+        let mut sender = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        sender.seq = u64::MAX - 1;
+        sender
+            .seal(TLS_RECORD_APPLICATION_DATA, b"last")
+            .expect("u64::MAX - 1 still seals");
+        assert_eq!(sender.seq, u64::MAX);
+        let err = sender
+            .seal(TLS_RECORD_APPLICATION_DATA, b"one too far")
+            .expect_err("u64::MAX must be refused, not wrapped");
+        assert!(
+            matches!(&err, TransportError::Tls(msg) if msg.contains("sequence")),
+            "unexpected error: {err:?}"
+        );
+
+        let mut receiver = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        receiver.seq = u64::MAX;
+        let mut payload = vec![0u8; 32];
+        let header = [0x17, 0x03, 0x03, 0, 32];
+        assert!(
+            receiver.open_in_place(&header, &mut payload).is_err(),
+            "open at u64::MAX must fail rather than wrap the nonce"
+        );
+    }
+
+    /// C1: `verify_finished` accepts only the exact verify_data — a
+    /// flipped bit or a truncated value fails, through the same path the
+    /// client and server share.
+    #[test]
+    fn verify_finished_rejects_mismatch_and_wrong_length() {
+        let secret = b"test-secret";
+        let transcript = b"test-transcript";
+        let expected = finished_verify_data(HashAlg::Sha256, secret, transcript);
+        verify_finished(HashAlg::Sha256, secret, transcript, &expected)
+            .expect("exact verify_data passes");
+
+        let mut flipped = expected.clone();
+        flipped[0] ^= 1;
+        assert!(verify_finished(HashAlg::Sha256, secret, transcript, &flipped).is_err());
+        assert!(
+            verify_finished(
+                HashAlg::Sha256,
+                secret,
+                transcript,
+                &expected[..expected.len() - 1]
+            )
+            .is_err(),
+            "truncated verify_data must fail, not prefix-compare"
         );
     }
 
@@ -2741,7 +3224,9 @@ mod tests {
             let hs = HandshakeKeys::derive(cipher, &shared_secret, &transcript);
             let (mut server_hs, mut client_hs) = (hs.server, hs.client);
 
-            let cert_pubkey = [0x22u8; 32];
+            let ed_key = boring::pkey::PKey::generate(boring::pkey::Id::ED25519).unwrap();
+            let mut cert_pubkey = [0u8; 32];
+            assert_eq!(ed_key.raw_public_key(&mut cert_pubkey).unwrap().len(), 32);
             let cert =
                 build_test_ed25519_cert(&cert_pubkey, &reality_cert_hmac(&auth_key, &cert_pubkey));
             let mut cert_body = vec![0]; // certificate_request_context
@@ -2750,15 +3235,29 @@ mod tests {
             cert_body.extend_from_slice(&cert);
             cert_body.extend_from_slice(&[0, 0]); // no entry extensions
 
+            let ee = handshake_message(HS_ENCRYPTED_EXTENSIONS, Vec::new()).raw;
+            transcript.extend_from_slice(&ee);
+            let certificate = handshake_message(HS_CERTIFICATE, cert_body).raw;
+            transcript.extend_from_slice(&certificate);
+            let mut signed = vec![0x20; 64];
+            signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+            signed.push(0);
+            signed.extend_from_slice(&cipher.hash().digest(&transcript));
+            let signature = boring::sign::Signer::new_without_digest(&ed_key)
+                .unwrap()
+                .sign_oneshot_to_vec(&signed)
+                .unwrap();
+            let mut cv_body = Vec::with_capacity(4 + signature.len());
+            cv_body.extend_from_slice(&[0x08, 0x07]);
+            put_u16(signature.len() as u16, &mut cv_body);
+            cv_body.extend_from_slice(&signature);
+            let certificate_verify = handshake_message(HS_CERTIFICATE_VERIFY, cv_body).raw;
+            transcript.extend_from_slice(&certificate_verify);
+
             let mut flight = Vec::new();
-            for (typ, body) in [
-                (HS_ENCRYPTED_EXTENSIONS, vec![0, 0]),
-                (HS_CERTIFICATE, cert_body),
-                (HS_CERTIFICATE_VERIFY, vec![0x08, 0x07, 0, 0]),
-            ] {
-                flight.extend_from_slice(&handshake_message(typ, body).raw);
-            }
-            transcript.extend_from_slice(&flight);
+            flight.extend_from_slice(&ee);
+            flight.extend_from_slice(&certificate);
+            flight.extend_from_slice(&certificate_verify);
             let verify_data = finished_verify_data(cipher.hash(), &hs.server_secret, &transcript);
             let finished = handshake_message(HS_FINISHED, verify_data).raw;
             flight.extend_from_slice(&finished);

@@ -33,11 +33,20 @@
 use bytes::{BufMut, BytesMut};
 use meow_common::Metadata;
 
+/// The only successful response header a Vision server writes: version 0
+/// with an empty addon vector.  It rides immediately before the first
+/// downlink padding frame and is never a standalone connectivity ACK.
+#[cfg(feature = "vless-vision")]
+pub const RESPONSE_HEADER: [u8; 2] = [0x00, 0x00];
+
 // ─── Address type ─────────────────────────────────────────────────────────────
 
 /// Destination address for a VLESS connection.
-#[derive(Debug, Clone)]
-pub(crate) enum VlessAddr {
+///
+/// Public — but narrow — because the inbound server surface hands decoded
+/// targets to the listener wave; construction validation stays crate-side.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VlessAddr {
     Ipv4([u8; 4]),
     Ipv6([u8; 16]),
     /// UTF-8 domain name; max 255 bytes enforced at construction.

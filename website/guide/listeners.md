@@ -48,9 +48,9 @@ listeners:
 | Field | Type | Required | Default | Notes |
 | --- | --- | --- | --- | --- |
 | `name` | string | ✓ | — | Unique; appears in logs, the API, and `IN-NAME` rules |
-| `type` | string | ✓ | — | `mixed` · `http` · `socks5` · `tproxy` · `redir` · `shadowsocks` · `anytls` |
+| `type` | string | ✓ | — | `mixed` · `http` · `socks5` · `tproxy` · `redir` · `shadowsocks` · `anytls` · `vless` |
 | `port` | u16 | | — | Unique across listeners; omit or `0` to let the OS assign an ephemeral port |
-| `listen` | string | | per type | Bind IP literal, or `host:port` (e.g. `127.0.0.1:0`); `anytls` also accepts a comma-separated list of them |
+| `listen` | string | | per type | Bind IP literal, or `host:port` (e.g. `127.0.0.1:0`); `anytls` and `vless` also accept a comma-separated list of them |
 | `tproxy-sni` | bool | | global | (tproxy) deprecated SNI shorthand — prefer [`sniffer`](./sniffer) |
 | `firewall` | bool | | `true` | (tproxy) `false` = external firewall management — no nft/pfctl calls, no cleanup; see [Transparent Proxy](./transparent-proxy) |
 | `udp` | bool | | `false` | (tproxy, Linux only) UDP TPROXY on the same port; IPv4 or unscoped, non-link-local IPv6 `listen` (`::` covers both families); requires `firewall: false`; see [Transparent Proxy](./transparent-proxy) |
@@ -129,6 +129,44 @@ own OS-assigned port.
   are rejected rather than silently ignored. See
   [docs/specs/listener-anytls.md](https://github.com/meow-rs/meow-rs/blob/main/docs/specs/listener-anytls.md)
   for the full contract.
+- **`vless`** — VLESS server inbound for XTLS `xtls-rprx-vision` clients.
+  The outer transport is either standard TLS 1.3 (`certificate` +
+  `private-key`, optional `alpn`) or REALITY (`reality-config`). TCP uses
+  Vision padding with independent raw-passthrough switching; UDP is XUDP
+  inside the same connection. There is no plaintext, fallback-chain,
+  WebSocket/gRPC, generic Mux.Cool TCP, or VLESS-Encryption server mode.
+  Behind the `listener-vless` cargo feature (`full`, not `minimal`); a build
+  without it fails `-t`/startup rather than silently skipping the port.
+
+  ```yaml
+  listeners:
+    - name: vision-in
+      type: vless
+      listen: "0.0.0.0,::"       # multi-address entries bind atomically
+      port: 443
+      reality-config:
+        dest: "www.example.com:443"
+        private-key: "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo"  # example only
+        short-id: ["0123456789abcdef"]
+        server-names: ["www.example.com"]
+      users:
+        - username: alice          # list form — not username: uuid mapping
+          uuid: "71884bd4-d6a0-4e19-9895-3e1d8b469317"
+          flow: xtls-rprx-vision   # exact; no `-udp443` server suffix
+  ```
+
+  For standard TLS, replace `reality-config` with `certificate` and
+  `private-key` (both file paths or both inline PEM). One security mode is
+  required and the two modes are mutually exclusive. Wrong UUIDs close
+  without a response or target dial; unauthenticated REALITY-looking or
+  ordinary TLS traffic is transparently relayed to the fixed cover `dest`.
+  The authenticated username is available to `IN-USER`, and `IN-TYPE,VLESS`
+  matches the inbound alongside `IN-NAME`, `IN-PORT`, or a listener
+  `proxy:`/`rule:` override. See
+  [docs/specs/listener-vless.md](https://github.com/meow-rs/meow-rs/blob/main/docs/specs/listener-vless.md)
+  and the [migration guide](https://github.com/meow-rs/meow-rs/blob/main/docs/migration-from-go-mihomo.md#vless-vision-server-inbound-listeners-type-vless)
+  for traps such as `reality-config` versus `reality-opts`, empty short IDs,
+  `target`/`xver`, and GlobalID.
 - **`tun:`** (top-level, not in this array) — L3 TUN inbound. On Windows this is a
   Wintun adapter and is the transparent-proxy path. See [Transparent Proxy](./transparent-proxy).
 
@@ -155,7 +193,7 @@ Three rule types let you route based on *where a connection came in*:
 
 - `IN-PORT` — the listener port.
 - `IN-NAME` — the listener `name`.
-- `IN-TYPE` — `HTTP` / `HTTPS` / `SOCKS5` / `TPROXY` / `INNER` / `ANYTLS`.
+- `IN-TYPE` — `HTTP` / `HTTPS` / `SOCKS5` / `TPROXY` / `INNER` / `ANYTLS` / `VLESS`.
 
 ```yaml
 rules:

@@ -356,6 +356,7 @@ impl ApiServer {
                 ui_storage: Default::default(),
                 provider_dialer_registry,
                 ntp_reconcile,
+                listener_gate: None,
                 cors,
             }),
         }

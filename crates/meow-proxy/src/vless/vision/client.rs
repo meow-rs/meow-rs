@@ -1,4 +1,9 @@
 //! XTLS-Vision padding wrapper for VLESS.
+//!
+//! Client role policy over the shared role-independent [`super::codec`].
+//! The read/write state machines below are the long-standing client
+//! contract — xray-interoperable and deliberately unchanged by the codec
+//! split; only the wire layout definitions are shared with the server role.
 
 use std::io;
 use std::pin::Pin;
@@ -6,24 +11,14 @@ use std::task::{Context, Poll};
 use std::time::Instant;
 
 use meow_common::ProxyConn;
-use rand::RngCore;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 
-use super::conn::VlessConn;
-
-const UUID_LEN: usize = 16;
-const PADDING_HEADER_LEN: usize = UUID_LEN + 1 + 2 + 2;
-const COMMAND_PADDING_CONTINUE: u8 = 0x00;
-const COMMAND_PADDING_END: u8 = 0x01;
-const COMMAND_PADDING_DIRECT: u8 = 0x02;
-const TLS_HANDSHAKE: u8 = 0x16;
-const TLS_APPLICATION_DATA: u8 = 0x17;
-const TLS_MAJOR: u8 = 0x03;
-const TLS_CLIENT_HELLO: u8 = 0x01;
-const TLS_SERVER_HELLO: u8 = 0x02;
-const TLS13_SUPPORTED_VERSIONS_EXT: [u8; 6] = [0x00, 0x2b, 0x00, 0x02, 0x03, 0x04];
-const TLS13_CIPHER_SUITES: [u16; 4] = [0x1301, 0x1302, 0x1303, 0x1304];
-const TLS_FILTER_PACKETS: usize = 8;
+use super::super::conn::VlessConn;
+use super::codec::{
+    build_padding_frame, COMMAND_PADDING_CONTINUE, COMMAND_PADDING_DIRECT, COMMAND_PADDING_END,
+    PADDING_HEADER_LEN, TLS13_CIPHER_SUITES, TLS13_SUPPORTED_VERSIONS_EXT, TLS_APPLICATION_DATA,
+    TLS_CLIENT_HELLO, TLS_FILTER_PACKETS, TLS_HANDSHAKE, TLS_MAJOR, TLS_SERVER_HELLO, UUID_LEN,
+};
 
 enum ReadState {
     Header {
@@ -306,40 +301,6 @@ fn tls_server_hello_cipher_suite(record: &[u8]) -> Option<u16> {
     let cipher_offset = 44 + session_id_len;
     let bytes = record.get(cipher_offset..cipher_offset + 2)?;
     Some(u16::from_be_bytes([bytes[0], bytes[1]]))
-}
-
-fn build_padding_frame(
-    command: u8,
-    user_uuid: Option<&[u8; UUID_LEN]>,
-    content: &[u8],
-    padding_tls: bool,
-) -> Vec<u8> {
-    let padding_len = if content.len() < 900 {
-        let mut rng = rand::rng();
-        if padding_tls {
-            (rng.next_u32() as usize % 500) + 900 - content.len()
-        } else {
-            rng.next_u32() as usize % 256
-        }
-    } else {
-        0
-    };
-
-    let header_len = if user_uuid.is_some() {
-        PADDING_HEADER_LEN
-    } else {
-        PADDING_HEADER_LEN - UUID_LEN
-    };
-    let mut frame = Vec::with_capacity(header_len + content.len() + padding_len);
-    if let Some(uuid) = user_uuid {
-        frame.extend_from_slice(uuid);
-    }
-    frame.push(command);
-    frame.extend_from_slice(&(content.len() as u16).to_be_bytes());
-    frame.extend_from_slice(&(padding_len as u16).to_be_bytes());
-    frame.extend_from_slice(content);
-    frame.resize(frame.len() + padding_len, 0);
-    frame
 }
 
 impl AsyncRead for VisionConn {

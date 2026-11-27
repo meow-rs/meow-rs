@@ -53,6 +53,7 @@ use crate::{Result, Stream, Transport, TransportError};
 pub(crate) mod boring_backend;
 pub(crate) mod boring_stream;
 pub mod distrust;
+pub mod server;
 
 /// The Mozilla CA bundle, parsed once per process. `X509` is refcounted,
 /// so a store built from these clones shares the parsed certificates.

@@ -8,6 +8,8 @@
 //!   SOCKS5 → ConnType::Socks5
 //!   TPROXY → ConnType::TProxy
 //!   INNER  → ConnType::Inner
+//!   ANYTLS → ConnType::Anytls
+//!   VLESS  → ConnType::Vless
 //!
 //! Unknown value → hard parse error (Class A per ADR-0002).
 
@@ -26,6 +28,7 @@ pub struct InTypeRule {
     match_tproxy: bool,
     match_inner: bool,
     match_anytls: bool,
+    match_vless: bool,
 }
 
 impl InTypeRule {
@@ -42,6 +45,7 @@ impl InTypeRule {
             match_tproxy: false,
             match_inner: false,
             match_anytls: false,
+            match_vless: false,
         };
         match type_str.to_uppercase().as_str() {
             "HTTP" => {
@@ -53,9 +57,10 @@ impl InTypeRule {
             "TPROXY" => r.match_tproxy = true,
             "INNER" => r.match_inner = true,
             "ANYTLS" => r.match_anytls = true,
+            "VLESS" => r.match_vless = true,
             other => {
                 return Err(format!(
-                "unknown IN-TYPE value '{other}'; expected HTTP, HTTPS, SOCKS5, TPROXY, INNER, or ANYTLS \
+                "unknown IN-TYPE value '{other}'; expected HTTP, HTTPS, SOCKS5, TPROXY, INNER, ANYTLS, or VLESS \
                      (Class A per ADR-0002, upstream: rules/common/inbound.go)"
             ))
             }
@@ -77,6 +82,7 @@ impl Rule for InTypeRule {
             ConnType::TProxy => self.match_tproxy,
             ConnType::Inner => self.match_inner,
             ConnType::Anytls => self.match_anytls,
+            ConnType::Vless => self.match_vless,
             _ => false,
         }
     }
@@ -148,6 +154,39 @@ mod tests {
             assert!(
                 !r.match_metadata(&meta_with_conn(other), &helper()),
                 "{other:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_type_vless_matches_only_vless() {
+        let r = InTypeRule::new("VLESS", "DIRECT").unwrap();
+        assert!(r.match_metadata(&meta_with_conn(ConnType::Vless), &helper()));
+        for other in [
+            ConnType::Http,
+            ConnType::Https,
+            ConnType::Socks5,
+            ConnType::TProxy,
+            ConnType::Inner,
+            ConnType::Anytls,
+        ] {
+            assert!(
+                !r.match_metadata(&meta_with_conn(other), &helper()),
+                "{other:?}"
+            );
+        }
+        // Case semantics follow the existing values: the payload is
+        // uppercased before dispatch.
+        assert!(InTypeRule::new("vless", "DIRECT").is_ok());
+    }
+
+    #[test]
+    fn in_type_other_values_do_not_match_vless() {
+        for value in ["HTTP", "HTTPS", "SOCKS5", "TPROXY", "INNER", "ANYTLS"] {
+            let r = InTypeRule::new(value, "DIRECT").unwrap();
+            assert!(
+                !r.match_metadata(&meta_with_conn(ConnType::Vless), &helper()),
+                "{value}"
             );
         }
     }

@@ -55,15 +55,19 @@ fn no_proxy_dep() {
 ///
 /// `simple_obfs/server.rs` is an intentional exception: it is the server
 /// side of the simple-obfs transport, consumed by the `listener-shadowsocks`
-/// inbound.  Only the fake HTTP header string `"Server: nginx"` trips the
-/// `\bServer\b` heuristic — the module does not use `accept`, `bind`, or
-/// `listen`.
+/// inbound.  `tls/server.rs` and `reality_server.rs` are also intentional:
+/// they accept TLS over a caller-supplied stream for inbound transports, but
+/// they still may not bind or listen on sockets — listener construction and
+/// connection admission stay outside this crate.  Those files are therefore
+/// checked only for socket-ownership symbols, not for acceptor naming.
 #[test]
 fn no_server_side_symbols_in_src() {
     let src_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
     // Files exempt from the check (relative to `src/`).
     let exempt: &[&str] = &["simple_obfs/server.rs"];
+    // Stream acceptors are inbound scope, but socket ownership remains forbidden.
+    let stream_acceptors: &[&str] = &["tls/server.rs", "reality_server.rs"];
 
     // Patterns that indicate server-side code.
     let forbidden_patterns = [
@@ -86,11 +90,13 @@ fn no_server_side_symbols_in_src() {
     walk_rs_files(&src_dir, &mut |path, content| {
         // Skip exempt files (e.g. `simple_obfs/server.rs`). Normalise path
         // separators so the check works on both Unix and Windows.
+        let mut stream_acceptor = false;
         if let Ok(rel) = path.strip_prefix(&src_dir) {
             let rel_str = rel.to_string_lossy().replace('\\', "/");
             if exempt.contains(&rel_str.as_str()) {
                 return;
             }
+            stream_acceptor = stream_acceptors.contains(&rel_str.as_str());
         }
         let test_only = test_only_lines(path, content);
         for (line_no, line) in content.lines().enumerate() {
@@ -104,6 +110,11 @@ fn no_server_side_symbols_in_src() {
                 continue;
             }
             for (re, pat) in regexes.iter().zip(forbidden_patterns.iter()) {
+                if stream_acceptor
+                    && matches!(*pat, r"\baccept\b" | r"\bServer\b" | r"\bAcceptor\b")
+                {
+                    continue;
+                }
                 if re.is_match(line) {
                     violations.push(format!(
                         "{}:{}: '{}' matches pattern '{}'",

@@ -343,6 +343,17 @@ impl ProxyPacketConn for DirectPacketConn {
         Ok(())
     }
 
+    /// A raw direct socket is the one conn whose answer is local fact:
+    /// `connect()`ed, replies can only come from the bound peer (the
+    /// kernel filters the rest); unbound, `send_to` goes exactly to the
+    /// canonical requested address.
+    fn local_udp_destination(&self, requested: SocketAddr) -> Option<SocketAddr> {
+        Some(match self.bound {
+            Some(bound) => bound,
+            None => meow_common::canonical_socket_addr(requested),
+        })
+    }
+
     /// A raw UDP socket — poll-capable by definition (one
     /// `poll_recv_from`/`poll_send[_to]` per datagram).
     fn poll_packet_conn(self: Arc<Self>) -> Option<Arc<dyn PollPacketConn>> {

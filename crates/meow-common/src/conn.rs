@@ -122,6 +122,27 @@ pub trait ProxyPacketConn: Send + Sync {
         let _ = self;
         None
     }
+
+    /// The peer a datagram written with `requested` as the write address
+    /// actually reaches through this conn — locally-known evidence for
+    /// reply-source attribution (a server inbound restoring a domain
+    /// target onto replies must key on where the dial truly went, not on
+    /// the pre-dial resolution: a DIRECT outbound under
+    /// `dns.direct-nameserver` re-resolves and `connect()`s elsewhere).
+    ///
+    /// `Some` only where the answer is local fact: a `connect()`ed raw
+    /// socket answers its bound peer; an unbound raw socket answers the
+    /// canonical form of `requested` (that is where its `send_to` goes).
+    /// The default `None` covers every conn whose datagrams are routed
+    /// beyond local visibility — proxied, remote-resolution,
+    /// stream-framed and synthetic paths — where no local evidence ties
+    /// a reply to the dialed peer and attribution must stay honest by
+    /// not rewriting. Transparent counting/shim wrappers forward the
+    /// inner conn's answer.
+    fn local_udp_destination(&self, requested: SocketAddr) -> Option<SocketAddr> {
+        let _ = requested;
+        None
+    }
 }
 
 /// The synchronous-poll counterpart of [`ProxyPacketConn`], obtained

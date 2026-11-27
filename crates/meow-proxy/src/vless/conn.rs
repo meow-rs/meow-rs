@@ -512,12 +512,14 @@ impl VlessUdpReader {
         if packet_len > buf.len() {
             // The oversized payload was fully drained into the internal
             // buffer, so the stream framing stays aligned for the next
-            // read — surface the error only after the drain.
+            // read — surface the error only after the drain, and as the
+            // matchable variant so the caller can drop just this packet
+            // instead of retiring the conn.
             self.reset_datagram();
-            return Err(MeowError::Proxy(format!(
-                "vless: UDP packet ({packet_len} bytes) exceeds read buffer ({} bytes)",
-                buf.len()
-            )));
+            return Err(MeowError::UdpPacketTooLarge {
+                packet_len,
+                buffer_len: buf.len(),
+            });
         }
         buf[..packet_len].copy_from_slice(&self.payload);
         self.reset_datagram();

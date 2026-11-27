@@ -45,7 +45,7 @@ cargo clippy --all-targets
 ## Architecture
 
 ```
-Listeners (HTTP/SOCKS5/Mixed/TProxy/TUN)
+Listeners (HTTP/SOCKS5/Mixed/TProxy/TUN/WireGuard/AnyTLS/VLESS)
         |
         v
     Tunnel (routing engine)  <-->  DNS Resolver (Snooping/Cache/FakeIP)
@@ -79,7 +79,7 @@ The workspace has 17 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md)
 | `meow-rules` | Rule matching engine and parser (domain, IP-CIDR, GeoIP, process, logic composition) |
 | `meow-dns` | DNS resolver, cache, DNS snooping (IP→domain reverse table), UDP server |
 | `meow-tunnel` | Core routing engine: TCP/UDP relay, rule matching dispatch, connection statistics |
-| `meow-listener` | Inbound protocol handlers (Mixed/HTTP/SOCKS5/TProxy, plus TUN behind the opt-in `listener-tun` feature and the WireGuard responder behind `listener-wireguard`) |
+| `meow-listener` | Inbound protocol handlers (Mixed/HTTP/SOCKS5/TProxy, plus TUN behind `listener-tun`, WireGuard behind `listener-wireguard`, AnyTLS behind `listener-anytls`, and the VLESS Vision/REALITY server behind `listener-vless`) |
 | `meow-config` | YAML configuration parsing into typed structs |
 | `meow-api` | REST API server (Axum) for proxies, rules, connections, configs, traffic, DNS query |
 | `meow-app` | CLI entry point (`main.rs`) — wires config → tunnel → listeners → DNS → API → health checks → subscription refresh |
@@ -88,7 +88,7 @@ The workspace has 17 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md)
 
 ### Startup Flow
 
-`meow-app/src/main.rs` → parse CLI args → `meow_config::load_config()` → create `Tunnel` → spawn health checks for fallback/url-test groups → spawn DNS server, API server, listeners (Mixed/SOCKS/HTTP/TProxy) as tokio tasks → await SIGINT/SIGTERM.
+`meow-app/src/main.rs` → parse CLI args → `meow_config::load_config()` → create `Tunnel` → spawn health checks for fallback/url-test groups → spawn DNS server, API server, and every configured listener (Mixed/SOCKS/HTTP/TProxy/TUN plus feature-gated server inbounds) as tokio tasks → await SIGINT/SIGTERM.
 
 ### Transparent-proxy gateway
 
@@ -103,6 +103,10 @@ The `tun:` config section (issue #326, feature `listener-tun`, in the `full` bun
 ### WireGuard inbound (responder listener)
 
 `listeners: - type: wireguard` (feature `listener-wireguard`, in `full`, never `minimal`) makes meow a static multi-peer WireGuard *server* — "a TUN carried over WireGuard". Implementation: `meow-listener/src/wireguard/` (`mod.rs` socket + spec, `peer.rs`/`demux.rs` peer table + dispatch, `actor.rs` the single-threaded wire loop + smoltcp AnyIP stack + listen pool, `inner_udp.rs` the per-flow UDP path). One UDP socket per listener; handshake-init datagrams dispatch on the anonymous-decrypted static pubkey, everything else on `receiver_idx >> 8` (each peer's `Tunn` owns a disjoint index namespace). The listener-level `RateLimiter` verifies mac1/cookies before any per-peer work; peers roam only on ACL-admitted inner packets; `allowed-ips` is the inner-source ACL. Inner TCP terminates in a lazy 64-entry smoltcp listen pool and routes through `route_inbound_tcp` (with the shared `stream_sniff` window); inner UDP goes through `TunnelInner::dial_udp` keyed on `(peer, inner src, inner dst)`. `metadata.type` reports `"wireguard"`. Docs: [docs/wireguard.md](docs/wireguard.md), spec [docs/specs/proxy-wireguard-server.md](docs/specs/proxy-wireguard-server.md).
+
+### VLESS Vision inbound (TLS/REALITY server listener)
+
+`listeners: - type: vless` (feature `listener-vless`, in `full`, never `minimal`) terminates XTLS `xtls-rprx-vision` servers over standard TLS 1.3 or REALITY. Implementation: `meow-listener/src/vless.rs` owns multi-address accept, the shared 15 s handshake deadline, connection caps, cover dialing/self-loop defense and `IN-USER` metadata; `meow-proxy/src/vless/` owns the bounded request decoder and Vision server codec; `meow-listener/src/vless_xudp.rs` owns XUDP control/data-plane sessions; `meow-transport/src/reality_server.rs` and `tls/server.rs` own the outer handshakes. Every address binds atomically on one listener instance. REALITY unauthenticated traffic is transparently relayed to fixed `reality-config.dest` (256 handshake slots, 64 cover slots, 3 s cover dial); authenticated flows never dial the cover. Metadata uses `ConnType::Vless`, matchable by `IN-TYPE,VLESS` as well as `IN-NAME`/`IN-PORT`/`IN-USER` or listener override. Spec: [docs/specs/listener-vless.md](docs/specs/listener-vless.md).
 
 ### Key Patterns
 

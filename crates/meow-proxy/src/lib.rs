@@ -131,6 +131,12 @@ pub use unavailable::UnavailableAdapter;
 #[cfg(feature = "vless")]
 pub use vless_adapter::{VlessAdapter, VlessFlow};
 
+/// Inbound (server-side) VLESS Vision protocol surface: bounded request
+/// decoder, constant response header and the role-separated server padding
+/// codec.  Internal modules stay crate-private behind it.
+#[cfg(feature = "vless-vision")]
+pub use vless::inbound as vless_inbound;
+
 #[cfg(feature = "vless-encryption")]
 pub use vless::encryption::{parse_client_encryption, ClientInstance as VlessEncryptionClient};
 #[cfg(feature = "vmess")]

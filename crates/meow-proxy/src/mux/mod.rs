@@ -24,6 +24,7 @@ pub mod padding;
 pub mod request;
 pub mod smux;
 pub mod stream;
+pub mod xudp;
 pub mod yamux;
 
 pub use brutal::MuxBrutal;

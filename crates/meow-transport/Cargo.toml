@@ -34,7 +34,7 @@ tls = [
 # implied) so existing `--features boring-tls` invocations and downstream
 # manifests keep building. New code should enable `tls`.
 boring-tls = ["tls", "reality"]
-# reality: xray REALITY client handshake (issue #377). The record layer,
+# reality: xray REALITY client handshake (issue #377) and inbound acceptor. The record layer,
 # the X25519 / HKDF crypto (the hybrid share's ML-KEM-768 comes from
 # boring) and the browser-shaped ClientHello builder (`reality_hello.rs`,
 # issue #708) are all in-tree (`reality_tls.rs`) on top of the
@@ -46,6 +46,7 @@ reality = [
     "boring/mlkem",
     "dep:rand",
     "dep:x25519-dalek",
+    "dep:subtle",
 ]
 ws = [
     "dep:tokio-tungstenite",
@@ -238,6 +239,10 @@ sha1 = { workspace = true }
 
 [[test]]
 name = "boring_tls_test"
+required-features = ["tls"]
+
+[[test]]
+name = "tls_server_test"
 required-features = ["tls"]
 
 [[test]]

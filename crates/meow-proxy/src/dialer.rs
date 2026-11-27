@@ -1864,6 +1864,10 @@ impl ProxyPacketConn for CountedHopPacketConn {
         self.conn.close()
     }
 
+    fn local_udp_destination(&self, requested: SocketAddr) -> Option<SocketAddr> {
+        self.conn.local_udp_destination(requested)
+    }
+
     /// The counting wrapper keeps the inner conn's fast path *through
     /// itself*: handing out the inner handle would let a `PacketConnSocket`
     /// move datagrams the hop counters never see.

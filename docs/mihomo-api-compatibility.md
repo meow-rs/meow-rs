@@ -34,18 +34,18 @@ bind is the only startup-fatal endpoint; the new ones log-and-skip like
 upstream, and a config where every endpoint failed to bind logs that no
 controller is available.
 
-The same holds for named `listeners:` — including `type: anytls`: a PUT
-that changes the effective listener set (its own keys OR an inherited
-default like `max-connections`/`bind-address`/`sniffer:` resolving
-differently) is committed to the in-memory document and reported with a
-restart warning; running sockets, the authenticated user table and TLS
-material are untouched. The committed document is NOT written back to
-the backing config file — `PUT /configs` is a reload, not a save: keep
-the submitted YAML as the file the next boot reads (or run
+The same holds for named `listeners:` — including `type: anytls` and
+`type: vless`: a PUT that changes the effective listener set (its own keys OR
+an inherited default like `max-connections`/`bind-address`/`sniffer:`
+resolving differently) is committed to the in-memory document and reported
+with a restart warning; running sockets, the authenticated user table and
+TLS/REALITY material are untouched. The committed document is NOT written
+back to the backing config file — `PUT /configs` is a reload, not a save:
+keep the submitted YAML as the file the next boot reads (or run
 `PUT /configs` against the persisted path), otherwise the change is lost
-on restart. A `type: anytls` entry this build cannot serve (no
-`listener-anytls` feature) is rejected with 400 even under `?force=true`,
-so a persisted config can never strand the next boot.
+on restart. A `type: anytls`/`type: vless` entry this build cannot serve
+(no `listener-anytls`/`listener-vless` feature) is rejected with 400 even
+under `?force=true`, so a persisted config can never strand the next boot.
 
 ## Panel runtime API
 
@@ -137,10 +137,10 @@ The following routes are retained and do not collide with the mihomo surface:
 - `GET /dns/results` and `POST /dns/query`
 - `GET /listeners`: active listeners (`name`, `type`, `port`, `listen`);
   tproxy entries also report `firewall`/`udp`/`udp-timeout`, and a
-  `type: anytls` entry with several `listen` addresses reports them all
+  multi-address `type: anytls` or `type: vless` entry reports every bind
   under `addresses` (`port`/`listen` stay the first address). Credentials
-  — the `users` digests, certificate and private key — are never in the
-  output
+  — user digests/UUIDs, certificate/private-key and REALITY material — are
+  never in the output
 - `GET /statistics`: `uploadTotal` / `downloadTotal` (the `/traffic`
   totals) and `proxies`, the bytes each proxy carried since start, TCP and
   UDP: `{"DIRECT": {"upload": N, "download": N}, ...}`. A group's traffic

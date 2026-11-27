@@ -123,5 +123,9 @@ tracing-subscriber = { workspace = true }
 name = "vless_config_test"
 path = "tests/vless_config_test.rs"
 
+[[test]]
+name = "vless_listener_config_test"
+path = "tests/vless_listener_config_test.rs"
+
 [lints]
 workspace = true

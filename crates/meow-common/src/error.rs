@@ -44,6 +44,19 @@ pub enum MeowError {
     RelayHopFailed { hop: usize, source: Box<MeowError> },
     #[error("UDP not supported by this relay chain")]
     UdpNotSupported,
+    /// A stream-framed packet conn (VLESS UoT, mux) reassembled a complete
+    /// datagram that does not fit the caller's read buffer. The variant is
+    /// emitted ONLY after the datagram was fully consumed and the framing
+    /// reset for the next read, so the transport is intact and the caller
+    /// may drop just this packet and keep reading — unlike EOF, half-frame
+    /// and transport errors, which are terminal for the conn. Producers:
+    /// meow-proxy's framed UDP readers. Raw-datagram conns never emit it
+    /// (the kernel truncates at the socket instead).
+    #[error("UDP packet ({packet_len} bytes) exceeds read buffer ({buffer_len} bytes)")]
+    UdpPacketTooLarge {
+        packet_len: usize,
+        buffer_len: usize,
+    },
     #[error("{0}")]
     Other(String),
 }
