@@ -305,6 +305,111 @@ fn missing_vless_listener_gate(spec: &meow_config::ListenerSpec) -> Option<&'sta
     matches!(spec, meow_config::ListenerSpec::Vless(_)).then_some("listener-vless")
 }
 
+const TEST_TLS_CERTIFICATE: &str = "-----BEGIN CERTIFICATE-----\nMIIBNzCB36ADAgECAgkAqoMW3roW4aowCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJ\nbG9jYWxob3N0MCAXDTI2MTEyNzA3MTgyNFoYDzIxMjYxMTAzMDcxODI0WjAUMRIw\nEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASIGoOq\nLSbzRlVYeSsZVPuRVEVl1vLuy9fwyAeaL3SRkdksE6rZ9tKfs4ccpNw8A0QRAUTo\n2nYqxjRaUSuzhoAqoxgwFjAUBgNVHREEDTALgglsb2NhbGhvc3QwCgYIKoZIzj0E\nAwIDRwAwRAIgVO92ZOhBj5iaeBEcc28ORj/8DLr1N+l82YVP+hUyKcMCIHvlI+/W\n5TgvSmdKR6y3DejAKXxI8JLvbyNUnmd55Ncs\n-----END CERTIFICATE-----\n";
+const TEST_TLS_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgTTqgqtc3lQE45oGc\nyMVp3aW7293O/nrp6irnV1G0qMehRANCAASIGoOqLSbzRlVYeSsZVPuRVEVl1vLu\ny9fwyAeaL3SRkdksE6rZ9tKfs4ccpNw8A0QRAUTo2nYqxjRaUSuzhoAq\n-----END PRIVATE KEY-----\n";
+const TEST_TLS_OTHER_PRIVATE_KEY: &str = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgDBYCQih1i0LucHMc\nkEgJsSB37HsgJPttBJHT3GNKZyWhRANCAAQ+JSSbwLstC0vrRCw6UuOIhSOXF3Xo\nQEYVASJmRW5WJcO8AfsPNkPJaKY/UwhpRzhHjnUccxQ0VJ7u8eqNxDHq\n-----END PRIVATE KEY-----\n";
+
+fn pem_block(pem: &str) -> String {
+    pem.lines().map(|line| format!("      {line}\n")).collect()
+}
+
+fn vless_tls_document(certificate: &str, private_key: &str) -> String {
+    format!(
+        "mode: rule\nlisteners:\n  - name: vision-tls-in\n    type: vless\n    listen: 127.0.0.1\n    port: 0\n    certificate: |\n{}    private-key: |\n{}    users:\n      - username: alice\n        uuid: \"11111111-1111-4111-8111-111111111111\"\n        flow: xtls-rprx-vision\nrules:\n  - MATCH,DIRECT\n",
+        pem_block(certificate),
+        pem_block(private_key)
+    )
+}
+
+/// The PUT admission gate must run the same security-identity validation
+/// startup runs: a certificate/key pair that cannot form a TLS identity is
+/// not an environment defect `force` can wave through — it can never boot.
+#[tokio::test]
+async fn put_configs_rejects_vless_tls_identity_startup_would_reject() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state_default();
+    let certificate = TEST_TLS_CERTIFICATE;
+    let matching_key = TEST_TLS_PRIVATE_KEY;
+    let mismatched_key = TEST_TLS_OTHER_PRIVATE_KEY;
+
+    for query in ["", "?force=true"] {
+        let resp = put_configs_payload(
+            &state,
+            &vless_tls_document(certificate, mismatched_key),
+            query,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {query}");
+        let body = body_string(resp).await;
+        assert!(body.contains("vless security"), "{body}");
+        assert!(
+            !body.contains("BEGIN PRIVATE KEY") && !body.contains("BEGIN CERTIFICATE"),
+            "PEM material leaked into the rejection: {body}"
+        );
+    }
+    assert!(
+        state.raw_config.read().listeners.is_none(),
+        "the rejected identity must not commit"
+    );
+
+    let resp =
+        put_configs_payload(&state, &vless_tls_document(certificate, matching_key), "").await;
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+}
+
+/// REALITY's runtime cardinality is part of the security identity the next
+/// boot either can or cannot construct. More than 64 syntactically valid
+/// short IDs must be refused at PUT admission, force included.
+#[tokio::test]
+async fn put_configs_rejects_vless_reality_short_id_overflow_even_force() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state_default();
+    let ids = (1..=65)
+        .map(|i| format!("\"{i:02x}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let yaml = vless_reality_document().replace(
+        "short-id: [\"0123456789abcdef\"]",
+        &format!("short-id: [{ids}]"),
+    );
+
+    for query in ["", "?force=true"] {
+        let resp = put_configs_payload(&state, &yaml, query).await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "query {query}");
+        let body = body_string(resp).await;
+        assert!(body.contains("short-id"), "{body}");
+        assert!(body.contains("64"), "{body}");
+    }
+    assert!(
+        state.raw_config.read().listeners.is_none(),
+        "the overflowing identity must not commit"
+    );
+}
+
+/// `decryption` can carry sensitive Xray inbound material in imported
+/// configurations. The rejection is allowed to name the field and the sole
+/// supported value, never the operator-supplied secret.
+#[tokio::test]
+async fn put_configs_vless_decryption_rejection_never_echoes_value() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state_default();
+    let secret = "xray_inbound_private_key_9f8e7d6c5b4a";
+    let yaml = vless_reality_document().replace(
+        "    type: vless\n",
+        &format!("    type: vless\n    decryption: {secret}\n"),
+    );
+
+    let resp = put_configs_payload(&state, &yaml, "").await;
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body = body_string(resp).await;
+    assert!(body.contains("decryption"), "{body}");
+    assert!(body.contains("none"), "{body}");
+    assert!(
+        !body.contains(secret),
+        "decryption value leaked into the API response: {body}"
+    );
+}
+
 /// `type: vless` is one of the persistence-hard feature gates: even
 /// `?force=true` must not write a listener this binary cannot serve,
 /// because the next startup would fail its unservable-inbound check.
@@ -379,6 +484,8 @@ fn vless_reality_named_listener(
             }],
             security: VlessSecurity::Reality(VlessRealityConfig {
                 dest: "www.example.com:443".into(),
+                dest_host: "www.example.com".into(),
+                dest_port: 443,
                 private_key: [0x42; 32],
                 short_ids: vec![[0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef]],
                 server_names: vec!["www.example.com".into()],

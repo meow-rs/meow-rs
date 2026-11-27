@@ -5302,6 +5302,20 @@ async fn put_configs(
             ),
         );
     }
+    // VLESS security identity is a startup snapshot too: validate the same
+    // certificate/key pair and REALITY parameters before commit, without
+    // binding sockets or contacting the cover. `force` cannot waive this —
+    // unlike an environment failure, a bad identity can never boot as written.
+    for l in &named_listeners {
+        if let meow_config::ListenerSpec::Vless(cfg) = &l.spec {
+            if let Err(e) = meow_config::validate_vless_security_identity(&cfg.security) {
+                return reload_rejected(
+                    StatusCode::BAD_REQUEST,
+                    &format!("listener '{}': invalid vless security: {e}", l.name),
+                );
+            }
+        }
+    }
     // A `listeners[].proxy` target the document itself never declares —
     // not a `proxies:`/`proxy-groups:` name or a built-in — is a
     // document-shape defect too: provider members are not registry keys,

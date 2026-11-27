@@ -283,16 +283,53 @@ impl<'de> Deserialize<'de> for UnknownYamlValue {
     where
         D: serde::Deserializer<'de>,
     {
-        deserializer.deserialize_any(UnknownValueVisitor).map(Self)
+        deserializer
+            .deserialize_any(UnknownValueVisitor::<false>)
+            .map(Self)
     }
 }
 
-struct UnknownValueVisitor;
+/// Captured YAML for listener fields whose schema has no floating-point
+/// value. JSON cannot represent `.nan`/`.inf`, so accepting them through
+/// [`UnknownYamlValue`] would rewrite them to null and make malformed
+/// numeric fields indistinguishable from an explicit null default.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+#[serde(transparent)]
+pub struct FiniteYamlValue(pub serde_json::Value);
+
+impl<'de> Deserialize<'de> for FiniteYamlValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_any(UnknownValueVisitor::<true>)
+            .map(Self)
+    }
+}
+
+struct CapturedYamlValue<const REJECT_NONFINITE: bool>(serde_json::Value);
+
+impl<'de, const REJECT_NONFINITE: bool> Deserialize<'de> for CapturedYamlValue<REJECT_NONFINITE> {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        deserializer
+            .deserialize_any(UnknownValueVisitor::<REJECT_NONFINITE>)
+            .map(Self)
+    }
+}
+
+struct UnknownValueVisitor<const REJECT_NONFINITE: bool>;
 
 // Scalar visits mirror `serde_json::Value`'s own visitor so a captured
-// subtree keeps identical values — ints narrow through `Number`, a
-// non-finite float becomes `Null`.
-impl<'de> serde::de::Visitor<'de> for UnknownValueVisitor {
+// subtree keeps identical values — ints narrow through `Number`. The
+// strict mode rejects non-finite floats instead of lossily reading them
+// as `Null`.
+impl<'de, const REJECT_NONFINITE: bool> serde::de::Visitor<'de>
+    for UnknownValueVisitor<REJECT_NONFINITE>
+{
     type Value = serde_json::Value;
 
     fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -322,6 +359,11 @@ impl<'de> serde::de::Visitor<'de> for UnknownValueVisitor {
     }
 
     fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Self::Value, E> {
+        if REJECT_NONFINITE && !v.is_finite() {
+            return Err(E::custom(
+                "non-finite YAML number (.nan/.inf) is not valid here",
+            ));
+        }
         Ok(serde_json::Number::from_f64(v)
             .map_or(serde_json::Value::Null, serde_json::Value::Number))
     }
@@ -343,19 +385,19 @@ impl<'de> serde::de::Visitor<'de> for UnknownValueVisitor {
     }
 
     fn visit_some<D: serde::Deserializer<'de>>(self, d: D) -> Result<Self::Value, D::Error> {
-        UnknownYamlValue::deserialize(d).map(|w| w.0)
+        CapturedYamlValue::<REJECT_NONFINITE>::deserialize(d).map(|w| w.0)
     }
 
     fn visit_newtype_struct<D: serde::Deserializer<'de>>(
         self,
         d: D,
     ) -> Result<Self::Value, D::Error> {
-        UnknownYamlValue::deserialize(d).map(|w| w.0)
+        CapturedYamlValue::<REJECT_NONFINITE>::deserialize(d).map(|w| w.0)
     }
 
     fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
         let mut items = Vec::new();
-        while let Some(v) = seq.next_element::<UnknownYamlValue>()? {
+        while let Some(v) = seq.next_element::<CapturedYamlValue<REJECT_NONFINITE>>()? {
             items.push(v.0);
         }
         Ok(serde_json::Value::Array(items))
@@ -364,7 +406,10 @@ impl<'de> serde::de::Visitor<'de> for UnknownValueVisitor {
     fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
         let mut out = serde_json::Map::new();
         while let Some(k) = map.next_key::<ScalarKey>()? {
-            out.insert(k.0, map.next_value::<UnknownYamlValue>()?.0);
+            out.insert(
+                k.0,
+                map.next_value::<CapturedYamlValue<REJECT_NONFINITE>>()?.0,
+            );
         }
         Ok(serde_json::Value::Object(out))
     }
@@ -1435,12 +1480,12 @@ pub struct RawListener {
     /// `alpn` — the standard-TLS outer ALPN list. Captured as a value so
     /// a non-list shape errors in the typed builder with the listener
     /// name in scope rather than failing the whole document at parse.
-    pub alpn: Option<UnknownYamlValue>,
+    pub alpn: Option<FiniteYamlValue>,
     /// `reality-config` — the nested REALITY server block (mihomo's
     /// inbound spelling; `reality-opts` is the outbound one). Captured
     /// raw so shape/unknown-key errors carry the listener name; mutually
     /// exclusive with the flat certificate pair in the typed builder.
-    pub reality_config: Option<UnknownYamlValue>,
+    pub reality_config: Option<FiniteYamlValue>,
 
     // ── upstream sub-options not yet supported by meow-rs ──
     // Captured as opaque `Value`s so their mere presence can be warned about

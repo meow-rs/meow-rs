@@ -485,6 +485,11 @@ pub struct VlessRealityConfig {
     /// Cover target `host:port` as written — shape-validated (port
     /// 1..=65535, bracketed IPv6), never resolved at build time.
     pub dest: String,
+    /// Host half of [`Self::dest`], split once by the config validator so
+    /// the runtime does not need its own copy of the shape parser.
+    pub dest_host: String,
+    /// Port half of [`Self::dest`], likewise prevalidated in `1..=65535`.
+    pub dest_port: u16,
     /// X25519 static private key, 32 bytes. Never logged.
     #[serde(with = "reality_key_serde")]
     pub private_key: [u8; 32],
@@ -6591,6 +6596,50 @@ fn anytls_front_layer_enabled(
     }
 }
 
+/// Resolve the multi-address `listen` contract shared by TCP server
+/// inbounds: comma-separated segments, the entry `port` merge rules, IP
+/// literal validation, and canonical duplicate detection.
+fn resolve_multi_listener_binds(
+    raw_l: &raw::RawListener,
+    default_bind: &str,
+) -> Result<Vec<ListenerBind>, anyhow::Error> {
+    let listen_raw = raw_l.listen.as_deref().unwrap_or(default_bind);
+    let mut addresses: Vec<ListenerBind> = Vec::new();
+    for segment in listen_raw.split(',') {
+        let segment = segment.trim();
+        if segment.is_empty() {
+            anyhow::bail!(
+                "listeners[{}].listen: empty address in comma-separated list '{listen_raw}'",
+                raw_l.name
+            );
+        }
+        let (listen, port) = resolve_listener_bind(segment, raw_l.port)
+            .map_err(|e| anyhow::anyhow!("listeners[{}].listen: {e}", raw_l.name))?;
+        addresses.push(ListenerBind { listen, port });
+    }
+    // `::1` and `0:0:0:0:0:0:0:1` are the same bind; comparison goes
+    // through `IpAddr` so non-canonical spellings still collide.
+    let mut seen = std::collections::HashSet::new();
+    for b in &addresses {
+        let ip = b.listen.parse::<IpAddr>().map_err(|_| {
+            anyhow::anyhow!(
+                "listeners[{}].listen: '{}' is not an IP literal",
+                raw_l.name,
+                b.listen
+            )
+        })?;
+        if !seen.insert((ip, b.port)) {
+            anyhow::bail!(
+                "listeners[{}].listen: duplicate bind address '{}':{}",
+                raw_l.name,
+                b.listen,
+                b.port
+            );
+        }
+    }
+    Ok(addresses)
+}
+
 /// Build a validated [`AnytlsListenerConfig`] from a raw `listeners:`
 /// entry — the single semantic entry point for `type: anytls`, reached
 /// identically by startup, `-t` and `PUT /configs` via
@@ -6842,46 +6891,7 @@ fn build_anytls_listener_spec(
         }
     }
 
-    // ── `listen` — one YAML string, possibly comma-separated; each
-    // segment normalizes in declaration order via the shared bind
-    // resolver. An empty segment between commas is a shape error.
-    let listen_raw = raw_l.listen.as_deref().unwrap_or(default_bind);
-    let mut addresses: Vec<ListenerBind> = Vec::new();
-    for segment in listen_raw.split(',') {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            anyhow::bail!(
-                "listeners[{}].listen: empty address in comma-separated list '{listen_raw}'",
-                raw_l.name
-            );
-        }
-        let (listen, port) = resolve_listener_bind(segment, raw_l.port)
-            .map_err(|e| anyhow::anyhow!("listeners[{}].listen: {e}", raw_l.name))?;
-        addresses.push(ListenerBind { listen, port });
-    }
-    // Reject duplicate resolved targets — `::1` and `0:0:0:0:0:0:0:1`
-    // are the same bind and a second TcpListener::bind on it fails
-    // anyway; fail the config HERE with a clear diagnostic instead of a
-    // partial bind (F11). Comparison goes through `IpAddr`, not the
-    // string, so non-canonical spellings still collide.
-    let mut seen = std::collections::HashSet::new();
-    for b in &addresses {
-        let ip = b.listen.parse::<IpAddr>().map_err(|_| {
-            anyhow::anyhow!(
-                "listeners[{}].listen: '{}' is not an IP literal",
-                raw_l.name,
-                b.listen
-            )
-        })?;
-        if !seen.insert((ip, b.port)) {
-            anyhow::bail!(
-                "listeners[{}].listen: duplicate bind address '{}':{}",
-                raw_l.name,
-                b.listen,
-                b.port
-            );
-        }
-    }
+    let addresses = resolve_multi_listener_binds(raw_l, default_bind)?;
 
     Ok(AnytlsListenerConfig {
         users,
@@ -6959,6 +6969,72 @@ fn parse_reality_dest(dest: &str, ctx: &str) -> Result<(String, u16), anyhow::Er
         anyhow::bail!("{ctx}: port 0 is not a dialable cover target — use 1..=65535");
     }
     Ok((host, port))
+}
+
+/// Split a REALITY cover `dest` with the same shape rules the config
+/// builder enforces. Exposed for the runtime listener conversion so the
+/// wire-format parser has one owner; no DNS or network I/O happens here.
+pub fn parse_vless_reality_dest(dest: &str) -> Result<(String, u16), anyhow::Error> {
+    parse_reality_dest(dest, "reality-config.dest")
+}
+
+const MAX_TLS_IDENTITY_FILE_BYTES: u64 = 1 << 20;
+
+fn read_tls_identity_file(path: &std::path::Path, what: &str) -> Result<Vec<u8>, anyhow::Error> {
+    use std::io::Read as _;
+
+    let meta = std::fs::metadata(path)
+        .map_err(|e| anyhow::anyhow!("{what}: cannot stat {}: {e}", path.display()))?;
+    if !meta.is_file() {
+        anyhow::bail!("{what}: {} is not a regular file", path.display());
+    }
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::custom_flags(&mut opts, libc::O_NONBLOCK);
+    let file = opts
+        .open(path)
+        .map_err(|e| anyhow::anyhow!("{what}: cannot open {}: {e}", path.display()))?;
+    let mut buf = Vec::new();
+    file.take(MAX_TLS_IDENTITY_FILE_BYTES + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| anyhow::anyhow!("{what}: cannot read {}: {e}", path.display()))?;
+    if buf.len() as u64 > MAX_TLS_IDENTITY_FILE_BYTES {
+        anyhow::bail!(
+            "{what}: {} exceeds {} bytes",
+            path.display(),
+            MAX_TLS_IDENTITY_FILE_BYTES
+        );
+    }
+    Ok(buf)
+}
+
+/// Load a listener certificate/private-key pair exactly as the TLS-server
+/// inbounds do: both inline PEM or both home-contained regular files, each
+/// file capped well below any plausible certificate chain.
+pub fn load_tls_identity_pair(
+    cert: &str,
+    key: &str,
+    protocol: &str,
+) -> Result<(Vec<u8>, Vec<u8>), anyhow::Error> {
+    let cert_inline = is_pem_literal(cert);
+    let key_inline = is_pem_literal(key);
+    if cert_inline != key_inline {
+        anyhow::bail!(
+            "{protocol} certificate and private-key must be both inline PEM or both file paths"
+        );
+    }
+    if cert_inline {
+        return Ok((cert.as_bytes().to_vec(), key.as_bytes().to_vec()));
+    }
+    let cert_path = resolve_home_contained(std::path::Path::new(cert))
+        .map_err(|e| anyhow::anyhow!("{protocol} certificate: {e}"))?;
+    let key_path = resolve_home_contained(std::path::Path::new(key))
+        .map_err(|e| anyhow::anyhow!("{protocol} private-key: {e}"))?;
+    Ok((
+        read_tls_identity_file(&cert_path, &format!("{protocol} certificate"))?,
+        read_tls_identity_file(&key_path, &format!("{protocol} private-key"))?,
+    ))
 }
 
 /// Read a required string out of a `reality-config`-style captured map.
@@ -7047,6 +7123,50 @@ fn validate_server_name(name: &str, ctx: &str) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
+/// Validate the config-dependent parts of a VLESS listener security
+/// identity without binding sockets, resolving names, or contacting the
+/// REALITY cover. Standard TLS runs the same BoringSSL certificate/key
+/// pairing check as the server acceptor; REALITY checks the parsed cover
+/// endpoint, cardinality, and SNI names that acceptor construction gates.
+pub fn validate_vless_security_identity(security: &VlessSecurity) -> Result<(), anyhow::Error> {
+    match security {
+        VlessSecurity::StandardTls {
+            certificate,
+            private_key,
+            alpn,
+        } => {
+            let (certificate_chain_pem, private_key_pem) =
+                load_tls_identity_pair(certificate, private_key, "vless")?;
+            meow_transport::tls::server::TlsServer::new(
+                &meow_transport::tls::server::TlsServerConfig {
+                    certificate_chain_pem,
+                    private_key_pem,
+                    alpn: alpn.clone(),
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("vless TLS: {e}"))?;
+        }
+        VlessSecurity::Reality(reality) => {
+            let (dest_host, dest_port) = parse_vless_reality_dest(&reality.dest)?;
+            if dest_host != reality.dest_host || dest_port != reality.dest_port {
+                anyhow::bail!(
+                    "reality-config.dest: structured cover host/port do not match the dest string"
+                );
+            }
+            if reality.short_ids.is_empty() || reality.short_ids.len() > 64 {
+                anyhow::bail!("reality-config.short-id: must contain 1..=64 entries");
+            }
+            if reality.server_names.is_empty() || reality.server_names.len() > 64 {
+                anyhow::bail!("reality-config.server-names: must contain 1..=64 entries");
+            }
+            for (i, name) in reality.server_names.iter().enumerate() {
+                validate_server_name(name, &format!("reality-config.server-names[{i}]"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validate one `limit-fallback-{upload,download}` sub-map: optional
 /// keys `after-bytes`/`bytes-per-sec`/`burst-bytes-per-sec`, non-negative
 /// integers; unknown keys hard-error.
@@ -7099,7 +7219,7 @@ fn parse_limit_fallback(
 fn build_vless_reality_config(
     raw_l: &raw::RawListener,
     value: &serde_json::Value,
-) -> Result<(VlessRealityConfig, String, u16), anyhow::Error> {
+) -> Result<VlessRealityConfig, anyhow::Error> {
     let ctx = format!("listeners[{}].reality-config", raw_l.name);
     let Some(obj) = value.as_object() else {
         anyhow::bail!("{ctx}: must be a mapping — see the `type: vless` REALITY example");
@@ -7218,6 +7338,11 @@ fn build_vless_reality_config(
         }
         short_ids.push(padded);
     }
+    if short_ids.len() > 64 {
+        anyhow::bail!(
+            "{ctx}.short-id: at most 64 entries — the REALITY acceptor cannot serve more"
+        );
+    }
 
     // ── server-names — the exact-match SNI allowlist.
     let mut server_names: Vec<String> = Vec::new();
@@ -7234,6 +7359,11 @@ fn build_vless_reality_config(
             anyhow::bail!("{ctx}.server-names[{i}]: '{name}' duplicates an earlier entry");
         }
         server_names.push(name.clone());
+    }
+    if server_names.len() > 64 {
+        anyhow::bail!(
+            "{ctx}.server-names: at most 64 entries — the REALITY acceptor cannot serve more"
+        );
     }
 
     // ── max-time-difference — optional microseconds; absent defaults to
@@ -7263,19 +7393,17 @@ fn build_vless_reality_config(
         &format!("{ctx}.limit-fallback-download"),
     )?;
 
-    Ok((
-        VlessRealityConfig {
-            dest: dest.to_string(),
-            private_key,
-            short_ids,
-            server_names,
-            max_time_difference_us,
-            limit_fallback_upload,
-            limit_fallback_download,
-        },
+    Ok(VlessRealityConfig {
+        dest: dest.to_string(),
         dest_host,
         dest_port,
-    ))
+        private_key,
+        short_ids,
+        server_names,
+        max_time_difference_us,
+        limit_fallback_upload,
+        limit_fallback_download,
+    })
 }
 
 /// Build a validated [`VlessListenerConfig`] from a raw `listeners:`
@@ -7419,9 +7547,9 @@ fn build_vless_listener_spec(
     if let Some(decryption) = raw_l.decryption.as_deref() {
         if !decryption.is_empty() && decryption != "none" {
             anyhow::bail!(
-                "listeners[{}].decryption: '{decryption}' is not supported — meow's \
-                 VLESS inbound serves only `decryption: none` (the outer TLS/REALITY \
-                 layer is the encryption); remove the key or set `none`",
+                "listeners[{}].decryption: value is not supported — meow's VLESS \
+                 inbound serves only `decryption: none` (the outer TLS/REALITY layer \
+                 is the encryption); remove the key or set `none`",
                 raw_l.name
             );
         }
@@ -7688,41 +7816,7 @@ fn build_vless_listener_spec(
         }
     }
 
-    // ── `listen` — one YAML string, possibly comma-separated; every
-    // segment normalizes through the shared bind resolver with the
-    // entry's `port` (identical merge/conflict rules to anytls).
-    let listen_raw = raw_l.listen.as_deref().unwrap_or(default_bind);
-    let mut addresses: Vec<ListenerBind> = Vec::new();
-    for segment in listen_raw.split(',') {
-        let segment = segment.trim();
-        if segment.is_empty() {
-            anyhow::bail!(
-                "listeners[{}].listen: empty address in comma-separated list '{listen_raw}'",
-                raw_l.name
-            );
-        }
-        let (listen, port) = resolve_listener_bind(segment, raw_l.port)
-            .map_err(|e| anyhow::anyhow!("listeners[{}].listen: {e}", raw_l.name))?;
-        addresses.push(ListenerBind { listen, port });
-    }
-    let mut seen = std::collections::HashSet::new();
-    for b in &addresses {
-        let ip = b.listen.parse::<IpAddr>().map_err(|_| {
-            anyhow::anyhow!(
-                "listeners[{}].listen: '{}' is not an IP literal",
-                raw_l.name,
-                b.listen
-            )
-        })?;
-        if !seen.insert((ip, b.port)) {
-            anyhow::bail!(
-                "listeners[{}].listen: duplicate bind address '{}':{}",
-                raw_l.name,
-                b.listen,
-                b.port
-            );
-        }
-    }
+    let addresses = resolve_multi_listener_binds(raw_l, default_bind)?;
 
     // ── REALITY self-loop static gate — the certain cases only: the
     // cover `dest` is an IP literal that provably lands back on THIS
@@ -7730,10 +7824,10 @@ fn build_vless_listener_spec(
     // Domain dests and non-local literals are the runtime dial guard's
     // job (it checks resolution results against every listener); an
     // ephemeral `port: 0` bind can never match statically.
-    if let Some((_, dest_host, dest_port)) = &reality {
-        if let Ok(dest_ip) = dest_host.parse::<IpAddr>() {
+    if let Some(reality_cfg) = &reality {
+        if let Ok(dest_ip) = reality_cfg.dest_host.parse::<IpAddr>() {
             for bind in &addresses {
-                if bind.port != *dest_port || bind.port == 0 {
+                if bind.port != reality_cfg.dest_port || bind.port == 0 {
                     continue;
                 }
                 let Ok(bind_ip) = bind.listen.parse::<IpAddr>() else {
@@ -7767,7 +7861,7 @@ fn build_vless_listener_spec(
             private_key,
             alpn,
         },
-        (None, Some((reality_cfg, _, _))) => VlessSecurity::Reality(reality_cfg),
+        (None, Some(reality_cfg)) => VlessSecurity::Reality(reality_cfg),
         // Both/neither already hard-errored above; the compiler cannot
         // see through the early bail without this arm.
         _ => unreachable!("security-mode exclusivity is enforced before this point"),
@@ -16143,7 +16237,7 @@ mod listener_surface_tests {
     }
 
     fn vless_named(extra: &str) -> Result<Vec<NamedListener>, anyhow::Error> {
-        let raw: raw::RawConfig = crate::parse_raw_yaml(&vless_yaml(extra)).unwrap();
+        let raw: raw::RawConfig = crate::parse_raw_yaml(&vless_yaml(extra))?;
         build_named_listeners(&raw, "127.0.0.1", false)
     }
 
@@ -16339,8 +16433,14 @@ mod listener_surface_tests {
         // decryption absent/""/none pass; anything else errors.
         vless_named(&format!("{VLESS_CERT}{users}    decryption: none\n")).unwrap();
         vless_named(&format!("{VLESS_CERT}{users}    decryption: \"\"\n")).unwrap();
-        let err = vless_named_err(&format!("{VLESS_CERT}{users}    decryption: aes-128-gcm\n"));
+        let secret = "xray_inbound_private_key_9f8e7d6c5b4a";
+        let err = vless_named_err(&format!("{VLESS_CERT}{users}    decryption: {secret}\n"));
         assert!(err.contains("decryption"), "{err}");
+        assert!(err.contains("`none`"), "{err}");
+        assert!(
+            !err.contains(secret),
+            "decryption value leaked into the config error: {err}"
+        );
 
         // `encryption` (outbound key) errors with the decryption hint.
         let err = vless_named_err(&format!("{VLESS_CERT}{users}    encryption: none\n"));
@@ -16571,6 +16671,71 @@ mod listener_surface_tests {
     }
 
     #[test]
+    fn vless_reality_runtime_cardinality_is_config_shape() {
+        let users = format!("    users:\n{VLESS_USER_A}");
+        // 64 legal entries pass; the 65th is a hard error even though every
+        // item is individually valid.
+        let ids64 = (1..=64)
+            .map(|i| format!("\"{i:02x}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        vless_named(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [{ids64}]\n      server-names: [\"example.com\"]\n{users}"
+        ))
+        .unwrap();
+        let ids65 = (1..=65)
+            .map(|i| format!("\"{i:02x}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [{ids65}]\n      server-names: [\"example.com\"]\n{users}"
+        ));
+        assert!(err.contains("short-id"), "{err}");
+        assert!(err.contains("64"), "{err}");
+
+        let names65 = (1..=65)
+            .map(|i| format!("\"n{i}.example.com\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let err = vless_named_err(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [{names65}]\n{users}"
+        ));
+        assert!(err.contains("server-names"), "{err}");
+        assert!(err.contains("64"), "{err}");
+    }
+
+    #[test]
+    fn vless_reality_nonfinite_numbers_never_become_null_defaults() {
+        let users = format!("    users:\n{VLESS_USER_A}");
+        for block in [
+            "      max-time-difference: .nan\n",
+            "      max-time-difference: .inf\n",
+            "      max-time-difference: 1e999\n",
+            "      limit-fallback-upload: .nan\n",
+            "      limit-fallback-download: .inf\n",
+        ] {
+            let err = vless_named_err(&format!(
+                "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n{block}{users}"
+            ));
+            assert!(err.contains("non-finite"), "{err} for {block}");
+        }
+
+        // Explicit null remains the documented absent-equivalent spelling.
+        let listeners = vless_named(&format!(
+            "    reality-config:\n      dest: \"www.example.com:443\"\n      private-key: \"{REALITY_KEY}\"\n      short-id: [\"ab\"]\n      server-names: [\"example.com\"]\n      max-time-difference: null\n      limit-fallback-upload: null\n{users}"
+        ))
+        .unwrap();
+        let ListenerSpec::Vless(cfg) = &listeners[0].spec else {
+            panic!("expected vless spec");
+        };
+        let VlessSecurity::Reality(rc) = &cfg.security else {
+            panic!("expected REALITY");
+        };
+        assert_eq!(rc.max_time_difference_us, 120_000_000);
+        assert_eq!(rc.limit_fallback_upload, RealityLimitFallback::default());
+    }
+
+    #[test]
     fn vless_reality_self_loop_static_gate() {
         let users = format!("    users:\n{VLESS_USER_A}");
         // dest at the listener's own bind (exact loopback match).
@@ -16594,6 +16759,31 @@ mod listener_surface_tests {
 
     #[test]
     fn vless_multi_address_and_foreign_keys() {
+        // Comma-separated listen shares the AnyTLS resolution contract in
+        // order and keeps canonical IPv6 spellings distinct only when they
+        // really are distinct addresses.
+        let raw: raw::RawConfig = crate::parse_raw_yaml(
+            "listeners:\n  - name: v\n    type: vless\n    port: 1080\n    listen: \"127.0.0.1,::1\"\n    certificate: \"-----BEGIN CERTIFICATE-----\\nM\\n-----END CERTIFICATE-----\"\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nM\\n-----END PRIVATE KEY-----\"\n    users:\n      - username: a\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision\n",
+        )
+        .unwrap();
+        let listeners = build_named_listeners(&raw, "127.0.0.1", false).unwrap();
+        let ListenerSpec::Vless(cfg) = &listeners[0].spec else {
+            panic!("expected vless spec");
+        };
+        assert_eq!(cfg.addresses.len(), 2);
+        assert_eq!(cfg.addresses[0].listen, "127.0.0.1");
+        assert_eq!(cfg.addresses[1].listen, "::1");
+        assert!(cfg.addresses.iter().all(|a| a.port == 1080));
+
+        let err = vless_named_err(&format!(
+            "{VLESS_CERT}    listen: \"::1,0:0:0:0:0:0:0:1\"\n    users:\n{VLESS_USER_A}"
+        ));
+        assert!(err.contains("duplicate bind address"), "{err}");
+        let err = vless_named_err(&format!(
+            "{VLESS_CERT}    listen: \"127.0.0.1:1,,0.0.0.0:2\"\n    users:\n{VLESS_USER_A}"
+        ));
+        assert!(err.contains("empty address"), "{err}");
+
         // Comma-separated listen like anytls; ports join the registry.
         let raw: raw::RawConfig = crate::parse_raw_yaml(
             "listeners:\n  - name: v\n    type: vless\n    port: 1080\n    listen: \"127.0.0.1,::1\"\n    certificate: \"-----BEGIN CERTIFICATE-----\\nM\\n-----END CERTIFICATE-----\"\n    private-key: \"-----BEGIN PRIVATE KEY-----\\nM\\n-----END PRIVATE KEY-----\"\n    users:\n      - username: a\n        uuid: \"71884bd4-d6a0-4e19-9895-3e1d8b469317\"\n        flow: xtls-rprx-vision\n  - name: m\n    type: mixed\n    port: 1080\n",
