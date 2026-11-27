@@ -4230,9 +4230,24 @@ mod independent_wire_vectors {
         framing: HelloFraming,
     ) -> CompletedVectorHandshake {
         let decoded = decode_vector(vector);
+        perform_independent_client_handshake(
+            server,
+            &decoded.client_hello,
+            &decoded.auth_key,
+            framing,
+        )
+        .await
+    }
+
+    async fn perform_independent_client_handshake(
+        server: RealityServer,
+        client_hello: &[u8],
+        auth_key: &[u8],
+        framing: HelloFraming,
+    ) -> CompletedVectorHandshake {
         let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
         let accept_task = tokio::spawn(async move { server.accept(Box::new(server_io)).await });
-        write_client_hello(&mut client_io, &decoded.client_hello, framing).await;
+        write_client_hello(&mut client_io, client_hello, framing).await;
 
         let server_hello_record = read_required_record(&mut client_io, "ServerHello").await;
         assert_eq!(server_hello_record.typ, TLS_RECORD_HANDSHAKE);
@@ -4240,7 +4255,7 @@ mod independent_wire_vectors {
         assert_eq!(server_hello.cipher_suite, TLS_AES_128_GCM_SHA256);
         assert_eq!(
             server_hello.session_id,
-            decoded.client_hello[39..71],
+            client_hello[39..71],
             "ServerHello must echo the encrypted REALITY session id"
         );
         let ccs = read_required_record(&mut client_io, "compatibility CCS").await;
@@ -4250,7 +4265,7 @@ mod independent_wire_vectors {
             read_required_record(&mut client_io, "encrypted server flight").await;
         assert_eq!(encrypted_flight.typ, TLS_RECORD_APPLICATION_DATA);
 
-        let mut transcript = decoded.client_hello.clone();
+        let mut transcript = client_hello.to_vec();
         transcript.extend_from_slice(&server_hello_record.payload);
         let shared = independent_shared_secret(
             &server_hello,
@@ -4282,9 +4297,8 @@ mod independent_wire_vectors {
         let certificate_der = extract_certificate_der(&messages[1]);
         assert_eq!(
             certificate_der,
-            expected_leaf_for_auth_key(&decoded.auth_key),
-            "{}: certificate HMAC must match the independent AuthKey/public-key vector",
-            vector.name
+            expected_leaf_for_auth_key(auth_key),
+            "certificate HMAC must match the independent AuthKey/public-key vector"
         );
         let cv_signature = extract_certificate_verify(&messages[2]);
 
@@ -5781,5 +5795,229 @@ mod independent_wire_vectors {
         );
         let session = open_mirror_vector_session(vector).await;
         finish_error_after_record(session, &record).await;
+    }
+
+    // --- Wire-level off-vs-mirror dual-path evidence (P2-4) -----------------
+
+    /// Insert one extra extension into the frozen positive ClientHello and
+    /// re-seal the session id.  The AAD covers the whole logical CH, so any
+    /// extension change rekeys nothing but rewrites the ciphertext; the
+    /// AuthKey itself is unchanged because the random and the key shares are
+    /// untouched.
+    fn resealed_hello_with_extra_extension(
+        base: &[u8],
+        ext_type: u16,
+        ext_data: &[u8],
+        auth_key: &[u8],
+    ) -> Vec<u8> {
+        let mut pos = 4 + 2 + 32;
+        let sid_len = base[pos] as usize;
+        pos += 1 + sid_len;
+        let cs_len = usize::from(u16::from_be_bytes([base[pos], base[pos + 1]]));
+        pos += 2 + cs_len;
+        let comp_len = base[pos] as usize;
+        pos += 1 + comp_len;
+        let ext_len = usize::from(u16::from_be_bytes([base[pos], base[pos + 1]]));
+        pos += 2;
+        assert_eq!(pos + ext_len, base.len(), "base CH extensions end exactly");
+
+        let mut new_exts = base[pos..pos + ext_len].to_vec();
+        new_exts.extend_from_slice(&ext_type.to_be_bytes());
+        new_exts.extend_from_slice(&(ext_data.len() as u16).to_be_bytes());
+        new_exts.extend_from_slice(ext_data);
+
+        let mut hello = base[..pos - 2].to_vec();
+        hello.extend_from_slice(&(new_exts.len() as u16).to_be_bytes());
+        hello.extend_from_slice(&new_exts);
+        let body_len = hello.len() - 4;
+        hello[1..4].copy_from_slice(&(body_len as u32).to_be_bytes()[1..4]);
+        hello[39..71].fill(0);
+
+        let mut auth_plaintext = hex_bytes(VERSION_HEX);
+        auth_plaintext.push(0);
+        auth_plaintext.extend_from_slice(&(UNIX_SECONDS as u32).to_be_bytes());
+        auth_plaintext.extend_from_slice(&hex_bytes(SHORT_ID_HEX));
+        let auth_box = Aes256Gcm::new_from_slice(auth_key).expect("AES-256 AuthKey");
+        let nonce: [u8; 12] = hello[26..38].try_into().expect("REALITY nonce window");
+        let sid = auth_box
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                aes_gcm::aead::Payload {
+                    msg: &auth_plaintext,
+                    aad: &hello,
+                },
+            )
+            .expect("re-seal mutated CH");
+        hello[39..71].copy_from_slice(&sid);
+        hello
+    }
+
+    /// Minimal valid mirror target prefix bound to one session id: SH record
+    /// (x25519, TLS_AES_128, both mandatory extensions) plus canonical CCS
+    /// and the four standard application records.
+    fn target_prefix_for_session(session_id: &[u8]) -> Vec<u8> {
+        let share = hex_bytes(CLIENT_X25519_PUBLIC_HEX);
+        let mut key_share_body = Vec::new();
+        key_share_body.extend_from_slice(&GROUP_X25519.to_be_bytes());
+        key_share_body.extend_from_slice(&(share.len() as u16).to_be_bytes());
+        key_share_body.extend_from_slice(&share);
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&[0x00, 0x2b, 0x00, 0x02, 0x03, 0x04]);
+        extensions.extend_from_slice(&EXT_KEY_SHARE.to_be_bytes());
+        extensions.extend_from_slice(&(key_share_body.len() as u16).to_be_bytes());
+        extensions.extend_from_slice(&key_share_body);
+
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0x77; 32]);
+        body.push(32);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&TLS_AES_128_GCM_SHA256.to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        body.extend_from_slice(&extensions);
+        let mut sh = vec![0x02];
+        sh.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..4]);
+        sh.extend_from_slice(&body);
+
+        let mut prefix = plaintext_record(&sh);
+        prefix.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+        for len in MIRROR_RECORD_LENGTHS {
+            prefix.extend_from_slice(&[0x17, 0x03, 0x03]);
+            prefix.extend_from_slice(&len.to_be_bytes());
+            prefix.resize(prefix.len() + usize::from(len), 0);
+        }
+        prefix
+    }
+
+    async fn verify_wire_hello(server: RealityServer, hello: &[u8]) -> RealityClientHello {
+        let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let classify_task =
+            tokio::spawn(async move { server.verify_client_hello(Box::new(server_io)).await });
+        client_io.write_all(&plaintext_record(hello)).await.unwrap();
+        client_io.flush().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), classify_task)
+            .await
+            .expect("wire-verify timed out")
+            .expect("wire-verify joined")
+            .expect("wire-verify io")
+    }
+
+    #[tokio::test]
+    async fn mirror_profile_restrictions_do_not_leak_into_v1_accept_path() {
+        // Every CH below passes through the real preflight parser and REALITY
+        // authentication as wire bytes; nothing constructs a VerifiedHello by
+        // hand.  The v1/off path must treat them exactly like the positive
+        // baseline (authenticate and complete), while the mirror profile
+        // judgment rejects them with the typed profile error.
+        let positive = decode_vector(&POSITIVE_X25519);
+        let psk_body = {
+            // well-formed minimal pre_shared_key: one identity, one binder
+            let mut body = Vec::new();
+            body.extend_from_slice(&6u16.to_be_bytes());
+            body.extend_from_slice(&1u16.to_be_bytes());
+            body.push(0x58);
+            body.extend_from_slice(&0u32.to_be_bytes());
+            body.extend_from_slice(&3u16.to_be_bytes());
+            body.push(2);
+            body.extend_from_slice(&[0xaa, 0xbb]);
+            body
+        };
+        for (ext_type, ext_data, profile_error, name) in [
+            (
+                EXT_RECORD_SIZE_LIMIT,
+                16384u16.to_be_bytes().to_vec(),
+                MirrorClientProfileError::RecordSizeLimit,
+                "shrunk record_size_limit",
+            ),
+            (
+                EXT_PRE_SHARED_KEY,
+                psk_body,
+                MirrorClientProfileError::PreSharedKey,
+                "pre_shared_key",
+            ),
+            (
+                EXT_EARLY_DATA,
+                Vec::new(),
+                MirrorClientProfileError::EarlyData,
+                "early_data",
+            ),
+        ] {
+            let hello = resealed_hello_with_extra_extension(
+                &positive.client_hello,
+                ext_type,
+                &ext_data,
+                &positive.auth_key,
+            );
+            assert_ne!(
+                hello[39..71],
+                positive.client_hello[39..71],
+                "{name}: the extended AAD must re-seal the session id"
+            );
+
+            let classified = verify_wire_hello(vector_server(), &hello).await;
+            let RealityClientHello::Verified {
+                hello: verified, ..
+            } = classified
+            else {
+                panic!(
+                    "{name}: the v1/off path must authenticate this CH; mirror restrictions must not leak into it"
+                );
+            };
+            assert_eq!(
+                verified.mirror_profile(),
+                Err(profile_error),
+                "{name}: mirror profile judgment on the wire-parsed CH"
+            );
+            let prefix = target_prefix_for_session(&hello[39..71]);
+            assert_eq!(
+                MirrorTemplate::parse(&verified, &prefix),
+                Err(MirrorTemplateError::ClientProfile(profile_error)),
+                "{name}: template parse must surface the profile rejection before any SH check"
+            );
+
+            let mut completed = perform_independent_client_handshake(
+                vector_server(),
+                &hello,
+                &positive.auth_key,
+                HelloFraming::SingleRecord,
+            )
+            .await;
+            assert_vector_roundtrip(&mut completed).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn mirror_profile_accepts_default_and_exact_record_size_limit_on_wire() {
+        // Controls for the dual-path evidence: the unmodified positive CH and
+        // a CH carrying the exact record_size_limit 16385 both authenticate
+        // AND satisfy the mirror profile, so the rejections above are caused
+        // by the specific extension semantics rather than the harness.
+        let positive = decode_vector(&POSITIVE_X25519);
+        for (hello, name) in [
+            (positive.client_hello.clone(), "baseline positive CH"),
+            (
+                resealed_hello_with_extra_extension(
+                    &positive.client_hello,
+                    EXT_RECORD_SIZE_LIMIT,
+                    &16385u16.to_be_bytes(),
+                    &positive.auth_key,
+                ),
+                "exact record_size_limit 16385",
+            ),
+        ] {
+            let classified = verify_wire_hello(vector_server(), &hello).await;
+            let RealityClientHello::Verified {
+                hello: verified, ..
+            } = classified
+            else {
+                panic!("{name}: must authenticate");
+            };
+            assert_eq!(verified.mirror_profile(), Ok(()), "{name}");
+            let prefix = target_prefix_for_session(&hello[39..71]);
+            assert!(
+                MirrorTemplate::parse(&verified, &prefix).is_ok(),
+                "{name}: template must parse when the profile is clean"
+            );
+        }
     }
 }
