@@ -23,6 +23,7 @@ use meow_dns::{DnsOutboundCell, ResolverSlot};
 use meow_proxy::dialer::TcpDialer;
 use serde_json::Value;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// Constructs an outbound from one configured node. The returned adapter must
@@ -76,6 +77,8 @@ impl<'a> OutboundContext<'a> {
 
     /// The transport dialer for the node's server. Clone it into the adapter
     /// so dials follow the configured `dialer-proxy` and socket options.
+    /// If the endpoint is outside the shared `server`/`port` keys, implement
+    /// [`ProxyAdapter::dialer_hop`] to report the front hop.
     pub fn dialer(&self) -> &'a Arc<dyn TcpDialer> {
         self.dialer
     }
@@ -118,12 +121,17 @@ impl std::fmt::Display for RegisterError {
 impl std::error::Error for RegisterError {}
 
 type Entry = (&'static str, OutboundFactory);
-static REGISTRY: OnceLock<parking_lot::RwLock<HashMap<&'static str, OutboundFactory>>> =
-    OnceLock::new();
+
+// Kept separate from the mutable lock so LTO can fold the empty fast
+// path in binaries with no registration calls.
+static HAS_FACTORIES: AtomicBool = AtomicBool::new(false);
+// Factories are registered once. Sorted exact names keep lookup compact.
+static REGISTRY: OnceLock<parking_lot::RwLock<Vec<Entry>>> = OnceLock::new();
 
 /// Register a process-wide factory. Configuration and controller responses
 /// use this exact spelling. Built-in reservations and duplicate checks ignore
 /// ASCII case.
+#[inline]
 pub fn register_outbound(
     type_name: &'static str,
     factory: OutboundFactory,
@@ -134,19 +142,27 @@ pub fn register_outbound(
     }
     let mut registry = REGISTRY.get_or_init(Default::default).write();
     if registry
-        .keys()
-        .any(|name| name.eq_ignore_ascii_case(type_name))
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case(type_name))
     {
         return Err(RegisterError::Duplicate(type_name));
     }
-    registry.insert(type_name, factory);
+    let index = registry.partition_point(|(name, _)| *name < type_name);
+    registry.insert(index, (type_name, factory));
+    HAS_FACTORIES.store(true, Ordering::Release);
     Ok(())
 }
 
+#[inline]
 pub(crate) fn lookup(type_name: &str) -> Option<Entry> {
+    if !HAS_FACTORIES.load(Ordering::Acquire) {
+        return None;
+    }
     let registry = REGISTRY.get()?.read();
     // Clone before invoking user code so factories may re-enter the parser.
-    registry
-        .get_key_value(type_name)
-        .map(|(&name, factory)| (name, Arc::clone(factory)))
+    let index = registry
+        .binary_search_by_key(&type_name, |&(name, _)| name)
+        .ok()?;
+    let (name, factory) = &registry[index];
+    Some((*name, Arc::clone(factory)))
 }

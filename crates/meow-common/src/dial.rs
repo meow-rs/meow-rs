@@ -91,13 +91,14 @@ where
     F: Future<Output = Result<T>>,
 {
     let deadline = dial_deadline().unwrap_or_else(|| Instant::now() + DIAL_TIMEOUT);
-    enforce_dial_deadline(deadline, fut, || {
-        format!(
-            "dial via {via} exceeded the {}s deadline",
-            DIAL_TIMEOUT.as_secs()
-        )
-    })
-    .await
+    DIAL_DEADLINE
+        .scope(deadline, async {
+            match tokio::time::timeout_at(deadline, fut).await {
+                Ok(result) => result,
+                Err(_) => Err(dial_timeout(via, false)),
+            }
+        })
+        .await
 }
 
 /// Run a dial under an explicit deadline. Adapter-owned tasks can carry a
@@ -108,31 +109,29 @@ where
     F: Future<Output = Result<T>>,
 {
     let deadline = dial_deadline().map_or(deadline, |current| current.min(deadline));
-    enforce_dial_deadline(deadline, fut, || {
-        format!("dial via {via} exceeded its deadline")
-    })
-    .await
-}
-
-async fn enforce_dial_deadline<F, T>(
-    deadline: Instant,
-    fut: F,
-    timeout_message: impl FnOnce() -> String,
-) -> Result<T>
-where
-    F: Future<Output = Result<T>>,
-{
     DIAL_DEADLINE
         .scope(deadline, async {
             match tokio::time::timeout_at(deadline, fut).await {
                 Ok(result) => result,
-                Err(_) => Err(MeowError::Io(io::Error::new(
-                    io::ErrorKind::TimedOut,
-                    timeout_message(),
-                ))),
+                Err(_) => Err(dial_timeout(via, true)),
             }
         })
         .await
+}
+
+// Keep error formatting out of the dial future's monomorphizations.
+#[cold]
+#[inline(never)]
+fn dial_timeout(via: &str, explicit: bool) -> MeowError {
+    let message = if explicit {
+        format!("dial via {via} exceeded its deadline")
+    } else {
+        format!(
+            "dial via {via} exceeded the {}s deadline",
+            DIAL_TIMEOUT.as_secs()
+        )
+    };
+    MeowError::Io(io::Error::new(io::ErrorKind::TimedOut, message))
 }
 
 #[cfg(test)]

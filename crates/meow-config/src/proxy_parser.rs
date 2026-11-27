@@ -40,6 +40,9 @@ pub struct WrappedProxy {
     adapter: Box<dyn ProxyAdapter>,
     /// The `dialer-proxy` the adapter dials its server through.
     hop: Option<DialerHop>,
+    /// For a registered outbound, whether its factory received a proxy dialer.
+    /// Its endpoint can be private, so a configured chain may have no wrapper hop.
+    external_declared_chain: Option<bool>,
     /// The `proxies:` entry's per-node dialer fields (issue #974):
     /// `routing-mark`, `interface-name`, `ip-version`, `tfo`, `mptcp`.
     /// Resolved over [`meow_common::global_dialer_opts`] at dial time and
@@ -63,6 +66,7 @@ impl WrappedProxy {
         Self {
             adapter,
             hop: None,
+            external_declared_chain: None,
             node_opts: meow_common::NodeDialerOpts::default(),
         }
     }
@@ -187,6 +191,9 @@ impl ProxyAdapter for WrappedProxy {
     /// Configured dependency, independent of the front group's current pick.
     fn has_configured_dialer(&self) -> bool {
         self.hop.is_some()
+            || self
+                .external_declared_chain
+                .is_some_and(|declared| declared || self.adapter.has_configured_dialer())
     }
 
     /// Transparent like every other leaf signal here — a wrapped
@@ -1135,11 +1142,11 @@ pub fn parse_proxy_with_dialer_and_fp(
                     adapter.adapter_type()
                 ));
             }
-            Ok(Arc::new(
-                WrappedProxy::new(adapter)
-                    .with_node_dialer_opts(node_opts)
-                    .dialing_through(config, dialer),
-            ))
+            let mut proxy = WrappedProxy::new(adapter)
+                .with_node_dialer_opts(node_opts)
+                .dialing_through(config, dialer);
+            proxy.external_declared_chain = Some(dialer.is_proxy());
+            Ok(Arc::new(proxy))
         }
     }
 }
@@ -7481,46 +7488,10 @@ tls: true
         (out, String::from_utf8_lossy(&captured).into_owned())
     }
 
-    struct ExternalFixture {
-        name: String,
-        kind: &'static str,
-        health: ProxyHealth,
-    }
-
-    #[async_trait]
-    impl ProxyAdapter for ExternalFixture {
-        fn name(&self) -> &str {
-            &self.name
-        }
-
-        fn adapter_type(&self) -> AdapterType {
-            AdapterType::External(self.kind)
-        }
-
-        fn addr(&self) -> &str {
-            "example.com:443"
-        }
-
-        fn support_udp(&self) -> bool {
-            false
-        }
-
-        async fn dial_tcp(&self, _: &Metadata) -> Result<Box<dyn ProxyConn>> {
-            unreachable!("parsing must not dial")
-        }
-
-        async fn dial_udp(&self, _: &Metadata) -> Result<Box<dyn ProxyPacketConn>> {
-            unreachable!("parsing must not dial")
-        }
-
-        fn health(&self) -> &ProxyHealth {
-            &self.health
-        }
-    }
-
     #[test]
     fn registered_outbound_reserves_names_and_uses_normal_config_build() {
         use crate::outbound_registry::{register_outbound, OutboundFactory, RegisterError};
+        use crate::test_support::ExternalFixture;
 
         let factory: OutboundFactory = Arc::new(|ctx| {
             assert!(!ctx.ipv6());
@@ -7534,11 +7505,7 @@ tls: true
             if ctx.name() == "reject-chain" && ctx.dialer().is_proxy() {
                 return Err("could not use supplied chain".into());
             }
-            Ok(Box::new(ExternalFixture {
-                name: ctx.name().into(),
-                kind: ctx.type_name(),
-                health: ProxyHealth::new(),
-            }))
+            Ok(Box::new(ExternalFixture::new(ctx, "example.com:443")))
         });
         for kind in [
             "Ss",
@@ -7622,6 +7589,30 @@ proxies:
             error.to_string().contains("invalid private-option"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn registered_outbound_reports_chain_without_shared_endpoint() {
+        use crate::outbound_registry::register_outbound;
+        use crate::test_support::ExternalFixture;
+
+        register_outbound(
+            "EndpointlessChainFixture",
+            Arc::new(|ctx| Ok(Box::new(ExternalFixture::new(ctx, "192.0.2.1:443")))),
+        )
+        .unwrap();
+        let raw = crate::parse_raw_yaml(
+            r#"
+strict: true
+proxies:
+  - {name: chained, type: EndpointlessChainFixture, dialer-proxy: DIRECT}
+  - {name: unchained, type: EndpointlessChainFixture}
+"#,
+        )
+        .unwrap();
+        let built = crate::rebuild_from_raw(&raw).unwrap();
+        assert!(built.proxies["chained"].has_configured_dialer());
+        assert!(!built.proxies["unchained"].has_configured_dialer());
     }
 
     fn lb_config_with_providers(

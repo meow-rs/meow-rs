@@ -4562,6 +4562,44 @@ dns:
         );
     }
 
+    #[tokio::test]
+    async fn node_policy_rejects_registered_outbound_chain_without_shared_endpoint() {
+        use crate::outbound_registry::register_outbound;
+        use crate::test_support::ExternalFixture;
+
+        register_outbound(
+            "NodePolicyChainFixture",
+            Arc::new(|ctx| Ok(Box::new(ExternalFixture::new(ctx, "192.0.2.1:443")))),
+        )
+        .unwrap();
+        let raw: RawConfig = serde_saphyr::from_str(
+            r#"
+proxies:
+  - {name: Node, type: NodePolicyChainFixture, dialer-proxy: G}
+  - {name: Front, type: http, server: front.invalid, port: 443}
+proxy-groups:
+  - {name: G, type: select, proxies: [REJECT, Front]}
+dns:
+  enable: true
+  nameserver: [rcode://success]
+  proxy-server-nameserver: [rcode://success]
+  proxy-server-nameserver-policy:
+    node.test: tcp://192.0.2.53#Node
+"#,
+        )
+        .unwrap();
+        let error = crate::build_config(raw, None)
+            .await
+            .err()
+            .expect("a tagged external node with a declared chain must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("proxy 'Node' needs independent bootstrap"),
+            "{error}"
+        );
+    }
+
     /// The relay-based `DialerProxyAdapter` fallback (a `type: direct`
     /// node cannot take an injected dialer — it is a raw egress) is not
     /// a `WrappedProxy` — the validator must see its declared chain

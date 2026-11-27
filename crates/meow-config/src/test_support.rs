@@ -5,10 +5,63 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use meow_common::adapter::Proxy;
 use meow_common::logbook::{self, Entry, Query};
 use meow_common::Metadata;
+use meow_common::{AdapterType, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn};
 use parking_lot::{Mutex, MutexGuard};
+
+use crate::outbound_registry::OutboundContext;
+
+pub(crate) struct ExternalFixture {
+    name: String,
+    kind: &'static str,
+    addr: &'static str,
+    health: ProxyHealth,
+}
+
+impl ExternalFixture {
+    pub(crate) fn new(ctx: &OutboundContext<'_>, addr: &'static str) -> Self {
+        Self {
+            name: ctx.name().into(),
+            kind: ctx.type_name(),
+            addr,
+            health: ProxyHealth::new(),
+        }
+    }
+}
+
+#[async_trait]
+impl ProxyAdapter for ExternalFixture {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn adapter_type(&self) -> AdapterType {
+        AdapterType::External(self.kind)
+    }
+
+    fn addr(&self) -> &str {
+        self.addr
+    }
+
+    fn support_udp(&self) -> bool {
+        false
+    }
+
+    async fn dial_tcp(&self, _: &Metadata) -> meow_common::Result<Box<dyn ProxyConn>> {
+        unreachable!("parsing must not dial")
+    }
+
+    async fn dial_udp(&self, _: &Metadata) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+        unreachable!("parsing must not dial")
+    }
+
+    fn health(&self) -> &ProxyHealth {
+        &self.health
+    }
+}
 
 /// A provider origin the test steers: counts requests, answers with the
 /// current body (503 while `None`) and `subscription-userinfo` header (none

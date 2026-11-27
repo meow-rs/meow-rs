@@ -1512,6 +1512,8 @@ impl ProxyProvider {
     /// except that provider payloads keep the fallback under `strict` too:
     /// the remote-declared chain still holds, where erroring would drop
     /// every sibling node with it.
+    /// A registered outbound factory's error is passed to the provider's
+    /// strict/lenient failure handler.
     /// A malformed `dialer-proxy` value or a self-reference rejects the node
     /// outright: warn-skipping just the edge would leave the node dialling
     /// direct, a silent misroute on remote-controlled content (ADR-0002
@@ -1668,6 +1670,7 @@ impl ProxyProvider {
             // UDP probe would otherwise read it as a plain `udp: false`
             // node and slide a matched flow to a later rule.
             Ok(proxy) => Arc::new(proxy_parser::ChainedProxy::new(proxy)) as Arc<dyn Proxy>,
+            Err(e) if proxy_parser::external_adapter_type(raw_map).is_some() => return Err(e),
             Err(e) => {
                 // The adapter type cannot carry an injected dialer — or the
                 // node is unparseable, in which case the direct re-parse
@@ -3566,6 +3569,54 @@ header:
         };
         assert_eq!(dial.host, "example.com", "front must see the final target");
         assert_eq!(dial.dst_port, 443);
+    }
+
+    #[tokio::test]
+    async fn registered_outbound_provider_keeps_chained_factory_failure() {
+        use crate::outbound_registry::register_outbound;
+        use crate::test_support::ExternalFixture;
+        use meow_common::AdapterType;
+
+        const KIND: &str = "ProviderChainRejectFixture";
+        const FACTORY_ERROR: &str = "provider factory could not use supplied chain";
+        register_outbound(
+            KIND,
+            Arc::new(|ctx| {
+                if ctx.dialer().is_proxy() {
+                    return Err(FACTORY_ERROR.into());
+                }
+                Ok(Box::new(ExternalFixture::new(ctx, "192.0.2.1:443")))
+            }),
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("nodes.yaml"),
+            format!(
+                "proxies:\n  - {{name: chained, type: {KIND}, dialer-proxy: DIRECT}}\n  - {{name: unchained, type: {KIND}}}\n"
+            ),
+        )
+        .unwrap();
+        let yaml = "proxy-providers:\n  test: {type: file, path: nodes.yaml}\n";
+        let strict = crate::parse_raw_yaml(&format!("strict: true\n{yaml}")).unwrap();
+        let Err(error) = crate::build_config(strict, Some(dir.path())).await else {
+            panic!("strict load must surface the chained factory error");
+        };
+        assert!(error.to_string().contains(FACTORY_ERROR), "{error}");
+
+        let lenient = crate::parse_raw_yaml(yaml).unwrap();
+        let built = crate::build_config(lenient, Some(dir.path()))
+            .await
+            .unwrap();
+        let nodes = built.proxy_providers["test"].proxies();
+        let chained = nodes.iter().find(|node| node.name() == "chained").unwrap();
+        assert_eq!(chained.adapter_type(), AdapterType::External(KIND));
+        assert!(!chained.alive());
+        let unchained = nodes
+            .iter()
+            .find(|node| node.name() == "unchained")
+            .unwrap();
+        assert!(unchained.alive());
     }
 
     /// `dialer-proxy` may name a group — the group's selection is the front
