@@ -1198,6 +1198,11 @@ async fn read_mirrored_client_finished(
         bytes: Zeroizing::new([0; 52]),
     };
     for _ in 0..32 {
+        if total_wire >= 65_536 {
+            return Err(TransportError::ResourceLimit(
+                "REALITY mirrored client Finished exceeds 64 KiB".into(),
+            ));
+        }
         let mut header = [0u8; 5];
         inner.read_exact(&mut header).await.map_err(|e| {
             if e.kind() == std::io::ErrorKind::UnexpectedEof {
