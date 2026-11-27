@@ -552,15 +552,12 @@ async fn scan_target_flight(
     probe_deadline: Instant,
     handshake_deadline: Instant,
 ) -> ProbeScan {
-    let mut scanner = match reality.server.target_flight_scanner(context) {
-        Ok(scanner) => scanner,
-        Err(_) => {
-            return ProbeScan::Cover {
-                prefix: Vec::new(),
-                reason: CoverReason::ClientProfile,
-                target_eof: false,
-            };
-        }
+    let Ok(mut scanner) = reality.server.target_flight_scanner(context) else {
+        return ProbeScan::Cover {
+            prefix: Vec::new(),
+            reason: CoverReason::ClientProfile,
+            target_eof: false,
+        };
     };
     // The scratch is heap-allocated and dropped before this function returns
     // a template, so prepare never coexists with the read staging allocation.
@@ -578,9 +575,11 @@ async fn scan_target_flight(
             drop(scratch);
             return cover_from_scanner(scanner, CoverReason::Capacity, false);
         }
-        let quiet_at = (state == TargetScanState::Freezable)
-            .then_some(last_byte_observed + quiet)
-            .unwrap_or(handshake_deadline);
+        let quiet_at = if state == TargetScanState::Freezable {
+            last_byte_observed + quiet
+        } else {
+            handshake_deadline
+        };
         let read_len = window.min(scratch.len());
         tokio::select! {
             biased;
@@ -634,7 +633,7 @@ enum PostCommitOutcome {
     },
 }
 
-fn monitor_close_reason(read: io::Result<usize>) -> CloseReason {
+fn monitor_close_reason(read: &io::Result<usize>) -> CloseReason {
     match read {
         Ok(0) => CloseReason::DestEof,
         Ok(_) => CloseReason::DestTail,
@@ -667,23 +666,20 @@ async fn drive_post_commit(
         client.flush().await
     });
 
-    loop {
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(handshake_deadline) => {
-                return PostCommitOutcome::Close { phase: ClosePhase::Emit, reason: CloseReason::Deadline };
-            }
-            _ = tokio::time::sleep_until(emit_deadline) => {
-                return PostCommitOutcome::Close { phase: ClosePhase::Emit, reason: CloseReason::Deadline };
-            }
-            read = &mut monitor => {
-                return PostCommitOutcome::Close { phase: ClosePhase::Emit, reason: monitor_close_reason(read) };
-            }
-            result = &mut emit => {
-                match result {
-                    Ok(()) => break,
-                    Err(_) => return PostCommitOutcome::Close { phase: ClosePhase::Emit, reason: CloseReason::EmitIo },
-                }
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(handshake_deadline) => {
+            return PostCommitOutcome::Close { phase: ClosePhase::Emit, reason: CloseReason::Deadline };
+        }
+        _ = tokio::time::sleep_until(emit_deadline) => {
+            return PostCommitOutcome::Close { phase: ClosePhase::Emit, reason: CloseReason::Deadline };
+        }
+        read = &mut monitor => {
+            return PostCommitOutcome::Close { phase: ClosePhase::Emit, reason: monitor_close_reason(&read) };
+        }
+        result = &mut emit => {
+            if result.is_err() {
+                return PostCommitOutcome::Close { phase: ClosePhase::Emit, reason: CloseReason::EmitIo };
             }
         }
     }
@@ -693,31 +689,29 @@ async fn drive_post_commit(
     let emit_done = Instant::now();
     let finish_deadline = handshake_deadline.min(emit_done + Duration::from_secs(5));
     let mut finish = Box::pin(completion.finish(client));
-    loop {
-        tokio::select! {
-            biased;
-            _ = tokio::time::sleep_until(handshake_deadline) => {
-                return PostCommitOutcome::Close { phase: ClosePhase::WaitFinished, reason: CloseReason::Deadline };
-            }
-            _ = tokio::time::sleep_until(finish_deadline) => {
-                return PostCommitOutcome::Close { phase: ClosePhase::WaitFinished, reason: CloseReason::Deadline };
-            }
-            read = &mut monitor => {
-                return PostCommitOutcome::Close { phase: ClosePhase::WaitFinished, reason: monitor_close_reason(read) };
-            }
-            result = &mut finish => {
-                match result {
-                    Ok(stream) => {
-                        drop(finish);
-                        drop(monitor);
-                        drop(target);
-                        return PostCommitOutcome::Established(stream);
-                    }
-                    Err(error) => {
-                        return PostCommitOutcome::Close {
-                            phase: ClosePhase::WaitFinished,
-                            reason: finish_close_reason(&error),
-                        };
+    tokio::select! {
+        biased;
+        _ = tokio::time::sleep_until(handshake_deadline) => {
+            PostCommitOutcome::Close { phase: ClosePhase::WaitFinished, reason: CloseReason::Deadline }
+        }
+        _ = tokio::time::sleep_until(finish_deadline) => {
+            PostCommitOutcome::Close { phase: ClosePhase::WaitFinished, reason: CloseReason::Deadline }
+        }
+        read = &mut monitor => {
+            PostCommitOutcome::Close { phase: ClosePhase::WaitFinished, reason: monitor_close_reason(&read) }
+        }
+        result = &mut finish => {
+            match result {
+                Ok(stream) => {
+                    drop(finish);
+                    drop(monitor);
+                    drop(target);
+                    PostCommitOutcome::Established(stream)
+                }
+                Err(error) => {
+                    PostCommitOutcome::Close {
+                        phase: ClosePhase::WaitFinished,
+                        reason: finish_close_reason(&error),
                     }
                 }
             }
@@ -871,30 +865,27 @@ where
         return None;
     }
 
-    let probe_permit = match Arc::clone(&reality.probe_slots).try_acquire_owned() {
-        Ok(permit) => permit,
-        Err(_) => {
-            let (context, wire) = upload.finish_upload();
-            drop(context);
-            handoff_cover(
-                reality,
-                CoverHandoff {
-                    client,
-                    target: target.stream,
-                    upload_prefix: wire,
-                    download_prefix: Vec::new(),
-                    uploaded: 0,
-                    target_eof: false,
-                    reason: CoverReason::ProbeSaturated,
-                },
-                handshake_deadline,
-                handshake_permit,
-                None,
-                &mut accountant,
-            )
-            .await;
-            return None;
-        }
+    let Ok(probe_permit) = Arc::clone(&reality.probe_slots).try_acquire_owned() else {
+        let (context, wire) = upload.finish_upload();
+        drop(context);
+        handoff_cover(
+            reality,
+            CoverHandoff {
+                client,
+                target: target.stream,
+                upload_prefix: wire,
+                download_prefix: Vec::new(),
+                uploaded: 0,
+                target_eof: false,
+                reason: CoverReason::ProbeSaturated,
+            },
+            handshake_deadline,
+            handshake_permit,
+            None,
+            &mut accountant,
+        )
+        .await;
+        return None;
     };
 
     accountant.set_phase(ClosePhase::Upload);
