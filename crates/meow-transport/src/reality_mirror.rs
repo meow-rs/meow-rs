@@ -3347,17 +3347,39 @@ mod tests {
             );
 
             let logical_flight = mirrored_flight_len(template.cipher, certificate.der_len());
+            let hash_len = template.cipher.hash().len();
+            // Enumerate the fixed prepare-time residents instead of treating
+            // the 4096-byte temporary envelope as an unexplained additive
+            // constant: four transcript hashes, three handshake secrets, the
+            // expected Finished, both AEAD key schedules (512 bytes each is a
+            // conservative bound for BoringSSL's opaque schedule), record
+            // heads, record plans, certificate/share serialization scratch,
+            // and the completion object's stack size.
+            let fixed_prepare_residents = 8 * hash_len
+                + 2 * 512
+                + template.record_heads.capacity() * std::mem::size_of::<[u8; 5]>()
+                + std::mem::size_of::<MirroredHandshakeCompletion>();
             let small_coexisting = logical_flight
                 + certificate.der_len()
                 + template.share_range.len()
                 + 64
-                + template.record_heads.len() * std::mem::size_of::<MirroredRecordPlan>();
+                + template.record_heads.len() * std::mem::size_of::<MirroredRecordPlan>()
+                + fixed_prepare_residents;
             assert!(
                 small_coexisting <= 4096,
                 "{name}: small prepare allocations {small_coexisting}"
             );
             let prepared = prepare_mirrored_flight_context(&certificate, context, template)
                 .expect("W-shaped template prepares");
+            let completion_fixed = prepared.completion.master_secret.capacity()
+                + prepared.completion.transcript_t3_hash.capacity()
+                + prepared.completion.expected_client_finished.capacity()
+                + std::mem::size_of::<MirroredHandshakeCompletion>()
+                + 512;
+            assert!(
+                completion_fixed <= small_coexisting,
+                "{name}: retained completion state is inside the enumerated prepare envelope"
+            );
             let prepared_and_sealed = prepared.target_prefix.capacity()
                 + prepared.wire.capacity()
                 + retained_shares
@@ -3367,7 +3389,7 @@ mod tests {
                 "{name}: prepared/sealed sample {prepared_and_sealed} exceeds Bprobe"
             );
             eprintln!(
-                "bprobe-stage {name}: scanning={scanning} frozen={frozen} prepared_or_sealed={prepared_and_sealed} small_coexisting={small_coexisting} G={retained_shares} records=16"
+                "bprobe-stage {name}: scanning={scanning} frozen={frozen} prepared_or_sealed={prepared_and_sealed} small_coexisting={small_coexisting} fixed_prepare={fixed_prepare_residents} completion_fixed={completion_fixed} G={retained_shares} records=16"
             );
             let committed = prepared.commit();
             let (wire, _completion) = committed.into_wire_and_completion();
