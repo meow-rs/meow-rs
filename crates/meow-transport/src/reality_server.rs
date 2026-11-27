@@ -386,14 +386,6 @@ pub struct MirrorHelloUpload {
 }
 
 impl MirrorHelloUpload {
-    #[cfg(test)]
-    pub(crate) fn test_from_context(context: AuthenticatedMirrorContext) -> Self {
-        Self {
-            context,
-            wire: Vec::new(),
-        }
-    }
-
     pub fn context(&self) -> &AuthenticatedMirrorContext {
         &self.context
     }
@@ -402,6 +394,15 @@ impl MirrorHelloUpload {
     }
     pub fn finish_upload(self) -> (AuthenticatedMirrorContext, Vec<u8>) {
         (self.context, self.wire)
+    }
+}
+
+impl AuthenticatedMirrorContext {
+    /// Whether this authenticated context is eligible for v2 mirroring.
+    pub fn mirror_profile(
+        &self,
+    ) -> std::result::Result<(), crate::reality_mirror::MirrorClientProfileError> {
+        crate::reality_mirror::mirror_profile_view(self)
     }
 }
 
@@ -658,24 +659,36 @@ impl RealityServer {
         )
     }
 
-    /// Prepare mirroring from the consuming upload/context split.  This path
-    /// does not retain the logical CH or require the wire prefix to remain
-    /// alive while the local flight is constructed.
+    /// Start the incremental target scan for the consuming upload/context
+    /// split.  The scanner owns the W+1 target prefix arena until the caller
+    /// either freezes a template or moves the same allocation into cover.
+    pub fn target_flight_scanner<'a>(
+        &self,
+        context: &'a AuthenticatedMirrorContext,
+    ) -> crate::reality_mirror::TargetFlightScanner<'a> {
+        let certificate_der_len = self.inner.certificate.for_auth_key(&context.auth_key).len();
+        crate::reality_mirror::TargetFlightScanner::new(context, certificate_der_len)
+    }
+
+    /// Prepare mirroring by consuming both the authenticated context and the
+    /// frozen template.  The logical CH and upload wire are already gone at
+    /// this point; a pre-commit rejection returns the template (and therefore
+    /// the target prefix allocation) inside the error for cover.
+    #[allow(clippy::needless_pass_by_value)] // consumption is the pre-commit ownership contract
     pub fn prepare_mirrored_upload(
         &self,
-        upload: &MirrorHelloUpload,
+        context: AuthenticatedMirrorContext,
         template: MirrorTemplate,
-    ) -> Result<PreparedFlight> {
-        if !Arc::ptr_eq(&upload.context.issuer, &self.inner.instance) {
-            return Err(TransportError::Tls(
-                "REALITY verified ClientHello belongs to a different server instance".into(),
+    ) -> std::result::Result<PreparedFlight, Box<crate::reality_mirror::MirrorPrepareError>> {
+        if !Arc::ptr_eq(&context.issuer, &self.inner.instance) {
+            return Err(Box::new(
+                crate::reality_mirror::MirrorPrepareError::cross_instance(template),
             ));
         }
         crate::reality_mirror::prepare_mirrored_flight_context(
             &self.inner.certificate,
-            &upload.context,
+            context,
             template,
-            None,
         )
     }
 
@@ -2192,7 +2205,7 @@ mod tests {
     /// application seq=0 roundtrip runs in both directions.
     #[tokio::test]
     async fn mirrored_real_hybrid_end_to_end_no_injection() {
-        use crate::reality_mirror::{TargetFlightScanner, TargetScanState};
+        use crate::reality_mirror::TargetScanState;
 
         let (private, public) = keypair();
         let server = RealityServer::new(&server_config(private)).expect("server");
@@ -2260,12 +2273,15 @@ mod tests {
 
         // Fragmented feeding: 1-byte slices across the SH header, then a
         // slice crossing a record header boundary, then the remainder.
-        let mut scanner = TargetFlightScanner::new();
+        let mut scanner = server.target_flight_scanner(upload.context());
         for byte in &flight[..7] {
-            assert_eq!(scanner.push(&[*byte]), TargetScanState::NeedBytes);
+            assert_eq!(scanner.push(&[*byte]).unwrap(), TargetScanState::NeedBytes);
         }
-        assert_eq!(scanner.push(&flight[7..40]), TargetScanState::NeedBytes);
-        let mid = scanner.push(&flight[40..flight.len() - 100]);
+        assert_eq!(
+            scanner.push(&flight[7..40]).unwrap(),
+            TargetScanState::NeedBytes
+        );
+        let mid = scanner.push(&flight[40..flight.len() - 100]).unwrap();
         assert!(
             matches!(
                 mid,
@@ -2273,31 +2289,35 @@ mod tests {
             ),
             "mid-flight must not be freezable before record bodies complete: {mid:?}"
         );
-        let final_state = scanner.push(&flight[flight.len() - 100..]);
+        let final_state = scanner.push(&flight[flight.len() - 100..]).unwrap();
         assert_eq!(
             final_state,
             TargetScanState::Freezable,
             "complete acceptance-shape flight must be freezable"
         );
 
-        let template = scanner
-            .freeze_context(upload.context())
-            .expect("freeze context");
+        let template = scanner.freeze().expect("freeze context");
+        let (context, upload_wire) = upload.finish_upload();
+        assert_eq!(
+            upload_wire.len(),
+            ch_len,
+            "upload wire survives until release"
+        );
+        drop(upload_wire);
         let prepared = server
-            .prepare_mirrored_upload(&upload, template)
+            .prepare_mirrored_upload(context, template)
             .expect("no-injection prepare");
         let (wire, completion) = prepared.into_wire_and_completion();
-        drop(upload);
 
         // The patched flight must carry a real hybrid server share: parse the
         // patched SH out of the emitted wire and check the share length.
         let sh_len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
         let patched = &wire[5..5 + sh_len];
-        let pos = patched
-            .windows(2)
-            .position(|w| w == [0x11, 0xec])
-            .expect("patched SH keeps hybrid group");
-        let share_len = usize::from(u16::from_be_bytes([patched[pos + 2], patched[pos + 3]]));
+        let (group, share_len) = server_hello_key_share(patched);
+        assert_eq!(
+            group, GROUP_X25519_MLKEM768,
+            "patched SH keeps hybrid group"
+        );
         assert_eq!(share_len, 1120, "real ML-KEM ciphertext || X25519 share");
 
         stream
@@ -2406,16 +2426,19 @@ mod tests {
             flight.resize(flight.len() + usize::from(len), 0x5a);
         }
 
-        let mut scanner = crate::reality_mirror::TargetFlightScanner::new();
-        scanner.push(&flight);
+        let mut scanner = issuer.target_flight_scanner(&context);
+        scanner.push(&flight).unwrap();
         let template = scanner
-            .freeze_context(&context)
+            .freeze()
             .expect("synthetic flight must freeze for the controlled context");
 
-        let upload = MirrorHelloUpload::test_from_context(context);
-        assert!(
-            other.prepare_mirrored_upload(&upload, template).is_err(),
-            "foreign instance must reject the upload context before any output"
+        let error = other
+            .prepare_mirrored_upload(context, template)
+            .expect_err("foreign instance must reject the upload context before any output");
+        assert_eq!(
+            error.into_target_prefix(),
+            flight,
+            "even an issuer rejection returns the original target prefix for cover"
         );
     }
 
@@ -2761,7 +2784,7 @@ mod tests {
         hello[39..71].copy_from_slice(&plaintext);
     }
 
-    fn server_hello_group(message: &[u8]) -> u16 {
+    fn server_hello_key_share(message: &[u8]) -> (u16, usize) {
         assert_eq!(message[0], HS_SERVER_HELLO);
         assert_eq!(message.len(), 4 + read_u24(&message[1..4]));
         let mut pos = 4 + 2 + 32;
@@ -2776,11 +2799,20 @@ mod tests {
             pos += 4;
             if typ == EXT_KEY_SHARE {
                 assert!(len >= 4, "ServerHello key_share carries group and length");
-                return u16::from_be_bytes([message[pos], message[pos + 1]]);
+                let share_len = u16::from_be_bytes([message[pos + 2], message[pos + 3]]) as usize;
+                assert_eq!(share_len + 4, len, "ServerHello key_share is exact");
+                return (
+                    u16::from_be_bytes([message[pos], message[pos + 1]]),
+                    share_len,
+                );
             }
             pos += len;
         }
         panic!("ServerHello key_share extension missing")
+    }
+
+    fn server_hello_group(message: &[u8]) -> u16 {
+        server_hello_key_share(message).0
     }
 
     /// Selection itself must treat a correctly sized but unparsable ML-KEM
@@ -3741,7 +3773,7 @@ mod independent_wire_vectors {
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::DuplexStream;
 
-    use crate::reality_mirror::{prepare_mirrored_flight, MirrorCryptoInput, MirrorTemplate};
+    use crate::reality_mirror::{prepare_mirrored_flight_context_fixed, MirrorCryptoInput};
     use crate::reality_tls::RecordKey;
 
     include!(concat!(
@@ -4908,11 +4940,32 @@ mod independent_wire_vectors {
             assert_eq!(hello.ch_wire(), hex_bytes(vector.ch_wire_hex));
         }
         let prefix = mirror_target_prefix(vector);
-        let template = MirrorTemplate::parse(&hello, &prefix)
-            .unwrap_or_else(|error| panic!("{}: template parse failed: {error}", vector.name));
-        let prepared =
-            prepare_mirrored_flight(&server.inner.certificate, &hello, template, Some(&crypto))
-                .unwrap_or_else(|error| panic!("{}: prepare failed: {error}", vector.name));
+        let upload = (*hello).into_mirror_upload();
+        let mut scanner = server.target_flight_scanner(upload.context());
+        let scan_state = scanner
+            .push(&prefix)
+            .unwrap_or_else(|error| panic!("{}: scan push failed: {error}", vector.name));
+        assert_eq!(
+            scan_state,
+            crate::reality_mirror::TargetScanState::Freezable,
+            "{}: vector target shape must freeze through the production scanner",
+            vector.name
+        );
+        let template = scanner
+            .freeze()
+            .unwrap_or_else(|error| panic!("{}: scanner freeze failed: {:?}", vector.name, error));
+        let (context, upload_wire) = upload.finish_upload();
+        if single_record {
+            assert_eq!(upload_wire, hex_bytes(vector.ch_wire_hex));
+        }
+        drop(upload_wire);
+        let prepared = prepare_mirrored_flight_context_fixed(
+            &server.inner.certificate,
+            context,
+            template,
+            Some(&crypto),
+        )
+        .unwrap_or_else(|error| panic!("{}: prepare failed: {error}", vector.name));
         let (wire, completion) = prepared.into_wire_and_completion();
         if expect_frozen_wire {
             assert_eq!(
@@ -6005,13 +6058,13 @@ mod independent_wire_vectors {
         let psk_body = {
             // well-formed minimal pre_shared_key: one identity, one binder
             let mut body = Vec::new();
-            body.extend_from_slice(&6u16.to_be_bytes());
+            body.extend_from_slice(&8u16.to_be_bytes());
             body.extend_from_slice(&1u16.to_be_bytes());
             body.push(0x58);
             body.extend_from_slice(&0u32.to_be_bytes());
-            body.extend_from_slice(&3u16.to_be_bytes());
-            body.push(2);
-            body.extend_from_slice(&[0xaa, 0xbb]);
+            body.extend_from_slice(&33u16.to_be_bytes());
+            body.push(32);
+            body.extend_from_slice(&[0xaa; 32]);
             body
         };
         for (ext_type, ext_data, profile_error, name) in [
@@ -6065,6 +6118,12 @@ mod independent_wire_vectors {
                 MirrorTemplate::parse(&verified, &prefix),
                 Err(MirrorTemplateError::ClientProfile(profile_error)),
                 "{name}: template parse must surface the profile rejection before any SH check"
+            );
+            let upload = verified.into_mirror_upload();
+            assert_eq!(
+                upload.context().mirror_profile(),
+                Err(profile_error),
+                "{name}: the consuming context must carry the same profile facts"
             );
 
             let mut completed = perform_independent_client_handshake(

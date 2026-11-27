@@ -8,6 +8,9 @@ use subtle::ConstantTimeEq;
 use tokio::io::AsyncReadExt;
 use zeroize::Zeroizing;
 
+#[cfg(test)]
+use crate::reality_tls::{x25519, x25519_public_from_private};
+
 use crate::reality_server::{
     certificate_message, certificate_verify_input, encapsulate_server_share, handshake_message,
     hybrid_key_share_usable, x25519_public_key_usable, AuthenticatedMirrorContext, ChosenKeyShare,
@@ -15,11 +18,10 @@ use crate::reality_server::{
     SIG_ED25519,
 };
 use crate::reality_tls::{
-    finished_verify_data_with_hash, put_u16, read_u24, x25519, x25519_public_from_private,
-    ApplicationKeys, CipherSuite, HandshakeKeys, HashAlg, RecordKey, TranscriptHasher,
-    HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS, HS_FINISHED, TLS_AES_128_GCM_SHA256,
-    TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256, TLS_RECORD_APPLICATION_DATA,
-    TLS_RECORD_CHANGE_CIPHER_SPEC, TLS_RECORD_HANDSHAKE,
+    finished_verify_data_with_hash, put_u16, read_u24, ApplicationKeys, CipherSuite, HandshakeKeys,
+    HashAlg, RecordKey, TranscriptHasher, HS_CERTIFICATE_VERIFY, HS_ENCRYPTED_EXTENSIONS,
+    HS_FINISHED, TLS_AES_128_GCM_SHA256, TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256,
+    TLS_RECORD_APPLICATION_DATA, TLS_RECORD_CHANGE_CIPHER_SPEC, TLS_RECORD_HANDSHAKE,
 };
 use crate::{Result as TransportResult, Stream, TransportError};
 
@@ -121,6 +123,7 @@ const HRR_RANDOM: [u8; 32] = [
 ];
 const DOWNGRADE_TLS12: &[u8; 8] = b"DOWNGRD\x01";
 const DOWNGRADE_PRE_TLS12: &[u8; 8] = b"DOWNGRD\x00";
+#[cfg(test)]
 const HYBRID_CLIENT_SHARE_LEN: usize = 1184 + 32;
 const HYBRID_SERVER_SHARE_LEN: usize = 1088 + 32;
 
@@ -227,7 +230,7 @@ impl MirrorHelloView for AuthenticatedMirrorContext {
     }
 }
 
-fn mirror_profile_view(
+pub(crate) fn mirror_profile_view(
     view: &dyn MirrorHelloView,
 ) -> std::result::Result<(), MirrorClientProfileError> {
     let (has_psk, has_early, rsl, rsl_malformed, key_malformed) = view.profile();
@@ -551,13 +554,7 @@ impl MirrorTemplate {
         Self::parse_owned(verified, prefix.to_vec())
     }
 
-    pub(crate) fn parse_context(
-        context: &AuthenticatedMirrorContext,
-        prefix: Vec<u8>,
-    ) -> std::result::Result<Self, MirrorTemplateError> {
-        Self::parse_owned(context, prefix)
-    }
-
+    #[cfg(test)]
     fn parse_owned(
         verified: &dyn MirrorHelloView,
         prefix_buf: Vec<u8>,
@@ -670,20 +667,87 @@ pub enum TargetScanState {
     Incompatible(MirrorCoverReason),
 }
 
+/// `push` input larger than the scanner's currently safe read window.  No
+/// byte from that input was consumed; callers must bound socket reads with
+/// [`TargetFlightScanner::read_window`] or split the input themselves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TargetScanPushError {
+    window: usize,
+    offered: usize,
+}
+
+impl TargetScanPushError {
+    pub fn window(&self) -> usize {
+        self.window
+    }
+    pub fn offered(&self) -> usize {
+        self.offered
+    }
+}
+
+impl fmt::Display for TargetScanPushError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "target scan input {} bytes exceeds bounded read window {} bytes",
+            self.offered, self.window
+        )
+    }
+}
+impl std::error::Error for TargetScanPushError {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TargetScanPhase {
     ServerHelloHeader,
-    ServerHelloBody { end: usize },
+    ServerHelloBody {
+        end: usize,
+    },
     AfterServerHello,
-    CompatCcs { end: usize },
+    CompatCcs {
+        end: usize,
+    },
     RecordHeader,
-    RecordBody { end: usize, capacity: usize },
+    RecordBody {
+        end: usize,
+        capacity: usize,
+        head: [u8; 5],
+    },
 }
 
-/// Incremental, socket-independent scanner for the target prefix.  It owns
-/// only the W+1 byte prefix arena and a monotonically advancing parse cursor;
-/// cryptography and ClientHello binding are deferred to `freeze`.
-pub struct TargetFlightScanner {
+pub(crate) const TARGET_SCAN_WIRE_LIMIT: usize = 65_536;
+pub(crate) const TARGET_SCAN_PREFIX_CAPACITY: usize = TARGET_SCAN_WIRE_LIMIT + 1;
+
+fn handshake_frame_len(body_len: usize) -> usize {
+    4 + body_len
+}
+
+fn certificate_frame_len(certificate_der_len: usize) -> usize {
+    let entry_len = 3 + certificate_der_len + 2;
+    let list_len = 3 + entry_len;
+    handshake_frame_len(1 + list_len)
+}
+
+/// Exact logical server-flight length for the mirror's single serialization
+/// layout.  Preparation re-checks the actually serialized bytes against this
+/// value; scanner feasibility never uses a separate 301/317 literal.
+pub(crate) fn mirrored_flight_len(cipher: CipherSuite, certificate_der_len: usize) -> usize {
+    handshake_frame_len(2)
+        + certificate_frame_len(certificate_der_len)
+        + handshake_frame_len(2 + 2 + 64)
+        + handshake_frame_len(cipher.hash().len())
+}
+
+/// Incremental scanner for the target prefix.  The scanner owns the only
+/// W+1-byte prefix arena; its parse cursor never rewinds, and its caller must
+/// bound socket reads with [`Self::read_window`] so bytes can never be
+/// silently discarded after an oversized read.
+///
+/// Once the ServerHello body completes it is validated exactly once against
+/// the authenticated context: SID echo, cipher/group advertisement, key-share
+/// presence and low-order checks all happen here, not again in `freeze`.
+pub struct TargetFlightScanner<'a> {
+    hello: &'a dyn MirrorHelloView,
+    certificate_der_len: usize,
     prefix: Vec<u8>,
     cursor: usize,
     phase: TargetScanPhase,
@@ -691,67 +755,122 @@ pub struct TargetFlightScanner {
     record_count: usize,
     capacity_sum: usize,
     flight_len: usize,
+    server_hello_end: Option<usize>,
+    parsed_server_hello: Option<ParsedServerHello>,
+    record_heads: Vec<[u8; 5]>,
     incompatible: Option<MirrorCoverReason>,
 }
 
-impl Default for TargetFlightScanner {
-    fn default() -> Self {
-        Self::new()
+impl<'a> TargetFlightScanner<'a> {
+    pub(crate) fn new(context: &'a AuthenticatedMirrorContext, certificate_der_len: usize) -> Self {
+        Self::new_view(context, certificate_der_len)
     }
-}
 
-impl TargetFlightScanner {
-    pub fn new() -> Self {
+    #[cfg(test)]
+    pub(crate) fn new_compat(verified: &'a VerifiedHello, certificate_der_len: usize) -> Self {
+        Self::new_view(verified, certificate_der_len)
+    }
+
+    fn new_view(hello: &'a dyn MirrorHelloView, certificate_der_len: usize) -> Self {
         Self {
-            prefix: Vec::with_capacity(65_537),
+            hello,
+            certificate_der_len,
+            prefix: Vec::with_capacity(TARGET_SCAN_PREFIX_CAPACITY),
             cursor: 0,
             phase: TargetScanPhase::ServerHelloHeader,
             has_ccs: false,
             record_count: 0,
             capacity_sum: 0,
-            flight_len: 301,
+            flight_len: 0,
+            server_hello_end: None,
+            parsed_server_hello: None,
+            record_heads: Vec::with_capacity(MAX_MIRRORED_RECORDS),
             incompatible: None,
         }
     }
 
+    /// Remaining bytes in the lossless prefix arena, including the one-byte
+    /// overflow sentinel.  This is informational; socket reads must use
+    /// [`Self::read_window`].
     pub fn remaining_capacity(&self) -> usize {
-        65_537usize.saturating_sub(self.prefix.len())
+        TARGET_SCAN_PREFIX_CAPACITY.saturating_sub(self.prefix.len())
     }
 
-    /// Feed target-flight bytes.  Bytes beyond the hard wire budget (W+1,
-    /// 65_537) are never retained: the scanner truncates the input at the
-    /// budget, and once the buffer reaches exactly W+1 bytes the scan is
-    /// `Incompatible(Capacity)` — a flight that long cannot be mirrored, so
-    /// nothing is gained by scanning further.  Callers feeding a stream may
-    /// push arbitrarily large chunks; the truncation contract is part of the
-    /// API, not a caller error.
-    pub fn push(&mut self, bytes: &[u8]) -> TargetScanState {
-        let take = bytes.len().min(self.remaining_capacity());
-        self.prefix.extend_from_slice(&bytes[..take]);
+    /// Maximum number of bytes the caller may read from the target socket in
+    /// one step without risking loss.  Once the scan is typed incompatible
+    /// the window is zero: ownership should move to cover rather than
+    /// continuing to buffer the target.
+    pub fn read_window(&self) -> usize {
+        if self.incompatible.is_some() {
+            0
+        } else {
+            self.remaining_capacity()
+        }
+    }
+
+    /// Feed at most `read_window()` bytes.  Oversized input is rejected
+    /// before consuming anything; the bytes remain in the caller's own read
+    /// buffer, so a real socket caller never loses bytes it already read.
+    pub fn push(
+        &mut self,
+        bytes: &[u8],
+    ) -> std::result::Result<TargetScanState, TargetScanPushError> {
+        let window = self.read_window();
+        if bytes.len() > window {
+            return Err(TargetScanPushError {
+                window,
+                offered: bytes.len(),
+            });
+        }
+        self.prefix.extend_from_slice(bytes);
         self.scan_available();
-        self.state()
+        Ok(self.state())
     }
 
     pub fn state(&self) -> TargetScanState {
         if let Some(reason) = self.incompatible {
             return TargetScanState::Incompatible(reason);
         }
-        if self.prefix.len() == 65_537 {
+        if self.prefix.len() == TARGET_SCAN_PREFIX_CAPACITY {
             return TargetScanState::Incompatible(MirrorCoverReason::Capacity);
         }
-        if self.record_count == 0 || self.cursor != self.prefix.len() {
+        if self.record_count == 0 || self.cursor != self.prefix.len() || self.flight_len == 0 {
             return TargetScanState::NeedBytes;
         }
-        if self.capacity_sum < self.flight_len {
-            TargetScanState::CapacityTemporarilyInsufficient
-        } else {
-            TargetScanState::Freezable
+        if self.capacity_sum >= self.flight_len {
+            return TargetScanState::Freezable;
         }
+        if self.can_still_reach_flight_len() {
+            TargetScanState::CapacityTemporarilyInsufficient
+        } else if self.record_count == MAX_MIRRORED_RECORDS {
+            TargetScanState::Incompatible(MirrorCoverReason::RecordLimit)
+        } else {
+            TargetScanState::Incompatible(MirrorCoverReason::Capacity)
+        }
+    }
+
+    /// Exact upper bound on additional bucket capacity representable in the
+    /// remaining wire bytes and record slots.  A record carrying capacity C
+    /// costs C+22 wire bytes (5-byte header, inner type and tag), has minimum
+    /// capacity one and maximum capacity 16,384.
+    fn can_still_reach_flight_len(&self) -> bool {
+        let remaining_wire = TARGET_SCAN_WIRE_LIMIT.saturating_sub(self.prefix.len());
+        let remaining_records = MAX_MIRRORED_RECORDS - self.record_count;
+        let mut best_additional = 0usize;
+        for records in 1..=remaining_records {
+            let minimum_wire = records.saturating_mul(23);
+            if remaining_wire < minimum_wire {
+                break;
+            }
+            let wire_limited = remaining_wire - records * 22;
+            best_additional = best_additional.max(wire_limited.min(records * 16_384));
+        }
+        self.capacity_sum + best_additional >= self.flight_len
     }
 
     fn scan_available(&mut self) {
         loop {
-            if self.incompatible.is_some() || self.prefix.len() == 65_537 {
+            if self.incompatible.is_some() || self.prefix.len() == TARGET_SCAN_PREFIX_CAPACITY {
                 return;
             }
             match self.phase {
@@ -770,13 +889,17 @@ impl TargetFlightScanner {
                     if self.prefix.len() < end {
                         return;
                     }
-                    match scan_server_hello_shape(&self.prefix[5..end]) {
-                        Ok(m) => self.flight_len = m,
-                        Err(reason) => {
-                            self.incompatible = Some(reason);
+                    let parsed = match parse_template_server_hello(self.hello, &self.prefix[5..end])
+                    {
+                        Ok(parsed) => parsed,
+                        Err(error) => {
+                            self.incompatible = Some(cover_reason_for_template_error(error));
                             return;
                         }
-                    }
+                    };
+                    self.flight_len = mirrored_flight_len(parsed.cipher, self.certificate_der_len);
+                    self.server_hello_end = Some(end);
+                    self.parsed_server_hello = Some(parsed);
                     self.cursor = end;
                     self.phase = TargetScanPhase::AfterServerHello;
                 }
@@ -835,117 +958,138 @@ impl TargetFlightScanner {
                         self.incompatible = Some(MirrorCoverReason::DestProfile);
                         return;
                     }
+                    let end = pos + 5 + len;
+                    let head: [u8; 5] = self.prefix[pos..pos + 5]
+                        .try_into()
+                        .expect("five-byte record header");
+                    if end > TARGET_SCAN_WIRE_LIMIT {
+                        // The complete body can never become part of a legal
+                        // W-byte candidate.  Fail at header time instead of
+                        // waiting for bytes that cannot change the outcome.
+                        self.incompatible = Some(MirrorCoverReason::Capacity);
+                        return;
+                    }
                     self.phase = TargetScanPhase::RecordBody {
-                        end: pos + 5 + len,
+                        end,
                         capacity: len - 17,
+                        head,
                     };
                 }
-                TargetScanPhase::RecordBody { end, capacity } => {
+                TargetScanPhase::RecordBody {
+                    end,
+                    capacity,
+                    head,
+                } => {
                     if self.prefix.len() < end {
                         return;
                     }
                     self.cursor = end;
                     self.capacity_sum += capacity;
                     self.record_count += 1;
+                    self.record_heads.push(head);
                     self.phase = TargetScanPhase::RecordHeader;
                 }
             }
         }
     }
 
-    pub fn freeze(
-        self,
-        verified: &VerifiedHello,
-    ) -> std::result::Result<MirrorTemplate, MirrorTemplateError> {
-        if self.state() != TargetScanState::Freezable {
-            return Err(MirrorTemplateError::Incomplete);
-        }
-        MirrorTemplate::parse_owned(verified, self.prefix)
+    /// Borrow the lossless prefix while deciding between cover and prepare.
+    pub fn prefix(&self) -> &[u8] {
+        &self.prefix
     }
 
-    pub fn freeze_context(
-        self,
-        context: &AuthenticatedMirrorContext,
-    ) -> std::result::Result<MirrorTemplate, MirrorTemplateError> {
+    /// Move the unique prefix allocation into the cover branch without a
+    /// copy.  This consumes scanning metadata; commit is no longer possible.
+    pub fn into_prefix(self) -> Vec<u8> {
+        self.prefix
+    }
+
+    /// Freeze a verified, complete and feasible scan boundary.  Failure
+    /// returns the scanner — and therefore the original prefix allocation —
+    /// in the error object, so SID mismatch and every other pre-commit
+    /// rejection can still be covered byte-for-byte.
+    pub fn freeze(self) -> std::result::Result<MirrorTemplate, Box<TargetFreezeError<'a>>> {
         if self.state() != TargetScanState::Freezable {
-            return Err(MirrorTemplateError::Incomplete);
+            return Err(Box::new(TargetFreezeError {
+                error: MirrorTemplateError::Incomplete,
+                scanner: self,
+            }));
         }
-        MirrorTemplate::parse_context(context, self.prefix)
+        if let Err(profile) = mirror_profile_view(self.hello) {
+            return Err(Box::new(TargetFreezeError {
+                error: MirrorTemplateError::ClientProfile(profile),
+                scanner: self,
+            }));
+        }
+        let client_session_id = *self.hello.session_id();
+        let server_hello_end = self
+            .server_hello_end
+            .expect("freezable scan has a complete ServerHello");
+        let parsed = self
+            .parsed_server_hello
+            .expect("freezable scan has a validated ServerHello");
+        Ok(MirrorTemplate {
+            client_session_id,
+            target_prefix: self.prefix,
+            server_hello_range: 5..server_hello_end,
+            share_range: parsed.share_range,
+            group: parsed.group,
+            cipher: parsed.cipher,
+            has_ccs: self.has_ccs,
+            record_heads: self.record_heads,
+        })
     }
 }
 
-fn scan_server_hello_shape(sh: &[u8]) -> std::result::Result<usize, MirrorCoverReason> {
-    if sh.len() < 46
-        || sh[0] != 0x02
-        || read_u24(&sh[1..4]) + 4 != sh.len()
-        || sh[4..6] != [0x03, 0x03]
-    {
-        return Err(MirrorCoverReason::DestProfile);
-    }
-    let random = &sh[6..38];
-    if random == HRR_RANDOM {
-        return Err(MirrorCoverReason::Hrr);
-    }
-    if random.ends_with(DOWNGRADE_TLS12) || random.ends_with(DOWNGRADE_PRE_TLS12) {
-        return Err(MirrorCoverReason::DestProfile);
-    }
-    if sh[38] != 32 || sh.len() < 77 || sh[71 + 2] != 0 {
-        return Err(MirrorCoverReason::DestProfile);
-    }
-    let cipher = u16::from_be_bytes([sh[71], sh[72]]);
-    let flight_len = match cipher {
-        TLS_AES_128_GCM_SHA256 | TLS_CHACHA20_POLY1305_SHA256 => 301,
-        TLS_AES_256_GCM_SHA384 => 317,
-        _ => return Err(MirrorCoverReason::UnsupportedCipher),
-    };
-    let ext_len = usize::from(u16::from_be_bytes([sh[74], sh[75]]));
-    if 76 + ext_len != sh.len() {
-        return Err(MirrorCoverReason::DestProfile);
-    }
-    let mut pos = 76;
-    let mut saw_versions = false;
-    let mut saw_key_share = false;
-    while pos < sh.len() {
-        if pos + 4 > sh.len() {
-            return Err(MirrorCoverReason::DestProfile);
-        }
-        let typ = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
-        let len = usize::from(u16::from_be_bytes([sh[pos + 2], sh[pos + 3]]));
-        pos += 4;
-        if pos + len > sh.len() {
-            return Err(MirrorCoverReason::DestProfile);
-        }
-        let data = &sh[pos..pos + len];
-        pos += len;
-        match typ {
-            EXT_SUPPORTED_VERSIONS if !saw_versions && data == TLS13_VERSION_BYTES => {
-                saw_versions = true;
-            }
-            EXT_KEY_SHARE if !saw_key_share && data.len() >= 4 => {
-                saw_key_share = true;
-                let group = u16::from_be_bytes([data[0], data[1]]);
-                let share_len = usize::from(u16::from_be_bytes([data[2], data[3]]));
-                let expected = match group {
-                    GROUP_X25519 => 32,
-                    GROUP_X25519_MLKEM768 => HYBRID_SERVER_SHARE_LEN,
-                    _ => return Err(MirrorCoverReason::UnsupportedGroup),
-                };
-                if share_len != expected || share_len + 4 != data.len() {
-                    return Err(MirrorCoverReason::DestProfile);
-                }
-            }
-            EXT_SUPPORTED_VERSIONS | EXT_KEY_SHARE => {
-                return Err(MirrorCoverReason::UnsupportedExt)
-            }
-            _ => return Err(MirrorCoverReason::UnsupportedExt),
-        }
-    }
-    if !saw_versions || !saw_key_share {
-        return Err(MirrorCoverReason::UnsupportedExt);
-    }
-    Ok(flight_len)
+/// Owning freeze failure.  The scanner is not a copy: it is the same prefix
+/// allocation that was fed by the probe, returned so cover never has to
+/// reconstruct or duplicate the target bytes.
+pub struct TargetFreezeError<'a> {
+    error: MirrorTemplateError,
+    scanner: TargetFlightScanner<'a>,
 }
 
+impl<'a> TargetFreezeError<'a> {
+    pub fn error(&self) -> MirrorTemplateError {
+        self.error
+    }
+    pub fn into_scanner(self) -> TargetFlightScanner<'a> {
+        self.scanner
+    }
+    pub fn into_prefix(self) -> Vec<u8> {
+        self.scanner.into_prefix()
+    }
+}
+
+impl fmt::Debug for TargetFreezeError<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TargetFreezeError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+fn cover_reason_for_template_error(error: MirrorTemplateError) -> MirrorCoverReason {
+    match error {
+        MirrorTemplateError::HelloRetryRequest => MirrorCoverReason::Hrr,
+        MirrorTemplateError::UnsupportedCipher | MirrorTemplateError::CipherNotOffered => {
+            MirrorCoverReason::UnsupportedCipher
+        }
+        MirrorTemplateError::UnsupportedGroup
+        | MirrorTemplateError::GroupNotOffered
+        | MirrorTemplateError::KeyShareNotProvided
+        | MirrorTemplateError::InvalidClientKeyShare
+        | MirrorTemplateError::InvalidServerKeyShare => MirrorCoverReason::UnsupportedGroup,
+        MirrorTemplateError::MissingExtension
+        | MirrorTemplateError::DuplicateExtension
+        | MirrorTemplateError::UnsupportedExtension => MirrorCoverReason::UnsupportedExt,
+        MirrorTemplateError::TooManyRecords => MirrorCoverReason::RecordLimit,
+        MirrorTemplateError::PlaintextAlert => MirrorCoverReason::DestAlert,
+        _ => MirrorCoverReason::DestProfile,
+    }
+}
+
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct MirrorCryptoInput {
     pub(crate) server_random: [u8; 32],
@@ -975,6 +1119,7 @@ fn valid_server_random(random: [u8; 32]) -> bool {
         && !random.ends_with(DOWNGRADE_PRE_TLS12)
 }
 
+#[cfg(test)]
 fn mirror_server_random(fixed: Option<&MirrorCryptoInput>) -> TransportResult<[u8; 32]> {
     if let Some(fixed) = fixed {
         if !valid_server_random(fixed.server_random) {
@@ -984,6 +1129,15 @@ fn mirror_server_random(fixed: Option<&MirrorCryptoInput>) -> TransportResult<[u
         }
         return Ok(fixed.server_random);
     }
+    random_mirror_server_random()
+}
+
+#[cfg(not(test))]
+fn mirror_server_random() -> TransportResult<[u8; 32]> {
+    random_mirror_server_random()
+}
+
+fn random_mirror_server_random() -> TransportResult<[u8; 32]> {
     for _ in 0..64 {
         let random = rand::random::<[u8; 32]>();
         if valid_server_random(random) {
@@ -995,6 +1149,7 @@ fn mirror_server_random(fixed: Option<&MirrorCryptoInput>) -> TransportResult<[u
     ))
 }
 
+#[cfg(test)]
 fn fixed_ephemeral_exchange(
     verified: &dyn MirrorHelloView,
     group: u16,
@@ -1043,6 +1198,7 @@ fn fixed_ephemeral_exchange(
     Ok((server_share, tls_dh))
 }
 
+#[cfg(test)]
 fn ephemeral_exchange(
     verified: &dyn MirrorHelloView,
     group: u16,
@@ -1051,6 +1207,21 @@ fn ephemeral_exchange(
     if let Some(fixed) = fixed {
         return fixed_ephemeral_exchange(verified, group, fixed);
     }
+    random_ephemeral_exchange(verified, group)
+}
+
+#[cfg(not(test))]
+fn ephemeral_exchange(
+    verified: &dyn MirrorHelloView,
+    group: u16,
+) -> TransportResult<(Vec<u8>, Zeroizing<Vec<u8>>)> {
+    random_ephemeral_exchange(verified, group)
+}
+
+fn random_ephemeral_exchange(
+    verified: &dyn MirrorHelloView,
+    group: u16,
+) -> TransportResult<(Vec<u8>, Zeroizing<Vec<u8>>)> {
     let entry = client_key_share_entry(verified, group)
         .ok_or_else(|| TransportError::Tls("REALITY mirror client key share disappeared".into()))?;
     encapsulate_server_share(&ChosenKeyShare {
@@ -1102,6 +1273,13 @@ fn build_mirror_flight(
     plaintext.extend_from_slice(&certificate_msg);
     plaintext.extend_from_slice(&certificate_verify);
     plaintext.extend_from_slice(&server_finished);
+    let expected_len = mirrored_flight_len(cipher, certificate_der.len());
+    if plaintext.len() != expected_len {
+        return Err(TransportError::Crypto(format!(
+            "REALITY mirror flight layout diverged: serialized {} bytes, scanner model {expected_len}",
+            plaintext.len()
+        )));
+    }
     Ok(BuiltMirrorFlight {
         plaintext,
         handshake: hs,
@@ -1310,6 +1488,51 @@ async fn read_mirrored_client_finished(
     ))
 }
 
+/// Failure before commit.  The template — including the original target
+/// prefix allocation — is returned to the caller, so a validation/planning
+/// rejection can still move byte-for-byte into cover instead of forcing a
+/// copy or losing already-read bytes.
+pub struct MirrorPrepareError {
+    error: TransportError,
+    template: MirrorTemplate,
+}
+
+impl MirrorPrepareError {
+    pub(crate) fn cross_instance(template: MirrorTemplate) -> Self {
+        Self {
+            error: TransportError::Tls(
+                "REALITY verified ClientHello belongs to a different server instance".into(),
+            ),
+            template,
+        }
+    }
+
+    pub fn error(&self) -> &TransportError {
+        &self.error
+    }
+    pub fn into_template(self) -> MirrorTemplate {
+        self.template
+    }
+    pub fn into_target_prefix(self) -> Vec<u8> {
+        self.template.target_prefix
+    }
+}
+
+impl fmt::Debug for MirrorPrepareError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MirrorPrepareError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for MirrorPrepareError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.error)
+    }
+}
+impl std::error::Error for MirrorPrepareError {}
+
 #[cfg(test)]
 #[allow(clippy::needless_pass_by_value)] // ownership is an explicit pre-commit barrier
 pub(crate) fn prepare_mirrored_flight(
@@ -1318,33 +1541,66 @@ pub(crate) fn prepare_mirrored_flight(
     template: MirrorTemplate,
     fixed_crypto: Option<&MirrorCryptoInput>,
 ) -> TransportResult<PreparedFlight> {
-    prepare_mirrored_flight_view(certificate, verified, template, fixed_crypto)
+    prepare_mirrored_flight_impl(certificate, verified, &template, fixed_crypto)
 }
 
-#[allow(clippy::needless_pass_by_value)] // ownership is an explicit pre-commit barrier
-pub(crate) fn prepare_mirrored_flight_context(
+#[cfg(test)]
+#[allow(clippy::needless_pass_by_value)] // test vectors follow the same consuming chain
+pub(crate) fn prepare_mirrored_flight_context_fixed(
     certificate: &RealityCertificate,
-    verified: &AuthenticatedMirrorContext,
+    verified: AuthenticatedMirrorContext,
     template: MirrorTemplate,
     fixed_crypto: Option<&MirrorCryptoInput>,
 ) -> TransportResult<PreparedFlight> {
-    prepare_mirrored_flight_view(certificate, verified, template, fixed_crypto)
+    prepare_mirrored_flight_impl(certificate, &verified, &template, fixed_crypto)
 }
 
-#[allow(clippy::needless_pass_by_value)] // consuming the template prevents reuse after commit preparation
-fn prepare_mirrored_flight_view(
+#[cfg(not(test))]
+#[allow(clippy::needless_pass_by_value)] // consumption is the public pre-commit ownership contract
+pub(crate) fn prepare_mirrored_flight_context(
+    certificate: &RealityCertificate,
+    verified: AuthenticatedMirrorContext,
+    template: MirrorTemplate,
+) -> std::result::Result<PreparedFlight, Box<MirrorPrepareError>> {
+    match prepare_mirrored_flight_impl(certificate, &verified, &template) {
+        Ok(prepared) => Ok(prepared),
+        Err(error) => Err(Box::new(MirrorPrepareError { error, template })),
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code, clippy::needless_pass_by_value)]
+pub(crate) fn prepare_mirrored_flight_context(
+    certificate: &RealityCertificate,
+    verified: AuthenticatedMirrorContext,
+    template: MirrorTemplate,
+) -> std::result::Result<PreparedFlight, Box<MirrorPrepareError>> {
+    match prepare_mirrored_flight_impl(certificate, &verified, &template, None) {
+        Ok(prepared) => Ok(prepared),
+        Err(error) => Err(Box::new(MirrorPrepareError { error, template })),
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // ownership is an explicit pre-commit barrier
+fn prepare_mirrored_flight_impl(
     certificate: &RealityCertificate,
     verified: &dyn MirrorHelloView,
-    template: MirrorTemplate,
-    fixed_crypto: Option<&MirrorCryptoInput>,
+    template: &MirrorTemplate,
+    #[cfg(test)] fixed_crypto: Option<&MirrorCryptoInput>,
 ) -> TransportResult<PreparedFlight> {
     if *verified.session_id() != template.client_session_id {
         return Err(TransportError::Tls(
             "REALITY mirror template is bound to a different ClientHello".into(),
         ));
     }
+    #[cfg(test)]
     let random = mirror_server_random(fixed_crypto)?;
+    #[cfg(not(test))]
+    let random = mirror_server_random()?;
+    #[cfg(test)]
     let (server_share, tls_dh) = ephemeral_exchange(verified, template.group, fixed_crypto)?;
+    #[cfg(not(test))]
+    let (server_share, tls_dh) = ephemeral_exchange(verified, template.group)?;
     if server_share.len() != template.share_range.len() {
         return Err(TransportError::Tls(
             "REALITY mirror server share length does not match template".into(),
@@ -2366,17 +2622,33 @@ mod tests {
         assert!(error.to_string().contains("exceeds 64 KiB"), "{error}");
     }
 
+    fn scanner_certificate_len(hello: &VerifiedHello) -> usize {
+        RealityCertificate::generate()
+            .expect("test certificate")
+            .for_auth_key(&hello.auth_key)
+            .len()
+    }
+
+    fn push_scanner(scanner: &mut TargetFlightScanner<'_>, bytes: &[u8]) -> TargetScanState {
+        scanner
+            .push(bytes)
+            .expect("scanner input within read window")
+    }
+
     #[test]
     fn incremental_target_scanner_reaches_freezable_only_at_complete_boundaries() {
         let hello = x25519_verified();
         let sh = valid_x25519_sh(&hello, true);
         let prefix = target_prefix(&sh.message, true, &[25, 3217, 281, 69]);
-        let mut scanner = TargetFlightScanner::new();
+        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
         let split = 5 + sh.message.len() + COMPAT_CCS_RECORD.len() + 5 + 10;
-        assert_eq!(scanner.push(&prefix[..split]), TargetScanState::NeedBytes);
+        assert_eq!(
+            push_scanner(&mut scanner, &prefix[..split]),
+            TargetScanState::NeedBytes
+        );
         let mut saw_capacity_wait = false;
         for byte in &prefix[split..] {
-            let state = scanner.push(&[*byte]);
+            let state = push_scanner(&mut scanner, &[*byte]);
             if state == TargetScanState::CapacityTemporarilyInsufficient {
                 saw_capacity_wait = true;
             }
@@ -2387,7 +2659,7 @@ mod tests {
         );
         assert_eq!(scanner.state(), TargetScanState::Freezable);
         let cursor_before_freeze = scanner.cursor;
-        let template = scanner.freeze(&hello).expect("freeze scanner prefix");
+        let template = scanner.freeze().expect("freeze scanner prefix");
         assert_eq!(template.target_prefix, prefix);
         assert_eq!(template.server_hello(), sh.message);
         assert!(
@@ -2401,34 +2673,52 @@ mod tests {
         let hello = x25519_verified();
         let sh = valid_x25519_sh(&hello, false);
 
-        let mut scanner = TargetFlightScanner::new();
+        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
         let repeated = target_prefix(&sh.message, true, &[18])
             .into_iter()
             .take(5 + sh.message.len() + COMPAT_CCS_RECORD.len())
             .chain(COMPAT_CCS_RECORD)
             .collect::<Vec<_>>();
         for chunk in repeated.chunks(7) {
-            scanner.push(chunk);
+            push_scanner(&mut scanner, chunk);
         }
         assert_eq!(
             scanner.state(),
             TargetScanState::Incompatible(MirrorCoverReason::DestProfile)
         );
 
-        let mut scanner = TargetFlightScanner::new();
+        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
+        let mut prefix = target_prefix(&sh.message, false, &[16401, 16401, 16401]);
+        // A fourth maximum-size header is inside W but its body necessarily
+        // ends beyond W.  The scanner must reject as soon as that header is
+        // known rather than consuming bytes that cannot change the outcome.
+        prefix.extend_from_slice(&[0x17, 0x03, 0x03, 0x40, 0x11]);
+        push_scanner(&mut scanner, &prefix);
+        assert_eq!(
+            scanner.state(),
+            TargetScanState::Incompatible(MirrorCoverReason::Capacity)
+        );
+        let error = scanner
+            .push(&[0xaa])
+            .expect_err("typed incompatible scans close the read window");
+        assert_eq!(error.window(), 0);
+        assert_eq!(
+            scanner.prefix.len(),
+            prefix.len(),
+            "rejected input is not consumed"
+        );
+
+        // If the overflow byte arrives in the same bounded read as the Wth
+        // byte, it is retained byte-for-byte for cover as the sentinel.
+        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
         let mut prefix = target_prefix(&sh.message, false, &[16401, 16401, 16401]);
         let remaining = 65_536 - prefix.len();
-        // Add a fourth maximum-size header and as much of its body as fits in
-        // W.  That body is necessarily incomplete; one further byte is the
-        // lossless cover sentinel and turns the scan into typed capacity
-        // incompatibility rather than a successful freeze.
         prefix.extend_from_slice(&[0x17, 0x03, 0x03, 0x40, 0x11]);
         let body_room = remaining - 5;
         prefix.extend(std::iter::repeat_n(0, body_room));
         assert_eq!(prefix.len(), 65_536);
-        scanner.push(&prefix);
-        assert_eq!(scanner.state(), TargetScanState::NeedBytes);
-        scanner.push(&[0xaa]);
+        prefix.push(0xaa);
+        push_scanner(&mut scanner, &prefix);
         assert_eq!(
             scanner.state(),
             TargetScanState::Incompatible(MirrorCoverReason::Capacity)
@@ -2437,6 +2727,156 @@ mod tests {
             scanner.prefix.len(),
             65_537,
             "sentinel is retained for cover"
+        );
+    }
+
+    #[test]
+    fn scanner_push_rejects_input_beyond_read_window_without_consuming() {
+        let hello = x25519_verified();
+        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
+        let sh = valid_x25519_sh(&hello, false);
+        let prefix = target_prefix(&sh.message, false, &[25]);
+        push_scanner(&mut scanner, &prefix[..7]);
+        let before = scanner.prefix().to_vec();
+        let window = scanner.read_window();
+        let oversized = vec![0xaa; window + 1];
+        let error = scanner
+            .push(&oversized)
+            .expect_err("input larger than the read window");
+        assert_eq!(error.window(), window);
+        assert_eq!(error.offered(), window + 1);
+        assert_eq!(
+            scanner.prefix(),
+            before,
+            "no byte is consumed on contract violation"
+        );
+    }
+
+    #[test]
+    fn scanner_freeze_failure_returns_the_same_target_prefix_for_cover() {
+        let hello = verified_hello(
+            vec![0x001d],
+            vec![(0x001d, x25519_public(0x30))],
+            vec![0x1301, 0x1302, 0x1303],
+            true,
+            false,
+            None,
+        );
+        let sh = valid_x25519_sh(&hello, false);
+        let prefix = target_prefix(&sh.message, false, &[25, 3217, 281, 69]);
+        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
+        push_scanner(&mut scanner, &prefix);
+        assert_eq!(scanner.state(), TargetScanState::Freezable);
+        let error = scanner.freeze().expect_err("PSK profile is not mirrorable");
+        assert!(matches!(
+            error.error(),
+            MirrorTemplateError::ClientProfile(MirrorClientProfileError::PreSharedKey)
+        ));
+        assert_eq!(
+            error.into_prefix(),
+            prefix,
+            "pre-commit failure returns the original target bytes without a copy"
+        );
+    }
+
+    #[test]
+    fn scanner_types_sid_mismatch_when_server_hello_completes_and_prefix_is_movable() {
+        let hello = x25519_verified();
+        let mut sh = valid_x25519_sh(&hello, false).message;
+        sh[39] ^= 1;
+        let prefix = target_prefix(&sh, false, &[25]);
+        let mut scanner = TargetFlightScanner::new_compat(&hello, scanner_certificate_len(&hello));
+        let sh_end = 5 + sh.len();
+        push_scanner(&mut scanner, &prefix[..sh_end - 1]);
+        assert_eq!(scanner.state(), TargetScanState::NeedBytes);
+        push_scanner(&mut scanner, &prefix[sh_end - 1..]);
+        assert_eq!(
+            scanner.state(),
+            TargetScanState::Incompatible(MirrorCoverReason::DestProfile),
+            "SID mismatch is fully validated as soon as the SH body completes"
+        );
+        assert_eq!(scanner.into_prefix(), prefix);
+    }
+
+    #[test]
+    fn scanner_flight_len_model_matches_independent_frame_layout() {
+        for (cipher, hash_len) in [
+            (CipherSuite::Aes128GcmSha256, 32),
+            (CipherSuite::Aes256GcmSha384, 48),
+            (CipherSuite::ChaCha20Poly1305Sha256, 32),
+        ] {
+            for certificate_len in [1, 890, 4096] {
+                let certificate_entry = 3 + certificate_len + 2;
+                let certificate_list = 3 + certificate_entry;
+                let independent =
+                    (4 + 2) + (4 + 1 + certificate_list) + (4 + 2 + 2 + 64) + (4 + hash_len);
+                assert_eq!(
+                    mirrored_flight_len(cipher, certificate_len),
+                    independent,
+                    "M must come from the single serialization layout"
+                );
+            }
+        }
+    }
+
+    fn record_lengths_filling_width(base: usize, width: usize) -> Vec<u16> {
+        let needed = width - base;
+        for count in 1..=MAX_MIRRORED_RECORDS {
+            let minimum = count * 23;
+            let maximum = count * 16_406;
+            if !(minimum..=maximum).contains(&needed) {
+                continue;
+            }
+            let mut lengths = vec![18usize; count];
+            let mut extra = needed - minimum;
+            for len in &mut lengths {
+                let add = extra.min(16_401 - 18);
+                *len += add;
+                extra -= add;
+            }
+            assert_eq!(extra, 0);
+            return lengths
+                .into_iter()
+                .map(|len| u16::try_from(len).expect("record length"))
+                .collect();
+        }
+        panic!("width {width} cannot be represented from base {base}")
+    }
+
+    #[test]
+    fn probe_prepare_arena_reconciles_with_spec_bprobe() {
+        let hello = hybrid_verified();
+        let certificate = RealityCertificate::generate().expect("test certificate");
+        let certificate_len = certificate.for_auth_key(&hello.auth_key).len();
+        let sh = valid_hybrid_sh(&hello, false);
+        let base = 5 + sh.message.len();
+        let lengths = record_lengths_filling_width(base, TARGET_SCAN_WIRE_LIMIT);
+        assert!(lengths.len() <= MAX_MIRRORED_RECORDS);
+        let prefix = target_prefix(&sh.message, false, &lengths);
+        assert_eq!(prefix.len(), TARGET_SCAN_WIRE_LIMIT);
+
+        let upload = hello.into_mirror_upload();
+        let retained_share_capacity = upload.context().key_shares.retained_capacity();
+        let mut scanner = TargetFlightScanner::new(upload.context(), certificate_len);
+        push_scanner(&mut scanner, &prefix);
+        assert_eq!(scanner.state(), TargetScanState::Freezable);
+        let template = scanner.freeze().expect("W-sized candidate freezes");
+        let prefix_capacity = template.target_prefix.capacity();
+        assert_eq!(
+            prefix_capacity, TARGET_SCAN_PREFIX_CAPACITY,
+            "the scanner's single W+1 allocation moves into the template"
+        );
+        let (context, upload_wire) = upload.finish_upload();
+        drop(upload_wire);
+        let prepared = prepare_mirrored_flight_context(&certificate, context, template)
+            .expect("W-shaped template prepares");
+        let (wire, _completion) = prepared.into_wire_and_completion();
+        assert_eq!(wire.len(), TARGET_SCAN_WIRE_LIMIT);
+        let explicit_peak = prefix_capacity + wire.capacity() + retained_share_capacity + 4096;
+        assert_eq!(
+            explicit_peak, 136_417,
+            "Bprobe=(W+1)+W+G+4096 by capacity: prefix {prefix_capacity}, seal output {}, G {retained_share_capacity}, temp 4096",
+            wire.capacity()
         );
     }
 
