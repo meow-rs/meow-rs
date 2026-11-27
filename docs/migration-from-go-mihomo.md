@@ -357,9 +357,10 @@ Migration traps:
 - REALITY self-loops are rejected statically where possible and filtered at
   runtime after address resolution; a target with no non-looping candidate
   fails closed.
-- `meow -t` validates the typed listener shape but does not construct the
-  TLS/REALITY acceptor: unreadable certificates and certificate/key mismatches
-  are startup errors before binding, not `-t` errors.
+- `meow -t` shares startup's TLS/REALITY security construction: unreadable
+  certificates, certificate/key mismatches and invalid REALITY parameters
+  are `-t` errors, not deferred startup failures. The one boundary `-t`
+  keeps is that it binds nothing and never resolves or dials `dest`.
 - See [specs/listener-vless.md](specs/listener-vless.md) for the complete
   field table, wire limits, rejection matrix and interoperability evidence.
 

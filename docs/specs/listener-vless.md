@@ -386,12 +386,16 @@ not enable `listener-anytls` or the outbound REALITY feature separately.
 - **Startup validation is not a cover health check.** `-t` and startup do not
   resolve or dial `dest`; a dead cover does not block authenticated REALITY
   service.
-- **`-t` is typed shape validation, not listener construction.** It checks
-  the security-mode union, key shapes, users, bind syntax and feature gate,
-  but it does not read certificate files or verify a certificate/key pair;
-  those failures are startup errors before binding. REALITY's runtime
-  `1..=64` short-ID/server-name cardinality is likewise enforced by listener
-  construction rather than by the config-shape pass.
+- **`-t` shares startup's security construction, files included.** Beyond
+  the typed shape, feature gate, users and bind syntax, `-t` runs the same
+  security-material validation startup runs. Standard TLS loads the
+  certificate chain and private key — reading referenced PEM files is a
+  deliberate exception to the config test's no-I/O rule, because the pair's
+  syntax and key match cannot be checked from the YAML shape — parses both
+  and verifies they form a pair. REALITY validates the cover `dest` shape,
+  the `1..=64` short-ID/server-name cardinality and the server names, and
+  constructs the REALITY acceptor. What `-t` still never does: bind a
+  socket, resolve or dial the cover target, or touch the network.
 
 ## Interoperability evidence
 
@@ -405,24 +409,53 @@ fatality, `udp: false`, oversize meta/payload, unknown-sid End, and teardown
 scoping). It is fast and hermetic; it is not a substitute for pinned-client
 interop.
 
-`crates/meow-listener/tests/vless_interop_docker.rs` runs pinned client
-images `ghcr.io/xtls/xray-core:26.3.27` and `metacubex/mihomo:v1.19.17`
-against the real listener in process. On Linux, `MEOW_REQUIRE_DOCKER=1`
-makes missing Docker/images a hard failure rather than a skip.
+`crates/meow-listener/tests/vless_interop_docker.rs` pins both client
+images by immutable multi-arch index digest —
+`ghcr.io/xtls/xray-core@sha256:592ec4d1…` (tag 26.3.27) and
+`metacubex/mihomo@sha256:4c2495d7…` (tag v1.19.34) — and asserts the
+binaries' self-reported versions before any leg runs. The mihomo pin is
+v1.19.34 rather than v1.19.17: upstream `refs/tags/v1.19.34` resolves to
+the frozen interop commit `0455d0d28c4526937380505153e65a843d8612e8`,
+while `refs/tags/v1.19.17` resolves to a different commit and cannot
+represent it. A missing Docker daemon or image skips the tests, unless
+`MEOW_REQUIRE_DOCKER=1` — set in CI — makes that a hard failure.
 
-For both clients and both outer modes (standard TLS and REALITY) the matrix
-asserts:
+The evidence splits across two topologies. The **in-process matrix** runs
+the production listener inside the test process with pinned xray/mihomo
+client containers reaching it over `host.docker.internal`, so the
+listener's own DIRECT raw-switch counters are direct evidence rather than
+inference from a successful echo. For both clients and both outer modes
+(standard TLS and REALITY) this leg asserts:
 
 - inner TLS 1.3 echo of more than 1 MiB of patterned data each way;
 - exactly one raw-read and one raw-write DIRECT transition per connection —
   the test does not mistake an END-only echo for DIRECT;
+- TLS 1.2, plaintext and server-first inners staying framed END — the
+  DIRECT counters do not move;
 - XUDP echo datagrams of several sizes with correct reply source port and
   source-address shape (xray preserves the domain source; mihomo resolves
-  before VLESS and observes the IP source);
+  before VLESS and observes the IP source), never switching the Vision
+  stream raw;
 - wrong-UUID and missing-flow clients closing without application bytes and
   without incrementing the target accept counter;
 - an ordinary TLS client to the REALITY port receiving the independent cover
   site's real certificate and byte-exact HTTPS response.
+
+The **real-app matrix** instead containerizes the actual `meow` binary and
+its echo target: the target sits on an `--internal` Docker network that
+only the target and meow attach to, the clients sit on a separate
+client/control network the target never joins, meow is the only container
+attached to both networks, and before the matrix runs an active bypass
+probe — a client-network-only container dialling the target directly —
+must fail. The client/control network cannot itself be internal because
+Docker unpublishes loopback-published ports on internal networks; that is
+a documented control-plane deviation, not a client→target data path. For
+both clients and both outer modes this leg asserts end-to-end TLS 1.3 echo
+through the containerized meow and the XUDP matrix: interleaved per-packet
+targets, UDP/443, and reply source ports, plus an IPv6 target on the TLS
+leg when the daemon gives the target network a global IPv6 address. What
+it cannot do is count DIRECT transitions — the listener is in another
+container — which is exactly what the in-process leg exists for.
 
 Golden vectors freeze the VLESS request/first-frame shape, empty first frame,
 first downlink response frame, TLS 1.3 ServerHello decision, XUDP New+Data,
