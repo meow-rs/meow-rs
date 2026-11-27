@@ -8,6 +8,17 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Fixed
+
+- `authentication: [""]` no longer fails the whole config. The stock mihomo
+  template leaves the field as a placeholder to fill in when a password is
+  set, and mihomo accepts the empty entry; the ADR-0002 Class A rule read it
+  as a missing-colon typo and rejected the config at load, which surfaced in
+  the app as a failed first sync with an empty profile list. An entry that is
+  empty after trimming is now skipped — it carries no credential, so the
+  result equals an empty list. A non-empty entry without a colon is still a
+  hard error.
+
 ## [0.30.0] - 2026-11-26
 
 ### Added
