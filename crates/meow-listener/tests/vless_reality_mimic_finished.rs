@@ -890,6 +890,173 @@ async fn run_positive(name: &str, with_ccs: bool) {
     task.abort();
 }
 
+// ─── negative-path driver ─────────────────────────────────────────────────
+
+/// Write the caller-shaped wire after the real mirrored flight and assert
+/// the post-commit close accounting: exactly one
+/// `close(wait_finished, finished_invalid)`, no cover, no hit.
+async fn run_negative(name: &str, shape: NegativeShape) {
+    let target = start_mimic_target().await;
+    let (port, listener, task) = start_listener(target, name).await;
+
+    let mut session = controlled_handshake(port).await;
+    let wire = shape.build(&mut session);
+    session
+        .stream
+        .write_all(&wire)
+        .await
+        .expect("write shaped Finished wire");
+    session.stream.flush().await.expect("flush shaped wire");
+
+    let snapshot = wait_for_metric(&listener, |s| {
+        s.close_total.get(&("wait_finished", "finished_invalid")) == Some(&1)
+    })
+    .await;
+    assert_eq!(
+        snapshot.committed_total, 1,
+        "commit precedes the Finished stage"
+    );
+    assert_eq!(snapshot.mimic_hit_total, 0, "rejected Finished never hits");
+    assert!(
+        snapshot.cover_total.is_empty(),
+        "post-commit failures never cover: {:?}",
+        snapshot.cover_total
+    );
+    drop(session.stream);
+    task.abort();
+}
+
+enum NegativeShape {
+    /// Flip one byte of the first Finished record's AEAD tag.
+    TagFlip,
+    /// Valid AEAD everywhere, but the verify_data carried inside is wrong.
+    VerifyDataFlip,
+    /// Extra handshake bytes after the Finished inside the same record.
+    TrailingHandshakeBytes,
+    /// Correct verify_data sealed under a non-handshake inner type.
+    WrongInnerType,
+    /// Handshake inner type with zero content bytes.
+    EmptyHandshakeContent,
+    /// Correct Finished fragmented into more than 32 tiny records.
+    Over32Records,
+    /// Correct Finished in maximally padded records exceeding 65536 wire bytes.
+    Over64KWire,
+    /// Two canonical compat CCS records before a correct Finished.
+    DoubleCcs,
+}
+
+impl NegativeShape {
+    fn build(self, session: &mut ControlledSession) -> Vec<u8> {
+        let finished = session.client_finished.clone();
+        match self {
+            Self::TagFlip => {
+                let fragments = positive_fragments(&finished);
+                let mut wire = COMPAT_CCS.to_vec();
+                let mut records = seal_finished_records(
+                    &mut session.client_handshake,
+                    &fragments,
+                    TLS_RECORD_HANDSHAKE,
+                );
+                // The first record ends with its 16-byte tag; flipping its
+                // last byte must fail AEAD open before any semantic check.
+                let first_len = 5 + (13 + 1 + 5) + 16;
+                records[first_len - 1] ^= 0x01;
+                wire.extend_from_slice(&records);
+                wire
+            }
+            Self::VerifyDataFlip => {
+                let mut bad = finished.clone();
+                let last = bad.len() - 1;
+                bad[last] ^= 0x01;
+                let fragments = positive_fragments(&bad);
+                let mut wire = COMPAT_CCS.to_vec();
+                wire.extend_from_slice(&seal_finished_records(
+                    &mut session.client_handshake,
+                    &fragments,
+                    TLS_RECORD_HANDSHAKE,
+                ));
+                wire
+            }
+            Self::TrailingHandshakeBytes => {
+                let mut second = finished[13..].to_vec();
+                // A trailing zero byte would vanish into the padding strip;
+                // a non-zero byte is reassembled as handshake content.
+                second.push(0x14);
+                let fragments: [(&[u8], usize); 2] = [(&finished[..13], 5), (&second, 29)];
+                let mut wire = COMPAT_CCS.to_vec();
+                wire.extend_from_slice(&seal_finished_records(
+                    &mut session.client_handshake,
+                    &fragments,
+                    TLS_RECORD_HANDSHAKE,
+                ));
+                wire
+            }
+            Self::WrongInnerType => {
+                let fragments = positive_fragments(&finished);
+                let mut wire = COMPAT_CCS.to_vec();
+                wire.extend_from_slice(&seal_finished_records(
+                    &mut session.client_handshake,
+                    &fragments,
+                    TLS_RECORD_APPLICATION_DATA,
+                ));
+                wire
+            }
+            Self::EmptyHandshakeContent => {
+                let mut wire = COMPAT_CCS.to_vec();
+                wire.extend_from_slice(&session.client_handshake.seal_with_padding(
+                    TLS_RECORD_HANDSHAKE,
+                    &[],
+                    1,
+                ));
+                wire
+            }
+            Self::Over32Records => {
+                let mut wire = COMPAT_CCS.to_vec();
+                // 36 one-byte fragments cannot complete inside the 32-record
+                // budget even though every record is a validly sealed piece
+                // of the correct Finished — and would complete exactly if
+                // the record limit were raised.
+                for byte in &finished {
+                    wire.extend_from_slice(&session.client_handshake.seal_with_padding(
+                        TLS_RECORD_HANDSHAKE,
+                        &[*byte],
+                        0,
+                    ));
+                }
+                wire
+            }
+            Self::Over64KWire => {
+                let mut wire = COMPAT_CCS.to_vec();
+                // Three maximally padded valid records stay below W; the
+                // fourth maximum-length header already proves overflow.
+                let fragments: [(&[u8], usize); 4] = [
+                    (&finished[..9], 16375),
+                    (&finished[9..18], 16375),
+                    (&finished[18..27], 16375),
+                    (&finished[27..], 16375),
+                ];
+                wire.extend_from_slice(&seal_finished_records(
+                    &mut session.client_handshake,
+                    &fragments,
+                    TLS_RECORD_HANDSHAKE,
+                ));
+                wire
+            }
+            Self::DoubleCcs => {
+                let fragments = positive_fragments(&finished);
+                let mut wire = COMPAT_CCS.to_vec();
+                wire.extend_from_slice(&COMPAT_CCS);
+                wire.extend_from_slice(&seal_finished_records(
+                    &mut session.client_handshake,
+                    &fragments,
+                    TLS_RECORD_HANDSHAKE,
+                ));
+                wire
+            }
+        }
+    }
+}
+
 // ─── tests (spec §9 T4) ───────────────────────────────────────────────────
 
 /// §9 T4 positive: one write carries the canonical compat CCS, the client
@@ -910,3 +1077,50 @@ async fn t4_finished_without_compat_ccs_vision_echo() {
     run_positive("vless-t4-hit-noccs-it", false).await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t4_tampered_finished_record_tag_closes_without_cover_or_hit() {
+    run_negative("vless-t4-neg-tag-it", NegativeShape::TagFlip).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t4_wrong_verify_data_closes_without_cover_or_hit() {
+    run_negative("vless-t4-neg-verifydata-it", NegativeShape::VerifyDataFlip).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t4_handshake_bytes_after_finished_in_same_record_close() {
+    run_negative(
+        "vless-t4-neg-trailing-it",
+        NegativeShape::TrailingHandshakeBytes,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t4_non_handshake_inner_type_closes() {
+    run_negative("vless-t4-neg-innertype-it", NegativeShape::WrongInnerType).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t4_empty_handshake_content_closes() {
+    run_negative(
+        "vless-t4-neg-emptycontent-it",
+        NegativeShape::EmptyHandshakeContent,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t4_finished_over_32_records_closes() {
+    run_negative("vless-t4-neg-32records-it", NegativeShape::Over32Records).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t4_finished_over_65536_wire_bytes_closes() {
+    run_negative("vless-t4-neg-64kwire-it", NegativeShape::Over64KWire).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t4_second_compat_ccs_closes() {
+    run_negative("vless-t4-neg-doubleccs-it", NegativeShape::DoubleCcs).await;
+}
