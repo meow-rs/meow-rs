@@ -7,6 +7,10 @@ script serializes the ClientHello and certificate template byte-for-byte from
 the specification.  All seeds are fixed labels, so regenerating is
 byte-for-byte reproducible.  The script self-checks every vector and fails
 before writing if the independent verifier rejects it.
+
+Locked generation environment: Python 3.11 with cryptography==50.0.0.
+Regenerate with `python3 generate_reality_independent_vectors.py`; verify the
+committed oracle without touching the filesystem or network with `--check`.
 """
 
 from pathlib import Path

@@ -1977,7 +1977,7 @@ mod tests {
             assert_eq!(MirrorTemplate::parse(&hello, &prefix), Err(error), "{name}");
         }
 
-        for marker in [*b"DOWNGRD ", *b"DOWNGRD"] {
+        for marker in [*b"DOWNGRD\x00", *b"DOWNGRD\x01"] {
             let mut random = [0x77; 32];
             random[24..].copy_from_slice(&marker);
             let sh = server_hello(
