@@ -422,8 +422,9 @@ represent it. A missing Docker daemon or image skips the tests, unless
 
 The evidence splits across two topologies. The **in-process matrix** runs
 the production listener inside the test process with pinned xray/mihomo
-client containers reaching it over `host.docker.internal`, so the
-listener's own DIRECT raw-switch counters are direct evidence rather than
+client containers reaching it over the client network's IPv4 bridge gateway
+on Linux (`host.docker.internal` elsewhere), so the listener's own DIRECT
+raw-switch counters are direct evidence rather than
 inference from a successful echo. For both clients and both outer modes
 (standard TLS and REALITY) this leg asserts:
 

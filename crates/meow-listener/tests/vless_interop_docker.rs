@@ -205,7 +205,7 @@ fn create_network(label: &str, internal: bool, masquerade: bool) -> Result<TestN
         // a client-network-only probe look like a local peer to an internal
         // target network. The real-app client/control network needs no
         // external connectivity; the in-process leg keeps masquerading so
-        // clients can reach the host listener through host.docker.internal.
+        // clients can reach the host listener.
         v6_args.extend([
             "--opt".into(),
             "com.docker.network.bridge.enable_ip_masquerade=false".into(),
@@ -305,6 +305,105 @@ fn container_network_ips(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
     Ok((ipv4, ipv6))
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct NetworkGateways {
+    ipv4: Ipv4Addr,
+    ipv6: Option<Ipv6Addr>,
+}
+
+fn parse_network_gateways(text: &str, network: &str) -> Result<NetworkGateways, String> {
+    let json: Value = serde_json::from_str(text)
+        .map_err(|e| format!("docker network inspect {network} json: {e}"))?;
+    let root = if json.is_array() {
+        json.get(0)
+    } else {
+        Some(&json)
+    }
+    .ok_or_else(|| format!("docker network inspect {network} returned an empty array"))?;
+    let configs = root
+        .get("IPAM")
+        .and_then(|v| v.get("Config"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| format!("docker network inspect {network} has no IPAM config"))?;
+    let mut ipv4 = None;
+    let mut ipv6 = None;
+    for entry in configs {
+        let Some(gateway) = entry
+            .get("Gateway")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let ip = gateway.parse::<IpAddr>().map_err(|e| {
+            format!("docker network inspect {network} has invalid gateway {gateway:?}: {e}")
+        })?;
+        match ip {
+            IpAddr::V4(ip) if ipv4.is_none() => ipv4 = Some(ip),
+            IpAddr::V6(ip) if ipv6.is_none() => ipv6 = Some(ip),
+            _ => {}
+        }
+    }
+    let ipv4 = ipv4.ok_or_else(|| {
+        format!("docker network inspect {network} did not report an IPv4 gateway")
+    })?;
+    Ok(NetworkGateways { ipv4, ipv6 })
+}
+
+fn network_gateways(network: &TestNetwork) -> Result<NetworkGateways, String> {
+    let text = docker_stdout(&["network".into(), "inspect".into(), network.name.clone()])?;
+    parse_network_gateways(&text, &network.name)
+}
+
+fn inprocess_host_server(network: &TestNetwork) -> Result<String, String> {
+    if cfg!(target_os = "linux") {
+        let gateways = network_gateways(network)?;
+        let ipv6 = gateways
+            .ipv6
+            .map_or_else(|| "none".to_string(), |ip| ip.to_string());
+        eprintln!(
+            "topology evidence: Linux in-process clients dial IPv4 bridge gateway {} on {} (IPv6 gateway: {ipv6}, unused because the harness listener binds 0.0.0.0); host.docker.internal is intentionally unused",
+            gateways.ipv4, network.name
+        );
+        Ok(gateways.ipv4.to_string())
+    } else {
+        Ok("host.docker.internal".into())
+    }
+}
+
+#[test]
+fn network_gateway_parser_accepts_ipv6_first_ipam_config() {
+    let inspect = json!([{
+        "IPAM": {
+            "Config": [
+                { "Subnet": "fd42:aaaa:bbbb::/64", "Gateway": "fd42:aaaa:bbbb::1" },
+                { "Subnet": "192.168.147.0/24", "Gateway": "192.168.147.1" },
+            ],
+        },
+    }])
+    .to_string();
+    let gateways = parse_network_gateways(&inspect, "parser-test").unwrap();
+    assert_eq!(gateways.ipv4, Ipv4Addr::new(192, 168, 147, 1));
+    assert_eq!(gateways.ipv6, Some("fd42:aaaa:bbbb::1".parse().unwrap()));
+}
+
+#[test]
+fn network_gateway_parser_requires_an_ipv4_gateway() {
+    let inspect = json!([{
+        "IPAM": {
+            "Config": [
+                { "Subnet": "fd42:aaaa:bbbb::/64", "Gateway": "fd42:aaaa:bbbb::1" },
+            ],
+        },
+    }])
+    .to_string();
+    let err = parse_network_gateways(&inspect, "parser-test").unwrap_err();
+    assert!(
+        err.contains("did not report an IPv4 gateway"),
+        "unexpected error: {err}"
+    );
 }
 
 struct ManagedContainer {
@@ -980,10 +1079,6 @@ fn start_client_container(
     if let Some(network) = network {
         docker_args.push("--network".to_string());
         docker_args.push(network.name.clone());
-    }
-    if cfg!(target_os = "linux") && fixture.server == "host.docker.internal" {
-        docker_args.push("--add-host".to_string());
-        docker_args.push("host.docker.internal:host-gateway".to_string());
     }
     docker_args.extend([
         "-v".to_string(),
@@ -2281,20 +2376,23 @@ async fn reverse_vless_vision_interop_matrix() {
     )
     .await;
 
+    let client_network = create_network("clients", false, true)
+        .unwrap_or_else(|e| panic!("create isolated client network: {e}"));
+    let host_server = inprocess_host_server(&client_network)
+        .unwrap_or_else(|e| panic!("inspect in-process host listener address: {e}"));
+
     let reality_public =
         x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(REALITY_PRIVATE));
     let fixture = ClientFixture {
         tls_port,
         reality_port,
-        server: "host.docker.internal".into(),
+        server: host_server,
         udp_hosts_ip: "127.0.0.1".into(),
         outer_ca_pin,
         reality_public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD
             .encode(reality_public.as_bytes()),
     };
 
-    let client_network = create_network("clients", false, true)
-        .unwrap_or_else(|e| panic!("create isolated client network: {e}"));
     let xray = start_client_container(ClientKind::Xray, &fixture, Some(&client_network))
         .unwrap_or_else(|e| panic!("xray client setup failed: {e}"));
     wait_client_ready(&xray)
