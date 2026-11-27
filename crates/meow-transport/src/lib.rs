@@ -48,6 +48,9 @@ pub mod reality_server;
 #[cfg(all(feature = "tls", feature = "reality"))]
 mod reality_tls;
 
+#[cfg(all(test, feature = "reality"))]
+mod test_alloc;
+
 #[cfg(feature = "ws")]
 pub mod ws;
 

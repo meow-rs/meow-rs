@@ -3281,6 +3281,31 @@ mod tests {
             lengths.into_iter().map(|len| len as u16).collect()
         }
 
+        fn push_through_listener_scratch(
+            scanner: &mut TargetFlightScanner<'_>,
+            bytes: &[u8],
+        ) -> TargetScanState {
+            // The production scan loop owns a 4096-byte heap scratch while it
+            // copies socket reads into the scanner.  Drive the scanner through
+            // the same shape so the allocator measurement includes it and its
+            // release before freeze.
+            let mut scratch = vec![0u8; 4096];
+            let mut offset = 0usize;
+            let mut state = scanner.state();
+            while offset < bytes.len() {
+                let window = scanner.read_window();
+                assert!(window > 0, "scanner window stalls before W input");
+                let n = window.min(scratch.len()).min(bytes.len() - offset);
+                scratch[..n].copy_from_slice(&bytes[offset..offset + n]);
+                state = scanner
+                    .push(&scratch[..n])
+                    .expect("scanner input in window");
+                offset += n;
+            }
+            drop(scratch);
+            state
+        }
+
         for (name, use_hybrid, cipher) in [
             ("x25519-sha384-16rec", false, 0x1302u16),
             ("hybrid-sha256-16rec", true, 0x1301u16),
@@ -3320,74 +3345,37 @@ mod tests {
             let certificate = RealityCertificate::generate().expect("test certificate");
             let context = mirror_context_for_test(&hello);
             let retained_shares = context.key_shares.retained_capacity();
+
+            crate::test_alloc::start_measurement();
             let mut scanner = TargetFlightScanner::new(&context, certificate.der_len())
                 .expect("mirrorable synthetic profile");
             assert_eq!(
-                push_scanner(&mut scanner, &prefix),
+                push_through_listener_scratch(&mut scanner, &prefix),
                 TargetScanState::Freezable
             );
-            let record_head_bytes =
-                scanner.record_heads.capacity() * std::mem::size_of::<[u8; 5]>();
-            // The 4096 term is the listener scan scratch.  It is counted in
-            // the scanning sample even though it is not owned by the scanner.
-            let scanning = scanner.prefix.capacity() + record_head_bytes + retained_shares + 4096;
-            assert!(scanning <= 136_417, "{name}: scanning sample {scanning}");
-
             let template = scanner.freeze().expect("W-shaped flight freezes");
-            let frozen = template.target_prefix.capacity()
-                + template.record_heads.capacity() * std::mem::size_of::<[u8; 5]>()
-                + retained_shares;
             assert_eq!(
-                scanning - frozen,
-                4096,
-                "{name}: scan scratch is released before prepare"
+                template.target_prefix.capacity(),
+                TARGET_SCAN_PREFIX_CAPACITY,
+                "{name}: the scanner's W+1 allocation moves into the template"
             );
-
-            let logical_flight = mirrored_flight_len(template.cipher, certificate.der_len());
-            let hash_len = template.cipher.hash().len();
-            // Enumerate the fixed prepare-time residents instead of treating
-            // the 4096-byte temporary envelope as an unexplained additive
-            // constant: four transcript hashes, three handshake secrets, the
-            // expected Finished, both AEAD key schedules (512 bytes each is a
-            // conservative bound for BoringSSL's opaque schedule), record
-            // heads, record plans, certificate/share serialization scratch,
-            // and the completion object's stack size.
-            let fixed_prepare_residents = 8 * hash_len
-                + 2 * 512
-                + template.record_heads.capacity() * std::mem::size_of::<[u8; 5]>()
-                + std::mem::size_of::<MirroredHandshakeCompletion>();
-            let small_coexisting = logical_flight
-                + certificate.der_len()
-                + template.share_range.len()
-                + 64
-                + template.record_heads.len() * std::mem::size_of::<MirroredRecordPlan>()
-                + fixed_prepare_residents;
-            assert!(
-                small_coexisting <= 4096,
-                "{name}: small prepare allocations {small_coexisting}"
-            );
-            let prepared = prepare_mirrored_flight_context(&certificate, context, template)
+            let prepared = prepare_mirrored_flight_impl(&certificate, &context, &template, None)
                 .expect("W-shaped template prepares");
-            let completion_fixed = prepared.completion.master_secret.capacity()
-                + prepared.completion.transcript_t3_hash.capacity()
-                + prepared.completion.expected_client_finished.capacity()
-                + std::mem::size_of::<MirroredHandshakeCompletion>()
-                + 512;
+            let (prepare_live, prepare_peak) = crate::test_alloc::measurement();
             assert!(
-                completion_fixed <= small_coexisting,
-                "{name}: retained completion state is inside the enumerated prepare envelope"
+                prepare_live >= TARGET_SCAN_WIRE_LIMIT as i64,
+                "{name}: allocator witness must include the retained sealed wire; live={prepare_live}"
             );
-            let prepared_and_sealed = prepared.target_prefix.capacity()
-                + prepared.wire.capacity()
-                + retained_shares
-                + 4096;
+            let measured_peak = retained_shares
+                + usize::try_from(prepare_peak).expect("prepare peak is nonnegative");
             assert!(
-                prepared_and_sealed <= 136_417,
-                "{name}: prepared/sealed sample {prepared_and_sealed} exceeds Bprobe"
+                measured_peak <= 136_417,
+                "{name}: allocator-measured probe/prepare peak {measured_peak} exceeds Bprobe"
             );
             eprintln!(
-                "bprobe-stage {name}: scanning={scanning} frozen={frozen} prepared_or_sealed={prepared_and_sealed} small_coexisting={small_coexisting} fixed_prepare={fixed_prepare_residents} completion_fixed={completion_fixed} G={retained_shares} records=16"
+                "bprobe-measured {name}: peak={measured_peak} raw_peak={prepare_peak} live_at_prepare_return={prepare_live} G={retained_shares} records=16 Bprobe=136417"
             );
+
             let committed = prepared.commit();
             let (wire, _completion) = committed.into_wire_and_completion();
             assert_eq!(

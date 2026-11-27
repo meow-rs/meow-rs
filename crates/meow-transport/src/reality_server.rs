@@ -2468,8 +2468,7 @@ mod tests {
     #[tokio::test]
     async fn probe_prepare_arena_reconciles_with_spec_bprobe_in_real_public_order() {
         use crate::reality_mirror::{
-            mirrored_flight_len, MirroredRecordPlan, TargetScanState, TARGET_SCAN_PREFIX_CAPACITY,
-            TARGET_SCAN_WIRE_LIMIT,
+            TargetScanState, TARGET_SCAN_PREFIX_CAPACITY, TARGET_SCAN_WIRE_LIMIT,
         };
 
         let (private, public) = keypair();
@@ -2548,6 +2547,7 @@ mod tests {
         }
         assert_eq!(flight.len(), TARGET_SCAN_WIRE_LIMIT);
 
+        crate::test_alloc::start_measurement();
         let mut scanner = server
             .target_flight_scanner(&context)
             .expect("wire-authenticated context is mirrorable");
@@ -2556,41 +2556,30 @@ mod tests {
             TargetScanState::Freezable
         );
         let template = scanner.freeze().expect("W-sized candidate freezes");
-        let prefix_capacity = template.target_prefix.capacity();
-        let record_count = template.record_heads.len();
-        let share_output_len = template.share_range.len();
-        let cipher = template.cipher;
         assert_eq!(
-            prefix_capacity, TARGET_SCAN_PREFIX_CAPACITY,
+            template.target_prefix.capacity(),
+            TARGET_SCAN_PREFIX_CAPACITY,
             "the scanner's single W+1 allocation moves into the template"
         );
         let prepared = server
             .prepare_mirrored_upload(context, template)
             .expect("W-shaped template prepares");
+        let (prepare_live, prepare_peak) = crate::test_alloc::measurement();
+        assert!(
+            prepare_live >= (TARGET_SCAN_PREFIX_CAPACITY + TARGET_SCAN_WIRE_LIMIT) as i64,
+            "allocator witness must include the live target prefix and sealed wire: {prepare_live}"
+        );
+        let measured_peak = retained_share_capacity
+            + usize::try_from(prepare_peak).expect("prepare peak is nonnegative");
+        assert!(
+            measured_peak <= 136_417,
+            "allocator-measured real-order probe/prepare peak {measured_peak} exceeds Bprobe"
+        );
+        eprintln!(
+            "bprobe-measured real-public-order: peak={measured_peak} raw_peak={prepare_peak} live_at_prepare_return={prepare_live} G={retained_share_capacity} Bprobe=136417"
+        );
         let (wire, _completion) = prepared.commit().into_wire_and_completion();
         assert_eq!(wire.len(), TARGET_SCAN_WIRE_LIMIT);
-
-        // Count only allocations that coexist with the W-byte seal output:
-        // the logical plaintext flight, the cloned certificate DER inside it,
-        // the server-share output copied into the SH, the share secret, and
-        // the exact record plan.  KEM encapsulation temporaries are already
-        // dropped before seal output growth and are not mechanically added.
-        let logical_flight = mirrored_flight_len(cipher, server.inner.certificate.der_len());
-        let coexisting_small = logical_flight
-            + server.inner.certificate.der_len()
-            + share_output_len
-            + 64
-            + record_count * std::mem::size_of::<MirroredRecordPlan>();
-        assert!(
-            coexisting_small <= 4096,
-            "small coexisting allocations {coexisting_small} exceed the spec's 4096 temporary allowance"
-        );
-        let explicit_peak = prefix_capacity + wire.capacity() + retained_share_capacity + 4096;
-        assert_eq!(
-            explicit_peak, 136_417,
-            "Bprobe=(W+1)+W+G+4096 in real public order: prefix {prefix_capacity}, seal output {}, G {retained_share_capacity}, small coexisting {coexisting_small}<=4096",
-            wire.capacity()
-        );
     }
 
     /// The production mirror path enforces the same issuer binding as the
