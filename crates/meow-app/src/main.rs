@@ -4054,8 +4054,13 @@ ebe3y+ZRTVQVKhyaC1jbQ5c=
                 "\"0123456789abcdef\"",
                 &format!("\"0123456789abcdef\", {ids}"),
             );
-            let config = config_from_yaml(&overflow).await;
-            assert!(ensure_vless_security_valid(&config).is_err());
+            // Config parsing itself rejects the overflow, so the runtime
+            // validation layer can never observe it through the load path.
+            let raw = meow_config::parse_raw_yaml(&overflow).unwrap();
+            let Err(err) = meow_config::build_config(raw, None).await else {
+                panic!("65 short ids must be rejected at config build time");
+            };
+            assert!(err.to_string().contains("at most 64 entries"), "{err}");
         }
     }
 }
