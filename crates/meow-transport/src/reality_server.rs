@@ -2307,7 +2307,7 @@ mod tests {
         let prepared = server
             .prepare_mirrored_upload(context, template)
             .expect("no-injection prepare");
-        let (wire, completion) = prepared.into_wire_and_completion();
+        let (wire, completion) = prepared.commit().into_wire_and_completion();
 
         // The patched flight must carry a real hybrid server share: parse the
         // patched SH out of the emitted wire and check the share length.
@@ -4966,7 +4966,7 @@ mod independent_wire_vectors {
             Some(&crypto),
         )
         .unwrap_or_else(|error| panic!("{}: prepare failed: {error}", vector.name));
-        let (wire, completion) = prepared.into_wire_and_completion();
+        let (wire, completion) = prepared.commit().into_wire_and_completion();
         if expect_frozen_wire {
             assert_eq!(
                 wire,

@@ -375,6 +375,18 @@ impl MirrorTemplate {
     pub(crate) fn server_hello(&self) -> &[u8] {
         &self.target_prefix[self.server_hello_range.clone()]
     }
+
+    /// Borrow the original target prefix while a pre-commit cover decision is
+    /// still available.
+    pub fn target_prefix(&self) -> &[u8] {
+        &self.target_prefix
+    }
+
+    /// Move the original target prefix back out for cover.  This abandons the
+    /// template; no local flight can later be prepared from it.
+    pub fn into_target_prefix(self) -> Vec<u8> {
+        self.target_prefix
+    }
 }
 
 struct ParsedServerHello {
@@ -1294,6 +1306,15 @@ fn build_mirror_flight(
 pub struct PreparedFlight {
     wire: Vec<u8>,
     completion: MirroredHandshakeCompletion,
+    target_prefix: Vec<u8>,
+}
+
+/// Irreversibly committed mirror flight.  Constructing this type drops the
+/// target-prefix fallback allocation; even a zero-length or failed first
+/// client write cannot regain cover ownership.
+pub struct CommittedMirrorFlight {
+    wire: Vec<u8>,
+    completion: MirroredHandshakeCompletion,
 }
 
 impl fmt::Debug for PreparedFlight {
@@ -1305,6 +1326,29 @@ impl fmt::Debug for PreparedFlight {
 }
 
 impl PreparedFlight {
+    fn with_target_prefix(mut self, template: MirrorTemplate) -> Self {
+        self.target_prefix = template.target_prefix;
+        self
+    }
+
+    /// Abandon the prepared flight and recover the exact target prefix for
+    /// cover.  Handshake secrets inside the completion are dropped with self.
+    pub fn into_cover_prefix(self) -> Vec<u8> {
+        self.target_prefix
+    }
+
+    /// Explicit pre-commit barrier: drop the fallback prefix and return the
+    /// sealed flight plus post-emit handshake state.
+    pub fn commit(self) -> CommittedMirrorFlight {
+        drop(self.target_prefix);
+        CommittedMirrorFlight {
+            wire: self.wire,
+            completion: self.completion,
+        }
+    }
+}
+
+impl CommittedMirrorFlight {
     pub fn into_wire_and_completion(self) -> (Vec<u8>, MirroredHandshakeCompletion) {
         (self.wire, self.completion)
     }
@@ -1542,6 +1586,7 @@ pub(crate) fn prepare_mirrored_flight(
     fixed_crypto: Option<&MirrorCryptoInput>,
 ) -> TransportResult<PreparedFlight> {
     prepare_mirrored_flight_impl(certificate, verified, &template, fixed_crypto)
+        .map(|prepared| prepared.with_target_prefix(template))
 }
 
 #[cfg(test)]
@@ -1553,6 +1598,7 @@ pub(crate) fn prepare_mirrored_flight_context_fixed(
     fixed_crypto: Option<&MirrorCryptoInput>,
 ) -> TransportResult<PreparedFlight> {
     prepare_mirrored_flight_impl(certificate, &verified, &template, fixed_crypto)
+        .map(|prepared| prepared.with_target_prefix(template))
 }
 
 #[cfg(not(test))]
@@ -1563,7 +1609,7 @@ pub(crate) fn prepare_mirrored_flight_context(
     template: MirrorTemplate,
 ) -> std::result::Result<PreparedFlight, Box<MirrorPrepareError>> {
     match prepare_mirrored_flight_impl(certificate, &verified, &template) {
-        Ok(prepared) => Ok(prepared),
+        Ok(prepared) => Ok(prepared.with_target_prefix(template)),
         Err(error) => Err(Box::new(MirrorPrepareError { error, template })),
     }
 }
@@ -1576,7 +1622,7 @@ pub(crate) fn prepare_mirrored_flight_context(
     template: MirrorTemplate,
 ) -> std::result::Result<PreparedFlight, Box<MirrorPrepareError>> {
     match prepare_mirrored_flight_impl(certificate, &verified, &template, None) {
-        Ok(prepared) => Ok(prepared),
+        Ok(prepared) => Ok(prepared.with_target_prefix(template)),
         Err(error) => Err(Box::new(MirrorPrepareError { error, template })),
     }
 }
@@ -1676,7 +1722,11 @@ fn prepare_mirrored_flight_impl(
     };
     // tls_dh and every unneeded handshake secret are dropped (and erased)
     // here, before the caller ever sees the prepared flight.
-    Ok(PreparedFlight { wire, completion })
+    Ok(PreparedFlight {
+        wire,
+        completion,
+        target_prefix: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -2780,6 +2830,30 @@ mod tests {
     }
 
     #[test]
+    fn successful_prepare_keeps_cover_prefix_available_until_explicit_commit() {
+        let hello = x25519_verified();
+        let certificate = RealityCertificate::generate().expect("test certificate");
+        let sh = valid_x25519_sh(&hello, false);
+        let prefix = target_prefix(&sh.message, false, &[25, 3217, 281, 69]);
+        let upload = hello.into_mirror_upload();
+        let mut scanner = TargetFlightScanner::new(
+            upload.context(),
+            certificate.for_auth_key(&upload.context().auth_key).len(),
+        );
+        push_scanner(&mut scanner, &prefix);
+        let template = scanner.freeze().expect("freezable shape");
+        let (context, upload_wire) = upload.finish_upload();
+        drop(upload_wire);
+        let prepared = prepare_mirrored_flight_context(&certificate, context, template)
+            .expect("prepare succeeds");
+        assert_eq!(
+            prepared.into_cover_prefix(),
+            prefix,
+            "even after a successful prepare, cover still owns the exact target prefix until commit"
+        );
+    }
+
+    #[test]
     fn scanner_types_sid_mismatch_when_server_hello_completes_and_prefix_is_movable() {
         let hello = x25519_verified();
         let mut sh = valid_x25519_sh(&hello, false).message;
@@ -2870,7 +2944,7 @@ mod tests {
         drop(upload_wire);
         let prepared = prepare_mirrored_flight_context(&certificate, context, template)
             .expect("W-shaped template prepares");
-        let (wire, _completion) = prepared.into_wire_and_completion();
+        let (wire, _completion) = prepared.commit().into_wire_and_completion();
         assert_eq!(wire.len(), TARGET_SCAN_WIRE_LIMIT);
         let explicit_peak = prefix_capacity + wire.capacity() + retained_share_capacity + 4096;
         assert_eq!(
