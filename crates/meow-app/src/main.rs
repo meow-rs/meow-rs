@@ -886,10 +886,7 @@ fn vless_security_spec(security: &meow_config::VlessSecurity) -> meow_listener::
                     bytes_per_sec: reality.limit_fallback_download.bytes_per_sec,
                     burst_bytes_per_sec: reality.limit_fallback_download.burst_bytes_per_sec,
                 },
-                // Wave 2 implements the listener machine but deliberately
-                // does not expose the unfinished configuration path.  Wave 3
-                // replaces this explicit rollback pin with parsed `mimic`.
-                mimic: meow_listener::VlessRealityMimicSpec::off(),
+                mimic: reality.mimic,
             })
         }
     }

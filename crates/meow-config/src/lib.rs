@@ -508,6 +508,10 @@ pub struct VlessRealityConfig {
     /// fields disable the corresponding limiter.
     pub limit_fallback_upload: RealityLimitFallback,
     pub limit_fallback_download: RealityLimitFallback,
+    /// REALITY v2 mirror orchestration, normalized at build time. The
+    /// default is dial-first; `off` is the explicit v1 rollback.
+    #[serde(default)]
+    pub mimic: meow_common::VlessRealityMimicSpec,
 }
 
 impl std::fmt::Debug for VlessRealityConfig {
@@ -525,6 +529,7 @@ impl std::fmt::Debug for VlessRealityConfig {
             .field("max_time_difference_us", &self.max_time_difference_us)
             .field("limit_fallback_upload", &self.limit_fallback_upload)
             .field("limit_fallback_download", &self.limit_fallback_download)
+            .field("mimic", &self.mimic)
             .finish()
     }
 }
@@ -7162,6 +7167,10 @@ pub fn validate_vless_security_identity(security: &VlessSecurity) -> Result<(), 
             for (i, name) in reality.server_names.iter().enumerate() {
                 validate_server_name(name, &format!("reality-config.server-names[{i}]"))?;
             }
+            reality
+                .mimic
+                .validate()
+                .map_err(|e| anyhow::anyhow!("reality-config.mimic: {e}"))?;
         }
     }
     Ok(())
@@ -7209,6 +7218,112 @@ fn parse_limit_fallback(
     Ok(out)
 }
 
+/// Parse `reality-config.mimic` into the normalized shared runtime spec.
+/// Absent and `{}` both mean the complete default; every explicit key is
+/// validated even when `mode: off` selects the v1 path.
+fn parse_vless_reality_mimic(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    ctx: &str,
+) -> Result<meow_common::VlessRealityMimicSpec, anyhow::Error> {
+    use meow_common::{
+        VlessRealityMimicMode, VlessRealityMimicSpec, MIMIC_MAX_CONCURRENT_PROBES_RANGE,
+        MIMIC_PROBE_TIMEOUT_MS_RANGE, MIMIC_QUIESCENCE_MAX_MS_RANGE, MIMIC_QUIESCENCE_MIN_MS_RANGE,
+    };
+
+    let mut out = VlessRealityMimicSpec::default();
+    let Some(value) = obj.get("mimic") else {
+        return Ok(out);
+    };
+    let mctx = format!("{ctx}.mimic");
+    if value.is_null() {
+        anyhow::bail!("{mctx}: explicit null is not accepted — omit it or use a mapping");
+    }
+    let Some(mimic) = value.as_object() else {
+        anyhow::bail!("{mctx}: must be a mapping");
+    };
+    for key in mimic.keys() {
+        if !matches!(
+            key.as_str(),
+            "mode"
+                | "probe-timeout-ms"
+                | "quiescence-min-ms"
+                | "quiescence-max-ms"
+                | "max-concurrent-probes"
+        ) {
+            anyhow::bail!("{mctx}.{key}: unknown key");
+        }
+    }
+
+    if let Some(value) = mimic.get("mode") {
+        let serde_json::Value::String(mode) = value else {
+            anyhow::bail!("{mctx}.mode: must be exactly `dial-first` or `off`");
+        };
+        out.mode = match mode.as_str() {
+            "dial-first" => VlessRealityMimicMode::DialFirst,
+            "off" => VlessRealityMimicMode::Off,
+            _ => anyhow::bail!("{mctx}.mode: must be exactly `dial-first` or `off`"),
+        };
+    }
+
+    fn integer_field(
+        mimic: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        range: std::ops::RangeInclusive<u64>,
+        ctx: &str,
+    ) -> Result<Option<u64>, anyhow::Error> {
+        let Some(value) = mimic.get(key) else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            anyhow::bail!("{ctx}.{key}: explicit null is not accepted — omit the key");
+        }
+        let Some(v) = value.as_u64() else {
+            anyhow::bail!("{ctx}.{key}: must be an integer in {range:?}");
+        };
+        if !range.contains(&v) {
+            anyhow::bail!("{ctx}.{key}: outside {range:?}");
+        }
+        Ok(Some(v))
+    }
+
+    if let Some(v) = integer_field(
+        mimic,
+        "probe-timeout-ms",
+        MIMIC_PROBE_TIMEOUT_MS_RANGE,
+        &mctx,
+    )? {
+        out.probe_timeout_ms = v;
+    }
+    if let Some(v) = integer_field(
+        mimic,
+        "quiescence-min-ms",
+        MIMIC_QUIESCENCE_MIN_MS_RANGE,
+        &mctx,
+    )? {
+        out.quiescence_min_ms = v;
+    }
+    if let Some(v) = integer_field(
+        mimic,
+        "quiescence-max-ms",
+        MIMIC_QUIESCENCE_MAX_MS_RANGE,
+        &mctx,
+    )? {
+        out.quiescence_max_ms = v;
+    }
+    if let Some(v) = integer_field(
+        mimic,
+        "max-concurrent-probes",
+        (*MIMIC_MAX_CONCURRENT_PROBES_RANGE.start() as u64)
+            ..=(*MIMIC_MAX_CONCURRENT_PROBES_RANGE.end() as u64),
+        &mctx,
+    )? {
+        out.max_concurrent_probes = usize::try_from(v).expect("bounded by [1,256]");
+    }
+
+    out.validate().map_err(|e| anyhow::anyhow!("{mctx}: {e}"))?;
+    Ok(out)
+}
+
 /// Build the `reality-config` block of a `type: vless` listener. Every
 /// key rule follows the mihomo `RealityConfig` shape as the spec
 /// adjudicates it: `dest`/`private-key`/`short-id`/`server-names`
@@ -7242,6 +7357,7 @@ fn build_vless_reality_config(
             | "short-id"
             | "server-names"
             | "max-time-difference"
+            | "mimic"
             | "limit-fallback-upload"
             | "limit-fallback-download" => {}
             "target" => anyhow::bail!(
@@ -7264,11 +7380,11 @@ fn build_vless_reality_config(
             | "server-name" | "short_ids" | "short-ids" => anyhow::bail!(
                 "{ctx}.{key}: not a meow REALITY server key — supported keys are \
                  `dest`, `private-key`, `short-id`, `server-names`, \
-                 `max-time-difference`, `limit-fallback-upload`, `limit-fallback-download`"
+                 `max-time-difference`, `mimic`, `limit-fallback-upload`, `limit-fallback-download`"
             ),
             other => anyhow::bail!(
                 "{ctx}.{other}: unknown key — supported keys are `dest`, `private-key`, \
-                 `short-id`, `server-names`, `max-time-difference`, \
+                 `short-id`, `server-names`, `max-time-difference`, `mimic`, \
                  `limit-fallback-upload`, `limit-fallback-download`"
             ),
         }
@@ -7392,6 +7508,7 @@ fn build_vless_reality_config(
         obj.get("limit-fallback-download"),
         &format!("{ctx}.limit-fallback-download"),
     )?;
+    let mimic = parse_vless_reality_mimic(obj, &ctx)?;
 
     Ok(VlessRealityConfig {
         dest: dest.to_string(),
@@ -7403,6 +7520,7 @@ fn build_vless_reality_config(
         max_time_difference_us,
         limit_fallback_upload,
         limit_fallback_download,
+        mimic,
     })
 }
 

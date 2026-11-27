@@ -99,10 +99,8 @@ pub struct VlessRealitySpec {
     pub max_time_difference_us: u64,
     pub limit_fallback_upload: VlessFallbackLimit,
     pub limit_fallback_download: VlessFallbackLimit,
-    /// REALITY v2 mirror orchestration.  Configuration parsing is a later
-    /// wave; production application wiring currently selects `off`
-    /// explicitly while listener tests can opt into the implemented
-    /// dial-first machine directly.
+    /// REALITY v2 mirror orchestration, normalized and validated by the
+    /// shared config/runtime contract in `meow-common`.
     pub mimic: VlessRealityMimicSpec,
 }
 
@@ -113,74 +111,7 @@ pub struct VlessFallbackLimit {
     pub burst_bytes_per_sec: u64,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum VlessRealityMimicMode {
-    #[default]
-    DialFirst,
-    Off,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct VlessRealityMimicSpec {
-    pub mode: VlessRealityMimicMode,
-    pub probe_timeout_ms: u64,
-    pub quiescence_min_ms: u64,
-    pub quiescence_max_ms: u64,
-    pub max_concurrent_probes: usize,
-}
-
-impl Default for VlessRealityMimicSpec {
-    fn default() -> Self {
-        Self {
-            mode: VlessRealityMimicMode::DialFirst,
-            probe_timeout_ms: 3000,
-            quiescence_min_ms: 15,
-            quiescence_max_ms: 40,
-            max_concurrent_probes: 64,
-        }
-    }
-}
-
-impl VlessRealityMimicSpec {
-    pub fn off() -> Self {
-        Self {
-            mode: VlessRealityMimicMode::Off,
-            ..Self::default()
-        }
-    }
-
-    pub(crate) fn probe_timeout(&self) -> Duration {
-        Duration::from_millis(self.probe_timeout_ms)
-    }
-
-    fn validate(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let invalid = |message: &str| {
-            Box::new(meow_common::MeowError::Config(format!(
-                "vless REALITY mimic: {message}"
-            ))) as Box<dyn std::error::Error + Send + Sync>
-        };
-        if !(500..=15_000).contains(&self.probe_timeout_ms) {
-            return Err(invalid("probe-timeout-ms outside [500,15000]"));
-        }
-        if !(5..=200).contains(&self.quiescence_min_ms) {
-            return Err(invalid("quiescence-min-ms outside [5,200]"));
-        }
-        if !(10..=500).contains(&self.quiescence_max_ms) {
-            return Err(invalid("quiescence-max-ms outside [10,500]"));
-        }
-        if self.quiescence_min_ms > self.quiescence_max_ms
-            || self.quiescence_max_ms >= self.probe_timeout_ms
-        {
-            return Err(invalid(
-                "requires quiescence-min <= quiescence-max < probe-timeout",
-            ));
-        }
-        if !(1..=256).contains(&self.max_concurrent_probes) {
-            return Err(invalid("max-concurrent-probes outside [1,256]"));
-        }
-        Ok(())
-    }
-}
+pub use meow_common::{VlessRealityMimicMode, VlessRealityMimicSpec};
 
 pub(crate) enum SecurityRuntime {
     StandardTls(TlsServer),
@@ -275,7 +206,9 @@ fn build_security_runtime(
             Ok(SecurityRuntime::StandardTls(server))
         }
         VlessSecuritySpec::Reality(spec) => {
-            spec.mimic.validate()?;
+            spec.mimic
+                .validate()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
             let dest_host = spec.dest_host.clone();
             let dest_port = spec.dest_port;
             let server = RealityServer::new(&RealityServerConfig {
