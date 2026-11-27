@@ -1218,7 +1218,15 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reality_classification_admission_refuses_overflow_sockets() {
-        let listener = test_reality_listener();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = target.accept().await {
+                held.push(stream);
+            }
+        });
+        let listener = test_reality_listener_with(target_port, VlessRealityMimicSpec::default());
         // Saturate the classification slots externally: the permits are
         // the same semaphores the accept loop draws from, so every new
         // socket arriving now is by definition overflow.
@@ -1275,6 +1283,41 @@ mod tests {
         drop(admitted);
         task.abort();
         let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_mode_admission_saturation_does_not_count_v2_metrics() {
+        let listener = test_reality_listener();
+        let SecurityRuntime::Reality(reality) = &listener.security else {
+            panic!("test listener must be REALITY");
+        };
+        let held: Vec<_> = (0..REALITY_HANDSHAKE_SLOTS)
+            .map(|_| {
+                Arc::clone(&reality.handshake_slots)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+        let _overflowed = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .close_total
+                .get(&("admission", "handshake_saturated")),
+            None,
+            "off mode admission rejection is v1 behavior, not v2 accounting"
+        );
+        drop(held);
+        task.abort();
     }
 
     #[tokio::test(start_paused = true)]
