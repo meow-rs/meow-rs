@@ -1347,10 +1347,42 @@ fn der_read<'a>(input: &'a [u8], pos: &mut usize) -> Option<DerNode<'a>> {
 }
 
 /// Transcript hash / HKDF hash of a TLS 1.3 cipher suite.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum HashAlg {
     Sha256,
     Sha384,
+}
+
+/// Incremental TLS transcript hash.  The mirrored server path hashes a
+/// ClientHello once, then carries only the small hash state through the local
+/// flight instead of retaining a second copy of the whole transcript.
+#[derive(Clone)]
+pub(crate) enum TranscriptHasher {
+    Sha256(Sha256),
+    Sha384(Sha384),
+}
+
+impl TranscriptHasher {
+    pub(crate) fn new(hash: HashAlg) -> Self {
+        match hash {
+            HashAlg::Sha256 => Self::Sha256(Sha256::new()),
+            HashAlg::Sha384 => Self::Sha384(Sha384::new()),
+        }
+    }
+
+    pub(crate) fn update(&mut self, bytes: &[u8]) {
+        match self {
+            Self::Sha256(state) => state.update(bytes),
+            Self::Sha384(state) => state.update(bytes),
+        }
+    }
+
+    pub(crate) fn finalize_clone(&self) -> Vec<u8> {
+        match self {
+            Self::Sha256(state) => state.clone().finalize().to_vec(),
+            Self::Sha384(state) => state.clone().finalize().to_vec(),
+        }
+    }
 }
 
 impl HashAlg {
@@ -1393,7 +1425,7 @@ impl HashAlg {
 /// The three TLS 1.3 suites every browser profile offers; the server
 /// picks, so all of them have to complete (a Go peer without AES
 /// hardware prefers ChaCha20-Poly1305).
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CipherSuite {
     Aes128GcmSha256,
     Aes256GcmSha384,
@@ -1437,17 +1469,26 @@ pub(crate) struct HandshakeKeys {
 
 impl HandshakeKeys {
     pub(crate) fn derive(cipher: CipherSuite, shared_secret: &[u8], transcript: &[u8]) -> Self {
+        let transcript_hash = cipher.hash().digest(transcript);
+        Self::derive_with_transcript_hash(cipher, shared_secret, &transcript_hash)
+    }
+
+    pub(crate) fn derive_with_transcript_hash(
+        cipher: CipherSuite,
+        shared_secret: &[u8],
+        transcript_hash: &[u8],
+    ) -> Self {
         let hash = cipher.hash();
+        debug_assert_eq!(transcript_hash.len(), hash.len());
         let zero = vec![0u8; hash.len()];
         let empty_hash = hash.digest(&[]);
         let early_secret = hkdf_extract(hash, &zero, &zero);
         let derived = derive_secret(hash, &early_secret, b"derived", &empty_hash);
         let handshake_secret = hkdf_extract(hash, &derived, shared_secret);
-        let transcript_hash = hash.digest(transcript);
         let client_secret =
-            derive_secret(hash, &handshake_secret, b"c hs traffic", &transcript_hash);
+            derive_secret(hash, &handshake_secret, b"c hs traffic", transcript_hash);
         let server_secret =
-            derive_secret(hash, &handshake_secret, b"s hs traffic", &transcript_hash);
+            derive_secret(hash, &handshake_secret, b"s hs traffic", transcript_hash);
         let derived = derive_secret(hash, &handshake_secret, b"derived", &empty_hash);
         let master_secret = hkdf_extract(hash, &derived, &zero);
         Self {
@@ -1467,10 +1508,19 @@ pub(crate) struct ApplicationKeys {
 
 impl ApplicationKeys {
     pub(crate) fn derive(cipher: CipherSuite, master_secret: &[u8], transcript: &[u8]) -> Self {
+        let transcript_hash = cipher.hash().digest(transcript);
+        Self::derive_with_transcript_hash(cipher, master_secret, &transcript_hash)
+    }
+
+    pub(crate) fn derive_with_transcript_hash(
+        cipher: CipherSuite,
+        master_secret: &[u8],
+        transcript_hash: &[u8],
+    ) -> Self {
         let hash = cipher.hash();
-        let transcript_hash = hash.digest(transcript);
-        let client_secret = derive_secret(hash, master_secret, b"c ap traffic", &transcript_hash);
-        let server_secret = derive_secret(hash, master_secret, b"s ap traffic", &transcript_hash);
+        debug_assert_eq!(transcript_hash.len(), hash.len());
+        let client_secret = derive_secret(hash, master_secret, b"c ap traffic", transcript_hash);
+        let server_secret = derive_secret(hash, master_secret, b"s ap traffic", transcript_hash);
         Self {
             client: RecordKey::new(cipher, &client_secret),
             server: RecordKey::new(cipher, &server_secret),
@@ -1519,16 +1569,61 @@ impl RecordKey {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_key_iv(cipher_suite: CipherSuite, key: &[u8], iv: &[u8; 12]) -> Self {
+        let algorithm = match cipher_suite {
+            CipherSuite::Aes128GcmSha256 => Algorithm::aes_128_gcm(),
+            CipherSuite::Aes256GcmSha384 => Algorithm::aes_256_gcm(),
+            CipherSuite::ChaCha20Poly1305Sha256 => Algorithm::chacha20_poly1305(),
+        };
+        Self {
+            aead: AeadCtx::new_default_tag(&algorithm, key)
+                .expect("TLS 1.3 key length matches the suite"),
+            iv: *iv,
+            seq: 0,
+        }
+    }
+
     /// Seal `plaintext` as one TLS 1.3 record: header, ciphertext, tag.
     pub(crate) fn seal(&mut self, inner_type: u8, plaintext: &[u8]) -> Result<Vec<u8>> {
-        let mut out = Vec::with_capacity(RECORD_OVERHEAD + plaintext.len());
-        self.seal_into(&mut out, inner_type, plaintext)?;
+        self.seal_with_padding(inner_type, plaintext, 0)
+    }
+
+    /// Seal `plaintext` with zero padding after the inner content type, as
+    /// required for shaped handshake records.
+    pub(crate) fn seal_with_padding(
+        &mut self,
+        inner_type: u8,
+        plaintext: &[u8],
+        pad_len: usize,
+    ) -> Result<Vec<u8>> {
+        let capacity = plaintext
+            .len()
+            .checked_add(pad_len)
+            .and_then(|len| len.checked_add(RECORD_OVERHEAD))
+            .ok_or_else(|| TransportError::Tls("TLS record length overflow".into()))?;
+        let mut out = Vec::with_capacity(capacity);
+        self.seal_with_padding_into(&mut out, inner_type, plaintext, pad_len)?;
         Ok(out)
     }
 
-    /// Append `plaintext`, sealed as one TLS 1.3 record, to `out`.
     fn seal_into(&mut self, out: &mut Vec<u8>, inner_type: u8, plaintext: &[u8]) -> Result<()> {
-        let body_len = plaintext.len() + 1;
+        self.seal_with_padding_into(out, inner_type, plaintext, 0)
+    }
+
+    /// Append `plaintext`, sealed as one padded TLS 1.3 record, to `out`.
+    pub(crate) fn seal_with_padding_into(
+        &mut self,
+        out: &mut Vec<u8>,
+        inner_type: u8,
+        plaintext: &[u8],
+        pad_len: usize,
+    ) -> Result<()> {
+        let content_plus_padding = plaintext
+            .len()
+            .checked_add(pad_len)
+            .ok_or_else(|| TransportError::Tls("TLS record length overflow".into()))?;
+        let body_len = content_plus_padding + 1;
         let record_len = body_len + RECORD_TAG_LEN;
         let Ok(record_len16) = u16::try_from(record_len) else {
             return Err(TransportError::Tls(format!(
@@ -1626,8 +1721,16 @@ pub(crate) fn verify_finished(
 }
 
 pub(crate) fn finished_verify_data(hash: HashAlg, secret: &[u8], transcript: &[u8]) -> Vec<u8> {
+    finished_verify_data_with_hash(hash, secret, &hash.digest(transcript))
+}
+
+pub(crate) fn finished_verify_data_with_hash(
+    hash: HashAlg,
+    secret: &[u8],
+    transcript_hash: &[u8],
+) -> Vec<u8> {
     let finished_key = hkdf_expand_label(hash, secret, b"finished", &[], hash.len());
-    hash.hmac(&finished_key, &[&hash.digest(transcript)])
+    hash.hmac(&finished_key, &[transcript_hash])
 }
 
 fn derive_secret(hash: HashAlg, secret: &[u8], label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
@@ -1784,6 +1887,26 @@ mod tests {
     /// write/read pair on the two ends of a connection. Sealing then opening
     /// must round-trip, and the per-record nonce sequence must advance in
     /// lockstep so the second record also decrypts.
+    #[test]
+    fn record_key_padded_seal_places_inner_type_before_zero_padding() {
+        let secret = [7u8; 32];
+        let mut sender = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        let mut receiver = RecordKey::new(CipherSuite::Aes128GcmSha256, &secret);
+        let sealed = sender
+            .seal_with_padding(TLS_RECORD_HANDSHAKE, b"abc", 5)
+            .expect("padded seal");
+        let len = u16::from_be_bytes([sealed[3], sealed[4]]) as usize;
+        assert_eq!(len, 3 + 1 + 5 + 16);
+        assert_eq!(sealed.len(), 5 + len);
+        let mut payload = sealed[5..].to_vec();
+        let header: [u8; 5] = sealed[..5].try_into().unwrap();
+        let (inner_type, plaintext_len) = receiver
+            .open_in_place(&header, &mut payload)
+            .expect("padded open");
+        assert_eq!(inner_type, TLS_RECORD_HANDSHAKE);
+        assert_eq!(&payload[..plaintext_len], b"abc");
+    }
+
     #[test]
     fn record_key_seal_open_round_trips_and_sequences() {
         let secret = [0x2bu8; 32];

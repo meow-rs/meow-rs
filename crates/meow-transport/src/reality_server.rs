@@ -30,8 +30,16 @@ use crate::reality_tls::{
 };
 use crate::{Result, Stream, TransportError};
 
+pub use crate::reality_mirror::{
+    MirrorClientProfileError, MirrorTemplate, MirrorTemplateError, MirroredHandshakeCompletion,
+    PreparedFlight,
+};
+
 const EXT_SERVER_NAME: u16 = 0;
 const EXT_SUPPORTED_GROUPS: u16 = 10;
+const EXT_RECORD_SIZE_LIMIT: u16 = 28;
+const EXT_PRE_SHARED_KEY: u16 = 41;
+const EXT_EARLY_DATA: u16 = 42;
 const EXT_SUPPORTED_VERSIONS: u16 = 43;
 const TLS13_VERSION: u16 = 0x0304;
 const HYBRID_SHARE_LEN: usize = 1184 + 32;
@@ -102,6 +110,66 @@ pub enum RealityServerAccept {
     /// Ordinary TLS or unauthenticated REALITY-looking traffic.  Relay the
     /// preserved bytes first, then both directions transparently.
     Cover(CoverRelay),
+}
+
+/// ClientHello pre-read and static REALITY authentication, split from the
+/// server-flight completion so the listener can drive the next phase itself.
+pub enum RealityClientHello {
+    /// Statically authenticated REALITY ClientHello.  No response byte has
+    /// been written and the client stream is unchanged after the exact
+    /// pre-read prefix.
+    Verified {
+        stream: Box<dyn Stream>,
+        hello: Box<VerifiedHello>,
+    },
+    /// Ordinary TLS or authentication failure; the relay owns the exact
+    /// consumed wire prefix and the client stream.
+    Cover(CoverRelay),
+}
+
+impl fmt::Debug for RealityClientHello {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Verified { .. } => f.write_str("RealityClientHello::Verified(..)"),
+            Self::Cover(_) => f.write_str("RealityClientHello::Cover(..)"),
+        }
+    }
+}
+
+/// Opaque result of a successful static REALITY authentication.
+///
+/// The type intentionally exposes wire bytes needed for upload/cover but no
+/// AuthKey, private key, certificate identity, or constructor: production
+/// callers can obtain it only by validating a real ClientHello against a
+/// [`RealityServer`].
+pub struct VerifiedHello {
+    pub(crate) hello: ClientHello,
+    pub(crate) ch_wire: Vec<u8>,
+    pub(crate) auth_key: [u8; 32],
+    pub(crate) local_cipher: CipherSuite,
+    pub(crate) local_key_share: ChosenKeyShare,
+}
+
+impl fmt::Debug for VerifiedHello {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VerifiedHello").finish_non_exhaustive()
+    }
+}
+
+impl VerifiedHello {
+    /// Exact pre-read TCP prefix, including TLS record headers.  This is the
+    /// only byte string a dial-first probe may upload or a cover relay may
+    /// forward; it is never reconstructed from the parse tree.
+    pub fn ch_wire(&self) -> &[u8] {
+        &self.ch_wire
+    }
+
+    /// Convert an authenticated-but-not-locally-served ClientHello into the
+    /// transparent cover branch without losing or duplicating the pre-read
+    /// prefix.
+    pub fn into_cover(self, stream: Box<dyn Stream>) -> CoverRelay {
+        CoverRelay::new(stream, self.ch_wire)
+    }
 }
 
 impl fmt::Debug for RealityServerAccept {
@@ -193,27 +261,91 @@ impl RealityServer {
     }
 
     async fn accept_inner(&self, inner: Box<dyn Stream>) -> Result<RealityServerAccept> {
-        let (inner, preflight) = read_client_hello_preflight(inner).await?;
-        let (hello, wire_prefix) = match preflight {
-            Preflight::Cover(wire) => {
-                return Ok(RealityServerAccept::Cover(CoverRelay::new(inner, wire)))
-            }
-            Preflight::Candidate { hello, wire_prefix } => (hello, wire_prefix),
-        };
-
-        let Some(prepared) = self.classify(&hello) else {
-            return Ok(RealityServerAccept::Cover(CoverRelay::new(
-                inner,
-                wire_prefix,
-            )));
+        let classified = self.verify_client_hello(inner).await?;
+        let (stream, hello) = match classified {
+            RealityClientHello::Verified { stream, hello } => (stream, hello),
+            RealityClientHello::Cover(relay) => return Ok(RealityServerAccept::Cover(relay)),
         };
         let stream = self
-            .complete_handshake(inner, prepared)
+            .complete_handshake(stream, *hello)
             .await
             .inspect_err(|e| {
                 tracing::debug!(error = %redact_error(e), "authenticated REALITY handshake failed");
             })?;
         Ok(RealityServerAccept::Authenticated(stream))
+    }
+
+    /// Read the bounded ClientHello prefix and statically authenticate it.
+    ///
+    /// This phase writes nothing.  The returned stream still owns every byte
+    /// after the exact pre-read prefix, and `Cover` preserves that prefix for
+    /// transparent relaying.  Completion is deliberately separate: callers
+    /// either drive the v1 local flight with [`Self::complete_handshake`] or,
+    /// in a later dial-first pipeline, prepare a mirrored flight.
+    pub async fn verify_client_hello(&self, inner: Box<dyn Stream>) -> Result<RealityClientHello> {
+        let (inner, preflight) = read_client_hello_preflight(inner).await?;
+        let (hello, wire_prefix) = match preflight {
+            Preflight::Cover(wire) => {
+                return Ok(RealityClientHello::Cover(CoverRelay::new(inner, wire)))
+            }
+            Preflight::Candidate { hello, wire_prefix } => (hello, wire_prefix),
+        };
+
+        let verified = match self.verify_hello(hello, wire_prefix) {
+            Ok(verified) => verified,
+            Err(wire_prefix) => {
+                return Ok(RealityClientHello::Cover(CoverRelay::new(
+                    inner,
+                    wire_prefix,
+                )))
+            }
+        };
+        Ok(RealityClientHello::Verified {
+            stream: inner,
+            hello: Box::new(verified),
+        })
+    }
+
+    /// Complete the v1 local REALITY server flight for an already verified
+    /// ClientHello.  Authentication cannot be bypassed through this API
+    /// because [`VerifiedHello`] has no public constructor.
+    pub async fn complete_handshake(
+        &self,
+        inner: Box<dyn Stream>,
+        hello: VerifiedHello,
+    ) -> Result<Box<dyn Stream>> {
+        let VerifiedHello {
+            hello,
+            auth_key,
+            local_cipher,
+            local_key_share,
+            ..
+        } = hello;
+        let prepared = PreparedHandshake {
+            raw_hello: hello.raw,
+            session_id: hello.session_id,
+            cipher: local_cipher,
+            key_share: local_key_share,
+            auth_key,
+        };
+        self.complete_prepared_handshake(inner, prepared).await
+    }
+
+    /// Prepare the v2 mirrored server flight for an authenticated ClientHello
+    /// and a target template already validated against it.  Nothing is written
+    /// by this method; the caller controls commit ordering and then drives the
+    /// returned completion state.
+    pub fn prepare_mirrored_flight(
+        &self,
+        hello: &VerifiedHello,
+        template: MirrorTemplate,
+    ) -> Result<PreparedFlight> {
+        crate::reality_mirror::prepare_mirrored_flight(
+            &self.inner.certificate,
+            hello,
+            template,
+            None,
+        )
     }
 
     fn open_auth_plaintext(&self, hello: &ClientHello) -> Option<([u8; 32], Vec<u8>)> {
@@ -234,7 +366,10 @@ impl RealityServer {
         Some((auth_key, plaintext))
     }
 
-    fn classify(&self, hello: &ClientHello) -> Option<PreparedHandshake> {
+    fn validate_hello(
+        &self,
+        hello: &ClientHello,
+    ) -> Option<([u8; 32], CipherSuite, ChosenKeyShare)> {
         if !hello.reality_session_id_layout
             || !hello.offers_tls13
             || hello.duplicate_extension
@@ -271,6 +406,29 @@ impl RealityServer {
 
         let cipher = select_cipher(&hello.cipher_suites)?;
         let key_share = select_key_share(hello)?;
+        Some((auth_key, cipher, key_share))
+    }
+
+    fn verify_hello(
+        &self,
+        hello: ClientHello,
+        ch_wire: Vec<u8>,
+    ) -> std::result::Result<VerifiedHello, Vec<u8>> {
+        match self.validate_hello(&hello) {
+            Some((auth_key, local_cipher, local_key_share)) => Ok(VerifiedHello {
+                hello,
+                ch_wire,
+                auth_key,
+                local_cipher,
+                local_key_share,
+            }),
+            None => Err(ch_wire),
+        }
+    }
+
+    #[cfg(test)]
+    fn classify(&self, hello: &ClientHello) -> Option<PreparedHandshake> {
+        let (auth_key, cipher, key_share) = self.validate_hello(hello)?;
         Some(PreparedHandshake {
             raw_hello: hello.raw.clone(),
             session_id: hello.session_id.clone(),
@@ -280,7 +438,7 @@ impl RealityServer {
         })
     }
 
-    async fn complete_handshake(
+    async fn complete_prepared_handshake(
         &self,
         mut inner: Box<dyn Stream>,
         prepared: PreparedHandshake,
@@ -372,7 +530,7 @@ fn valid_server_name(name: &str) -> bool {
         && !name.chars().any(char::is_whitespace)
 }
 
-const SIG_ED25519: u16 = 0x0807;
+pub(crate) const SIG_ED25519: u16 = 0x0807;
 
 fn parse_auth_plaintext(plaintext: &[u8]) -> Option<([u8; 3], u8, u32, [u8; 8])> {
     if plaintext.len() != 16 {
@@ -386,7 +544,7 @@ fn parse_auth_plaintext(plaintext: &[u8]) -> Option<([u8; 3], u8, u32, [u8; 8])>
     ))
 }
 
-fn certificate_verify_input(transcript_hash: &[u8]) -> Vec<u8> {
+pub(crate) fn certificate_verify_input(transcript_hash: &[u8]) -> Vec<u8> {
     let mut signed = Vec::with_capacity(64 + 33 + 1 + transcript_hash.len());
     signed.extend_from_slice(&[0x20; 64]);
     signed.extend_from_slice(b"TLS 1.3, server CertificateVerify");
@@ -500,24 +658,28 @@ async fn read_client_hello_preflight(
     ))
 }
 
-struct ClientHello {
-    raw: Vec<u8>,
-    random: [u8; 32],
-    session_id: Vec<u8>,
-    server_name: Option<String>,
-    cipher_suites: Vec<u16>,
-    supported_groups: Vec<u16>,
-    key_shares: Vec<KeyShareEntry>,
-    offers_tls13: bool,
-    reality_session_id_layout: bool,
-    duplicate_extension: bool,
-    sni_malformed: bool,
-    key_share_malformed: bool,
+pub(crate) struct ClientHello {
+    pub(crate) raw: Vec<u8>,
+    pub(crate) random: [u8; 32],
+    pub(crate) session_id: Vec<u8>,
+    pub(crate) server_name: Option<String>,
+    pub(crate) cipher_suites: Vec<u16>,
+    pub(crate) supported_groups: Vec<u16>,
+    pub(crate) key_shares: Vec<KeyShareEntry>,
+    pub(crate) offers_tls13: bool,
+    pub(crate) reality_session_id_layout: bool,
+    pub(crate) duplicate_extension: bool,
+    pub(crate) sni_malformed: bool,
+    pub(crate) key_share_malformed: bool,
+    pub(crate) has_pre_shared_key: bool,
+    pub(crate) has_early_data: bool,
+    pub(crate) record_size_limit: Option<u16>,
+    pub(crate) record_size_limit_malformed: bool,
 }
 
-struct KeyShareEntry {
-    group: u16,
-    bytes: Vec<u8>,
+pub(crate) struct KeyShareEntry {
+    pub(crate) group: u16,
+    pub(crate) bytes: Vec<u8>,
 }
 
 impl ClientHello {
@@ -595,6 +757,10 @@ fn parse_client_hello(raw: Vec<u8>) -> Result<ClientHello> {
         duplicate_extension: false,
         sni_malformed: false,
         key_share_malformed: false,
+        has_pre_shared_key: false,
+        has_early_data: false,
+        record_size_limit: None,
+        record_size_limit_malformed: false,
     };
     let mut ep = 0;
     let mut seen = HashSet::new();
@@ -607,6 +773,15 @@ fn parse_client_hello(raw: Vec<u8>) -> Result<ClientHello> {
         }
         match ext_type {
             EXT_SERVER_NAME => parse_server_name(data, &mut out),
+            EXT_PRE_SHARED_KEY => out.has_pre_shared_key = true,
+            EXT_EARLY_DATA => out.has_early_data = true,
+            EXT_RECORD_SIZE_LIMIT => {
+                if data.len() == 2 {
+                    out.record_size_limit = Some(u16::from_be_bytes([data[0], data[1]]));
+                } else {
+                    out.record_size_limit_malformed = true;
+                }
+            }
             EXT_SUPPORTED_VERSIONS => {
                 if data.is_empty()
                     || data[0] as usize + 1 != data.len()
@@ -726,9 +901,14 @@ fn parse_key_share(data: &[u8], out: &mut ClientHello) {
         if !seen.insert(group) {
             out.key_share_malformed = true;
         }
+        let retained = match group {
+            GROUP_X25519 if bytes.len() == 32 => bytes.to_vec(),
+            GROUP_X25519_MLKEM768 if bytes.len() == HYBRID_SHARE_LEN => bytes.to_vec(),
+            _ => Vec::new(),
+        };
         out.key_shares.push(KeyShareEntry {
             group,
-            bytes: bytes.to_vec(),
+            bytes: retained,
         });
     }
     if lp != list.len() {
@@ -757,12 +937,12 @@ struct PreparedHandshake {
     auth_key: [u8; 32],
 }
 
-struct ChosenKeyShare {
-    group: u16,
-    client_share: Vec<u8>,
+pub(crate) struct ChosenKeyShare {
+    pub(crate) group: u16,
+    pub(crate) client_share: Vec<u8>,
 }
 
-fn x25519_public_key_usable(bytes: &[u8]) -> bool {
+pub(crate) fn x25519_public_key_usable(bytes: &[u8]) -> bool {
     let Ok(public) = <[u8; 32]>::try_from(bytes) else {
         return false;
     };
@@ -775,7 +955,7 @@ fn x25519_public_key_usable(bytes: &[u8]) -> bool {
     x25519(&probe_private, &public).is_ok()
 }
 
-fn hybrid_key_share_usable(bytes: &[u8]) -> bool {
+pub(crate) fn hybrid_key_share_usable(bytes: &[u8]) -> bool {
     if bytes.len() != HYBRID_SHARE_LEN {
         return false;
     }
@@ -813,7 +993,7 @@ fn select_key_share(hello: &ClientHello) -> Option<ChosenKeyShare> {
     None
 }
 
-fn encapsulate_server_share(chosen: &ChosenKeyShare) -> Result<(Vec<u8>, Vec<u8>)> {
+pub(crate) fn encapsulate_server_share(chosen: &ChosenKeyShare) -> Result<(Vec<u8>, Vec<u8>)> {
     let mut x_private = rand::random::<[u8; 32]>();
     crate::reality_tls::clamp_x25519_private(&mut x_private);
     let x_public = x25519_public_from_private(&x_private);
@@ -892,7 +1072,7 @@ fn build_server_hello(
     handshake_message(HS_SERVER_HELLO, &body)
 }
 
-fn handshake_message(kind: u8, body: &[u8]) -> Vec<u8> {
+pub(crate) fn handshake_message(kind: u8, body: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(4 + body.len());
     out.push(kind);
     put_u24(body.len(), &mut out);
@@ -900,7 +1080,7 @@ fn handshake_message(kind: u8, body: &[u8]) -> Vec<u8> {
     out
 }
 
-fn certificate_message(certificate_der: &[u8]) -> Vec<u8> {
+pub(crate) fn certificate_message(certificate_der: &[u8]) -> Vec<u8> {
     let mut entry = Vec::with_capacity(3 + certificate_der.len() + 2);
     put_u24(certificate_der.len(), &mut entry);
     entry.extend_from_slice(certificate_der);
@@ -993,13 +1173,13 @@ fn aes_gcm_open(
     Some(data)
 }
 
-struct RealityCertificate {
+pub(crate) struct RealityCertificate {
     key: PKey<Private>,
     template_der: Vec<u8>,
 }
 
 impl RealityCertificate {
-    fn generate() -> Result<Self> {
+    pub(crate) fn generate() -> Result<Self> {
         let key = PKey::generate(Id::ED25519)
             .map_err(|e| TransportError::Crypto(format!("REALITY Ed25519 identity: {e}")))?;
         Self::from_key(key)
@@ -1032,7 +1212,7 @@ impl RealityCertificate {
         Ok(Self { key, template_der })
     }
 
-    fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
+    pub(crate) fn sign(&self, message: &[u8]) -> Result<Vec<u8>> {
         let mut signer = Signer::new_without_digest(&self.key).map_err(|e| {
             TransportError::Crypto(format!("REALITY CertificateVerify signer: {e}"))
         })?;
@@ -1041,7 +1221,7 @@ impl RealityCertificate {
             .map_err(|e| TransportError::Crypto(format!("REALITY CertificateVerify sign: {e}")))
     }
 
-    fn for_auth_key(&self, auth_key: &[u8; 32]) -> Vec<u8> {
+    pub(crate) fn for_auth_key(&self, auth_key: &[u8; 32]) -> Vec<u8> {
         let mut der = self.template_der.clone();
         let signature_start = der.len() - 64;
         let mut mac =
@@ -1528,6 +1708,37 @@ mod tests {
         authenticated_roundtrip(true).await;
     }
 
+    #[tokio::test]
+    async fn verified_hello_split_api_preserves_prefix_and_completes_independently() {
+        let (private, public) = keypair();
+        let server = RealityServer::new(&server_config(private)).expect("server");
+        let (client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let verify_task = tokio::spawn({
+            let server = server.clone();
+            async move { server.verify_client_hello(Box::new(server_io)).await }
+        });
+
+        let layer =
+            RealityTlsLayer::new(&client_config(public, SHORT_ID, false)).expect("client layer");
+        let client_task = tokio::spawn(async move { layer.connect(Box::new(client_io)).await });
+        let classified = verify_task
+            .await
+            .expect("verify task")
+            .expect("verify ClientHello");
+        let RealityClientHello::Verified { stream, hello } = classified else {
+            panic!("valid REALITY client must verify")
+        };
+        assert!(hello.ch_wire().len() > 5 + 71);
+        assert_eq!(hello.ch_wire()[0], TLS_RECORD_HANDSHAKE);
+        let server_task =
+            tokio::spawn(async move { server.complete_handshake(stream, *hello).await });
+        assert!(
+            server_task.await.expect("completion task").is_ok(),
+            "a statically verified ClientHello completes through the split v1 API"
+        );
+        assert!(client_task.await.expect("client task").is_ok());
+    }
+
     async fn rejected_client_goes_to_cover(client_config: TlsConfig, server: RealityServer) {
         let (client_io, server_io) = tokio::io::duplex(128 * 1024);
         let accept_task = tokio::spawn(async move { server.accept(Box::new(server_io)).await });
@@ -1896,6 +2107,10 @@ mod tests {
             duplicate_extension: false,
             sni_malformed: false,
             key_share_malformed: false,
+            has_pre_shared_key: false,
+            has_early_data: false,
+            record_size_limit: None,
+            record_size_limit_malformed: false,
         };
 
         let chosen = select_key_share(&hello).expect("classical fallback remains usable");
@@ -2579,6 +2794,9 @@ mod independent_wire_vectors {
     use sha2::{Digest, Sha256};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio::io::DuplexStream;
+
+    use crate::reality_mirror::{prepare_mirrored_flight, MirrorCryptoInput, MirrorTemplate};
+    use crate::reality_tls::RecordKey;
 
     include!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -3564,5 +3782,331 @@ mod independent_wire_vectors {
             n, 0,
             "dropping a never-dialed cover must close the client side"
         );
+    }
+
+    const MIRROR_RECORD_LENGTHS: [u16; 4] = [25, 3217, 281, 69];
+
+    struct MirrorVectorSession {
+        client_io: DuplexStream,
+        stream: Box<dyn Stream>,
+        completion: crate::reality_mirror::MirroredHandshakeCompletion,
+    }
+
+    fn mirror_target_prefix(vector: &FrozenMirrorVector) -> Vec<u8> {
+        let mut prefix = plaintext_record(&hex_bytes(vector.target_sh_hex));
+        prefix.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
+        for len in MIRROR_RECORD_LENGTHS {
+            prefix.extend_from_slice(&[0x17, 0x03, 0x03]);
+            prefix.extend_from_slice(&len.to_be_bytes());
+            prefix.resize(prefix.len() + usize::from(len), 0);
+        }
+        prefix
+    }
+
+    fn mirror_fixed_crypto(vector: &FrozenMirrorVector) -> MirrorCryptoInput {
+        MirrorCryptoInput {
+            server_random: hex_array(vector.server_random_hex),
+            x25519_private: hex_array(vector.server_x25519_private_hex),
+            mlkem_ciphertext: (!vector.mlkem_ciphertext_hex.is_empty())
+                .then(|| hex_bytes(vector.mlkem_ciphertext_hex)),
+            mlkem_secret: (!vector.mlkem_secret_hex.is_empty())
+                .then(|| hex_bytes(vector.mlkem_secret_hex)),
+        }
+    }
+
+    async fn open_mirror_vector_session(vector: &FrozenMirrorVector) -> MirrorVectorSession {
+        let server = vector_server();
+        let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let classify_server = server.clone();
+        let classify_task = tokio::spawn(async move {
+            classify_server
+                .verify_client_hello(Box::new(server_io))
+                .await
+        });
+        client_io
+            .write_all(&hex_bytes(vector.ch_wire_hex))
+            .await
+            .unwrap();
+        client_io.flush().await.unwrap();
+        let classified = tokio::time::timeout(Duration::from_secs(2), classify_task)
+            .await
+            .expect("mirror classification timed out")
+            .expect("mirror classification joined")
+            .expect("mirror classification io");
+        let RealityClientHello::Verified { stream, hello } = classified else {
+            panic!("{}: frozen mirror CH must authenticate", vector.name);
+        };
+        assert_eq!(hello.ch_wire(), hex_bytes(vector.ch_wire_hex));
+        let prefix = mirror_target_prefix(vector);
+        let template = MirrorTemplate::parse(&hello, &prefix)
+            .unwrap_or_else(|error| panic!("{}: template parse failed: {error}", vector.name));
+        let prepared = prepare_mirrored_flight(
+            &server.inner.certificate,
+            &hello,
+            template,
+            Some(&mirror_fixed_crypto(vector)),
+        )
+        .unwrap_or_else(|error| panic!("{}: prepare failed: {error}", vector.name));
+        let (wire, completion) = prepared.into_wire_and_completion();
+        assert_eq!(
+            wire,
+            hex_bytes(vector.server_flight_wire_hex),
+            "{}: complete mirrored server flight",
+            vector.name
+        );
+        let sh_len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
+        assert_eq!(
+            &wire[5..5 + sh_len],
+            &hex_bytes(vector.patched_sh_hex),
+            "{}: patched ServerHello",
+            vector.name
+        );
+        MirrorVectorSession {
+            client_io,
+            stream,
+            completion,
+        }
+    }
+
+    fn cipher_suite_from_vector(vector: &FrozenMirrorVector) -> CipherSuite {
+        match vector.cipher {
+            TLS_AES_128_GCM_SHA256 => CipherSuite::Aes128GcmSha256,
+            TLS_AES_256_GCM_SHA384 => CipherSuite::Aes256GcmSha384,
+            TLS_CHACHA20_POLY1305_SHA256 => CipherSuite::ChaCha20Poly1305Sha256,
+            other => panic!("unsupported frozen cipher {other:#x}"),
+        }
+    }
+
+    fn open_vector_record(
+        vector: &FrozenMirrorVector,
+        key_hex: &str,
+        iv_hex: &str,
+        record_hex: &str,
+    ) -> (u8, Vec<u8>) {
+        let record = hex_bytes(record_hex);
+        let header: [u8; 5] = record[..5].try_into().unwrap();
+        let mut key = RecordKey::from_key_iv(
+            cipher_suite_from_vector(vector),
+            &hex_bytes(key_hex),
+            &hex_array::<12>(iv_hex),
+        );
+        key.open(&header, &record[5..])
+            .expect("frozen vector record must decrypt")
+    }
+
+    fn assert_mirror_vector_intermediates(vector: &FrozenMirrorVector) {
+        let hash_len = if vector.cipher == TLS_AES_256_GCM_SHA384 {
+            48
+        } else {
+            32
+        };
+        assert_eq!(
+            vector.group == 0x11ec,
+            !vector.mlkem_ciphertext_hex.is_empty()
+        );
+        assert!(hex_bytes(vector.ch_wire_hex).ends_with(&hex_bytes(vector.ch_message_hex)));
+        assert_eq!(hex_bytes(vector.aad_hex)[39..71], [0u8; 32]);
+        assert_eq!(
+            hex_bytes(vector.tls_dh_hex).len(),
+            if vector.group == 0x11ec { 64 } else { 32 }
+        );
+        assert_eq!(hex_bytes(vector.auth_key_hex).len(), 32);
+        for hash_hex in [vector.t0_hex, vector.t1_hex, vector.t2_hex, vector.t3_hex] {
+            assert_eq!(hex_bytes(hash_hex).len(), hash_len);
+        }
+        assert_eq!(hex_bytes(vector.server_finished_hex).len(), hash_len);
+        assert_eq!(hex_bytes(vector.client_finished_hex).len(), hash_len);
+        let flight = hex_bytes(vector.flight_plaintext_hex);
+        let cv = hex_bytes(vector.cv_hex);
+        assert!(flight.windows(cv.len()).any(|window| window == cv));
+        assert!(flight.ends_with(&hex_bytes(vector.server_finished_hex)));
+
+        let mut offset = 0usize;
+        let mut server_hs = RecordKey::from_key_iv(
+            cipher_suite_from_vector(vector),
+            &hex_bytes(vector.server_hs_key_hex),
+            &hex_array::<12>(vector.server_hs_iv_hex),
+        );
+        for record_hex in [
+            vector.record0_hex,
+            vector.record1_hex,
+            vector.record2_hex,
+            vector.record3_hex,
+        ] {
+            let record = hex_bytes(record_hex);
+            let header: [u8; 5] = record[..5].try_into().unwrap();
+            let (inner_type, plaintext) = server_hs
+                .open(&header, &record[5..])
+                .expect("frozen mirrored record must decrypt");
+            assert_eq!(inner_type, TLS_RECORD_HANDSHAKE);
+            assert_eq!(
+                plaintext,
+                flight[offset..offset + plaintext.len()],
+                "{}: mirrored bucket plaintext slice",
+                vector.name
+            );
+            offset += plaintext.len();
+        }
+        assert_eq!(
+            offset,
+            flight.len(),
+            "{}: all mirrored plaintext consumed",
+            vector.name
+        );
+
+        let (inner_type, finished_plaintext) = open_vector_record(
+            vector,
+            vector.client_hs_key_hex,
+            vector.client_hs_iv_hex,
+            vector.client_finished_record_hex,
+        );
+        assert_eq!(inner_type, TLS_RECORD_HANDSHAKE);
+        assert_eq!(finished_plaintext[0], HS_FINISHED);
+        assert_eq!(
+            &finished_plaintext[4..],
+            &hex_bytes(vector.client_finished_hex)
+        );
+
+        let (inner_type, client_plaintext) = open_vector_record(
+            vector,
+            vector.client_ap_key_hex,
+            vector.client_ap_iv_hex,
+            vector.client_app_record_hex,
+        );
+        assert_eq!(inner_type, TLS_RECORD_APPLICATION_DATA);
+        assert_eq!(client_plaintext, hex_bytes(vector.app_plaintext_hex));
+        let mut server_app = RecordKey::from_key_iv(
+            cipher_suite_from_vector(vector),
+            &hex_bytes(vector.server_ap_key_hex),
+            &hex_array::<12>(vector.server_ap_iv_hex),
+        );
+        assert_eq!(
+            server_app
+                .seal(
+                    TLS_RECORD_APPLICATION_DATA,
+                    &hex_bytes(vector.app_plaintext_hex)
+                )
+                .unwrap(),
+            hex_bytes(vector.server_app_record_hex),
+            "{}: frozen server application record",
+            vector.name
+        );
+    }
+
+    #[tokio::test]
+    async fn mirror_independent_vectors_are_byte_exact_and_roundtrip() {
+        for vector in [
+            &MIRROR_X25519_AES128,
+            &MIRROR_X25519_AES256,
+            &MIRROR_X25519_CHACHA,
+            &MIRROR_HYBRID_AES256,
+        ] {
+            assert_mirror_vector_intermediates(vector);
+            let mut session = open_mirror_vector_session(vector).await;
+            session
+                .client_io
+                .write_all(&hex_bytes(vector.client_finished_record_hex))
+                .await
+                .unwrap();
+            session.client_io.flush().await.unwrap();
+            let mut stream = tokio::time::timeout(
+                Duration::from_secs(2),
+                session.completion.finish(session.stream),
+            )
+            .await
+            .expect("mirrored Finished timed out")
+            .unwrap_or_else(|error| panic!("{}: finish failed: {error}", vector.name));
+
+            session
+                .client_io
+                .write_all(&hex_bytes(vector.client_app_record_hex))
+                .await
+                .unwrap();
+            session.client_io.flush().await.unwrap();
+            let app = hex_bytes(vector.app_plaintext_hex);
+            let mut got = vec![0u8; app.len()];
+            stream.read_exact(&mut got).await.unwrap();
+            assert_eq!(got, app, "{}: client application plaintext", vector.name);
+
+            stream.write_all(&app).await.unwrap();
+            stream.flush().await.unwrap();
+            let expected_record = hex_bytes(vector.server_app_record_hex);
+            let mut encrypted = vec![0u8; expected_record.len()];
+            session.client_io.read_exact(&mut encrypted).await.unwrap();
+            assert_eq!(
+                encrypted, expected_record,
+                "{}: server application record seq=0",
+                vector.name
+            );
+            assert!(!hex_bytes(vector.leaf_der_hex).is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn mirrored_finished_refragments_across_records_and_rejects_bad_sequence() {
+        let vector = &MIRROR_X25519_AES128;
+        let finished_body = hex_bytes(vector.client_finished_hex);
+        let mut finished = Vec::new();
+        finished.push(HS_FINISHED);
+        finished.extend_from_slice(&(finished_body.len() as u32).to_be_bytes()[1..4]);
+        finished.extend_from_slice(&finished_body);
+        let split = 2;
+        let key = hex_bytes(vector.client_hs_key_hex);
+        let iv = hex_array::<12>(vector.client_hs_iv_hex);
+        let cipher = cipher_suite_from_vector(vector);
+        let mut key0 = RecordKey::from_key_iv(cipher, &key, &iv);
+        let first = key0.seal(TLS_RECORD_HANDSHAKE, &finished[..split]).unwrap();
+        let second = key0.seal(TLS_RECORD_HANDSHAKE, &finished[split..]).unwrap();
+
+        let mut session = open_mirror_vector_session(vector).await;
+        session.client_io.write_all(&first).await.unwrap();
+        session.client_io.write_all(&second).await.unwrap();
+        session.client_io.flush().await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            session.completion.finish(session.stream),
+        )
+        .await
+        .expect("refragmented Finished timed out")
+        .expect("refragmented valid Finished must pass");
+
+        let mut session = open_mirror_vector_session(vector).await;
+        session.client_io.write_all(&second).await.unwrap();
+        session.client_io.write_all(&first).await.unwrap();
+        session.client_io.flush().await.unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            session.completion.finish(session.stream),
+        )
+        .await
+        .expect("reordered Finished timed out");
+        assert!(
+            result.is_err(),
+            "records encrypted under reversed sequence order must fail"
+        );
+    }
+
+    #[tokio::test]
+    async fn mirrored_finished_rejects_bit_tampered_or_replayed_foreign_records() {
+        let vector = &MIRROR_X25519_AES128;
+        for mutation in ["tag", "foreign"] {
+            let mut session = open_mirror_vector_session(vector).await;
+            let mut record = hex_bytes(vector.client_finished_record_hex);
+            if mutation == "tag" {
+                let last = record.len() - 1;
+                record[last] ^= 1;
+            } else {
+                record = hex_bytes(MIRROR_X25519_AES256.client_finished_record_hex);
+            }
+            session.client_io.write_all(&record).await.unwrap();
+            session.client_io.flush().await.unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(2),
+                session.completion.finish(session.stream),
+            )
+            .await
+            .expect("tampered Finished timed out");
+            assert!(result.is_err(), "{mutation} Finished must be rejected");
+        }
     }
 }
