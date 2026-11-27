@@ -575,6 +575,8 @@ impl VlessListener {
                             .await;
                         drop(permit);
                     });
+                    #[cfg(test)]
+                    tests::after_connection_spawn_for_test().await;
                 }
             }
         }
@@ -1144,6 +1146,20 @@ mod tests {
     use meow_transport::Transport;
     use tokio::io::AsyncReadExt;
 
+    thread_local! {
+        static ADVANCE_AFTER_CONNECTION_SPAWN: std::cell::RefCell<Option<Duration>> =
+            const { std::cell::RefCell::new(None) };
+        static CONNECTION_SPAWN_HOOKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) async fn after_connection_spawn_for_test() {
+        CONNECTION_SPAWN_HOOKS.with(|cell| cell.set(cell.get() + 1));
+        let advance_by = ADVANCE_AFTER_CONNECTION_SPAWN.with(|cell| cell.borrow_mut().take());
+        if let Some(advance_by) = advance_by {
+            tokio::time::advance(advance_by).await;
+        }
+    }
+
     fn test_tunnel() -> Tunnel {
         let resolver = Arc::new(meow_dns::Resolver::new(
             vec![],
@@ -1325,6 +1341,40 @@ mod tests {
             "off mode admission rejection is v1 behavior, not v2 accounting"
         );
         drop(held);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_first_run_on_deadline_counts_spawn_to_first_poll_delay() {
+        let listener = test_reality_listener_with(9, VlessRealityMimicSpec::default());
+        ADVANCE_AFTER_CONNECTION_SPAWN.with(|cell| {
+            *cell.borrow_mut() = Some(DEFAULT_HANDSHAKE_TIMEOUT + Duration::from_millis(1));
+        });
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+        let _client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+
+        let mut snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        for _ in 0..20 {
+            if snapshot.close_total.get(&("read_and_dial", "deadline")) == Some(&1) {
+                break;
+            }
+            tokio::task::yield_now().await;
+            snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        }
+        assert_eq!(
+            snapshot.close_total.get(&("read_and_dial", "deadline")),
+            Some(&1),
+            "run_on admission deadline must include spawn-to-first-poll delay: {snapshot:?}"
+        );
+        assert_eq!(snapshot.tcp_connect_started_total, 0);
+        assert_eq!(CONNECTION_SPAWN_HOOKS.with(std::cell::Cell::get), 1);
         task.abort();
     }
 

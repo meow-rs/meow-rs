@@ -785,6 +785,10 @@ where
 {
     let metrics = Arc::clone(&reality.metrics);
     let mut accountant = CloseAccountant::new(metrics);
+    if Instant::now() >= handshake_deadline {
+        accountant.close(CloseReason::Deadline);
+        return None;
+    }
     let dial_begin = Instant::now();
     let dial_deadline = handshake_deadline.min(dial_begin + Duration::from_secs(3));
 
