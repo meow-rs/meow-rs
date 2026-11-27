@@ -1749,6 +1749,80 @@ pub struct CoverBandwidthLimit {
     pub burst_bytes: u64,
 }
 
+/// Directional byte state for a cover relay over an already-connected target.
+///
+/// `upload` and `download` are exact byte prefixes that must be written once
+/// before their direction's later socket bytes.  `uploaded` counts bytes the
+/// caller already wrote to the target before relay ownership began; those
+/// bytes consume the upload rate-limit exemption but are never replayed.
+/// `download_eof` preserves a target EOF observed during probing: the relay
+/// still writes the complete download prefix, then half-closes the client
+/// write side without waiting for another target read.
+#[derive(Default)]
+pub struct CoverRelayPrefixes {
+    pub upload: Vec<u8>,
+    pub download: Vec<u8>,
+    pub uploaded: u64,
+    pub download_eof: bool,
+}
+
+impl fmt::Debug for CoverRelayPrefixes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CoverRelayPrefixes")
+            .field("upload_len", &self.upload.len())
+            .field("download_len", &self.download.len())
+            .field("uploaded", &self.uploaded)
+            .field("download_eof", &self.download_eof)
+            .finish()
+    }
+}
+
+/// Run the shared shaped cover relay over an already-connected target with
+/// explicit directional prefixes.  This is the same relay engine used by the
+/// v1 [`CoverRelay`] path: 16 KiB direction buffers, independent half-close,
+/// the 60-second idle watchdog and the 600-second lifetime cap.
+pub async fn relay_cover_with_prefixes(
+    client: Box<dyn Stream>,
+    target: Box<dyn Stream>,
+    prefixes: CoverRelayPrefixes,
+    limit: CoverBandwidthLimit,
+) -> Result<()> {
+    let (client_read, client_write) = tokio::io::split(client);
+    let (target_read, target_write) = tokio::io::split(target);
+    let (activity_tx, activity_rx) = tokio::sync::watch::channel(());
+    let upload_limit = DirectionalLimit::with_transferred(
+        limit.upload_bytes_per_second,
+        limit.upload_exempt_bytes,
+        limit.burst_bytes,
+        prefixes.uploaded,
+    );
+    let download_limit = DirectionalLimit::new(
+        limit.download_bytes_per_second,
+        limit.download_exempt_bytes,
+        limit.burst_bytes,
+    );
+    let upload = relay_direction(
+        client_read,
+        target_write,
+        prefixes.upload,
+        upload_limit,
+        activity_tx.clone(),
+    );
+    let download = relay_download_direction(
+        target_read,
+        client_write,
+        prefixes.download,
+        download_limit,
+        activity_tx,
+        prefixes.download_eof,
+    );
+    let watchdog = idle_watchdog(activity_rx);
+    let main = drive_cover(upload, download, watchdog);
+    tokio::time::timeout(COVER_MAX_LIFETIME, main)
+        .await
+        .map_err(|_| TransportError::Timeout("REALITY cover relay lifetime exceeded".into()))?
+}
+
 /// A cover connection with the ClientHello bytes already consumed from the
 /// client.  Those bytes must reach the target unchanged before any relay.
 pub struct CoverRelay {
@@ -1791,38 +1865,16 @@ impl CoverRelay {
         limit: CoverBandwidthLimit,
     ) -> Result<()> {
         let (client, prefix) = self.into_parts();
-        let (client_read, client_write) = tokio::io::split(client);
-        let (target_read, target_write) = tokio::io::split(target);
-        let (activity_tx, activity_rx) = tokio::sync::watch::channel(());
-        let upload_limit = DirectionalLimit::new(
-            limit.upload_bytes_per_second,
-            limit.upload_exempt_bytes,
-            limit.burst_bytes,
-        );
-        let download_limit = DirectionalLimit::new(
-            limit.download_bytes_per_second,
-            limit.download_exempt_bytes,
-            limit.burst_bytes,
-        );
-        let upload = relay_direction(
-            client_read,
-            target_write,
-            prefix,
-            upload_limit,
-            activity_tx.clone(),
-        );
-        let download = relay_direction(
-            target_read,
-            client_write,
-            Vec::new(),
-            download_limit,
-            activity_tx,
-        );
-        let watchdog = idle_watchdog(activity_rx);
-        let main = drive_cover(upload, download, watchdog);
-        tokio::time::timeout(COVER_MAX_LIFETIME, main)
-            .await
-            .map_err(|_| TransportError::Timeout("REALITY cover relay lifetime exceeded".into()))?
+        relay_cover_with_prefixes(
+            client,
+            target,
+            CoverRelayPrefixes {
+                upload: prefix,
+                ..CoverRelayPrefixes::default()
+            },
+            limit,
+        )
+        .await
     }
 }
 
@@ -1879,6 +1931,15 @@ struct DirectionalLimit {
 
 impl DirectionalLimit {
     fn new(bytes_per_second: u64, exempt_bytes: u64, burst_bytes: u64) -> Self {
+        Self::with_transferred(bytes_per_second, exempt_bytes, burst_bytes, 0)
+    }
+
+    fn with_transferred(
+        bytes_per_second: u64,
+        exempt_bytes: u64,
+        burst_bytes: u64,
+        transferred: u64,
+    ) -> Self {
         let capacity = if bytes_per_second == 0 {
             0
         } else {
@@ -1889,7 +1950,7 @@ impl DirectionalLimit {
             exempt_bytes,
             capacity,
             tokens: capacity,
-            transferred: 0,
+            transferred,
             refill_at: Instant::now(),
         }
     }
@@ -2009,6 +2070,29 @@ where
         writer.flush().await?;
     }
     Ok(())
+}
+
+async fn relay_download_direction<R, W>(
+    reader: R,
+    mut writer: W,
+    initial: Vec<u8>,
+    mut limit: DirectionalLimit,
+    activity: tokio::sync::watch::Sender<()>,
+    eof: bool,
+) -> Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    if eof {
+        drop(reader);
+        if !initial.is_empty() {
+            write_shaped(&mut writer, &initial, &mut limit, &activity).await?;
+        }
+        writer.shutdown().await?;
+        return Ok(());
+    }
+    relay_direction(reader, writer, initial, limit, activity).await
 }
 
 async fn relay_direction<R, W>(
@@ -3899,6 +3983,177 @@ mod tests {
         );
         assert_eq!(chunks.concat(), vec![0x5a; 1001]);
         relay.abort();
+    }
+
+    #[tokio::test]
+    async fn prefixed_cover_relay_writes_both_prefixes_once_and_preserves_half_close() {
+        let (mut client_peer, client_inner) = tokio::io::duplex(8192);
+        let (mut target_peer, target_inner) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(relay_cover_with_prefixes(
+            Box::new(client_inner),
+            Box::new(target_inner),
+            CoverRelayPrefixes {
+                upload: b"up-prefix".to_vec(),
+                download: b"down-prefix".to_vec(),
+                uploaded: 0,
+                download_eof: false,
+            },
+            CoverBandwidthLimit::default(),
+        ));
+
+        let mut up = [0u8; 9];
+        target_peer
+            .read_exact(&mut up)
+            .await
+            .expect("upload prefix");
+        assert_eq!(&up, b"up-prefix");
+        let mut down = [0u8; 11];
+        client_peer
+            .read_exact(&mut down)
+            .await
+            .expect("download prefix");
+        assert_eq!(&down, b"down-prefix");
+
+        target_peer
+            .write_all(b"target-suffix")
+            .await
+            .expect("target suffix write");
+        let mut suffix = [0u8; 13];
+        client_peer
+            .read_exact(&mut suffix)
+            .await
+            .expect("target suffix relay");
+        assert_eq!(&suffix, b"target-suffix");
+
+        target_peer
+            .shutdown()
+            .await
+            .expect("target write half-close");
+        let mut eof = [0u8; 1];
+        assert_eq!(
+            client_peer.read(&mut eof).await.expect("client EOF read"),
+            0,
+            "target EOF half-closes the client write side after the prefixes"
+        );
+
+        client_peer
+            .write_all(b"late-upload")
+            .await
+            .expect("upload after target EOF");
+        let mut late = [0u8; 11];
+        target_peer
+            .read_exact(&mut late)
+            .await
+            .expect("independent upload side continues");
+        assert_eq!(&late, b"late-upload");
+        client_peer.shutdown().await.expect("client half-close");
+        tokio::time::timeout(Duration::from_secs(2), relay)
+            .await
+            .expect("relay completion timeout")
+            .expect("relay task")
+            .expect("relay result");
+    }
+
+    #[tokio::test]
+    async fn prefixed_cover_relay_download_eof_delivers_prefix_then_half_closes() {
+        let (mut client_peer, client_inner) = tokio::io::duplex(8192);
+        let (mut target_peer, target_inner) = tokio::io::duplex(8192);
+        let relay = tokio::spawn(relay_cover_with_prefixes(
+            Box::new(client_inner),
+            Box::new(target_inner),
+            CoverRelayPrefixes {
+                upload: Vec::new(),
+                download: b"eof-prefix".to_vec(),
+                uploaded: 0,
+                download_eof: true,
+            },
+            CoverBandwidthLimit::default(),
+        ));
+
+        let mut down = [0u8; 10];
+        client_peer
+            .read_exact(&mut down)
+            .await
+            .expect("EOF download prefix");
+        assert_eq!(&down, b"eof-prefix");
+        let mut byte = [0u8; 1];
+        assert_eq!(
+            client_peer.read(&mut byte).await.expect("EOF after prefix"),
+            0,
+            "the preserved target EOF shuts down client writing even though the target peer is open"
+        );
+
+        client_peer
+            .write_all(b"still-uploads")
+            .await
+            .expect("upload remains independent");
+        let mut up = [0u8; 13];
+        target_peer
+            .read_exact(&mut up)
+            .await
+            .expect("upload reaches target");
+        assert_eq!(&up, b"still-uploads");
+        client_peer.shutdown().await.expect("client half-close");
+        tokio::time::timeout(Duration::from_secs(2), relay)
+            .await
+            .expect("relay completion timeout")
+            .expect("relay task")
+            .expect("relay result");
+    }
+
+    #[tokio::test]
+    async fn uploaded_bytes_consume_the_cover_upload_exemption() {
+        let mut limit = DirectionalLimit::with_transferred(1, 100, 1, 60);
+        let granted = limit.wait_for_allowance(50).await;
+        assert_eq!(
+            granted, 41,
+            "40 exemption bytes remain after 60 uploaded bytes, and one token is available"
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_cover_relay_shape_is_unchanged_with_empty_probe_prefix_state() {
+        let (mut client_peer, client_inner) = tokio::io::duplex(8192);
+        let (mut target_peer, target_inner) = tokio::io::duplex(8192);
+        let relay = CoverRelay::new(Box::new(client_inner), b"v1-hello".to_vec());
+        let task = tokio::spawn(
+            relay.relay_with_limit(Box::new(target_inner), CoverBandwidthLimit::default()),
+        );
+
+        let mut hello = [0u8; 8];
+        target_peer
+            .read_exact(&mut hello)
+            .await
+            .expect("v1 upload prefix");
+        assert_eq!(&hello, b"v1-hello");
+        target_peer
+            .write_all(b"v1-download")
+            .await
+            .expect("v1 target bytes");
+        let mut download = [0u8; 11];
+        client_peer
+            .read_exact(&mut download)
+            .await
+            .expect("v1 download relay");
+        assert_eq!(&download, b"v1-download");
+        client_peer
+            .write_all(b"v1-suffix")
+            .await
+            .expect("v1 client suffix");
+        let mut suffix = [0u8; 9];
+        target_peer
+            .read_exact(&mut suffix)
+            .await
+            .expect("v1 suffix relay");
+        assert_eq!(&suffix, b"v1-suffix");
+
+        client_peer.shutdown().await.expect("client half-close");
+        target_peer.shutdown().await.expect("target half-close");
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("v1 relay completion timeout")
+            .expect("v1 relay task")
+            .expect("v1 relay result");
     }
 }
 
