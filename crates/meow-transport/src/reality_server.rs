@@ -2348,7 +2348,7 @@ mod tests {
         let mut key_shares = ClientKeyShares::default();
         key_shares.insert(GROUP_X25519, &[0x11; 32]);
         let context = AuthenticatedMirrorContext {
-            issuer: issuer.inner.instance.clone(),
+            issuer: Arc::clone(&issuer.inner.instance),
             auth_key: Zeroizing::new([0x23; 32]),
             session_id: [0u8; 32],
             cipher_suites,
@@ -3659,8 +3659,8 @@ mod independent_wire_vectors {
     use super::*;
     use std::collections::HashSet;
 
-    use aes_gcm::aead::{AeadInPlace, KeyInit};
-    use aes_gcm::{Aes128Gcm, Nonce, Tag};
+    use aes_gcm::aead::{Aead, AeadInPlace, KeyInit};
+    use aes_gcm::{Aes128Gcm, Aes256Gcm, Nonce, Tag};
     use boring::sign::Verifier;
     use hmac::Mac;
     use sha2::{Digest, Sha256};
@@ -3842,6 +3842,90 @@ mod independent_wire_vectors {
     fn independent_finished_verify_data(secret: &[u8], transcript: &[u8]) -> Vec<u8> {
         let finished_key = hkdf_expand_label_independent(secret, b"finished", &[], 32);
         hmac_sha256(&finished_key, &[&sha256(transcript)])
+    }
+
+    type IndependentHmacSha384 = hmac::Hmac<sha2::Sha384>;
+
+    fn hmac_sha384(key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+        let mut mac = <IndependentHmacSha384 as Mac>::new_from_slice(key)
+            .expect("HMAC-SHA384 accepts any key length");
+        for part in parts {
+            mac.update(part);
+        }
+        mac.finalize().into_bytes().to_vec()
+    }
+
+    /// Suite-parameterized transcript hash for the mirror oracle: TLS 1.3
+    /// binds the hash to the cipher suite (SHA-384 only under
+    /// TLS_AES_256_GCM_SHA384), so the independent recomputation must follow
+    /// the suite instead of hardcoding SHA-256.
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum OracleHash {
+        Sha256,
+        Sha384,
+    }
+
+    impl OracleHash {
+        fn for_cipher(cipher: u16) -> Self {
+            if cipher == TLS_AES_256_GCM_SHA384 {
+                Self::Sha384
+            } else {
+                Self::Sha256
+            }
+        }
+
+        fn len(self) -> usize {
+            match self {
+                Self::Sha256 => 32,
+                Self::Sha384 => 48,
+            }
+        }
+
+        fn digest(self, data: &[u8]) -> Vec<u8> {
+            match self {
+                Self::Sha256 => Sha256::digest(data).to_vec(),
+                Self::Sha384 => sha2::Sha384::digest(data).to_vec(),
+            }
+        }
+
+        fn hmac(self, key: &[u8], parts: &[&[u8]]) -> Vec<u8> {
+            match self {
+                Self::Sha256 => hmac_sha256(key, parts),
+                Self::Sha384 => hmac_sha384(key, parts),
+            }
+        }
+
+        fn extract(self, salt: &[u8], ikm: &[u8]) -> Vec<u8> {
+            self.hmac(salt, &[ikm])
+        }
+
+        fn expand(self, prk: &[u8], info: &[u8], len: usize) -> Vec<u8> {
+            let mut okm = Vec::new();
+            let mut previous = Vec::new();
+            let mut counter = 1u8;
+            while okm.len() < len {
+                previous = self.hmac(prk, &[&previous, info, &[counter]]);
+                okm.extend_from_slice(&previous);
+                counter += 1;
+            }
+            okm.truncate(len);
+            okm
+        }
+
+        fn expand_label(self, secret: &[u8], label: &[u8], context: &[u8], len: usize) -> Vec<u8> {
+            let mut info = Vec::new();
+            info.extend_from_slice(&(len as u16).to_be_bytes());
+            info.push((6 + label.len()) as u8);
+            info.extend_from_slice(b"tls13 ");
+            info.extend_from_slice(label);
+            info.push(context.len() as u8);
+            info.extend_from_slice(context);
+            self.expand(secret, &info, len)
+        }
+
+        fn derive_secret(self, secret: &[u8], label: &[u8], transcript_hash: &[u8]) -> Vec<u8> {
+            self.expand_label(secret, label, transcript_hash, self.len())
+        }
     }
 
     struct IndependentRecordKey {
@@ -4687,6 +4771,14 @@ mod independent_wire_vectors {
     }
 
     async fn open_mirror_vector_session(vector: &FrozenMirrorVector) -> MirrorVectorSession {
+        open_mirror_vector_session_with_crypto(vector, mirror_fixed_crypto(vector), true).await
+    }
+
+    async fn open_mirror_vector_session_with_crypto(
+        vector: &FrozenMirrorVector,
+        crypto: MirrorCryptoInput,
+        expect_frozen_wire: bool,
+    ) -> MirrorVectorSession {
         let server = vector_server();
         let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
         let classify_server = server.clone();
@@ -4712,27 +4804,25 @@ mod independent_wire_vectors {
         let prefix = mirror_target_prefix(vector);
         let template = MirrorTemplate::parse(&hello, &prefix)
             .unwrap_or_else(|error| panic!("{}: template parse failed: {error}", vector.name));
-        let prepared = prepare_mirrored_flight(
-            &server.inner.certificate,
-            &hello,
-            template,
-            Some(&mirror_fixed_crypto(vector)),
-        )
-        .unwrap_or_else(|error| panic!("{}: prepare failed: {error}", vector.name));
+        let prepared =
+            prepare_mirrored_flight(&server.inner.certificate, &hello, template, Some(&crypto))
+                .unwrap_or_else(|error| panic!("{}: prepare failed: {error}", vector.name));
         let (wire, completion) = prepared.into_wire_and_completion();
-        assert_eq!(
-            wire,
-            hex_bytes(vector.server_flight_wire_hex),
-            "{}: complete mirrored server flight",
-            vector.name
-        );
-        let sh_len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
-        assert_eq!(
-            &wire[5..5 + sh_len],
-            &hex_bytes(vector.patched_sh_hex),
-            "{}: patched ServerHello",
-            vector.name
-        );
+        if expect_frozen_wire {
+            assert_eq!(
+                wire,
+                hex_bytes(vector.server_flight_wire_hex),
+                "{}: complete mirrored server flight",
+                vector.name
+            );
+            let sh_len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
+            assert_eq!(
+                &wire[5..5 + sh_len],
+                &hex_bytes(vector.patched_sh_hex),
+                "{}: patched ServerHello",
+                vector.name
+            );
+        }
         MirrorVectorSession {
             client_io,
             stream,
@@ -4766,7 +4856,381 @@ mod independent_wire_vectors {
             .expect("frozen vector record must decrypt")
     }
 
+    // --- Independent oracle recomputation of the mirrored flight ----------
+    //
+    // Every intermediate below is recomputed in the test from the base inputs
+    // (frozen private keys, seeds, the logical ClientHello and the target
+    // ServerHello) with hmac/sha2/x25519-dalek/boring called directly, then
+    // compared byte-for-byte against the frozen Python-oracle fields.  None of
+    // it flows through the implementation's key-schedule or patching code.
+
+    /// REALITY authentication is always HKDF-SHA256/AES-256-GCM regardless of
+    /// the negotiated TLS suite: AuthKey = HKDF(shared, random[..20],
+    /// "REALITY") with the static server key and the client's independent
+    /// X25519 share.
+    fn oracle_auth_key(ch_message: &[u8]) -> Vec<u8> {
+        let server_private = hex_array::<32>(SERVER_STATIC_PRIVATE_HEX);
+        let client_public = hex_array::<32>(CLIENT_X25519_PUBLIC_HEX);
+        let shared = x25519_dalek::x25519(server_private, client_public);
+        let prk = OracleHash::Sha256.extract(&ch_message[6..26], &shared);
+        OracleHash::Sha256.expand(&prk, b"REALITY", 32)
+    }
+
+    /// Rebuild the patched ServerHello and the TLS ECDH input from the target
+    /// SH, the fixed server random and the ephemeral/KEM material alone.
+    fn oracle_patched_sh_and_tls_dh(vector: &FrozenMirrorVector) -> (Vec<u8>, Vec<u8>) {
+        let target_sh = hex_bytes(vector.target_sh_hex);
+        let target = parse_server_hello_independent(&target_sh);
+        assert_eq!(target.group, vector.group);
+        let server_x_private = hex_array::<32>(vector.server_x25519_private_hex);
+        let server_x_public =
+            x25519_dalek::x25519(server_x_private, x25519_dalek::X25519_BASEPOINT_BYTES);
+        let (server_share, tls_dh) = if vector.group == GROUP_X25519 {
+            assert_eq!(target.share.len(), 32);
+            let secret =
+                x25519_dalek::x25519(server_x_private, hex_array::<32>(CLIENT_X25519_PUBLIC_HEX));
+            assert_ne!(secret, [0u8; 32], "low-order oracle ECDH");
+            (server_x_public.to_vec(), secret.to_vec())
+        } else {
+            assert_eq!(vector.group, GROUP_X25519_MLKEM768);
+            assert_eq!(target.share.len(), 1088 + 32);
+            let mlkem = boring::mlkem::MlKemPrivateKey::from_seed(
+                boring::mlkem::Algorithm::MlKem768,
+                &hex_array::<64>(MLKEM768_SEED_HEX),
+            )
+            .expect("fixed ML-KEM seed");
+            let mlkem_ciphertext = hex_bytes(vector.mlkem_ciphertext_hex);
+            let mlkem_secret = mlkem
+                .decapsulate(&mlkem_ciphertext)
+                .expect("oracle ML-KEM ciphertext decapsulates");
+            assert_eq!(
+                mlkem_secret[..],
+                hex_bytes(vector.mlkem_secret_hex)[..],
+                "{}: ML-KEM secret byte-exact from independent decapsulation",
+                vector.name
+            );
+            let x_secret =
+                x25519_dalek::x25519(server_x_private, hex_array::<32>(HYBRID_X25519_PUBLIC_HEX));
+            assert_ne!(x_secret, [0u8; 32], "low-order oracle hybrid ECDH");
+            let mut share = mlkem_ciphertext;
+            share.extend_from_slice(&server_x_public);
+            let mut dh = mlkem_secret.to_vec();
+            dh.extend_from_slice(&x_secret);
+            (share, dh)
+        };
+
+        let mut patched = target_sh;
+        patched[6..38].copy_from_slice(&hex_bytes(vector.server_random_hex));
+        let share_pos = patched
+            .windows(target.share.len())
+            .position(|window| window == target.share.as_slice())
+            .expect("target share occurs exactly in the target SH");
+        patched[share_pos..share_pos + target.share.len()].copy_from_slice(&server_share);
+        (patched, tls_dh)
+    }
+
+    fn oracle_sign_ed25519(message: &[u8]) -> Vec<u8> {
+        let key = PKey::private_key_from_der(&hex_bytes(ED25519_PRIVATE_DER_HEX))
+            .expect("fixed Ed25519 private key");
+        let mut signer = Signer::new_without_digest(&key).expect("Ed25519 oracle signer");
+        signer
+            .sign_oneshot_to_vec(message)
+            .expect("Ed25519 oracle sign")
+    }
+
+    fn oracle_certificate_message(leaf: &[u8]) -> Vec<u8> {
+        let mut entry = Vec::new();
+        entry.extend_from_slice(&(leaf.len() as u32).to_be_bytes()[1..4]);
+        entry.extend_from_slice(leaf);
+        entry.extend_from_slice(&[0, 0]);
+        let mut body = vec![0];
+        body.extend_from_slice(&(entry.len() as u32).to_be_bytes()[1..4]);
+        body.extend_from_slice(&entry);
+        independent_handshake_message(HS_CERTIFICATE, &body)
+    }
+
+    struct OracleMirrorCrypto {
+        leaf_der: Vec<u8>,
+        ee: Vec<u8>,
+        certificate: Vec<u8>,
+        cv: Vec<u8>,
+        server_finished_message: Vec<u8>,
+        server_finished_body: Vec<u8>,
+        client_finished_body: Vec<u8>,
+        flight_plaintext: Vec<u8>,
+        t0: Vec<u8>,
+        t1: Vec<u8>,
+        t2: Vec<u8>,
+        t3: Vec<u8>,
+        client_hs_secret: Vec<u8>,
+        client_hs_key: Vec<u8>,
+        client_hs_iv: Vec<u8>,
+        server_hs_key: Vec<u8>,
+        server_hs_iv: Vec<u8>,
+        client_ap_key: Vec<u8>,
+        client_ap_iv: Vec<u8>,
+        server_ap_key: Vec<u8>,
+        server_ap_iv: Vec<u8>,
+    }
+
+    /// Full TLS 1.3 key schedule and server-flight reconstruction, given the
+    /// exact transcript inputs.  `transcript_ch`/`transcript_sh` are
+    /// parameters rather than hardwired vector fields so negative tests can
+    /// measure how a mutated transcript input diverges.
+    fn oracle_flight_crypto(
+        vector: &FrozenMirrorVector,
+        transcript_ch: &[u8],
+        transcript_sh: &[u8],
+        tls_dh: &[u8],
+        auth_key: &[u8],
+    ) -> OracleMirrorCrypto {
+        let hash = OracleHash::for_cipher(vector.cipher);
+        let mut transcript = transcript_ch.to_vec();
+        transcript.extend_from_slice(transcript_sh);
+        let t0 = hash.digest(&transcript);
+
+        let zero = vec![0u8; hash.len()];
+        let empty_hash = hash.digest(&[]);
+        let early = hash.extract(&zero, &zero);
+        let handshake_secret = {
+            let derived = hash.derive_secret(&early, b"derived", &empty_hash);
+            hash.extract(&derived, tls_dh)
+        };
+        let client_hs_secret = hash.derive_secret(&handshake_secret, b"c hs traffic", &t0);
+        let server_hs_secret = hash.derive_secret(&handshake_secret, b"s hs traffic", &t0);
+        let master_secret = {
+            let derived = hash.derive_secret(&handshake_secret, b"derived", &empty_hash);
+            hash.extract(&derived, &zero)
+        };
+
+        let ee = independent_handshake_message(HS_ENCRYPTED_EXTENSIONS, &[0, 0]);
+        let mut leaf_der = hex_bytes(LEAF_DER_HEX);
+        let mac = hmac_sha512(auth_key, &[&hex_bytes(ED25519_PUBLIC_HEX)]);
+        let leaf_mac_start = leaf_der.len() - 64;
+        leaf_der[leaf_mac_start..].copy_from_slice(&mac);
+        let certificate = oracle_certificate_message(&leaf_der);
+        transcript.extend_from_slice(&ee);
+        transcript.extend_from_slice(&certificate);
+        let t1 = hash.digest(&transcript);
+
+        let mut cv_input = vec![0x20; 64];
+        cv_input.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+        cv_input.push(0);
+        cv_input.extend_from_slice(&t1);
+        let signature = oracle_sign_ed25519(&cv_input);
+        assert_eq!(signature.len(), 64, "Ed25519 signature length");
+        let mut cv_body = Vec::new();
+        cv_body.extend_from_slice(&SIG_ED25519.to_be_bytes());
+        cv_body.extend_from_slice(&64u16.to_be_bytes());
+        cv_body.extend_from_slice(&signature);
+        let cv = independent_handshake_message(HS_CERTIFICATE_VERIFY, &cv_body);
+        transcript.extend_from_slice(&cv);
+        let t2 = hash.digest(&transcript);
+
+        let server_finished_key =
+            hash.expand_label(&server_hs_secret, b"finished", &[], hash.len());
+        let server_finished_body = hash.hmac(&server_finished_key, &[&t2]);
+        let server_finished_message =
+            independent_handshake_message(HS_FINISHED, &server_finished_body);
+        transcript.extend_from_slice(&server_finished_message);
+        let t3 = hash.digest(&transcript);
+
+        let client_finished_key =
+            hash.expand_label(&client_hs_secret, b"finished", &[], hash.len());
+        let client_finished_body = hash.hmac(&client_finished_key, &[&t3]);
+
+        let key_len = if vector.cipher == TLS_AES_128_GCM_SHA256 {
+            16
+        } else {
+            32
+        };
+        let traffic = |secret: &[u8]| {
+            (
+                hash.expand_label(secret, b"key", &[], key_len),
+                hash.expand_label(secret, b"iv", &[], 12),
+            )
+        };
+        let (client_hs_key, client_hs_iv) = traffic(&client_hs_secret);
+        let (server_hs_key, server_hs_iv) = traffic(&server_hs_secret);
+        let client_ap_secret = hash.derive_secret(&master_secret, b"c ap traffic", &t3);
+        let server_ap_secret = hash.derive_secret(&master_secret, b"s ap traffic", &t3);
+        let (client_ap_key, client_ap_iv) = traffic(&client_ap_secret);
+        let (server_ap_key, server_ap_iv) = traffic(&server_ap_secret);
+
+        let mut flight_plaintext = ee.clone();
+        flight_plaintext.extend_from_slice(&certificate);
+        flight_plaintext.extend_from_slice(&cv);
+        flight_plaintext.extend_from_slice(&server_finished_message);
+
+        OracleMirrorCrypto {
+            leaf_der,
+            ee,
+            certificate,
+            cv,
+            server_finished_message,
+            server_finished_body,
+            client_finished_body,
+            flight_plaintext,
+            t0,
+            t1,
+            t2,
+            t3,
+            client_hs_secret,
+            client_hs_key,
+            client_hs_iv,
+            server_hs_key,
+            server_hs_iv,
+            client_ap_key,
+            client_ap_iv,
+            server_ap_key,
+            server_ap_iv,
+        }
+    }
+
+    /// Recompute every frozen intermediate of one mirror vector from the base
+    /// inputs and compare byte-for-byte.  A single flipped hex digit in any
+    /// covered field must turn this red.
+    fn assert_mirror_vector_oracle_recompute(vector: &FrozenMirrorVector) {
+        let ch_message = hex_bytes(vector.ch_message_hex);
+
+        let mut aad = ch_message.clone();
+        aad[39..71].fill(0);
+        assert_eq!(
+            aad,
+            hex_bytes(vector.aad_hex),
+            "{}: AAD is the logical CH with a zeroed session-id window",
+            vector.name
+        );
+
+        let auth_key = oracle_auth_key(&ch_message);
+        assert_eq!(
+            auth_key,
+            hex_bytes(vector.auth_key_hex),
+            "{}: AuthKey byte-exact",
+            vector.name
+        );
+        let mut auth_plaintext = hex_bytes(VERSION_HEX);
+        auth_plaintext.push(0);
+        auth_plaintext.extend_from_slice(&(UNIX_SECONDS as u32).to_be_bytes());
+        auth_plaintext.extend_from_slice(&hex_bytes(SHORT_ID_HEX));
+        let auth_box = Aes256Gcm::new_from_slice(&auth_key).expect("AES-256 AuthKey");
+        let sid = auth_box
+            .encrypt(
+                Nonce::from_slice(&ch_message[26..38]),
+                aes_gcm::aead::Payload {
+                    msg: &auth_plaintext,
+                    aad: &aad,
+                },
+            )
+            .expect("oracle AuthKey seal");
+        assert_eq!(
+            sid,
+            ch_message[39..71],
+            "{}: session id re-seals byte-exact under the recomputed AuthKey/AAD/nonce",
+            vector.name
+        );
+
+        let (patched_sh, tls_dh) = oracle_patched_sh_and_tls_dh(vector);
+        assert_eq!(
+            patched_sh,
+            hex_bytes(vector.patched_sh_hex),
+            "{}: patched ServerHello byte-exact",
+            vector.name
+        );
+        assert_eq!(
+            tls_dh,
+            hex_bytes(vector.tls_dh_hex),
+            "{}: tls_dh byte-exact",
+            vector.name
+        );
+
+        let oracle = oracle_flight_crypto(vector, &ch_message, &patched_sh, &tls_dh, &auth_key);
+        let byte_exact = |label: &str, recomputed: &[u8], frozen_hex: &str| {
+            assert_eq!(
+                recomputed,
+                hex_bytes(frozen_hex),
+                "{}: {label} byte-exact",
+                vector.name
+            );
+        };
+        byte_exact("T0 transcript hash", &oracle.t0, vector.t0_hex);
+        byte_exact("T1 transcript hash", &oracle.t1, vector.t1_hex);
+        byte_exact("T2 transcript hash", &oracle.t2, vector.t2_hex);
+        byte_exact("T3 transcript hash", &oracle.t3, vector.t3_hex);
+        byte_exact(
+            "leaf certificate DER",
+            &oracle.leaf_der,
+            vector.leaf_der_hex,
+        );
+        byte_exact("CertificateVerify message", &oracle.cv, vector.cv_hex);
+        byte_exact(
+            "server Finished body",
+            &oracle.server_finished_body,
+            vector.server_finished_hex,
+        );
+        byte_exact(
+            "client Finished body",
+            &oracle.client_finished_body,
+            vector.client_finished_hex,
+        );
+        byte_exact(
+            "client handshake key",
+            &oracle.client_hs_key,
+            vector.client_hs_key_hex,
+        );
+        byte_exact(
+            "client handshake iv",
+            &oracle.client_hs_iv,
+            vector.client_hs_iv_hex,
+        );
+        byte_exact(
+            "server handshake key",
+            &oracle.server_hs_key,
+            vector.server_hs_key_hex,
+        );
+        byte_exact(
+            "server handshake iv",
+            &oracle.server_hs_iv,
+            vector.server_hs_iv_hex,
+        );
+        byte_exact(
+            "client application key",
+            &oracle.client_ap_key,
+            vector.client_ap_key_hex,
+        );
+        byte_exact(
+            "client application iv",
+            &oracle.client_ap_iv,
+            vector.client_ap_iv_hex,
+        );
+        byte_exact(
+            "server application key",
+            &oracle.server_ap_key,
+            vector.server_ap_key_hex,
+        );
+        byte_exact(
+            "server application iv",
+            &oracle.server_ap_iv,
+            vector.server_ap_iv_hex,
+        );
+        byte_exact(
+            "flight plaintext",
+            &oracle.flight_plaintext,
+            vector.flight_plaintext_hex,
+        );
+
+        let cv_input_t1 = {
+            let mut input = vec![0x20; 64];
+            input.extend_from_slice(b"TLS 1.3, server CertificateVerify");
+            input.push(0);
+            input.extend_from_slice(&oracle.t1);
+            input
+        };
+        verify_ed25519_signature(&oracle.cv[8..], &cv_input_t1);
+    }
+
     fn assert_mirror_vector_intermediates(vector: &FrozenMirrorVector) {
+        assert_mirror_vector_oracle_recompute(vector);
         let hash_len = if vector.cipher == TLS_AES_256_GCM_SHA384 {
             48
         } else {
@@ -4980,5 +5444,342 @@ mod independent_wire_vectors {
             .expect("tampered Finished timed out");
             assert!(result.is_err(), "{mutation} Finished must be rejected");
         }
+    }
+
+    // --- Discrete negative discriminators for the mirrored Finished --------
+    //
+    // Every test below isolates one mechanism: the record always opens under
+    // the keys the server actually uses unless the tested mechanism itself is
+    // the key schedule, so the rejection cause is never ambiguous.
+
+    fn oracle_inputs(vector: &FrozenMirrorVector) -> (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>) {
+        let ch_message = hex_bytes(vector.ch_message_hex);
+        let auth_key = oracle_auth_key(&ch_message);
+        let (patched_sh, tls_dh) = oracle_patched_sh_and_tls_dh(vector);
+        (ch_message, patched_sh, tls_dh, auth_key)
+    }
+
+    fn seal_vector_finished(
+        vector: &FrozenMirrorVector,
+        key_bytes: &[u8],
+        iv_bytes: &[u8],
+        verify_data: &[u8],
+    ) -> Vec<u8> {
+        let mut message = Vec::new();
+        message.push(HS_FINISHED);
+        message.extend_from_slice(&(verify_data.len() as u32).to_be_bytes()[1..4]);
+        message.extend_from_slice(verify_data);
+        let iv: [u8; 12] = iv_bytes.try_into().expect("twelve-byte record iv");
+        let mut key = RecordKey::from_key_iv(cipher_suite_from_vector(vector), key_bytes, &iv);
+        key.seal(TLS_RECORD_HANDSHAKE, &message)
+            .expect("test Finished record seal")
+    }
+
+    async fn finish_error_after_record(
+        mut session: MirrorVectorSession,
+        record: &[u8],
+    ) -> TransportError {
+        session.client_io.write_all(record).await.unwrap();
+        session.client_io.flush().await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            session.completion.finish(session.stream),
+        )
+        .await
+        .expect("mirrored Finished timed out")
+        .err()
+        .expect("negative Finished must be rejected")
+    }
+
+    /// Seal a first (sequence-zero) record whose AEAD tag is valid for the
+    /// transmitted header, even when that header violates the strict shape
+    /// the mirrored Finished reader admits.  The rejection then cannot be an
+    /// AEAD failure: it is the header policy alone.
+    fn seal_aes128_record_with_header(
+        key_bytes: &[u8],
+        iv: &[u8; 12],
+        typ: u8,
+        version: [u8; 2],
+        inner_type: u8,
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        let cipher = Aes128Gcm::new_from_slice(key_bytes).expect("AES-128 test key");
+        let mut body = plaintext.to_vec();
+        body.push(inner_type);
+        let record_len = body.len() + 16;
+        let mut header = [typ, version[0], version[1], 0, 0];
+        header[3..5].copy_from_slice(&(record_len as u16).to_be_bytes());
+        let tag = cipher
+            .encrypt_in_place_detached(Nonce::from_slice(iv), &header, &mut body)
+            .expect("test header-mutation seal");
+        body.extend_from_slice(&tag);
+        let mut out = header.to_vec();
+        out.extend_from_slice(&body);
+        out
+    }
+
+    #[tokio::test]
+    async fn mirrored_finished_replayed_from_same_suite_different_session_is_rejected() {
+        // The existing foreign-record case proves rejection across cipher
+        // suites; that failure is explained by the AEAD suite alone.  Here
+        // session B is the frozen session with one ServerHello-random bit
+        // flipped: same suite, same client, same ephemeral key — only the
+        // session keys differ, so rejecting the original session's Finished
+        // is same-suite cross-session discrimination.
+        let vector = &MIRROR_X25519_AES128;
+        let mut crypto_b = mirror_fixed_crypto(vector);
+        crypto_b.server_random[0] ^= 1;
+        let session = open_mirror_vector_session_with_crypto(vector, crypto_b.clone(), false).await;
+        let record = hex_bytes(vector.client_finished_record_hex);
+        finish_error_after_record(session, &record).await;
+
+        // Control: the honestly recomputed Finished for session B is accepted,
+        // so the rejection above is keyed to the session, not a broken path.
+        let (ch_message, patched_sh, tls_dh, auth_key) = oracle_inputs(vector);
+        let mut patched_b = patched_sh.clone();
+        patched_b[6] ^= 1;
+        let oracle_b = oracle_flight_crypto(vector, &ch_message, &patched_b, &tls_dh, &auth_key);
+        assert_ne!(
+            oracle_b.client_hs_key,
+            hex_bytes(vector.client_hs_key_hex),
+            "one random bit must rekey the session"
+        );
+        let valid_b = seal_vector_finished(
+            vector,
+            &oracle_b.client_hs_key,
+            &oracle_b.client_hs_iv,
+            &oracle_b.client_finished_body,
+        );
+        let mut session = open_mirror_vector_session_with_crypto(vector, crypto_b, false).await;
+        session.client_io.write_all(&valid_b).await.unwrap();
+        session.client_io.flush().await.unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            session.completion.finish(session.stream),
+        )
+        .await
+        .expect("session-B Finished timed out")
+        .expect("session-B honest Finished must be accepted");
+    }
+
+    #[tokio::test]
+    async fn mirrored_finished_with_wrong_verify_data_under_correct_keys_is_rejected() {
+        // Sealed under the exact keys of the current session, so the AEAD
+        // open succeeds and the rejection is isolated at the verify_data
+        // comparison rather than any decryption failure.
+        let vector = &MIRROR_X25519_AES128;
+        let (ch_message, patched_sh, tls_dh, auth_key) = oracle_inputs(vector);
+        let oracle = oracle_flight_crypto(vector, &ch_message, &patched_sh, &tls_dh, &auth_key);
+        assert_eq!(
+            oracle.client_hs_key,
+            hex_bytes(vector.client_hs_key_hex),
+            "oracle keys must be the current session keys for this isolation"
+        );
+        let mut wrong_verify = oracle.client_finished_body.clone();
+        wrong_verify[0] ^= 1;
+        let record = seal_vector_finished(
+            vector,
+            &oracle.client_hs_key,
+            &oracle.client_hs_iv,
+            &wrong_verify,
+        );
+        let session = open_mirror_vector_session(vector).await;
+        let error = finish_error_after_record(session, &record).await;
+        assert!(
+            error.to_string().contains("verify_data mismatch"),
+            "correct-key wrong-verify_data rejection must reach the comparison: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mirrored_finished_record_with_noncanonical_header_is_rejected_despite_valid_aead() {
+        let vector = &MIRROR_X25519_AES128;
+        assert_eq!(vector.cipher, TLS_AES_128_GCM_SHA256);
+        let (ch_message, patched_sh, tls_dh, auth_key) = oracle_inputs(vector);
+        let oracle = oracle_flight_crypto(vector, &ch_message, &patched_sh, &tls_dh, &auth_key);
+        let iv: [u8; 12] = oracle
+            .client_hs_iv
+            .as_slice()
+            .try_into()
+            .expect("twelve-byte iv");
+        let mut finished = Vec::new();
+        finished.push(HS_FINISHED);
+        finished.extend_from_slice(&(oracle.client_finished_body.len() as u32).to_be_bytes()[1..4]);
+        finished.extend_from_slice(&oracle.client_finished_body);
+        for (typ, version, expected) in [
+            (TLS_RECORD_HANDSHAKE, [0x03, 0x03], "record type"),
+            (TLS_RECORD_APPLICATION_DATA, [0x03, 0x01], "record version"),
+        ] {
+            let record = seal_aes128_record_with_header(
+                &oracle.client_hs_key,
+                &iv,
+                typ,
+                version,
+                TLS_RECORD_HANDSHAKE,
+                &finished,
+            );
+            let session = open_mirror_vector_session(vector).await;
+            let error = finish_error_after_record(session, &record).await;
+            assert!(
+                error.to_string().contains(expected),
+                "AEAD-valid record with mutated header must be rejected at admission ({expected}): {error}"
+            );
+        }
+    }
+
+    /// correct keys seal the record, but the verify_data is computed over a
+    /// transcript whose CH/SH segment is mutated — the comparison must fail
+    /// even though every other input is honest.
+    async fn assert_verify_data_over_mutated_transcript_is_rejected(
+        vector: &FrozenMirrorVector,
+        transcript_ch: &[u8],
+        transcript_sh: &[u8],
+        label: &str,
+    ) {
+        let (ch_message, patched_sh, tls_dh, auth_key) = oracle_inputs(vector);
+        let oracle = oracle_flight_crypto(vector, &ch_message, &patched_sh, &tls_dh, &auth_key);
+        let hash = OracleHash::for_cipher(vector.cipher);
+        let mut mutated = transcript_ch.to_vec();
+        mutated.extend_from_slice(transcript_sh);
+        mutated.extend_from_slice(&oracle.ee);
+        mutated.extend_from_slice(&oracle.certificate);
+        mutated.extend_from_slice(&oracle.cv);
+        mutated.extend_from_slice(&oracle.server_finished_message);
+        let mutated_t3 = hash.digest(&mutated);
+        let finished_key =
+            hash.expand_label(&oracle.client_hs_secret, b"finished", &[], hash.len());
+        let mutated_verify = hash.hmac(&finished_key, &[&mutated_t3]);
+        assert_ne!(
+            mutated_verify, oracle.client_finished_body,
+            "{label}: the mutated transcript must actually change verify_data"
+        );
+        let record = seal_vector_finished(
+            vector,
+            &oracle.client_hs_key,
+            &oracle.client_hs_iv,
+            &mutated_verify,
+        );
+        let session = open_mirror_vector_session(vector).await;
+        let error = finish_error_after_record(session, &record).await;
+        assert!(
+            error.to_string().contains("verify_data mismatch"),
+            "{label}: rejection must be the verify_data comparison, not AEAD: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn verify_data_over_zeroed_session_id_transcript_is_rejected() {
+        // The transcript binds the encrypted-SID logical CH.  Hashing the
+        // zeroed-SID (AAD) form instead — the confusion the mirror design
+        // rules out — must not produce an acceptable Finished.
+        let vector = &MIRROR_X25519_AES128;
+        let mut zeroed = hex_bytes(vector.ch_message_hex);
+        zeroed[39..71].fill(0);
+        let patched_sh = hex_bytes(vector.patched_sh_hex);
+        assert_verify_data_over_mutated_transcript_is_rejected(
+            vector,
+            &zeroed,
+            &patched_sh,
+            "zeroed-session-id CH transcript",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn verify_data_over_unpatched_target_sh_transcript_is_rejected() {
+        // The transcript binds the patched ServerHello, not the target's
+        // original bytes: an implementation hashing the unpatched SH must not
+        // interoperate with a correct peer.
+        let vector = &MIRROR_X25519_AES128;
+        let ch_message = hex_bytes(vector.ch_message_hex);
+        let target_sh = hex_bytes(vector.target_sh_hex);
+        assert_eq!(
+            target_sh.len(),
+            hex_bytes(vector.patched_sh_hex).len(),
+            "patching preserves length, so this mutation isolates content"
+        );
+        assert_verify_data_over_mutated_transcript_is_rejected(
+            vector,
+            &ch_message,
+            &target_sh,
+            "unpatched target SH transcript",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn hybrid_secret_with_reversed_halves_cannot_complete_mirrored_handshake() {
+        // tls_dh is ML-KEM secret ∥ X25519 secret.  A consistently reversed
+        // client derives a coherent-but-different key schedule; since the
+        // server concatenates in the correct order, the Finished record must
+        // already fail at AEAD open.
+        let vector = &MIRROR_HYBRID_AES256;
+        let (ch_message, patched_sh, tls_dh, auth_key) = oracle_inputs(vector);
+        assert_eq!(tls_dh.len(), 64, "hybrid tls_dh carries two halves");
+        let mut reversed = tls_dh[32..].to_vec();
+        reversed.extend_from_slice(&tls_dh[..32]);
+        assert_ne!(reversed, tls_dh, "halves must actually differ");
+        let oracle = oracle_flight_crypto(vector, &ch_message, &patched_sh, &reversed, &auth_key);
+        assert_ne!(
+            oracle.client_hs_key,
+            hex_bytes(vector.client_hs_key_hex),
+            "reversing the secret halves must rekey the client"
+        );
+        let record = seal_vector_finished(
+            vector,
+            &oracle.client_hs_key,
+            &oracle.client_hs_iv,
+            &oracle.client_finished_body,
+        );
+        let session = open_mirror_vector_session(vector).await;
+        finish_error_after_record(session, &record).await;
+    }
+
+    #[tokio::test]
+    async fn hybrid_finished_from_unreplaced_kem_ciphertext_cannot_complete_mirrored_handshake() {
+        // If the patcher replaced only the hybrid share's X25519 suffix and
+        // left the target's ML-KEM ciphertext in place, the honest client
+        // would decapsulate that target ciphertext.  Its secret then diverges
+        // from the mirror server's no matter what the server does, so the
+        // Finished must fail — the positive handshake genuinely depends on
+        // the ciphertext half being replaced.
+        let vector = &MIRROR_HYBRID_AES256;
+        let (ch_message, patched_sh, tls_dh, auth_key) = oracle_inputs(vector);
+        let target_sh = hex_bytes(vector.target_sh_hex);
+        let target = parse_server_hello_independent(&target_sh);
+        let mlkem = boring::mlkem::MlKemPrivateKey::from_seed(
+            boring::mlkem::Algorithm::MlKem768,
+            &hex_array::<64>(MLKEM768_SEED_HEX),
+        )
+        .expect("fixed ML-KEM seed");
+        let target_secret = mlkem
+            .decapsulate(&target.share[..1088])
+            .expect("ML-KEM decapsulation is total");
+        let correct_secret = mlkem
+            .decapsulate(&hex_bytes(vector.mlkem_ciphertext_hex))
+            .expect("correct ciphertext decapsulates");
+        assert_ne!(
+            target_secret[..],
+            correct_secret[..],
+            "the target ciphertext must yield a different secret, or this test proves nothing"
+        );
+        // The suffix half was patched in this scenario, so the client keeps
+        // the correct X25519 secret and only the KEM half diverges.
+        let mut mutated_dh = target_secret.to_vec();
+        mutated_dh.extend_from_slice(&tls_dh[32..]);
+        let oracle = oracle_flight_crypto(vector, &ch_message, &patched_sh, &mutated_dh, &auth_key);
+        assert_ne!(
+            oracle.client_hs_key,
+            hex_bytes(vector.client_hs_key_hex),
+            "decapsulating the target ciphertext must rekey the client"
+        );
+        let record = seal_vector_finished(
+            vector,
+            &oracle.client_hs_key,
+            &oracle.client_hs_iv,
+            &oracle.client_finished_body,
+        );
+        let session = open_mirror_vector_session(vector).await;
+        finish_error_after_record(session, &record).await;
     }
 }
