@@ -176,23 +176,20 @@ impl VerifiedHello {
     }
 }
 
-fn client_key_share_entry(
-    hello: &crate::reality_server::ClientHello,
-    group: u16,
-) -> Option<&crate::reality_server::KeyShareEntry> {
-    hello.key_shares.iter().find(|entry| entry.group == group)
+fn client_key_share_entry(hello: &crate::reality_server::ClientHello, group: u16) -> Option<&[u8]> {
+    hello.key_shares.bytes(group)
 }
 
 fn client_key_share_usable(hello: &crate::reality_server::ClientHello, group: u16) -> bool {
-    if !hello.supported_groups.contains(&group) {
+    if !hello.supported_groups.declares(group) {
         return false;
     }
     let Some(entry) = client_key_share_entry(hello, group) else {
         return false;
     };
     match group {
-        GROUP_X25519 => x25519_public_key_usable(&entry.bytes),
-        GROUP_X25519_MLKEM768 => hybrid_key_share_usable(&entry.bytes),
+        GROUP_X25519 => x25519_public_key_usable(entry),
+        GROUP_X25519_MLKEM768 => hybrid_key_share_usable(entry),
         _ => false,
     }
 }
@@ -323,7 +320,7 @@ fn parse_template_server_hello(
         TLS_CHACHA20_POLY1305_SHA256 => CipherSuite::ChaCha20Poly1305Sha256,
         _ => return Err(MirrorTemplateError::UnsupportedCipher),
     };
-    if !verified.hello.cipher_suites.contains(&cipher_value) {
+    if !verified.hello.cipher_suites.contains(cipher_value) {
         return Err(MirrorTemplateError::CipherNotOffered);
     }
     if take_sh_u8(sh, &mut pos) != Some(0) {
@@ -408,12 +405,12 @@ fn parse_template_server_hello(
         _ => return Err(MirrorTemplateError::UnsupportedGroup),
     }
 
-    if !verified.hello.supported_groups.contains(&group) {
+    if !verified.hello.supported_groups.declares(group) {
         return Err(MirrorTemplateError::GroupNotOffered);
     }
-    let Some(_entry) = client_key_share_entry(&verified.hello, group) else {
+    if !verified.hello.key_shares.present(group) {
         return Err(MirrorTemplateError::KeyShareNotProvided);
-    };
+    }
     if !client_key_share_usable(&verified.hello, group) {
         return Err(MirrorTemplateError::InvalidClientKeyShare);
     }
@@ -597,7 +594,6 @@ fn fixed_ephemeral_exchange(
         }
     };
     let client_x: [u8; 32] = entry
-        .bytes
         .get(client_x_offset..client_x_offset + 32)
         .ok_or_else(|| TransportError::Tls("REALITY mirror client X25519 share length".into()))?
         .try_into()
@@ -641,7 +637,7 @@ fn ephemeral_exchange(
         .ok_or_else(|| TransportError::Tls("REALITY mirror client key share disappeared".into()))?;
     encapsulate_server_share(&ChosenKeyShare {
         group,
-        client_share: entry.bytes.clone(),
+        client_share: entry.to_vec(),
     })
 }
 
@@ -940,7 +936,8 @@ pub(crate) fn prepare_mirrored_flight(
 mod tests {
     use super::*;
     use crate::reality_server::{
-        ChosenKeyShare, ClientHello, KeyShareEntry, RealityCertificate, VerifiedHello,
+        ClientHello, ClientKeyShares, FixedServerName, OfferedCipherSuites, RealityCertificate,
+        SupportedGroups, VerifiedHello,
     };
     use crate::reality_tls::{x25519_public_from_private, CipherSuite};
     use boring::mlkem::{Algorithm as MlKemAlgorithm, MlKemPrivateKey};
@@ -983,19 +980,31 @@ mod tests {
             .find(|(group, _)| *group == 0x001d)
             .or_else(|| shares.first())
             .expect("test hello carries a share")
-            .clone();
+            .0;
+        let mut offered = OfferedCipherSuites::default();
+        for cipher in ciphers {
+            offered.insert(cipher);
+        }
+        let mut supported = SupportedGroups::default();
+        if !groups.is_empty() {
+            supported.mark_nonempty();
+        }
+        for group in groups {
+            supported.insert(group);
+        }
+        let mut share_slots = ClientKeyShares::default();
+        for (group, bytes) in shares {
+            share_slots.insert(group, &bytes);
+        }
         VerifiedHello {
             hello: ClientHello {
                 raw: vec![1, 0, 0, 0],
                 random: [0x11; 32],
-                session_id: vec![0x42; 32],
-                server_name: Some("www.example.com".into()),
-                cipher_suites: ciphers,
-                supported_groups: groups,
-                key_shares: shares
-                    .into_iter()
-                    .map(|(group, bytes)| KeyShareEntry { group, bytes })
-                    .collect(),
+                session_id: [0x42; 32],
+                server_name: FixedServerName::from_test("www.example.com"),
+                cipher_suites: offered,
+                supported_groups: supported,
+                key_shares: share_slots,
                 offers_tls13: true,
                 reality_session_id_layout: true,
                 duplicate_extension: false,
@@ -1005,14 +1014,12 @@ mod tests {
                 has_early_data,
                 record_size_limit,
                 record_size_limit_malformed: false,
+                parse_explicit_arena_bytes: 0,
             },
             ch_wire: Vec::new(),
             auth_key: [0x23; 32],
             local_cipher: CipherSuite::Aes128GcmSha256,
-            local_key_share: ChosenKeyShare {
-                group: selected.0,
-                client_share: selected.1,
-            },
+            local_key_group: selected,
         }
     }
 

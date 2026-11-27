@@ -54,6 +54,210 @@ const COVER_MAX_LIFETIME: Duration = Duration::from_secs(600);
 const COVER_LIMITER_GRANULARITY: Duration = Duration::from_millis(10);
 const ED25519_OID: &[u8] = &[0x06, 0x03, 0x2b, 0x65, 0x70];
 
+/// One bit for every possible u16 extension/group value.  Reusing the same
+/// fixed bitmap for extension uniqueness and then key-share uniqueness keeps
+/// duplicate detection out of attacker-sized hash maps.
+struct DedupBitset([u64; 1024]);
+
+impl DedupBitset {
+    fn new() -> Self {
+        Self([0; 1024])
+    }
+
+    fn clear(&mut self) {
+        self.0.fill(0);
+    }
+
+    /// Returns true when the value had already been inserted.
+    fn insert(&mut self, value: u16) -> bool {
+        let word = usize::from(value / 64);
+        let bit = 1u64 << (value % 64);
+        let duplicate = self.0[word] & bit != 0;
+        self.0[word] |= bit;
+        duplicate
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct OfferedCipherSuites(u8);
+
+impl OfferedCipherSuites {
+    const AES128: u8 = 1;
+    const AES256: u8 = 2;
+    const CHACHA20: u8 = 4;
+
+    pub(crate) fn insert(&mut self, value: u16) {
+        self.0 |= match value {
+            TLS_AES_128_GCM_SHA256 => Self::AES128,
+            TLS_AES_256_GCM_SHA384 => Self::AES256,
+            TLS_CHACHA20_POLY1305_SHA256 => Self::CHACHA20,
+            _ => 0,
+        };
+    }
+
+    pub(crate) fn contains(&self, value: u16) -> bool {
+        self.0
+            & match value {
+                TLS_AES_128_GCM_SHA256 => Self::AES128,
+                TLS_AES_256_GCM_SHA384 => Self::AES256,
+                TLS_CHACHA20_POLY1305_SHA256 => Self::CHACHA20,
+                _ => 0,
+            }
+            != 0
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SupportedGroups {
+    x25519: bool,
+    hybrid: bool,
+    absent_or_empty: bool,
+}
+
+impl Default for SupportedGroups {
+    fn default() -> Self {
+        Self {
+            x25519: false,
+            hybrid: false,
+            absent_or_empty: true,
+        }
+    }
+}
+
+impl SupportedGroups {
+    pub(crate) fn insert(&mut self, group: u16) {
+        match group {
+            GROUP_X25519 => self.x25519 = true,
+            GROUP_X25519_MLKEM768 => self.hybrid = true,
+            _ => {}
+        }
+    }
+
+    pub(crate) fn mark_nonempty(&mut self) {
+        self.absent_or_empty = false;
+    }
+
+    pub(crate) fn declares(&self, group: u16) -> bool {
+        match group {
+            GROUP_X25519 => self.x25519,
+            GROUP_X25519_MLKEM768 => self.hybrid,
+            _ => false,
+        }
+    }
+
+    fn allows_v1(&self, group: u16) -> bool {
+        self.absent_or_empty || self.declares(group)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct FixedServerName {
+    len: u8,
+    bytes: [u8; 253],
+}
+
+impl FixedServerName {
+    fn from_wire(name: &str) -> Option<Self> {
+        if name.len() > 253 {
+            return None;
+        }
+        let mut out = Self {
+            len: name.len() as u8,
+            bytes: [0; 253],
+        };
+        for (dst, src) in out.bytes[..name.len()].iter_mut().zip(name.as_bytes()) {
+            *dst = src.to_ascii_lowercase();
+        }
+        Some(out)
+    }
+
+    pub(crate) fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.bytes[..usize::from(self.len)])
+            .expect("SNI was validated as UTF-8")
+    }
+
+    #[cfg(test)]
+    pub(crate) fn from_test(name: &str) -> Option<Self> {
+        Self::from_wire(name)
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct KeyShareSlot<const N: usize> {
+    present: bool,
+    wire_len: usize,
+    valid_len: bool,
+    bytes: [u8; N],
+}
+
+impl<const N: usize> Default for KeyShareSlot<N> {
+    fn default() -> Self {
+        Self {
+            present: false,
+            wire_len: 0,
+            valid_len: false,
+            bytes: [0; N],
+        }
+    }
+}
+
+impl<const N: usize> KeyShareSlot<N> {
+    pub(crate) fn insert(&mut self, bytes: &[u8]) {
+        self.present = true;
+        self.wire_len = bytes.len();
+        self.valid_len = bytes.len() == N;
+        if self.valid_len {
+            self.bytes.copy_from_slice(bytes);
+        }
+    }
+
+    fn bytes(&self) -> Option<&[u8; N]> {
+        self.valid_len.then_some(&self.bytes)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_capacity(&self) -> usize {
+        usize::from(self.valid_len) * N
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct ClientKeyShares {
+    x25519: KeyShareSlot<32>,
+    hybrid: KeyShareSlot<HYBRID_SHARE_LEN>,
+}
+
+impl ClientKeyShares {
+    pub(crate) fn insert(&mut self, group: u16, bytes: &[u8]) {
+        match group {
+            GROUP_X25519 => self.x25519.insert(bytes),
+            GROUP_X25519_MLKEM768 => self.hybrid.insert(bytes),
+            _ => {}
+        }
+    }
+
+    pub(crate) fn present(&self, group: u16) -> bool {
+        match group {
+            GROUP_X25519 => self.x25519.present,
+            GROUP_X25519_MLKEM768 => self.hybrid.present,
+            _ => false,
+        }
+    }
+
+    pub(crate) fn bytes(&self, group: u16) -> Option<&[u8]> {
+        match group {
+            GROUP_X25519 => self.x25519.bytes().map(|bytes| &bytes[..]),
+            GROUP_X25519_MLKEM768 => self.hybrid.bytes().map(|bytes| &bytes[..]),
+            _ => None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retained_capacity(&self) -> usize {
+        self.x25519.retained_capacity() + self.hybrid.retained_capacity()
+    }
+}
+
 type HmacSha512 = Hmac<Sha512>;
 
 /// REALITY private identity and admission policy.
@@ -147,7 +351,7 @@ pub struct VerifiedHello {
     pub(crate) ch_wire: Vec<u8>,
     pub(crate) auth_key: [u8; 32],
     pub(crate) local_cipher: CipherSuite,
-    pub(crate) local_key_share: ChosenKeyShare,
+    pub(crate) local_key_group: u16,
 }
 
 impl fmt::Debug for VerifiedHello {
@@ -288,7 +492,7 @@ impl RealityServer {
             Preflight::Cover(wire) => {
                 return Ok(RealityClientHello::Cover(CoverRelay::new(inner, wire)))
             }
-            Preflight::Candidate { hello, wire_prefix } => (hello, wire_prefix),
+            Preflight::Candidate { hello, wire_prefix } => (*hello, wire_prefix),
         };
 
         let verified = match self.verify_hello(hello, wire_prefix) {
@@ -318,14 +522,19 @@ impl RealityServer {
             hello,
             auth_key,
             local_cipher,
-            local_key_share,
+            local_key_group,
             ..
         } = hello;
+        let Some(key_share) = chosen_key_share_for(&hello, local_key_group) else {
+            return Err(TransportError::Tls(
+                "REALITY verified ClientHello lost its selected key share".into(),
+            ));
+        };
         let prepared = PreparedHandshake {
             raw_hello: hello.raw,
-            session_id: hello.session_id,
+            session_id: hello.session_id.to_vec(),
             cipher: local_cipher,
-            key_share: local_key_share,
+            key_share,
             auth_key,
         };
         self.complete_prepared_handshake(inner, prepared).await
@@ -348,28 +557,31 @@ impl RealityServer {
         )
     }
 
-    fn open_auth_plaintext(&self, hello: &ClientHello) -> Option<([u8; 32], Vec<u8>)> {
+    fn open_auth_plaintext(&self, hello: &mut ClientHello) -> Option<([u8; 32], Vec<u8>)> {
         let auth_share = hello.auth_share()?;
         let shared = x25519(&self.inner.private_key, &auth_share).ok()?;
         let auth_key: [u8; 32] = hkdf_sha256(&shared, &hello.random[..20], b"REALITY", 32)
             .try_into()
             .expect("REALITY AuthKey length");
 
-        let ciphertext = hello.session_id.get(..16)?;
-        let tag = hello.session_id.get(16..32)?;
-        let mut aad = hello.raw.clone();
-        aad[39..71].fill(0);
-        let plaintext = aes_gcm_open(&auth_key, &hello.random[20..32], ciphertext, tag, &aad)?;
+        let session_id = hello.session_id;
+        hello.raw[39..71].fill(0);
+        let plaintext = aes_gcm_open(
+            &auth_key,
+            &hello.random[20..32],
+            &session_id[..16],
+            &session_id[16..32],
+            &hello.raw,
+        );
+        hello.raw[39..71].copy_from_slice(&session_id);
+        let plaintext = plaintext?;
         if plaintext.len() != 16 {
             return None;
         }
         Some((auth_key, plaintext))
     }
 
-    fn validate_hello(
-        &self,
-        hello: &ClientHello,
-    ) -> Option<([u8; 32], CipherSuite, ChosenKeyShare)> {
+    fn validate_hello(&self, hello: &mut ClientHello) -> Option<([u8; 32], CipherSuite, u16)> {
         if !hello.reality_session_id_layout
             || !hello.offers_tls13
             || hello.duplicate_extension
@@ -378,7 +590,7 @@ impl RealityServer {
         {
             return None;
         }
-        let server_name = hello.server_name.as_deref()?;
+        let server_name = hello.server_name.as_ref()?.as_str();
         if !self.inner.server_names.contains(server_name) {
             return None;
         }
@@ -405,33 +617,34 @@ impl RealityServer {
         }
 
         let cipher = select_cipher(&hello.cipher_suites)?;
-        let key_share = select_key_share(hello)?;
-        Some((auth_key, cipher, key_share))
+        let key_group = select_key_group(hello)?;
+        Some((auth_key, cipher, key_group))
     }
 
     fn verify_hello(
         &self,
-        hello: ClientHello,
+        mut hello: ClientHello,
         ch_wire: Vec<u8>,
     ) -> std::result::Result<VerifiedHello, Vec<u8>> {
-        match self.validate_hello(&hello) {
-            Some((auth_key, local_cipher, local_key_share)) => Ok(VerifiedHello {
+        match self.validate_hello(&mut hello) {
+            Some((auth_key, local_cipher, local_key_group)) => Ok(VerifiedHello {
                 hello,
                 ch_wire,
                 auth_key,
                 local_cipher,
-                local_key_share,
+                local_key_group,
             }),
             None => Err(ch_wire),
         }
     }
 
     #[cfg(test)]
-    fn classify(&self, hello: &ClientHello) -> Option<PreparedHandshake> {
-        let (auth_key, cipher, key_share) = self.validate_hello(hello)?;
+    fn classify(&self, hello: &mut ClientHello) -> Option<PreparedHandshake> {
+        let (auth_key, cipher, key_group) = self.validate_hello(hello)?;
+        let key_share = chosen_key_share_for(hello, key_group)?;
         Some(PreparedHandshake {
             raw_hello: hello.raw.clone(),
-            session_id: hello.session_id.clone(),
+            session_id: hello.session_id.to_vec(),
             cipher,
             key_share,
             auth_key,
@@ -555,7 +768,7 @@ pub(crate) fn certificate_verify_input(transcript_hash: &[u8]) -> Vec<u8> {
 
 enum Preflight {
     Candidate {
-        hello: ClientHello,
+        hello: Box<ClientHello>,
         wire_prefix: Vec<u8>,
     },
     Cover(Vec<u8>),
@@ -564,19 +777,23 @@ enum Preflight {
 async fn read_client_hello_preflight(
     mut inner: Box<dyn Stream>,
 ) -> Result<(Box<dyn Stream>, Preflight)> {
-    let mut wire_prefix = Vec::new();
-    let mut handshake_bytes = Vec::new();
+    // The two CH arenas are explicit, bounded allocations: the exact wire
+    // prefix and the reassembled logical handshake.  They briefly coexist
+    // while records are read, then ownership of the logical allocation moves
+    // into ClientHello without a third copy.
+    let mut wire_prefix = Vec::with_capacity(MAX_AUTHED_STREAM_BYTES);
+    let mut logical = Vec::with_capacity(MAX_AUTHED_STREAM_BYTES);
     for _ in 0..MAX_AUTHED_STREAM_RECORDS {
-        let mut header = [0u8; 5];
         let remaining_budget = MAX_AUTHED_STREAM_BYTES - wire_prefix.len();
-        if remaining_budget < header.len() {
-            // A full header no longer fits.  Only the first byte beyond the
-            // remaining budget is decisive, though: EOF exactly at the cap is
-            // still the historical I/O boundary rather than a resource error.
+        if remaining_budget < 5 {
+            // A partial next header cannot prove overflow by itself.  Read the
+            // first byte beyond the cap before deciding; EOF exactly at the
+            // cap remains the historical I/O boundary.
             let needed = remaining_budget + 1;
+            let mut probe = [0u8; 5];
             let mut pos = 0;
             while pos < needed {
-                match inner.read(&mut header[pos..needed]).await {
+                match inner.read(&mut probe[pos..needed]).await {
                     Ok(0) => {
                         return Err(TransportError::Io(io::Error::new(
                             io::ErrorKind::UnexpectedEof,
@@ -595,16 +812,11 @@ async fn read_client_hello_preflight(
                 }
             }
         }
-        match inner.read_exact(&mut header).await {
-            Ok(_) => {}
-            Err(e) => return Err(TransportError::Io(e)),
+        let mut header = [0u8; 5];
+        if let Err(e) = inner.read_exact(&mut header).await {
+            return Err(TransportError::Io(e));
         }
         wire_prefix.extend_from_slice(&header);
-        // Match the pinned TLS server's first-record screen before trusting
-        // the length: only a handshake record with a plausible TLS version
-        // can carry a ClientHello.  Anything else is cover traffic after
-        // exactly the bytes already consumed, regardless of the declared
-        // body length.
         let record_version = u16::from_be_bytes([header[1], header[2]]);
         if header[0] != TLS_RECORD_HANDSHAKE || record_version >= 0x1000 {
             return Ok((inner, Preflight::Cover(wire_prefix)));
@@ -615,40 +827,45 @@ async fn read_client_hello_preflight(
                 "REALITY ClientHello pre-read record length out of range".into(),
             ));
         }
-        // The cap counts complete wire bytes — record headers included.
-        // `wire_prefix` already holds this record's header, so
-        // `wire_prefix.len() + len` is the exact total once the payload
-        // lands; the spec bound is 64 KiB of wire in at most 32 records.
         if wire_prefix.len() + len > MAX_AUTHED_STREAM_BYTES {
             return Err(TransportError::ResourceLimit(
                 "REALITY ClientHello pre-read exceeds 64 KiB".into(),
             ));
         }
-        let mut payload = vec![0u8; len];
-        if let Err(e) = inner.read_exact(&mut payload).await {
+        let body_start = wire_prefix.len();
+        wire_prefix.resize(body_start + len, 0);
+        if let Err(e) = inner
+            .read_exact(&mut wire_prefix[body_start..body_start + len])
+            .await
+        {
             return Err(TransportError::Io(e));
         }
-        wire_prefix.extend_from_slice(&payload);
-        handshake_bytes.extend_from_slice(&payload);
-        if handshake_bytes.len() >= 4 {
-            if handshake_bytes[0] != HS_CLIENT_HELLO {
+        logical.extend_from_slice(&wire_prefix[body_start..body_start + len]);
+        if logical.len() >= 4 {
+            if logical[0] != HS_CLIENT_HELLO {
                 return Ok((inner, Preflight::Cover(wire_prefix)));
             }
-            let message_len = read_u24(&handshake_bytes[1..4]);
+            let message_len = read_u24(&logical[1..4]);
             let total = 4usize.saturating_add(message_len);
             if total > MAX_AUTHED_STREAM_BYTES {
                 return Err(TransportError::ResourceLimit(
                     "REALITY ClientHello exceeds 64 KiB".into(),
                 ));
             }
-            if handshake_bytes.len() == total {
-                let raw = handshake_bytes[..total].to_vec();
+            if logical.len() == total {
+                let raw = std::mem::take(&mut logical);
                 return match parse_client_hello(raw) {
-                    Ok(hello) => Ok((inner, Preflight::Candidate { hello, wire_prefix })),
+                    Ok(hello) => Ok((
+                        inner,
+                        Preflight::Candidate {
+                            hello: Box::new(hello),
+                            wire_prefix,
+                        },
+                    )),
                     Err(_) => Ok((inner, Preflight::Cover(wire_prefix))),
                 };
             }
-            if handshake_bytes.len() > total {
+            if logical.len() > total {
                 return Ok((inner, Preflight::Cover(wire_prefix)));
             }
         }
@@ -661,11 +878,11 @@ async fn read_client_hello_preflight(
 pub(crate) struct ClientHello {
     pub(crate) raw: Vec<u8>,
     pub(crate) random: [u8; 32],
-    pub(crate) session_id: Vec<u8>,
-    pub(crate) server_name: Option<String>,
-    pub(crate) cipher_suites: Vec<u16>,
-    pub(crate) supported_groups: Vec<u16>,
-    pub(crate) key_shares: Vec<KeyShareEntry>,
+    pub(crate) session_id: [u8; 32],
+    pub(crate) server_name: Option<FixedServerName>,
+    pub(crate) cipher_suites: OfferedCipherSuites,
+    pub(crate) supported_groups: SupportedGroups,
+    pub(crate) key_shares: ClientKeyShares,
     pub(crate) offers_tls13: bool,
     pub(crate) reality_session_id_layout: bool,
     pub(crate) duplicate_extension: bool,
@@ -675,26 +892,46 @@ pub(crate) struct ClientHello {
     pub(crate) has_early_data: bool,
     pub(crate) record_size_limit: Option<u16>,
     pub(crate) record_size_limit_malformed: bool,
-}
-
-pub(crate) struct KeyShareEntry {
-    pub(crate) group: u16,
-    pub(crate) bytes: Vec<u8>,
+    #[cfg(test)]
+    pub(crate) parse_explicit_arena_bytes: usize,
 }
 
 impl ClientHello {
     fn auth_share(&self) -> Option<[u8; 32]> {
-        for entry in &self.key_shares {
-            if entry.group == GROUP_X25519 && entry.bytes.len() == 32 {
-                return entry.bytes.as_slice().try_into().ok();
-            }
+        if let Some(bytes) = self.key_shares.x25519.bytes() {
+            return Some(*bytes);
         }
-        for entry in &self.key_shares {
-            if entry.group == GROUP_X25519_MLKEM768 && entry.bytes.len() == HYBRID_SHARE_LEN {
-                return entry.bytes[HYBRID_SHARE_LEN - 32..].try_into().ok();
-            }
+        let hybrid = self.key_shares.hybrid.bytes()?;
+        Some(
+            hybrid[HYBRID_SHARE_LEN - 32..]
+                .try_into()
+                .expect("32-byte suffix"),
+        )
+    }
+}
+
+#[cfg(test)]
+impl ClientHello {
+    pub(crate) fn test_empty() -> Self {
+        Self {
+            raw: Vec::new(),
+            random: [0; 32],
+            session_id: [0; 32],
+            server_name: None,
+            cipher_suites: OfferedCipherSuites::default(),
+            supported_groups: SupportedGroups::default(),
+            key_shares: ClientKeyShares::default(),
+            offers_tls13: true,
+            reality_session_id_layout: true,
+            duplicate_extension: false,
+            sni_malformed: false,
+            key_share_malformed: false,
+            has_pre_shared_key: false,
+            has_early_data: false,
+            record_size_limit: None,
+            record_size_limit_malformed: false,
+            parse_explicit_arena_bytes: 0,
         }
-        None
     }
 }
 
@@ -714,72 +951,64 @@ fn parse_client_hello(raw: Vec<u8>) -> Result<ClientHello> {
     }
     let random: [u8; 32] = take(&raw, &mut pos, 32)?.try_into().expect("32 bytes");
     let sid_len = take_u8(&raw, &mut pos)? as usize;
-    let session_id = take(&raw, &mut pos, sid_len)?.to_vec();
+    let session_id: [u8; 32] = take(&raw, &mut pos, sid_len)?
+        .try_into()
+        .map_err(|_| TransportError::Tls("malformed REALITY session id".into()))?;
     let suites_len = take_u16(&raw, &mut pos)? as usize;
     if !suites_len.is_multiple_of(2) {
         return Err(TransportError::Tls("malformed cipher suites".into()));
     }
     let suites_bytes = take(&raw, &mut pos, suites_len)?;
-    let cipher_suites = suites_bytes
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| u16::from_be_bytes(*b))
-        .collect();
+    let mut cipher_suites = OfferedCipherSuites::default();
+    for suite in suites_bytes.as_chunks::<2>().0 {
+        cipher_suites.insert(u16::from_be_bytes(*suite));
+    }
     let compression_len = take_u8(&raw, &mut pos)? as usize;
     let compression = take(&raw, &mut pos, compression_len)?;
-    // RFC 8446 §4.1.2: a TLS 1.3 ClientHello carries exactly one
-    // compression method, zero.  Anything else is not a REALITY client
-    // shape — browsers and both pinned clients all send exactly `[0]`.
     if compression != [0] {
         return Err(TransportError::Tls(
             "REALITY ClientHello compression methods are not exactly [0]".into(),
         ));
     }
     let extensions_len = take_u16(&raw, &mut pos)? as usize;
-    let extensions = take(&raw, &mut pos, extensions_len)?.to_vec();
+    let extensions = take(&raw, &mut pos, extensions_len)?;
     if pos != raw.len() {
         return Err(TransportError::Tls(
             "REALITY ClientHello trailing bytes".into(),
         ));
     }
 
-    let mut out = ClientHello {
-        raw,
-        random,
-        session_id,
-        server_name: None,
-        cipher_suites,
-        supported_groups: Vec::new(),
-        key_shares: Vec::new(),
-        offers_tls13: false,
-        reality_session_id_layout: sid_len == 32,
-        duplicate_extension: false,
-        sni_malformed: false,
-        key_share_malformed: false,
-        has_pre_shared_key: false,
-        has_early_data: false,
-        record_size_limit: None,
-        record_size_limit_malformed: false,
-    };
+    let mut server_name = None;
+    let mut supported_groups = SupportedGroups::default();
+    let mut key_shares = ClientKeyShares::default();
+    let mut offers_tls13 = false;
+    let mut duplicate_extension = false;
+    let mut sni_malformed = false;
+    let mut key_share_malformed = false;
+    let mut has_pre_shared_key = false;
+    let mut has_early_data = false;
+    let mut record_size_limit = None;
+    let mut record_size_limit_malformed = false;
+    let mut key_share_data = None;
+
     let mut ep = 0;
-    let mut seen = HashSet::new();
+    let mut dedup = DedupBitset::new();
     while ep < extensions.len() {
-        let ext_type = take_u16(&extensions, &mut ep)?;
-        let ext_len = take_u16(&extensions, &mut ep)? as usize;
-        let data = take(&extensions, &mut ep, ext_len)?;
-        if !seen.insert(ext_type) {
-            out.duplicate_extension = true;
+        let ext_type = take_u16(extensions, &mut ep)?;
+        let ext_len = take_u16(extensions, &mut ep)? as usize;
+        let data = take(extensions, &mut ep, ext_len)?;
+        if dedup.insert(ext_type) {
+            duplicate_extension = true;
         }
         match ext_type {
-            EXT_SERVER_NAME => parse_server_name(data, &mut out),
-            EXT_PRE_SHARED_KEY => out.has_pre_shared_key = true,
-            EXT_EARLY_DATA => out.has_early_data = true,
+            EXT_SERVER_NAME => parse_server_name(data, &mut server_name, &mut sni_malformed),
+            EXT_PRE_SHARED_KEY => has_pre_shared_key = true,
+            EXT_EARLY_DATA => has_early_data = true,
             EXT_RECORD_SIZE_LIMIT => {
                 if data.len() == 2 {
-                    out.record_size_limit = Some(u16::from_be_bytes([data[0], data[1]]));
+                    record_size_limit = Some(u16::from_be_bytes([data[0], data[1]]));
                 } else {
-                    out.record_size_limit_malformed = true;
+                    record_size_limit_malformed = true;
                 }
             }
             EXT_SUPPORTED_VERSIONS => {
@@ -789,7 +1018,7 @@ fn parse_client_hello(raw: Vec<u8>) -> Result<ClientHello> {
                 {
                     return Err(TransportError::Tls("malformed supported_versions".into()));
                 }
-                out.offers_tls13 = data[1..]
+                offers_tls13 = data[1..]
                     .as_chunks::<2>()
                     .0
                     .iter()
@@ -803,14 +1032,14 @@ fn parse_client_hello(raw: Vec<u8>) -> Result<ClientHello> {
                 if len + 2 != data.len() || !len.is_multiple_of(2) {
                     return Err(TransportError::Tls("malformed supported_groups".into()));
                 }
-                out.supported_groups = data[2..]
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|b| u16::from_be_bytes(*b))
-                    .collect();
+                if len != 0 {
+                    supported_groups.mark_nonempty();
+                }
+                for group in data[2..].as_chunks::<2>().0 {
+                    supported_groups.insert(u16::from_be_bytes(*group));
+                }
             }
-            EXT_KEY_SHARE => parse_key_share(data, &mut out),
+            EXT_KEY_SHARE => key_share_data = Some(data),
             _ => {}
         }
     }
@@ -819,110 +1048,137 @@ fn parse_client_hello(raw: Vec<u8>) -> Result<ClientHello> {
             "REALITY extension block truncated".into(),
         ));
     }
-    Ok(out)
+
+    // The same 8 KiB bitmap is reused for key-share group uniqueness.  Only
+    // the two protocol groups are copied, and only when their length is exact.
+    dedup.clear();
+    if let Some(data) = key_share_data {
+        parse_key_share(data, &mut key_shares, &mut key_share_malformed, &mut dedup);
+    }
+    #[cfg(test)]
+    let parse_explicit_arena_bytes =
+        raw.capacity() + std::mem::size_of::<DedupBitset>() + 5 + key_shares.retained_capacity();
+
+    Ok(ClientHello {
+        raw,
+        random,
+        session_id,
+        server_name,
+        cipher_suites,
+        supported_groups,
+        key_shares,
+        offers_tls13,
+        reality_session_id_layout: sid_len == 32,
+        duplicate_extension,
+        sni_malformed,
+        key_share_malformed,
+        has_pre_shared_key,
+        has_early_data,
+        record_size_limit,
+        record_size_limit_malformed,
+        #[cfg(test)]
+        parse_explicit_arena_bytes,
+    })
 }
 
-fn parse_server_name(data: &[u8], out: &mut ClientHello) {
+fn parse_server_name(data: &[u8], server_name: &mut Option<FixedServerName>, malformed: &mut bool) {
     let mut pos = 0;
     let Ok(list_len) = take_u16(data, &mut pos) else {
-        out.sni_malformed = true;
+        *malformed = true;
         return;
     };
     let Ok(list) = take(data, &mut pos, list_len as usize) else {
-        out.sni_malformed = true;
+        *malformed = true;
         return;
     };
     if pos != data.len() || list.len() < 3 {
-        out.sni_malformed = true;
+        *malformed = true;
         return;
     }
     let mut lp = 0;
     while lp < list.len() {
         let Ok(kind) = take_u8(list, &mut lp) else {
-            out.sni_malformed = true;
+            *malformed = true;
             return;
         };
         let Ok(len) = take_u16(list, &mut lp) else {
-            out.sni_malformed = true;
+            *malformed = true;
             return;
         };
         let Ok(name) = take(list, &mut lp, len as usize) else {
-            out.sni_malformed = true;
+            *malformed = true;
             return;
         };
         if kind != 0 || name.is_empty() {
-            out.sni_malformed = true;
+            *malformed = true;
             return;
         }
         let Ok(name) = std::str::from_utf8(name) else {
-            out.sni_malformed = true;
+            *malformed = true;
             return;
         };
-        if out.server_name.is_some() {
-            out.sni_malformed = true;
+        if server_name.is_some() {
+            *malformed = true;
             return;
         }
-        out.server_name = Some(name.to_ascii_lowercase());
+        *server_name = FixedServerName::from_wire(name);
     }
     if lp != list.len() {
-        out.sni_malformed = true;
+        *malformed = true;
     }
 }
 
-fn parse_key_share(data: &[u8], out: &mut ClientHello) {
+fn parse_key_share(
+    data: &[u8],
+    shares: &mut ClientKeyShares,
+    malformed: &mut bool,
+    seen: &mut DedupBitset,
+) {
     let mut pos = 0;
     let Ok(list_len) = take_u16(data, &mut pos) else {
-        out.key_share_malformed = true;
+        *malformed = true;
         return;
     };
     let Ok(list) = take(data, &mut pos, list_len as usize) else {
-        out.key_share_malformed = true;
+        *malformed = true;
         return;
     };
     if pos != data.len() {
-        out.key_share_malformed = true;
+        *malformed = true;
         return;
     }
     let mut lp = 0;
-    let mut seen = HashSet::new();
     while lp < list.len() {
         let Ok(group) = take_u16(list, &mut lp) else {
-            out.key_share_malformed = true;
+            *malformed = true;
             return;
         };
         let Ok(len) = take_u16(list, &mut lp) else {
-            out.key_share_malformed = true;
+            *malformed = true;
             return;
         };
         let Ok(bytes) = take(list, &mut lp, len as usize) else {
-            out.key_share_malformed = true;
+            *malformed = true;
             return;
         };
-        if !seen.insert(group) {
-            out.key_share_malformed = true;
+        if seen.insert(group) {
+            *malformed = true;
+        } else {
+            shares.insert(group, bytes);
         }
-        let retained = match group {
-            GROUP_X25519 if bytes.len() == 32 => bytes.to_vec(),
-            GROUP_X25519_MLKEM768 if bytes.len() == HYBRID_SHARE_LEN => bytes.to_vec(),
-            _ => Vec::new(),
-        };
-        out.key_shares.push(KeyShareEntry {
-            group,
-            bytes: retained,
-        });
     }
     if lp != list.len() {
-        out.key_share_malformed = true;
+        *malformed = true;
     }
 }
 
-fn select_cipher(offered: &[u16]) -> Option<CipherSuite> {
+fn select_cipher(offered: &OfferedCipherSuites) -> Option<CipherSuite> {
     for suite in [
         TLS_AES_128_GCM_SHA256,
         TLS_AES_256_GCM_SHA384,
         TLS_CHACHA20_POLY1305_SHA256,
     ] {
-        if offered.contains(&suite) {
+        if offered.contains(suite) {
             return CipherSuite::try_from(suite).ok();
         }
     }
@@ -964,33 +1220,29 @@ pub(crate) fn hybrid_key_share_usable(bytes: &[u8]) -> bool {
         && x25519_public_key_usable(x25519_public)
 }
 
-fn select_key_share(hello: &ClientHello) -> Option<ChosenKeyShare> {
-    fn group_allowed(hello: &ClientHello, group: u16) -> bool {
-        hello.supported_groups.is_empty() || hello.supported_groups.contains(&group)
-    }
-    if group_allowed(hello, GROUP_X25519_MLKEM768) {
-        if let Some(entry) = hello.key_shares.iter().find(|entry| {
-            entry.group == GROUP_X25519_MLKEM768 && hybrid_key_share_usable(&entry.bytes)
-        }) {
-            return Some(ChosenKeyShare {
-                group: GROUP_X25519_MLKEM768,
-                client_share: entry.bytes.clone(),
-            });
+fn select_key_group(hello: &ClientHello) -> Option<u16> {
+    if hello.supported_groups.allows_v1(GROUP_X25519_MLKEM768) {
+        if let Some(bytes) = hello.key_shares.bytes(GROUP_X25519_MLKEM768) {
+            if hybrid_key_share_usable(bytes) {
+                return Some(GROUP_X25519_MLKEM768);
+            }
         }
     }
-    if group_allowed(hello, GROUP_X25519) {
-        if let Some(entry) = hello
-            .key_shares
-            .iter()
-            .find(|entry| entry.group == GROUP_X25519 && x25519_public_key_usable(&entry.bytes))
-        {
-            return Some(ChosenKeyShare {
-                group: GROUP_X25519,
-                client_share: entry.bytes.clone(),
-            });
+    if hello.supported_groups.allows_v1(GROUP_X25519) {
+        if let Some(bytes) = hello.key_shares.bytes(GROUP_X25519) {
+            if x25519_public_key_usable(bytes) {
+                return Some(GROUP_X25519);
+            }
         }
     }
     None
+}
+
+fn chosen_key_share_for(hello: &ClientHello, group: u16) -> Option<ChosenKeyShare> {
+    Some(ChosenKeyShare {
+        group,
+        client_share: hello.key_shares.bytes(group)?.to_vec(),
+    })
 }
 
 pub(crate) fn encapsulate_server_share(chosen: &ChosenKeyShare) -> Result<(Vec<u8>, Vec<u8>)> {
@@ -2085,35 +2337,15 @@ mod tests {
             "the test mutation must produce an unusable ML-KEM public key"
         );
         let classical = vec![9u8; 32];
-        let hello = ClientHello {
-            raw: Vec::new(),
-            random: [0u8; 32],
-            session_id: Vec::new(),
-            server_name: None,
-            cipher_suites: Vec::new(),
-            supported_groups: vec![GROUP_X25519_MLKEM768, GROUP_X25519],
-            key_shares: vec![
-                KeyShareEntry {
-                    group: GROUP_X25519_MLKEM768,
-                    bytes: hybrid,
-                },
-                KeyShareEntry {
-                    group: GROUP_X25519,
-                    bytes: classical.clone(),
-                },
-            ],
-            offers_tls13: true,
-            reality_session_id_layout: true,
-            duplicate_extension: false,
-            sni_malformed: false,
-            key_share_malformed: false,
-            has_pre_shared_key: false,
-            has_early_data: false,
-            record_size_limit: None,
-            record_size_limit_malformed: false,
-        };
+        let mut hello = ClientHello::test_empty();
+        hello.supported_groups.mark_nonempty();
+        hello.supported_groups.insert(GROUP_X25519_MLKEM768);
+        hello.supported_groups.insert(GROUP_X25519);
+        hello.key_shares.insert(GROUP_X25519_MLKEM768, &hybrid);
+        hello.key_shares.insert(GROUP_X25519, &classical);
 
-        let chosen = select_key_share(&hello).expect("classical fallback remains usable");
+        let key_group = select_key_group(&hello).expect("classical fallback remains usable");
+        let chosen = chosen_key_share_for(&hello, key_group).expect("classical share copy");
         assert_eq!(chosen.group, GROUP_X25519);
         assert_eq!(chosen.client_share, classical);
 
@@ -2122,20 +2354,12 @@ mod tests {
                 .expect("ML-KEM keygen");
         let mut usable_hybrid = pq_public.as_bytes().to_vec();
         usable_hybrid.extend_from_slice(&x25519_public_from_private(&probe_private));
-        let hello = ClientHello {
-            key_shares: vec![
-                KeyShareEntry {
-                    group: GROUP_X25519_MLKEM768,
-                    bytes: usable_hybrid.clone(),
-                },
-                KeyShareEntry {
-                    group: GROUP_X25519,
-                    bytes: classical,
-                },
-            ],
-            ..hello
-        };
-        let chosen = select_key_share(&hello).expect("usable hybrid remains selectable");
+        hello
+            .key_shares
+            .insert(GROUP_X25519_MLKEM768, &usable_hybrid);
+        hello.key_shares.insert(GROUP_X25519, &classical);
+        let key_group = select_key_group(&hello).expect("usable hybrid remains selectable");
+        let chosen = chosen_key_share_for(&hello, key_group).expect("hybrid share copy");
         assert_eq!(chosen.group, GROUP_X25519_MLKEM768);
         assert_eq!(chosen.client_share, usable_hybrid);
     }
@@ -2439,6 +2663,194 @@ mod tests {
     }
 
     // ─── ClientHello pre-read wire cap, compression shape, token bucket ──────
+
+    fn stress_extension(typ: u16, data: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + data.len());
+        out.extend_from_slice(&typ.to_be_bytes());
+        out.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        out.extend_from_slice(data);
+        out
+    }
+
+    fn stress_valid_client_hello(
+        server_public: [u8; 32],
+        padding_len: usize,
+        unknown_share_count: usize,
+        unknown_group_count: usize,
+        duplicate_x25519: bool,
+    ) -> Vec<u8> {
+        let mut client_private = rand::random::<[u8; 32]>();
+        crate::reality_tls::clamp_x25519_private(&mut client_private);
+        let client_public = x25519_public_from_private(&client_private);
+        let shared = x25519(&client_private, &server_public).unwrap();
+        let random = rand::random::<[u8; 32]>();
+
+        let name = SERVER_NAME.as_bytes();
+        let mut sni_body = Vec::new();
+        sni_body.extend_from_slice(&(name.len() as u16 + 3).to_be_bytes());
+        sni_body.push(0);
+        sni_body.extend_from_slice(&(name.len() as u16).to_be_bytes());
+        sni_body.extend_from_slice(name);
+
+        let mut groups = Vec::new();
+        groups.extend_from_slice(&GROUP_X25519.to_be_bytes());
+        groups.extend_from_slice(&GROUP_X25519_MLKEM768.to_be_bytes());
+        for index in 0..unknown_group_count {
+            let group = 0x4000u16 + index as u16;
+            if group != GROUP_X25519 && group != GROUP_X25519_MLKEM768 {
+                groups.extend_from_slice(&group.to_be_bytes());
+            }
+        }
+        let mut groups_body = Vec::new();
+        groups_body.extend_from_slice(&(groups.len() as u16).to_be_bytes());
+        groups_body.extend_from_slice(&groups);
+
+        let mut shares = Vec::new();
+        let mut push_share = |group: u16, bytes: &[u8]| {
+            shares.extend_from_slice(&group.to_be_bytes());
+            shares.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            shares.extend_from_slice(bytes);
+        };
+        push_share(GROUP_X25519, &client_public);
+        let hybrid = vec![0x5a; HYBRID_SHARE_LEN];
+        push_share(GROUP_X25519_MLKEM768, &hybrid);
+        for index in 0..unknown_share_count {
+            let group = 0x5000u16 + index as u16;
+            push_share(group, &[0x66; 7]);
+        }
+        if duplicate_x25519 {
+            push_share(GROUP_X25519, &client_public);
+        }
+        let mut shares_body = Vec::new();
+        shares_body.extend_from_slice(&(shares.len() as u16).to_be_bytes());
+        shares_body.extend_from_slice(&shares);
+
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&stress_extension(EXT_SERVER_NAME, &sni_body));
+        extensions.extend_from_slice(&stress_extension(EXT_SUPPORTED_VERSIONS, &[2, 0x03, 0x04]));
+        extensions.extend_from_slice(&stress_extension(EXT_SUPPORTED_GROUPS, &groups_body));
+        extensions.extend_from_slice(&stress_extension(EXT_KEY_SHARE, &shares_body));
+        extensions.extend_from_slice(&stress_extension(21, &vec![0u8; padding_len]));
+
+        let mut hello = Vec::new();
+        hello.push(HS_CLIENT_HELLO);
+        hello.extend_from_slice(&[0, 0, 0]);
+        hello.extend_from_slice(&[0x03, 0x03]);
+        hello.extend_from_slice(&random);
+        hello.push(32);
+        hello.extend_from_slice(&[0u8; 32]);
+        hello.extend_from_slice(&(2u16).to_be_bytes());
+        hello.extend_from_slice(&TLS_AES_128_GCM_SHA256.to_be_bytes());
+        hello.push(1);
+        hello.push(0);
+        hello.extend_from_slice(&(extensions.len() as u16).to_be_bytes());
+        hello.extend_from_slice(&extensions);
+        let body_len = hello.len() - 4;
+        hello[1..4].copy_from_slice(&(body_len as u32).to_be_bytes()[1..4]);
+
+        let auth_key = hkdf_sha256(&shared, &random[..20], b"REALITY", 32);
+        let mut plaintext = Vec::with_capacity(16);
+        plaintext.extend_from_slice(&[0, 0, 0, 0]);
+        plaintext.extend_from_slice(&(fixed_unix() as u32).to_be_bytes());
+        plaintext.extend_from_slice(&SHORT_ID);
+        let cipher = Aes256Gcm::new_from_slice(&auth_key).expect("AES-256-GCM key");
+        let tag = cipher
+            .encrypt_in_place_detached(Nonce::from_slice(&random[20..32]), &hello, &mut plaintext)
+            .expect("seal stress REALITY session id");
+        plaintext.extend_from_slice(&tag);
+        hello[39..71].copy_from_slice(&plaintext);
+        hello
+    }
+
+    fn frame_stress_hello(hello: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        for chunk in hello.chunks(MAX_PLAINTEXT_RECORD) {
+            wire.extend_from_slice(&[TLS_RECORD_HANDSHAKE, 0x03, 0x03]);
+            wire.extend_from_slice(&(chunk.len() as u16).to_be_bytes());
+            wire.extend_from_slice(chunk);
+        }
+        wire
+    }
+
+    fn near_cap_stress_input(
+        server_public: [u8; 32],
+        unknown_share_count: usize,
+        unknown_group_count: usize,
+        duplicate_x25519: bool,
+    ) -> (Vec<u8>, Vec<u8>) {
+        let target_wire = MAX_AUTHED_STREAM_BYTES - 8;
+        let mut padding = 0usize;
+        let mut hello = Vec::new();
+        let mut wire = Vec::new();
+        for _ in 0..64 {
+            hello = stress_valid_client_hello(
+                server_public,
+                padding,
+                unknown_share_count,
+                unknown_group_count,
+                duplicate_x25519,
+            );
+            wire = frame_stress_hello(&hello);
+            if wire.len() <= target_wire && wire.len() >= MAX_AUTHED_STREAM_BYTES - 32 {
+                break;
+            }
+            if wire.len() > target_wire {
+                padding = padding.saturating_sub(wire.len() - target_wire);
+            } else {
+                padding += target_wire - wire.len();
+            }
+        }
+        assert!(
+            wire.len() >= MAX_AUTHED_STREAM_BYTES - 32,
+            "stress input must be near the wire cap, got {}",
+            wire.len()
+        );
+        assert!(wire.len() <= MAX_AUTHED_STREAM_BYTES);
+        (hello, wire)
+    }
+
+    #[tokio::test]
+    async fn client_hello_arena_accounts_for_near_cap_padding_and_group_stress() {
+        let (private, public) = keypair();
+        let server = RealityServer::new(&server_config(private)).expect("server");
+        let (_logical, wire) = near_cap_stress_input(public, 384, 512, false);
+        let expected_wire = wire.clone();
+        let (mut client_io, server_io) = tokio::io::duplex(128 * 1024);
+        let verify_task =
+            tokio::spawn(async move { server.verify_client_hello(Box::new(server_io)).await });
+        client_io.write_all(&wire).await.unwrap();
+        client_io.flush().await.unwrap();
+        let classified = verify_task
+            .await
+            .expect("verify task")
+            .expect("near-cap stress ClientHello preflight");
+        let RealityClientHello::Verified { hello, .. } = classified else {
+            panic!("near-cap stress ClientHello must authenticate")
+        };
+        assert_eq!(hello.ch_wire(), expected_wire);
+        let measured_peak = hello.ch_wire.capacity() + hello.hello.parse_explicit_arena_bytes;
+        assert_eq!(
+            measured_peak, 140_517,
+            "wire, logical/AAD, bitset, header and both candidate shares exactly fill Bch"
+        );
+    }
+
+    #[test]
+    fn client_hello_group_stress_keeps_only_fixed_candidates() {
+        let (_private, public) = keypair();
+        let (logical, _wire) = near_cap_stress_input(public, 384, 512, true);
+        let logical_capacity = logical.capacity();
+        let parsed = parse_client_hello(logical).expect("stress ClientHello parses");
+        assert!(
+            parsed.key_share_malformed,
+            "duplicate group is still classified malformed"
+        );
+        assert_eq!(
+            parsed.parse_explicit_arena_bytes,
+            logical_capacity + std::mem::size_of::<DedupBitset>() + 5 + 32 + HYBRID_SHARE_LEN,
+            "duplicate/unknown groups leave only the two fixed candidates in the parse arena"
+        );
+    }
 
     /// C4: the pre-read cap is 64 KiB of *wire* bytes — record headers
     /// included — not 64 KiB plus one header.  Drives the boundary: an
@@ -3461,10 +3873,10 @@ mod independent_wire_vectors {
         let auth_key = hkdf_sha256(&shared, &decoded.client_hello[6..26], b"REALITY", 32);
         assert_eq!(auth_key, decoded.auth_key);
 
-        let parsed = parse_client_hello(decoded.client_hello.clone()).expect("vector parses");
+        let mut parsed = parse_client_hello(decoded.client_hello.clone()).expect("vector parses");
         let server = vector_server();
         let (opened_key, plaintext) = server
-            .open_auth_plaintext(&parsed)
+            .open_auth_plaintext(&mut parsed)
             .expect("positive frozen vector must authenticate cryptographically");
         assert_eq!(opened_key.as_slice(), decoded.auth_key.as_slice());
         assert_eq!(plaintext, decoded.plaintext);
@@ -3475,7 +3887,7 @@ mod independent_wire_vectors {
         assert_eq!(unix_seconds, UNIX_SECONDS as u32);
         assert_eq!(short_id.as_slice(), hex_bytes(SHORT_ID_HEX));
         assert!(
-            server.classify(&parsed).is_some(),
+            server.classify(&mut parsed).is_some(),
             "positive vector also satisfies the frozen time window and Short ID"
         );
     }
