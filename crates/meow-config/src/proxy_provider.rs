@@ -66,8 +66,8 @@ pub struct ProxyProvider {
     pub slot: ProviderSlot,
     pub vehicle_type: &'static str,
     vehicle: Vehicle,
-    filter: Option<regex::Regex>,
-    exclude_filter: Option<regex::Regex>,
+    filter: Option<fancy_regex::Regex>,
+    exclude_filter: Option<fancy_regex::Regex>,
     exclude_type: Vec<String>,
     pub health_check: Option<HealthCheckConfig>,
     updated_at: AtomicU,
@@ -203,8 +203,8 @@ type WeakSlot = std::sync::Weak<RwLock<Vec<Arc<dyn Proxy>>>>;
 /// filter, also matching upstream (compatible providers are not filtered).
 #[derive(Clone, Debug)]
 pub struct GroupFilter {
-    filter: Option<regex::Regex>,
-    exclude_filter: Option<regex::Regex>,
+    filter: Option<fancy_regex::Regex>,
+    exclude_filter: Option<fancy_regex::Regex>,
     exclude_type: Vec<String>,
 }
 
@@ -228,12 +228,12 @@ impl GroupFilter {
     fn keep(&self, proxy: &dyn Proxy) -> bool {
         let name = proxy.name();
         if let Some(re) = &self.filter {
-            if !re.is_match(name) {
+            if !regex_matches(re, name) {
                 return false;
             }
         }
         if let Some(re) = &self.exclude_filter {
-            if re.is_match(name) {
+            if regex_matches(re, name) {
                 return false;
             }
         }
@@ -1268,12 +1268,12 @@ impl ProxyProvider {
                 .to_lowercase();
 
             if let Some(ref re) = self.filter {
-                if !re.is_match(raw_name) {
+                if !regex_matches(re, raw_name) {
                     continue;
                 }
             }
             if let Some(ref re) = self.exclude_filter {
-                if re.is_match(raw_name) {
+                if regex_matches(re, raw_name) {
                     continue;
                 }
             }
@@ -1991,18 +1991,31 @@ fn warn_initial_load_failure(provider: &ProxyProvider, error: &str) {
 fn compile_opt_regex(
     pattern: &Option<String>,
     field: &str,
-) -> Result<Option<regex::Regex>, String> {
+) -> Result<Option<fancy_regex::Regex>, String> {
     match pattern.as_deref() {
-        Some(p) => regex::Regex::new(p).map(Some).map_err(|e| {
-            let hint = if ["(?!", "(?=", "(?<"].iter().any(|la| p.contains(la)) {
-                "; look-around assertions are not supported — split the pattern \
-                 into `filter` + `exclude-filter` instead"
-            } else {
-                ""
-            };
-            format!("{field} regex error: {e}{hint}")
-        }),
+        Some(p) => fancy_regex::Regex::new(p)
+            .map(Some)
+            .map_err(|e| format!("{field} regex error: {e}")),
         None => Ok(None),
+    }
+}
+
+/// Evaluate a `filter`/`exclude-filter` fancy-regex against a node name.
+///
+/// fancy-regex compiles look-around assertions the way mihomo's Go regex
+/// engine does, but its backtracking VM can still fail at *evaluation*
+/// time (e.g. a pathological pattern overflows the backtrack limit). A
+/// failure is logged and treated as a non-match: the node is kept by
+/// `exclude-filter` semantics and dropped by `filter` semantics — the
+/// same default `regex::Regex::is_match` gave for plain patterns, with
+/// the failed case visible in the log instead of silently swallowed.
+fn regex_matches(re: &fancy_regex::Regex, name: &str) -> bool {
+    match re.is_match(name) {
+        Ok(matched) => matched,
+        Err(e) => {
+            warn!(error = %e, "filter regex evaluation failed; treating as no match");
+            false
+        }
     }
 }
 
@@ -2679,16 +2692,50 @@ header:
         assert!(GroupFilter::from_raw_group(&raw).unwrap().is_none());
     }
 
-    #[test]
-    fn group_filter_lookahead_error_carries_hint() {
-        let raw = crate::raw::RawProxyGroup {
-            name: "g".to_string(),
-            group_type: "select".to_string(),
-            filter: Some("^(?!.*expat).*US".to_string()),
-            ..Default::default()
-        };
-        let err = GroupFilter::from_raw_group(&raw).unwrap_err();
-        assert!(err.contains("look-around"), "unexpected error: {err}");
+    #[tokio::test]
+    async fn group_filter_negative_lookahead_matches_mihomo_semantics() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_provider_file(
+            tmp.path(),
+            &[
+                ("US 1", "ss"),
+                ("剩余流量: 10G", "ss"),
+                ("到期: 2026", "ss"),
+            ],
+        );
+        let provider = file_provider(tmp.path()).await;
+
+        // The exact mihomo idiom airport configs use to drop info nodes.
+        let f = group_filter(Some("^(?!.*(流量|到期))"), None, None);
+        let derived = provider.derived_slot(&f);
+        assert_eq!(slot_names(&derived), ["US 1"]);
+    }
+
+    #[tokio::test]
+    async fn provider_filter_negative_lookahead_filters_payload() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_provider_file(
+            tmp.path(),
+            &[
+                ("US 1", "ss"),
+                ("剩余流量: 10G", "ss"),
+                ("官网 example.com", "ss"),
+            ],
+        );
+        let mut raw = raw_file_provider(tmp.path().to_str().unwrap());
+        raw.filter = Some("^(?!.*(流量|官网))".to_string());
+        let cache_dir = tmp.path().parent().expect("temp file has a parent dir");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(cache_dir),
+            true,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(slot_names(&p.proxies()), ["US 1"]);
     }
 
     // ─── issue #489: provider-sourced nodes honour `dialer-proxy` ─────────

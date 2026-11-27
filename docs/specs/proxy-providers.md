@@ -170,6 +170,23 @@ proxy-groups:
 | `proxy` | string | no | `""` | Route this provider's `http` fetches through the named proxy or group, resolved against the live route map at fetch time (issue #625). `DIRECT` or absent fetches directly; an unresolvable name fails the fetch (never silently direct); whitespace-only is a build error. A named value on `file` providers warns — no fetch to chain. |
 | `dialer-proxy` | string | no | `""` | Chain every node in this provider through the named front hop (issue #489). Distinct from `proxy`: that one routes the *fetch*, this one routes each node's *dials*. |
 
+#### Filter regex flavour
+
+`filter` and `exclude-filter` compile with `fancy-regex`, so the look-around
+assertions mihomo's engine accepts work as written — including the idiom
+airport configs use to drop info nodes:
+
+```yaml
+filter: '^(?!.*(剩余流量|到期|官网|客服))'
+```
+
+Plain patterns keep the linear-time `regex`-crate path inside fancy-regex;
+only a pattern that needs backtracking (look-around, back-references) runs on
+the backtracking VM. An evaluation-time failure — a pathological pattern
+exhausting the backtracking budget — is logged and treated as a non-match:
+the node is dropped by `filter` semantics and kept by `exclude-filter`
+semantics.
+
 ### Field reference — proxy-group additions
 
 | Field | Type | Required | Default | Meaning |

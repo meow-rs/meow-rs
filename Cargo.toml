@@ -243,6 +243,9 @@ uuid = { version = "1", features = ["v4", "serde"] }
 
 # Regex
 regex = "1"
+# Regex with look-around for user-supplied `filter`/`exclude-filter`
+# patterns (mihomo parity; the plain `regex` crate rejects `(?!)` etc.)
+fancy-regex = "0.16"
 
 # Byte manipulation
 bytes = "1"
