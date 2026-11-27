@@ -2094,6 +2094,7 @@ where
         if !initial.is_empty() {
             write_shaped(&mut writer, &initial, &mut limit, &activity).await?;
         }
+        drop(initial);
         writer.shutdown().await?;
         return Ok(());
     }
