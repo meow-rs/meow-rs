@@ -2513,6 +2513,7 @@ dependencies = [
  "meow-listener",
  "meow-proxy",
  "meow-rules",
+ "meow-transport",
  "meow-trie",
  "meow-tunnel",
  "mimalloc",
@@ -2528,6 +2529,7 @@ dependencies = [
  "tracing-subscriber",
  "windows-service",
  "windows-sys 0.61.2",
+ "x25519-dalek",
  "zstd",
 ]
 
