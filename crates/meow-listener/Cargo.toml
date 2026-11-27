@@ -91,6 +91,10 @@ listener-vless = [
     # binaries nothing; splitting the server codec out of the client
     # feature is a meow-proxy-side follow-up.
     "meow-proxy/mux",
+    # REALITY cover self-loop detection enumerates local interface
+    # addresses through GetAdaptersAddresses on Windows (the dep itself is
+    # target-gated, so this edge is inert elsewhere).
+    "dep:windows-sys",
 ]
 
 [dependencies]

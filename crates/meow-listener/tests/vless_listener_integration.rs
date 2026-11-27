@@ -1433,6 +1433,319 @@ async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn listener_teardown_cancels_accepted_connections() {
+    let echo = start_tcp_echo().await;
+    let (cert, key) = tls_cert();
+    let tunnel = tunnel_with_rules(&[]);
+    let (port, _listener, accept_task) = start_listener(
+        tls_spec(&cert, &key, vec![("alice", ALICE)]),
+        tunnel,
+        "vless-accept-teardown",
+    )
+    .await;
+
+    let adapter = vision_tls_adapter(port, ALICE);
+    let mut conn = timeout(T, adapter.dial_tcp(&metadata(echo)))
+        .await
+        .expect("dial timeout")
+        .expect("dial");
+    echo_roundtrip(&mut *conn, b"before-teardown")
+        .await
+        .expect("connection works before accept-loop teardown");
+
+    accept_task.abort();
+    let _ = accept_task.await;
+
+    // Cancelling the accept loop must cancel the supervised connection too,
+    // not leave an established relay detached behind the closed socket.
+    let mut closed = false;
+    for _ in 0..40 {
+        if echo_roundtrip(&mut *conn, b"after-teardown").await.is_err() {
+            closed = true;
+            break;
+        }
+        sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        closed,
+        "established connection survived accept-loop cancellation as a detached task"
+    );
+}
+
+/// Read the fixed VLESS request header for a plain (non-Vision) UDP-over-TCP
+/// client. The mock only needs to consume it; every fixture target is valid.
+async fn consume_plain_vless_udp_request(stream: &mut TcpStream) {
+    let mut fixed = [0u8; 1 + 16 + 1 + 1 + 2 + 1];
+    stream.read_exact(&mut fixed).await.unwrap();
+    assert_eq!(fixed[0], 0, "VLESS version");
+    let addon_len = fixed[17] as usize;
+    if addon_len > 0 {
+        let mut addon = vec![0u8; addon_len];
+        stream.read_exact(&mut addon).await.unwrap();
+    }
+    assert_eq!(fixed[18], 0x02, "mock expects the UDP command");
+    let port = u16::from_be_bytes([fixed[19], fixed[20]]);
+    assert_ne!(port, 0);
+    match fixed[21] {
+        0x01 => {
+            let mut addr = [0u8; 4];
+            stream.read_exact(&mut addr).await.unwrap();
+        }
+        0x02 => {
+            let mut len = [0u8; 1];
+            stream.read_exact(&mut len).await.unwrap();
+            let mut addr = vec![0u8; len[0] as usize];
+            stream.read_exact(&mut addr).await.unwrap();
+        }
+        0x03 => {
+            let mut addr = [0u8; 16];
+            stream.read_exact(&mut addr).await.unwrap();
+        }
+        other => panic!("unexpected VLESS address type {other}"),
+    }
+}
+
+/// A one-connection plain VLESS UDP server. Its first reply is deliberately
+/// larger than the flow's raw-encapsulation read buffer; the client-side
+/// VLESS packet conn drains that whole framed datagram and reports a
+/// recoverable buffer error. The next reply is normal and must still be
+/// deliverable.
+async fn start_plain_vless_oversize_then_echo() -> SocketAddr {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        consume_plain_vless_udp_request(&mut stream).await;
+        let mut first = true;
+        let mut wrote_response_header = false;
+        loop {
+            let mut len = [0u8; 2];
+            if stream.read_exact(&mut len).await.is_err() {
+                return;
+            }
+            let len = u16::from_be_bytes(len) as usize;
+            let mut payload = vec![0u8; len];
+            if stream.read_exact(&mut payload).await.is_err() {
+                return;
+            }
+            let reply = if first {
+                first = false;
+                vec![0x5au8; 16 * 1024]
+            } else {
+                payload
+            };
+            let mut out = Vec::new();
+            if !wrote_response_header {
+                wrote_response_header = true;
+                out.extend_from_slice(&[0, 0]);
+            }
+            out.extend_from_slice(&(reply.len() as u16).to_be_bytes());
+            out.extend_from_slice(&reply);
+            if stream.write_all(&out).await.is_err() {
+                return;
+            }
+            if stream.flush().await.is_err() {
+                return;
+            }
+        }
+    });
+    addr
+}
+
+fn tunnel_with_named_proxy(name: &str, proxy: Arc<dyn meow_common::Proxy>) -> Tunnel {
+    let resolver = Arc::new(Resolver::new(
+        vec![],
+        vec![],
+        meow_common::DnsMode::Normal,
+        meow_trie::DomainTrie::new(),
+        false,
+        true,
+    ));
+    let tunnel = Tunnel::new(resolver);
+    let res = meow_config::rebuild_from_raw(&Default::default()).unwrap();
+    let mut proxies = res.proxies;
+    proxies.insert(name.into(), proxy);
+    tunnel.update_proxies(proxies, res.dialer_registry);
+    tunnel.update_rules(vec![Box::new(meow_rules::final_rule::FinalRule::new(name))]);
+    tunnel
+}
+
+/// Acceptance test for the F11 cross-crate fix: passes only once
+/// meow-common carries a matchable "packet consumed but oversized" error
+/// (e.g. `MeowError::UdpPacketTooLarge`), meow-proxy's framed UDP readers
+/// emit it after fully draining the datagram, and the XUDP flow replies
+/// loop treats it as drop-this-packet rather than flow-fatal. Until then
+/// the flow dies and the marker never arrives.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "needs the F11 cross-crate error type in meow-common/meow-proxy; see vless_xudp module docs"]
+async fn xudp_plain_vless_oversize_reply_drops_packet_not_flow() {
+    let server = start_plain_vless_oversize_then_echo().await;
+    let outbound: Arc<dyn meow_common::Proxy> = Arc::new(
+        meow_config::proxy_parser::WrappedProxy::new(Box::new(VlessAdapter::new(
+            "plain-vless",
+            "127.0.0.1",
+            server.port(),
+            [0x44; 16],
+            None,
+            true,
+            TransportChain::empty(),
+            Arc::new(DirectDialer),
+        ))),
+    );
+    let tunnel = tunnel_with_named_proxy("plain-vless", outbound);
+    let (cert, key) = tls_cert();
+    let (port, _listener, _task) = start_listener(
+        tls_spec(&cert, &key, vec![("alice", ALICE)]),
+        tunnel,
+        "vless-xudp-plain-oversize",
+    )
+    .await;
+
+    let mut client = RawXudpClient::connect(port, ALICE).await;
+    let target = v4_target([127, 0, 0, 1], 15353);
+    let mut batch = new_data(31, &target, b"trigger");
+    batch.extend_from_slice(&keep_data(31, None, b"marker"));
+    client.send(&batch).await;
+
+    // The 8193-byte reply is consumed upstream and dropped whole. The flow
+    // must stay alive to deliver this later normal reply on the same sid.
+    let frame = timeout(Duration::from_secs(3), client.recv_frame())
+        .await
+        .expect("normal reply after a consumed oversize reply")
+        .expect("connection closed after a consumed oversize reply");
+    assert_keep_data(&frame, 31, b"marker");
+}
+
+struct GatedDialState {
+    started: AtomicUsize,
+    completed: AtomicUsize,
+    open: tokio::sync::Notify,
+}
+
+struct GatedDialConn;
+
+#[async_trait::async_trait]
+impl ProxyPacketConn for GatedDialConn {
+    async fn read_packet(&self, _buf: &mut [u8]) -> meow_common::Result<(usize, SocketAddr)> {
+        std::future::pending().await
+    }
+    async fn write_packet(&self, buf: &[u8], _addr: &SocketAddr) -> meow_common::Result<usize> {
+        Ok(buf.len())
+    }
+    fn local_addr(&self) -> meow_common::Result<SocketAddr> {
+        Ok("127.0.0.1:0".parse().unwrap())
+    }
+    fn close(&self) -> meow_common::Result<()> {
+        Ok(())
+    }
+}
+
+struct GatedDialProxy {
+    state: Arc<GatedDialState>,
+    health: meow_common::ProxyHealth,
+}
+
+#[async_trait::async_trait]
+impl meow_common::ProxyAdapter for GatedDialProxy {
+    fn name(&self) -> &str {
+        "gated-udp"
+    }
+    fn adapter_type(&self) -> meow_common::AdapterType {
+        meow_common::AdapterType::Direct
+    }
+    fn addr(&self) -> &str {
+        ""
+    }
+    fn support_udp(&self) -> bool {
+        true
+    }
+    async fn dial_tcp(
+        &self,
+        _metadata: &Metadata,
+    ) -> meow_common::Result<Box<dyn meow_common::ProxyConn>> {
+        Err(meow_common::MeowError::NotSupported("no tcp".into()))
+    }
+    async fn dial_udp(
+        &self,
+        _metadata: &Metadata,
+    ) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+        self.state.started.fetch_add(1, Ordering::Relaxed);
+        self.state.open.notified().await;
+        self.state.completed.fetch_add(1, Ordering::Relaxed);
+        Ok(Box::new(GatedDialConn))
+    }
+    fn health(&self) -> &meow_common::ProxyHealth {
+        &self.health
+    }
+}
+
+impl meow_common::Proxy for GatedDialProxy {
+    fn alive(&self) -> bool {
+        true
+    }
+    fn alive_for_url(&self, _url: &str) -> bool {
+        true
+    }
+    fn last_delay(&self) -> u16 {
+        0
+    }
+    fn last_delay_for_url(&self, _url: &str) -> u16 {
+        0
+    }
+    fn delay_history(&self) -> Vec<meow_common::DelayHistory> {
+        Vec::new()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn xudp_flush_races_flow_establishment_and_cancels_the_dial() {
+    let state = Arc::new(GatedDialState {
+        started: AtomicUsize::new(0),
+        completed: AtomicUsize::new(0),
+        open: tokio::sync::Notify::new(),
+    });
+    let proxy = Arc::new(GatedDialProxy {
+        state: Arc::clone(&state),
+        health: meow_common::ProxyHealth::new(),
+    });
+    let tunnel = tunnel_with_named_proxy("gated-udp", proxy);
+    let (cert, key) = tls_cert();
+    let (port, _listener, _task) = start_listener(
+        tls_spec(&cert, &key, vec![("alice", ALICE)]),
+        tunnel.clone(),
+        "vless-xudp-flush-establish",
+    )
+    .await;
+
+    let mut client = RawXudpClient::connect(port, ALICE).await;
+    client
+        .send(&new_data(
+            41,
+            &v4_target([127, 0, 0, 1], 15353),
+            b"flush-me",
+        ))
+        .await;
+    wait_until(
+        || state.started.load(Ordering::Relaxed) == 1,
+        "the flow dial to start",
+    )
+    .await;
+
+    assert_eq!(
+        tunnel.close_all_udp_sessions(),
+        1,
+        "the establishing flow's flush watch is live"
+    );
+    state.open.notify_one();
+    sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        state.completed.load(Ordering::Relaxed),
+        0,
+        "a flow flushed while establishing must cancel rather than complete its dial"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn xudp_teardown_reaps_every_flow_socket() {
     let (cert, key) = tls_cert();
     let probe = Arc::new(ProbeState {

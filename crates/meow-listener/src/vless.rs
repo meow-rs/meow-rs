@@ -130,6 +130,32 @@ fn endpoint_registries() -> &'static EndpointRegistry {
     REGISTRIES.get_or_init(|| parking_lot::Mutex::new(Vec::new()))
 }
 
+/// RAII inverse of [`VlessListener::note_bound_endpoint`] for one socket:
+/// the registration means "something is accepting here NOW", so it must
+/// not survive the listen socket it describes. Dropping the guard — the
+/// end of `run_on`, including cancellation — removes exactly the endpoint
+/// it inserted; a port later reused by an unrelated service must not stay
+/// blacklisted as a cover target.
+struct EndpointRegistration {
+    set: Arc<std::sync::RwLock<HashSet<SocketAddr>>>,
+    addr: SocketAddr,
+}
+
+impl EndpointRegistration {
+    fn new(set: Arc<std::sync::RwLock<HashSet<SocketAddr>>>, addr: SocketAddr) -> Self {
+        Self { set, addr }
+    }
+}
+
+impl Drop for EndpointRegistration {
+    fn drop(&mut self) {
+        self.set
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.addr);
+    }
+}
+
 pub struct VlessListener {
     tunnel: Tunnel,
     name: String,
@@ -315,12 +341,21 @@ impl VlessListener {
     /// Serve on an already-bound socket. Multi-address listeners spawn
     /// one `run_on` per socket on a shared `Arc` and share the same cap,
     /// auth table, TLS/REALITY state and endpoint registry.
+    ///
+    /// The accept loop SUPERVISES its connection tasks: cancelling this
+    /// future — or its task — aborts every connection it spawned (the
+    /// JoinSet's Drop), so cover relays, authenticated TCP relays and
+    /// XUDP associations all die with their listen socket instead of
+    /// detaching behind it. The endpoint registration follows the same
+    /// lifetime through the guard below.
     pub async fn run_on(
         self: &Arc<Self>,
         listener: TcpListener,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bound = listener.local_addr()?;
         self.note_bound_endpoint(bound);
+        let _endpoint_registration =
+            EndpointRegistration::new(Arc::clone(&self.bound_endpoints), canonical_endpoint(bound));
         let in_port = bound.port();
         info!(
             "VLESS listener '{}' on {} (security={}, users={}, udp={})",
@@ -334,59 +369,108 @@ impl VlessListener {
             self.udp,
         );
 
+        let mut conns = tokio::task::JoinSet::new();
         let mut warned_saturated = false;
         let mut accept_backoff = meow_common::ErrorBackoff::new();
         loop {
-            // Acquire AFTER accept(): the cap bounds connections the
-            // kernel actually delivered rather than parking the accept
-            // loop before a peer exists.
-            let (stream, peer) = match listener.accept().await {
-                Ok(v) => {
-                    accept_backoff.succeeded();
-                    v
-                }
-                Err(e) => {
-                    if accept_backoff.failed(&e).await {
-                        error!("vless listener '{}' accept error: {}", self.name, e);
-                    } else {
-                        debug!("vless listener '{}' accept error: {}", self.name, e);
+            tokio::select! {
+                // Reap finished connection tasks so their join slots and
+                // any panics surface instead of accumulating; cancel-safe
+                // and never the only arm, so accept is never starved.
+                reaped = conns.join_next(), if !conns.is_empty() => {
+                    if let Some(Err(e)) = reaped {
+                        if e.is_panic() {
+                            error!("vless listener '{}' connection task panicked: {}", self.name, e);
+                        }
                     }
                     continue;
                 }
-            };
-            let permit = if let Some(sem) = &self.conn_slots {
-                let sem = Arc::clone(sem);
-                if sem.available_permits() == 0 && !warned_saturated {
-                    warn!(
-                        "vless listener '{}' saturated at {} concurrent connections; new clients will queue",
-                        self.name, self.conn_max
-                    );
-                    warned_saturated = true;
-                }
-                match sem.acquire_owned().await {
-                    Ok(p) => {
-                        if warned_saturated {
-                            debug!("vless listener '{}' has free capacity again", self.name);
-                            warned_saturated = false;
+                accepted = listener.accept() => {
+                    // Acquire AFTER accept(): the cap bounds connections the
+                    // kernel actually delivered rather than parking the accept
+                    // loop before a peer exists.
+                    let (stream, peer) = match accepted {
+                        Ok(v) => {
+                            accept_backoff.succeeded();
+                            v
                         }
-                        Some(p)
-                    }
-                    Err(_) => return Ok(()),
-                }
-            } else {
-                None
-            };
+                        Err(e) => {
+                            if accept_backoff.failed(&e).await {
+                                error!("vless listener '{}' accept error: {}", self.name, e);
+                            } else {
+                                debug!("vless listener '{}' accept error: {}", self.name, e);
+                            }
+                            continue;
+                        }
+                    };
+                    let permit = if let Some(sem) = &self.conn_slots {
+                        let sem = Arc::clone(sem);
+                        if sem.available_permits() == 0 && !warned_saturated {
+                            warn!(
+                                "vless listener '{}' saturated at {} concurrent connections; new clients will queue",
+                                self.name, self.conn_max
+                            );
+                            warned_saturated = true;
+                        }
+                        match sem.acquire_owned().await {
+                            Ok(p) => {
+                                if warned_saturated {
+                                    debug!("vless listener '{}' has free capacity again", self.name);
+                                    warned_saturated = false;
+                                }
+                                Some(p)
+                            }
+                            Err(_) => return Ok(()),
+                        }
+                    } else {
+                        None
+                    };
 
-            crate::keepalive::apply(&stream, self.tcp_keepalive, &self.name);
-            let listener = Arc::clone(self);
-            tokio::spawn(async move {
-                listener.handle_conn(stream, peer, in_port).await;
-                drop(permit);
-            });
+                    // REALITY admission happens BEFORE the spawn: the
+                    // classification slots bound every socket in flight,
+                    // including the ones still waiting to be classified.
+                    // Without this, `max-connections: 0` would let an
+                    // unauthenticated ClientHello flood pile up unbounded
+                    // tasks holding sockets behind the semaphore. A
+                    // saturated classifier refuses the socket outright —
+                    // the same shape cover saturation already uses —
+                    // because classification is unauthenticated work.
+                    let handshake_permit = match &self.security {
+                        SecurityRuntime::Reality(reality) => {
+                            match Arc::clone(&reality.handshake_slots).try_acquire_owned() {
+                                Ok(p) => Some(p),
+                                Err(_) => {
+                                    debug!(
+                                        "vless listener '{}' REALITY classification saturated at {} slots; refusing {peer}",
+                                        self.name, REALITY_HANDSHAKE_SLOTS
+                                    );
+                                    continue;
+                                }
+                            }
+                        }
+                        SecurityRuntime::StandardTls(_) => None,
+                    };
+
+                    crate::keepalive::apply(&stream, self.tcp_keepalive, &self.name);
+                    let listener = Arc::clone(self);
+                    conns.spawn(async move {
+                        listener
+                            .handle_conn(stream, peer, in_port, handshake_permit)
+                            .await;
+                        drop(permit);
+                    });
+                }
+            }
         }
     }
 
-    async fn handle_conn(&self, stream: tokio::net::TcpStream, peer: SocketAddr, in_port: u16) {
+    async fn handle_conn(
+        &self,
+        stream: tokio::net::TcpStream,
+        peer: SocketAddr,
+        in_port: u16,
+        handshake_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) {
         // TLS/REALITY accept and the bounded VLESS request share ONE
         // absolute deadline. Splitting them would double the time a
         // silent peer can retain a connection slot.
@@ -410,22 +494,10 @@ impl VlessListener {
                 }
             }
             SecurityRuntime::Reality(reality) => {
-                let handshake_permit = match tokio::time::timeout_at(
-                    deadline,
-                    Arc::clone(&reality.handshake_slots).acquire_owned(),
-                )
-                .await
-                {
-                    Ok(Ok(permit)) => Some(permit),
-                    Ok(Err(_)) => return,
-                    Err(_) => {
-                        debug!(
-                            "vless listener '{}' REALITY handshake-slot wait from {peer} timed out",
-                            self.name
-                        );
-                        return;
-                    }
-                };
+                // The classification permit was acquired at admission,
+                // before this task existed; it is held through the
+                // handshake exactly as before and released right after
+                // classification — never for the relay's lifetime.
                 let accepted =
                     match tokio::time::timeout_at(deadline, reality.server.accept(inner)).await {
                         Ok(Ok(accept)) => Some(accept),
@@ -448,7 +520,12 @@ impl VlessListener {
                 match accepted {
                     Some(RealityServerAccept::Authenticated(stream)) => Some(stream),
                     Some(RealityServerAccept::Cover(relay)) => {
-                        self.run_cover(reality, relay, peer, deadline).await;
+                        // Boxed: the cover relay's two 16 KiB direction
+                        // scratches live across its copy-loop awaits, so
+                        // an unboxed relay future would embed them in
+                        // EVERY connection task's future — including the
+                        // authenticated majority that never covers.
+                        Box::pin(self.run_cover(reality, relay, peer, deadline)).await;
                         None
                     }
                     None => None,
@@ -775,31 +852,33 @@ fn canonical_endpoint(addr: SocketAddr) -> SocketAddr {
 }
 
 /// Snapshot local interface addresses for wildcard-bind self-loop checks.
-/// Enumeration failure is conservative: `None` makes a same-port candidate
-/// on a wildcard bind a self-loop.
-#[cfg_attr(
-    not(unix),
-    allow(
-        clippy::unnecessary_wraps,
-        reason = "interface enumeration is only fallible on unix; the non-unix loopback-only approximation is deliberately infallible"
-    )
-)]
+/// Every supported platform enumerates for real; any failure — or an
+/// empty table, which no live machine can honestly produce — is `None`,
+/// and `None` is conservative: a same-port candidate on a wildcard bind
+/// is then treated as a self-loop. Returning a loopback-only set dressed
+/// up as a complete inventory would invert that failure mode, letting a
+/// wildcard-bind cover self-loop to a non-loopback local NIC escape
+/// detection.
 fn local_addr_snapshot() -> Option<HashSet<IpAddr>> {
-    #[cfg(unix)]
-    {
-        local_interface_addrs().map(|set| {
-            set.into_iter()
-                .map(|ip| ip.to_canonical())
-                .collect::<HashSet<_>>()
-        })
-    }
-    #[cfg(not(unix))]
-    {
-        let mut addrs = HashSet::new();
-        addrs.insert(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
-        addrs.insert(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST));
-        Some(addrs)
-    }
+    let raw = {
+        #[cfg(unix)]
+        {
+            local_interface_addrs()
+        }
+        #[cfg(windows)]
+        {
+            local_interface_addrs_windows()
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            None
+        }
+    };
+    raw.map(|set| {
+        set.into_iter()
+            .map(|ip| ip.to_canonical())
+            .collect::<HashSet<_>>()
+    })
 }
 
 #[cfg(unix)]
@@ -836,6 +915,90 @@ fn local_interface_addrs() -> Option<HashSet<IpAddr>> {
     (!addrs.is_empty()).then_some(addrs)
 }
 
+/// Windows interface inventory through `GetAdaptersAddresses`, walking
+/// every adapter's unicast address list. Unlike the TUN device's
+/// name-lookup use, nothing here may skip unicast — the unicast table IS
+/// the answer — so the walk validates each sockaddr's family and length
+/// before copying it rather than trusting the list's shape.
+#[cfg(windows)]
+fn local_interface_addrs_windows() -> Option<HashSet<IpAddr>> {
+    use std::net::{Ipv4Addr, Ipv6Addr};
+    use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GetAdaptersAddresses, GAA_FLAG_INCLUDE_ALL_INTERFACES, GAA_FLAG_SKIP_ANYCAST,
+        GAA_FLAG_SKIP_DNS_SERVER, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+    };
+    use windows_sys::Win32::Networking::WinSock::{
+        AF_INET, AF_INET6, AF_UNSPEC, SOCKADDR_IN, SOCKADDR_IN6,
+    };
+
+    const FLAGS: u32 = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER;
+    // Same buffer discipline as the TUN device's name lookup: the u64
+    // store keeps the list 8-aligned, overflow retries grow it, and more
+    // than four overflows in a row is treated as enumeration failure
+    // (conservative `None`), never as a partial table.
+    let mut size: u32 = 15000;
+    let mut buf = vec![0u64; size as usize / 8 + 1];
+    let mut addrs = HashSet::new();
+    for _ in 0..4 {
+        // SAFETY: `buf` is 8-aligned by its element type, holds at least
+        // `size` initialised bytes, and outlives the call; on overflow
+        // the API writes the size it needs back through the same pointer.
+        let result = unsafe {
+            GetAdaptersAddresses(
+                AF_UNSPEC as u32,
+                FLAGS | GAA_FLAG_INCLUDE_ALL_INTERFACES,
+                std::ptr::null(),
+                buf.as_mut_ptr().cast(),
+                &raw mut size,
+            )
+        };
+        if result == ERROR_BUFFER_OVERFLOW {
+            buf.resize(size as usize / 8 + 1, 0);
+            continue;
+        }
+        if result != 0 {
+            return None;
+        }
+        // SAFETY: on success the buffer starts with the adapter linked
+        // list the call built inside it; the walk only reads entries of
+        // that list while the buffer is alive.
+        let mut adapter = buf.as_ptr().cast::<IP_ADAPTER_ADDRESSES_LH>();
+        while !adapter.is_null() {
+            let mut unicast = unsafe { (*adapter).FirstUnicastAddress };
+            while !unicast.is_null() {
+                // SAFETY: `unicast` is one node of the per-adapter list
+                // the API chained inside the same buffer.
+                let addr = unsafe { &*unicast };
+                let sockaddr = addr.Address.lpSockaddr;
+                let len = addr.Address.iSockaddrLength;
+                if !sockaddr.is_null() {
+                    // SAFETY: family/length are validated against the
+                    // concrete sockaddr type before it is read as one.
+                    unsafe {
+                        let family = (*sockaddr).sa_family;
+                        if family == AF_INET && len as usize >= std::mem::size_of::<SOCKADDR_IN>() {
+                            let sa = &*(sockaddr as *const SOCKADDR_IN);
+                            addrs.insert(IpAddr::V4(Ipv4Addr::from(u32::from_be(
+                                sa.sin_addr.S_un.S_addr,
+                            ))));
+                        } else if family == AF_INET6
+                            && len as usize >= std::mem::size_of::<SOCKADDR_IN6>()
+                        {
+                            let sa = &*(sockaddr as *const SOCKADDR_IN6);
+                            addrs.insert(IpAddr::V6(Ipv6Addr::from(sa.sin6_addr.u.Byte)));
+                        }
+                    }
+                }
+                unicast = addr.Next;
+            }
+            adapter = unsafe { (*adapter).Next };
+        }
+        return (!addrs.is_empty()).then_some(addrs);
+    }
+    None
+}
+
 fn endpoint_is_self(
     candidate: SocketAddr,
     endpoints: &HashSet<SocketAddr>,
@@ -861,6 +1024,159 @@ fn endpoint_is_self(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::AsyncReadExt;
+
+    fn test_tunnel() -> Tunnel {
+        let resolver = Arc::new(meow_dns::Resolver::new(
+            vec![],
+            vec![],
+            meow_common::DnsMode::Normal,
+            meow_trie::DomainTrie::new(),
+            false,
+            true,
+        ));
+        Tunnel::new(resolver)
+    }
+
+    fn test_reality_listener() -> Arc<VlessListener> {
+        let spec = VlessListenerSpec {
+            users: vec![VlessUserSpec {
+                username: "alice".into(),
+                uuid: [0x11; 16],
+            }],
+            security: VlessSecuritySpec::Reality(VlessRealitySpec {
+                dest: "127.0.0.1:9".into(),
+                private_key: [0x42; 32],
+                short_ids: vec![[0; 8]],
+                server_names: vec!["localhost".into()],
+                max_time_difference_us: 0,
+                limit_fallback_upload: VlessFallbackLimit::default(),
+                limit_fallback_download: VlessFallbackLimit::default(),
+            }),
+            udp: true,
+        };
+        Arc::new(VlessListener::new(test_tunnel(), "test".into(), spec).unwrap())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn connection_task_future_does_not_embed_cover_scratch() {
+        let listener = test_reality_listener();
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe_addr = probe.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(probe_addr).await.unwrap();
+        let (server, peer) = probe.accept().await.unwrap();
+        drop(client);
+        let fut = listener.handle_conn(server, peer, 443, None);
+        let size = std::mem::size_of_val(&fut);
+        eprintln!("handle_conn future size: {size}");
+        drop(fut);
+        // The cover relay's two 16 KiB direction scratches must not be
+        // embedded in every connection task: boxed behind the cover
+        // branch, the future stays small even though the relay itself
+        // needs them when a cover actually runs.
+        // Measured on the pinned toolchain: 25 KiB with the cover relay
+        // boxed (the Vision codec's own state dominates), 68 KiB with the
+        // two 16 KiB cover direction scratches embedded.
+        assert!(
+            size < 32 * 1024,
+            "connection future embeds the cover relay scratch: {size} bytes"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reality_classification_admission_refuses_overflow_sockets() {
+        let listener = test_reality_listener();
+        // Saturate the classification slots externally: the permits are
+        // the same semaphores the accept loop draws from, so every new
+        // socket arriving now is by definition overflow.
+        let SecurityRuntime::Reality(reality) = &listener.security else {
+            panic!("test listener must be REALITY");
+        };
+        let mut held = Vec::new();
+        for _ in 0..REALITY_HANDSHAKE_SLOTS {
+            held.push(
+                Arc::clone(&reality.handshake_slots)
+                    .try_acquire_owned()
+                    .unwrap(),
+            );
+        }
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+
+        // Overflow at admission: the socket is refused rather than
+        // spawning a task that parks holding it behind the semaphore.
+        let mut overflowed = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(2), overflowed.read(&mut byte)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        assert!(
+            closed,
+            "overflow REALITY socket was parked behind the classification semaphore instead of refused"
+        );
+
+        // Freeing one slot admits the next socket: it stays open, parked
+        // inside the handshake exactly like a silent classified peer.
+        drop(held.pop());
+        let mut admitted = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let open = tokio::time::timeout(Duration::from_millis(500), admitted.read(&mut byte))
+            .await
+            .is_err();
+        assert!(open, "admitted REALITY socket must stay open");
+        drop(admitted);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn endpoint_registration_follows_the_listen_socket_lifetime() {
+        let listener = test_reality_listener();
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = canonical_endpoint(socket.local_addr().unwrap());
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+        for _ in 0..100 {
+            if listener
+                .bound_endpoints
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&addr)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(listener
+            .bound_endpoints
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&addr));
+        task.abort();
+        let _ = task.await;
+        for _ in 0..100 {
+            if !listener
+                .bound_endpoints
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&addr)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("endpoint outlived its listen socket");
+    }
 
     #[test]
     fn reality_dest_parser_accepts_domain_ipv4_and_bracketed_ipv6() {
