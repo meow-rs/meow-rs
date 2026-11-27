@@ -228,6 +228,8 @@ maxminddb = { workspace = true }
 libc = "0.2"
 async-trait = { workspace = true }
 smol_str = { workspace = true }
+meow-transport = { workspace = true, features = ["reality"] }
+x25519-dalek = { workspace = true }
 
 [lints]
 workspace = true
