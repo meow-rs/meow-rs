@@ -606,7 +606,7 @@ impl VlessListener {
                     let dial = self.dial_first_target(reality);
                     crate::vless_mimic::run_dial_first(
                         reality,
-                        stream,
+                        Box::new(stream),
                         deadline,
                         handshake_permit,
                         dial,

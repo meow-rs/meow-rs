@@ -412,8 +412,18 @@ impl Drop for CloseAccountant {
 /// Result of the listener's exactly-one target dial.  `connect_elapsed` is
 /// the application-observed connect poll interval used only to derive the
 /// quiescence window; it deliberately excludes any earlier resolution wait.
-pub(crate) struct DialedTarget {
-    pub(crate) stream: TcpStream,
+pub(crate) trait TargetIo: Stream + 'static {
+    fn try_read(&mut self, buf: &mut [u8]) -> io::Result<usize>;
+}
+
+impl TargetIo for TcpStream {
+    fn try_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        TcpStream::try_read(self, buf)
+    }
+}
+
+pub(crate) struct DialedTarget<T = TcpStream> {
+    pub(crate) stream: T,
     pub(crate) connect_elapsed: Duration,
 }
 
@@ -423,9 +433,9 @@ pub(crate) enum DialFirstDialError {
     Connect,
 }
 
-struct CoverHandoff {
+struct CoverHandoff<T> {
     client: Box<dyn Stream>,
-    target: TcpStream,
+    target: T,
     upload_prefix: Vec<u8>,
     download_prefix: Vec<u8>,
     uploaded: u64,
@@ -433,9 +443,9 @@ struct CoverHandoff {
     reason: CoverReason,
 }
 
-async fn handoff_cover(
+async fn handoff_cover<T: TargetIo>(
     reality: &RealityRuntime,
-    handoff: CoverHandoff,
+    handoff: CoverHandoff<T>,
     handshake_deadline: Instant,
     handshake_permit: Option<OwnedSemaphorePermit>,
     probe_permit: Option<OwnedSemaphorePermit>,
@@ -492,7 +502,7 @@ enum UploadWriteOutcome {
 }
 
 async fn upload_ch_once(
-    target: &mut TcpStream,
+    target: &mut impl Stream,
     bytes: &[u8],
     probe_deadline: Instant,
     handshake_deadline: Instant,
@@ -547,7 +557,7 @@ fn freeze_scanner(scanner: meow_transport::reality_mirror::TargetFlightScanner<'
 async fn scan_target_flight(
     reality: &RealityRuntime,
     context: &meow_transport::reality_server::AuthenticatedMirrorContext,
-    target: &mut TcpStream,
+    target: &mut impl TargetIo,
     quiet: Duration,
     probe_deadline: Instant,
     handshake_deadline: Instant,
@@ -650,8 +660,8 @@ fn finish_close_reason(error: &TransportError) -> CloseReason {
     }
 }
 
-async fn drive_post_commit(
-    mut target: TcpStream,
+async fn drive_post_commit<T: TargetIo>(
+    mut target: T,
     mut client: Box<dyn Stream>,
     wire: Vec<u8>,
     completion: MirroredHandshakeCompletion,
@@ -736,26 +746,23 @@ fn preflight_close_reason(error: &TransportError) -> CloseReason {
 /// returned stream is the transport's original client stream wrapped in the
 /// mirrored REALITY application keys; every other terminal path either
 /// enters the shared cover relay or closes without emitting local TLS.
-pub(crate) async fn run_dial_first<D>(
+pub(crate) async fn run_dial_first<D, T>(
     reality: &RealityRuntime,
-    client: TcpStream,
+    client: Box<dyn Stream>,
     handshake_deadline: Instant,
     handshake_permit: Option<OwnedSemaphorePermit>,
     dial: D,
 ) -> Option<Box<dyn Stream>>
 where
-    D: Future<Output = Result<DialedTarget, DialFirstDialError>>,
+    D: Future<Output = Result<DialedTarget<T>, DialFirstDialError>>,
+    T: TargetIo,
 {
     let metrics = Arc::clone(&reality.metrics);
     let mut accountant = CloseAccountant::new(metrics);
     let dial_begin = Instant::now();
     let dial_deadline = handshake_deadline.min(dial_begin + Duration::from_secs(3));
 
-    let mut preflight = Box::pin(
-        reality
-            .server
-            .verify_client_hello(Box::new(client) as Box<dyn Stream>),
-    );
+    let mut preflight = Box::pin(reality.server.verify_client_hello(client));
     let mut dial = Box::pin(dial);
     let mut preflight_result = None;
     let mut dial_result = None;
@@ -1073,5 +1080,592 @@ where
             accountant.normal_end();
             Some(stream)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meow_transport::reality_server::{CoverBandwidthLimit, RealityServerConfig};
+    use meow_transport::tls::{RealityConfig, TlsConfig, TlsLayer};
+    use meow_transport::Transport;
+    use std::collections::VecDeque;
+    use std::pin::Pin;
+    use std::sync::Mutex;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
+    use tokio::time::advance;
+
+    const PRIVATE: [u8; 32] = [0x42; 32];
+    const SHORT: [u8; 8] = [1, 2, 3, 4, 0, 0, 0, 0];
+
+    fn public_key() -> [u8; 32] {
+        let secret = x25519_dalek::StaticSecret::from(PRIVATE);
+        x25519_dalek::PublicKey::from(&secret).to_bytes()
+    }
+
+    fn runtime() -> Arc<RealityRuntime> {
+        let mimic = crate::vless::VlessRealityMimicSpec {
+            quiescence_max_ms: 150,
+            ..Default::default()
+        };
+        Arc::new(RealityRuntime {
+            server: meow_transport::reality_server::RealityServer::new(&RealityServerConfig {
+                private_key: PRIVATE,
+                short_ids: vec![SHORT],
+                server_names: ["localhost".into()].into(),
+                max_time_difference: Some(Duration::ZERO),
+                now: None,
+            })
+            .unwrap(),
+            dest_host: "target.invalid".into(),
+            dest_port: 443,
+            cover_limit: CoverBandwidthLimit {
+                upload_bytes_per_second: 0,
+                upload_exempt_bytes: 0,
+                download_bytes_per_second: 0,
+                download_exempt_bytes: 0,
+                burst_bytes: 0,
+            },
+            handshake_slots: Arc::new(Semaphore::new(256)),
+            probe_slots: Arc::new(Semaphore::new(64)),
+            cover_slots: Arc::new(Semaphore::new(64)),
+            mimic,
+            metrics: Arc::new(RealityV2Metrics::new()),
+        })
+    }
+
+    fn snapshot(runtime: &RealityRuntime) -> RealityV2MetricsSnapshot {
+        runtime.metrics.snapshot(
+            &runtime.handshake_slots,
+            256,
+            &runtime.probe_slots,
+            64,
+            &runtime.cover_slots,
+            64,
+        )
+    }
+
+    async fn yields(times: usize) {
+        for _ in 0..times {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum TryStep {
+        Byte(u8),
+        Eof,
+        WouldBlock,
+    }
+
+    struct MockTarget {
+        inner: DuplexStream,
+        steps: Arc<Mutex<VecDeque<TryStep>>>,
+        dropped: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Drop for MockTarget {
+        fn drop(&mut self) {
+            self.dropped.store(true, Ordering::Relaxed);
+        }
+    }
+
+    impl AsyncRead for MockTarget {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for MockTarget {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            Pin::new(&mut self.inner).poll_write(cx, buf)
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    impl TargetIo for MockTarget {
+        fn try_read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            match self
+                .steps
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(TryStep::WouldBlock)
+            {
+                TryStep::Byte(byte) => {
+                    buf[0] = byte;
+                    Ok(1)
+                }
+                TryStep::Eof => Ok(0),
+                TryStep::WouldBlock => Err(io::Error::from(io::ErrorKind::WouldBlock)),
+            }
+        }
+    }
+
+    struct ScriptedClient {
+        inner: DuplexStream,
+        input: VecDeque<u8>,
+        writes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl AsyncRead for ScriptedClient {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut ReadBuf<'_>,
+        ) -> Poll<io::Result<()>> {
+            if !self.input.is_empty() {
+                let n = buf.remaining().min(self.input.len());
+                let bytes: Vec<u8> = self.input.drain(..n).collect();
+                buf.put_slice(&bytes);
+                return Poll::Ready(Ok(()));
+            }
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for ScriptedClient {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            let result = Pin::new(&mut self.inner).poll_write(cx, buf);
+            if let Poll::Ready(Ok(n)) = result {
+                self.writes.lock().unwrap().extend_from_slice(&buf[..n]);
+            }
+            result
+        }
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_flush(cx)
+        }
+        fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
+
+    fn mock_target(
+        steps: Vec<TryStep>,
+    ) -> (MockTarget, DuplexStream, Arc<std::sync::atomic::AtomicBool>) {
+        let (inner, peer) = tokio::io::duplex(256 * 1024);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (
+            MockTarget {
+                inner,
+                steps: Arc::new(Mutex::new(steps.into())),
+                dropped: Arc::clone(&dropped),
+            },
+            peer,
+            dropped,
+        )
+    }
+
+    fn scripted_client(ch: &[u8]) -> (ScriptedClient, DuplexStream, Arc<Mutex<Vec<u8>>>) {
+        scripted_client_with_capacity(ch, 256 * 1024)
+    }
+
+    fn scripted_client_with_capacity(
+        ch: &[u8],
+        capacity: usize,
+    ) -> (ScriptedClient, DuplexStream, Arc<Mutex<Vec<u8>>>) {
+        let (inner, peer) = tokio::io::duplex(capacity);
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        (
+            ScriptedClient {
+                inner,
+                input: ch.iter().copied().collect(),
+                writes: Arc::clone(&writes),
+            },
+            peer,
+            writes,
+        )
+    }
+
+    async fn capture_client_hello() -> Vec<u8> {
+        let (client_end, mut server_end) = tokio::io::duplex(128 * 1024);
+        let tls = TlsConfig {
+            reality: Some(RealityConfig {
+                public_key: public_key(),
+                short_id: SHORT,
+                support_x25519_mlkem768: false,
+                protocol_clock: None,
+            }),
+            ..TlsConfig::new("localhost")
+        };
+        let layer = TlsLayer::new(&tls).unwrap();
+        let task = tokio::spawn(async move { layer.connect(Box::new(client_end)).await });
+        let wire = read_record(&mut server_end).await;
+        task.abort();
+        wire
+    }
+
+    async fn read_record(stream: &mut DuplexStream) -> Vec<u8> {
+        let mut head = [0u8; 5];
+        stream.read_exact(&mut head).await.unwrap();
+        let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+        let mut body = vec![0u8; len];
+        stream.read_exact(&mut body).await.unwrap();
+        let mut wire = head.to_vec();
+        wire.extend_from_slice(&body);
+        wire
+    }
+
+    fn ext(kind: u16, body: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&kind.to_be_bytes());
+        out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+        out.extend_from_slice(body);
+        out
+    }
+
+    fn flight(session_id: &[u8; 32]) -> Vec<u8> {
+        let secret = x25519_dalek::StaticSecret::from([9u8; 32]);
+        let share = x25519_dalek::PublicKey::from(&secret).to_bytes();
+        let mut key_share_body = Vec::new();
+        key_share_body.extend_from_slice(&0x001du16.to_be_bytes());
+        key_share_body.extend_from_slice(&(share.len() as u16).to_be_bytes());
+        key_share_body.extend_from_slice(&share);
+        let mut exts = ext(0x002b, &0x0304u16.to_be_bytes());
+        exts.extend_from_slice(&ext(0x0033, &key_share_body));
+        let mut body = Vec::new();
+        body.extend_from_slice(&[3, 3]);
+        body.extend_from_slice(&[0x66; 32]);
+        body.push(32);
+        body.extend_from_slice(session_id);
+        body.extend_from_slice(&0x1301u16.to_be_bytes());
+        body.push(0);
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        let mut sh = vec![2];
+        sh.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..4]);
+        sh.extend_from_slice(&body);
+        let mut out = Vec::new();
+        out.extend_from_slice(&[0x16, 3, 3]);
+        out.extend_from_slice(&(sh.len() as u16).to_be_bytes());
+        out.extend_from_slice(&sh);
+        out.extend_from_slice(&[0x14, 3, 3, 0, 1, 1]);
+        for len in [25u16, 3217, 281, 69] {
+            out.extend_from_slice(&[0x17, 3, 3]);
+            out.extend_from_slice(&len.to_be_bytes());
+            out.resize(out.len() + usize::from(len), 0x5a);
+        }
+        out
+    }
+
+    fn extra_record() -> Vec<u8> {
+        let mut out = vec![0x17, 3, 3, 0, 18];
+        out.resize(out.len() + 18, 0x33);
+        out
+    }
+
+    fn session_id(ch: &[u8]) -> [u8; 32] {
+        assert_eq!(ch[5], 1, "first handshake is ClientHello");
+        assert_eq!(ch[5 + 38], 32);
+        ch[5 + 39..5 + 71].try_into().unwrap()
+    }
+
+    fn spawn_machine(
+        runtime: &Arc<RealityRuntime>,
+        client: ScriptedClient,
+        target: MockTarget,
+        deadline: Instant,
+    ) -> tokio::task::JoinHandle<Option<Box<dyn Stream>>> {
+        let permit = Arc::clone(&runtime.handshake_slots)
+            .try_acquire_owned()
+            .unwrap();
+        let dial = async move {
+            Ok::<_, DialFirstDialError>(DialedTarget {
+                stream: target,
+                connect_elapsed: Duration::from_millis(200),
+            })
+        };
+        let runtime = Arc::clone(runtime);
+        tokio::spawn(async move {
+            run_dial_first(
+                &runtime,
+                Box::new(client) as Box<dyn Stream>,
+                deadline,
+                Some(permit),
+                dial,
+            )
+            .await
+        })
+    }
+
+    async fn upload_and_write_flight(ch: &[u8], target_peer: &mut DuplexStream) -> Vec<u8> {
+        let uploaded = read_record(target_peer).await;
+        assert_eq!(
+            uploaded, ch,
+            "probe uploads the exact authenticated CH once"
+        );
+        let sid = session_id(&uploaded);
+        let flight = flight(&sid);
+        target_peer.write_all(&flight).await.unwrap();
+        target_peer.flush().await.unwrap();
+        flight
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_new_bytes_reset_quiet_and_no_client_write_before_t_last_plus_q() {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, _client_peer, writes) = scripted_client(&ch);
+        let (target, mut target_peer, _dropped) = mock_target(vec![]);
+        let machine = spawn_machine(
+            &runtime,
+            client,
+            target,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let _flight = upload_and_write_flight(&ch, &mut target_peer).await;
+        yields(10).await;
+
+        // q = floor(200ms/2) = 100ms.  Half of that interval elapses after
+        // the first complete flight; there must be no commit or client write.
+        advance(Duration::from_millis(50)).await;
+        yields(10).await;
+        assert_eq!(snapshot(&runtime).committed_total, 0);
+        assert!(writes.lock().unwrap().is_empty());
+
+        // A complete extra application record is target input ready long
+        // before the original quiet deadline.  It must be consumed first and
+        // becomes the new t_last; the old quiet deadline must not fire.
+        target_peer.write_all(&extra_record()).await.unwrap();
+        target_peer.flush().await.unwrap();
+        yields(10).await;
+        advance(Duration::from_millis(99)).await;
+        yields(10).await;
+        assert_eq!(
+            snapshot(&runtime).committed_total,
+            0,
+            "the quiet baseline from the earlier flight must have been reset"
+        );
+        assert!(writes.lock().unwrap().is_empty());
+
+        advance(Duration::from_millis(1)).await;
+        yields(20).await;
+        let snap = snapshot(&runtime);
+        assert_eq!(
+            snap.committed_total, 1,
+            "commit occurs at the reset t_last+q"
+        );
+        assert!(!writes.lock().unwrap().is_empty(), "emit follows commit");
+        machine.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_hard_deadline_beats_quiet_at_equal_instant() {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, _client_peer, writes) = scripted_client(&ch);
+        let (target, mut target_peer, _dropped) = mock_target(vec![]);
+        let machine = spawn_machine(
+            &runtime,
+            client,
+            target,
+            Instant::now() + Duration::from_millis(100),
+        );
+        let _flight = upload_and_write_flight(&ch, &mut target_peer).await;
+        yields(10).await;
+        advance(Duration::from_millis(100)).await;
+        yields(20).await;
+        machine.await.unwrap();
+        let snap = snapshot(&runtime);
+        assert_eq!(snap.committed_total, 0);
+        assert_eq!(snap.cover_total.values().sum::<usize>(), 0);
+        assert_eq!(snap.close_total.get(&("probe", "deadline")), Some(&1));
+        assert!(writes.lock().unwrap().is_empty());
+    }
+
+    async fn prepare_branch(step: TryStep) -> (RealityV2MetricsSnapshot, Vec<u8>, Vec<u8>) {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, _client_peer, writes) = scripted_client(&ch);
+        let (target, mut target_peer, _dropped) = mock_target(vec![step]);
+        let machine = spawn_machine(
+            &runtime,
+            client,
+            target,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let flight = upload_and_write_flight(&ch, &mut target_peer).await;
+        yields(10).await;
+        advance(Duration::from_millis(100)).await;
+        yields(30).await;
+        let snap = snapshot(&runtime);
+        let written = writes.lock().unwrap().clone();
+        machine.abort();
+        (snap, written, flight)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_precommit_byte_appends_to_recovered_prefix_and_covers() {
+        let (snap, written, flight) = prepare_branch(TryStep::Byte(0x99)).await;
+        let mut expected = flight;
+        expected.push(0x99);
+        assert_eq!(snap.cover_total.get("late_dest_bytes"), Some(&1));
+        assert_eq!(snap.committed_total, 0);
+        assert_eq!(
+            written, expected,
+            "cover download prefix is scanner prefix plus the exact tail byte"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_precommit_eof_recovers_exact_prefix_for_half_close_cover() {
+        let (snap, written, flight) = prepare_branch(TryStep::Eof).await;
+        assert_eq!(snap.cover_total.get("dest_eof"), Some(&1));
+        assert_eq!(snap.committed_total, 0);
+        assert_eq!(
+            written, flight,
+            "EOF branch recovers the exact scanner prefix without a tail byte"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_precommit_wouldblock_crosses_commit_barrier() {
+        let (snap, written, flight) = prepare_branch(TryStep::WouldBlock).await;
+        assert_eq!(snap.committed_total, 1);
+        assert_eq!(snap.cover_total.values().sum::<usize>(), 0);
+        assert!(!written.is_empty());
+        assert_ne!(
+            written, flight,
+            "committed wire is resealed rather than the recovered target prefix"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_commit_is_counted_before_first_client_write_completes() {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, _client_peer, writes) = scripted_client_with_capacity(&ch, 512);
+        let (target, mut target_peer, _dropped) = mock_target(vec![]);
+        let machine = spawn_machine(
+            &runtime,
+            client,
+            target,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let _flight = upload_and_write_flight(&ch, &mut target_peer).await;
+        yields(10).await;
+        advance(Duration::from_millis(100)).await;
+        yields(20).await;
+        assert!(
+            !writes.lock().unwrap().is_empty(),
+            "the small client buffer accepts only a partial first emit"
+        );
+        assert!(
+            !machine.is_finished(),
+            "emit remains incomplete while the peer does not drain the small buffer"
+        );
+        assert_eq!(
+            snapshot(&runtime).committed_total,
+            1,
+            "the ownership barrier is counted before the first client write completes"
+        );
+        machine.abort();
+    }
+
+    async fn postcommit_event(eof: bool) -> RealityV2MetricsSnapshot {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, mut client_peer, _writes) = scripted_client(&ch);
+        let (target, mut target_peer, _dropped) = mock_target(vec![]);
+        let machine = spawn_machine(
+            &runtime,
+            client,
+            target,
+            Instant::now() + Duration::from_secs(5),
+        );
+        let _flight = upload_and_write_flight(&ch, &mut target_peer).await;
+        yields(10).await;
+        advance(Duration::from_millis(100)).await;
+        yields(20).await;
+        assert_eq!(snapshot(&runtime).committed_total, 1);
+
+        // Queue the target terminal event and an invalid client Finished
+        // before the executor polls either branch again.  The biased monitor
+        // must win even though the client future is also observably ready.
+        if eof {
+            drop(target_peer);
+        } else {
+            target_peer.write_all(&[0xaa]).await.unwrap();
+        }
+        client_peer
+            .write_all(b"not-a-valid-finished")
+            .await
+            .unwrap();
+        yields(30).await;
+        machine.await.unwrap();
+        snapshot(&runtime)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_postcommit_target_tail_beats_simultaneous_client_result() {
+        let snap = postcommit_event(false).await;
+        assert_eq!(
+            snap.close_total.get(&("wait_finished", "dest_tail")),
+            Some(&1)
+        );
+        assert_eq!(snap.mimic_hit_total, 0);
+        assert_eq!(snap.cover_total.values().sum::<usize>(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_postcommit_target_eof_beats_simultaneous_client_result() {
+        let snap = postcommit_event(true).await;
+        assert_eq!(
+            snap.close_total.get(&("wait_finished", "dest_eof")),
+            Some(&1)
+        );
+        assert_eq!(snap.mimic_hit_total, 0);
+        assert_eq!(snap.cover_total.values().sum::<usize>(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn t3_probe_cancellation_releases_hp_and_closes_target() {
+        let runtime = runtime();
+        let ch = capture_client_hello().await;
+        let (client, _client_peer, _writes) = scripted_client(&ch);
+        let (target, _target_peer, dropped) = mock_target(vec![]);
+        let machine = spawn_machine(
+            &runtime,
+            client,
+            target,
+            Instant::now() + Duration::from_secs(5),
+        );
+        for _ in 0..100 {
+            if snapshot(&runtime).probe_started_total == 1 {
+                break;
+            }
+            yields(1).await;
+        }
+        assert_eq!(snapshot(&runtime).probe_started_total, 1);
+        assert_eq!(snapshot(&runtime).active_probes, 1);
+        machine.abort();
+        let _ = machine.await;
+        yields(5).await;
+        let snap = snapshot(&runtime);
+        assert_eq!(snap.active_probes, 0);
+        assert_eq!(snap.active_handshakes, 0);
+        assert!(
+            dropped.load(Ordering::Relaxed),
+            "cancellation drops the target socket"
+        );
+        assert_eq!(snap.close_total.get(&("probe", "canceled")), Some(&1));
     }
 }
