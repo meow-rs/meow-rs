@@ -458,8 +458,8 @@ impl Session {
         *self.close_hold.lock().unwrap() = Some((entered, release));
     }
 
-    /// Wait until [`initiate_close`](Self::initiate_close) has published
-    /// `is_closed`. Used by pooled checkout waiters.
+    /// Wait until [`is_closed`](Self::is_closed) is true. Used by pooled
+    /// checkout waiters.
     pub async fn wait_closed(&self) {
         let notified = self.close_notify.notified();
         tokio::pin!(notified);
