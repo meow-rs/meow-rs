@@ -213,10 +213,25 @@ pub struct Session {
     /// Weak-referenced by the pool so this cannot keep the pool alive.
     pool_close_notify: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 
+    /// Runtime the session's I/O tasks were spawned on. Off-runtime Drop
+    /// spawns `close()` here instead of requiring the dropper's Handle.
+    runtime: Option<tokio::runtime::Handle>,
+
     /// Test hook: the next [`open_stream`](Self::open_stream) returns Err
     /// while the session stays open, so pooled checkout discard is observed.
     #[cfg(test)]
     fail_open_stream: std::sync::atomic::AtomicBool,
+
+    /// Test hook: park [`close`](Self::close) after `entered` rendezvous
+    /// until `release` fires, so cleanup-abort tests can observe a sweep
+    /// that has already evicted sessions.
+    #[cfg(test)]
+    close_hold: std::sync::Mutex<
+        Option<(
+            Arc<tokio::sync::Barrier>,
+            tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
 }
 
 impl Session {
@@ -293,8 +308,11 @@ impl Session {
             pending_in: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             client_settings_received: std::sync::atomic::AtomicBool::new(false),
             pool_close_notify: std::sync::Mutex::new(None),
+            runtime: tokio::runtime::Handle::try_current().ok(),
             #[cfg(test)]
             fail_open_stream: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            close_hold: std::sync::Mutex::new(None),
         }
     }
 
@@ -341,8 +359,11 @@ impl Session {
             pending_in: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             client_settings_received: std::sync::atomic::AtomicBool::new(false),
             pool_close_notify: std::sync::Mutex::new(None),
+            runtime: tokio::runtime::Handle::try_current().ok(),
             #[cfg(test)]
             fail_open_stream: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            close_hold: std::sync::Mutex::new(None),
         }
     }
 
@@ -396,6 +417,47 @@ impl Session {
         }
     }
 
+    /// Runtime this session's tasks were spawned on, if one was current
+    /// at construction.
+    pub(crate) fn runtime_handle(&self) -> Option<&tokio::runtime::Handle> {
+        self.runtime.as_ref()
+    }
+
+    /// Spawn [`close`](Self::close) on the session's owning runtime, or
+    /// the current runtime. Without either Handle, publish `is_closed` so
+    /// the pool unregisters; I/O tasks still observe that flag.
+    pub(crate) fn spawn_close(self: Arc<Self>) {
+        let spawn = |handle: &tokio::runtime::Handle, session: Arc<Self>| {
+            handle.spawn(async move {
+                if let Err(e) = session.close().await {
+                    tracing::debug!("[Session] Failed to close session: {e}");
+                }
+            });
+        };
+        if let Some(handle) = self.runtime.clone() {
+            spawn(&handle, self);
+        } else if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            spawn(&handle, self);
+        } else {
+            tracing::warn!(
+                "[Session] close requested without a tokio runtime; publishing is_closed"
+            );
+            self.initiate_close();
+        }
+    }
+
+    /// Park the next [`close`](Self::close) until `release` fires, after
+    /// the `entered` barrier. Cleanup-abort tests use this to abort a
+    /// sweep that has already evicted sessions.
+    #[cfg(test)]
+    pub(crate) fn hold_close(
+        &self,
+        entered: Arc<tokio::sync::Barrier>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.close_hold.lock().unwrap() = Some((entered, release));
+    }
+
     /// Wait until [`initiate_close`](Self::initiate_close) has published
     /// `is_closed`. Used by pooled checkout waiters.
     pub async fn wait_closed(&self) {
@@ -447,6 +509,14 @@ impl Session {
     /// `teardown_done` is the separate completion state a second caller
     /// can trust, not merely "close was initiated".
     pub async fn close(&self) -> Result<()> {
+        #[cfg(test)]
+        {
+            let hold = self.close_hold.lock().unwrap().take();
+            if let Some((entered, release)) = hold {
+                entered.wait().await;
+                let _ = release.await;
+            }
+        }
         self.initiate_close();
         if self
             .teardown_done

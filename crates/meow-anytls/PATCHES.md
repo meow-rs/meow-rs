@@ -35,11 +35,17 @@ D4 — Session pool lifecycle hardening (issues #201, #535, #695, #1015)
     Idle entries only. `checkout()` removes the newest idle session;
     newly dialled sessions register as CheckedOut, not idle.
     Return requires a matching (generation, session_id, checkout_id)
-    and a healthy session. `reset()` bumps generation, drains idle,
+    and a healthy session. Dropping an armed `Checkout` discards
+    (closes) that session. `reset()` bumps generation, drains idle,
     takes every live session (including in-use) and closes them
     outside the lock; old-generation dials close and are not
     delivered (#201 FD-leak; #695 network-change reset; #1015
-    exclusive checkout).
+    exclusive checkout). Idle cleanup spawns each close independently
+    so aborting the sweep cannot strand already-evicted sessions.
+    `spawn_close` uses the Handle captured on the session at
+    construction, so off-runtime Drop still closes. Checkout
+    waiters (`finish_return` / `finish_discard`) publish completion
+    only after the pool transition.
   - `client.rs` stream open: a new stream no longer waits for the
     server SYNACK before returning (issue #535) — it is handed out
     right after the destination address like anytls-go/sing-anytls;

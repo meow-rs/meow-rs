@@ -263,7 +263,9 @@ impl Client {
     ///
     /// At most one new dial per open: a reset that lands mid-dial closes the
     /// unpublished session and fails this call rather than starting another.
-    pub async fn create_stream(&self) -> Result<Checkout> {
+    /// Internal: callers must go through [`create_proxy_stream`] so a
+    /// [`CheckoutGuard`] owns the exclusive checkout.
+    async fn create_stream(&self) -> Result<Checkout> {
         match self.session_pool.checkout() {
             Ok(checkout) => {
                 tracing::debug!("[Client] Reusing idle session from pool");
@@ -637,8 +639,13 @@ impl PooledStream {
         let Some(state) = guard.state_arc() else {
             return;
         };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
+        let handle = self
+            .session
+            .runtime_handle()
+            .cloned()
+            .or_else(|| tokio::runtime::Handle::try_current().ok());
+        match handle {
+            Some(handle) => {
                 handle.spawn(async move {
                     let notified = state.done().notified();
                     tokio::pin!(notified);
@@ -655,7 +662,7 @@ impl PooledStream {
                     drop(guard);
                 });
             }
-            Err(_) => drop(guard),
+            None => drop(guard),
         }
     }
 
@@ -710,10 +717,8 @@ impl Drop for CheckoutGuard {
 /// host's dial timeout cancels the open, or an early `?` returns, this
 /// guard closes the session so the transport and tasks die with it.
 ///
-/// `Drop` cannot `.await`, so the close is spawned — the same pattern
-/// `AnytlsConn`'s `Drop` uses for its owned session. Without a runtime
-/// handle the session persists until its transport dies; every caller runs
-/// inside one.
+/// `Drop` cannot `.await`, so the close is spawned on the session's
+/// stored runtime Handle.
 struct SessionCloseGuard(Option<Arc<Session>>);
 
 impl SessionCloseGuard {
@@ -733,20 +738,7 @@ impl Drop for SessionCloseGuard {
         let Some(session) = self.0.take() else {
             return;
         };
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(async move {
-                    if let Err(e) = session.close().await {
-                        tracing::debug!("[Client] guarded session close failed: {e}");
-                    }
-                });
-            }
-            // Every caller runs inside a runtime; if one ever doesn't,
-            // don't leave the leak silent.
-            Err(_) => tracing::warn!(
-                "[Client] session guard dropped without a tokio runtime; unpooled session leaks"
-            ),
-        }
+        session.spawn_close();
     }
 }
 
@@ -891,6 +883,8 @@ mod tests {
         pause_writes: AtomicBool,
         pause_waker: std::sync::Mutex<Option<Waker>>,
         saw_pause: tokio::sync::Notify,
+        /// Inject a write error on the client transport (FIN-write failure).
+        fail_writes: AtomicBool,
     }
 
     impl DialStats {
@@ -909,6 +903,7 @@ mod tests {
                 pause_writes: AtomicBool::new(false),
                 pause_waker: std::sync::Mutex::new(None),
                 saw_pause: tokio::sync::Notify::new(),
+                fail_writes: AtomicBool::new(false),
             })
         }
     }
@@ -940,6 +935,9 @@ mod tests {
             cx: &mut Context<'_>,
             buf: &[u8],
         ) -> Poll<std::io::Result<usize>> {
+            if self.stats.fail_writes.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::other("injected write failure")));
+            }
             if self.stats.pause_writes.load(Ordering::SeqCst) {
                 *self.stats.pause_waker.lock().unwrap() = Some(cx.waker().clone());
                 self.stats.saw_pause.notify_waiters();
@@ -949,6 +947,9 @@ mod tests {
         }
 
         fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.stats.fail_writes.load(Ordering::SeqCst) {
+                return Poll::Ready(Err(std::io::Error::other("injected write failure")));
+            }
             if self.stats.pause_writes.load(Ordering::SeqCst) {
                 *self.stats.pause_waker.lock().unwrap() = Some(cx.waker().clone());
                 self.stats.saw_pause.notify_waiters();
@@ -1222,13 +1223,7 @@ mod tests {
             .create_proxy_stream(("example.com".into(), 443))
             .await
             .unwrap();
-        {
-            let mut handles = stats.drain_handles.lock().await;
-            for handle in handles.drain(..) {
-                handle.abort();
-            }
-            stats.peers.lock().await.clear();
-        }
+        stats.fail_writes.store(true, Ordering::SeqCst);
         stream.close().await;
         wait_pool(&client, 0, 0).await;
     }
@@ -1569,5 +1564,77 @@ mod tests {
         drop(stream);
         wait_pool(&client, 0, 0).await;
         assert_eq!(stats.dials.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn dropped_create_stream_checkout_closes_session() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let checkout = client.create_stream().await.expect("dialled checkout");
+        assert_eq!(client.session_pool().live_len(), 1);
+        assert_eq!(client.session_pool().idle_len(), 0);
+        drop(checkout);
+        wait_pool(&client, 0, 0).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.drops.load(Ordering::SeqCst) == 0
+                && stats.shutdowns.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped Checkout must close the transport");
+    }
+
+    #[tokio::test]
+    async fn off_runtime_drop_closes_transport() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let stream = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        wait_pool(&client, 1, 0).await;
+        let joined = std::thread::spawn(move || {
+            drop(stream);
+        })
+        .join();
+        assert!(joined.is_ok(), "off-runtime Drop must not panic");
+        wait_pool(&client, 0, 0).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.drops.load(Ordering::SeqCst) == 0
+                && stats.shutdowns.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("off-runtime Drop must close the transport");
+    }
+
+    #[tokio::test]
+    async fn close_await_then_immediate_open_reuses_session() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let first = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        let first_id = first.session().id();
+        first.close().await;
+        let second = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .expect("immediate open after close().await");
+        assert_eq!(
+            second.session().id(),
+            first_id,
+            "close().await must settle idle before returning"
+        );
+        assert_eq!(stats.dials.load(Ordering::SeqCst), 1);
+        assert_eq!(client.session_pool().live_len(), 1);
+        assert_eq!(client.session_pool().idle_len(), 0);
+        second.close().await;
+        wait_pool(&client, 1, 1).await;
     }
 }

@@ -59,15 +59,17 @@ struct PoolState {
 pub(crate) struct PoolInner {
     state: Mutex<PoolState>,
     config: SessionPoolConfig,
+    this: Weak<PoolInner>,
 }
 
 /// Identity of one exclusive checkout.
-#[derive(Clone)]
 pub struct Checkout {
     pub session: Arc<Session>,
     generation: Uint,
     session_id: u64,
     checkout_id: u64,
+    pool: Weak<PoolInner>,
+    armed: bool,
 }
 
 impl Checkout {
@@ -78,29 +80,53 @@ impl Checkout {
     pub fn checkout_id(&self) -> u64 {
         self.checkout_id
     }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for Checkout {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        if let Some(pool) = self.pool.upgrade() {
+            pool.discard_checkout(self.generation, self.session_id, self.checkout_id);
+        } else {
+            spawn_close(Arc::clone(&self.session));
+        }
+    }
 }
 
 /// Shared checkout identity used by the open-window guard and owner-end
 /// callback. Completing return or discard is a no-op for late duplicates.
+/// `taken` claims the one-shot; `settled` is published only after the
+/// pool transition so waiters cannot observe completion before idle
+/// insert / discard.
 pub(crate) struct CheckoutState {
     pool: Weak<PoolInner>,
     generation: Uint,
     session_id: u64,
     checkout_id: u64,
     session: Arc<Session>,
-    completed: AtomicBool,
+    taken: AtomicBool,
+    settled: AtomicBool,
     done: Notify,
 }
 
 impl CheckoutState {
-    pub(crate) fn from_checkout(pool: Weak<PoolInner>, checkout: Checkout) -> Arc<Self> {
+    pub(crate) fn from_checkout(pool: Weak<PoolInner>, mut checkout: Checkout) -> Arc<Self> {
+        checkout.disarm();
         Arc::new(Self {
             pool,
             generation: checkout.generation,
             session_id: checkout.session_id,
             checkout_id: checkout.checkout_id,
-            session: checkout.session,
-            completed: AtomicBool::new(false),
+            session: Arc::clone(&checkout.session),
+            taken: AtomicBool::new(false),
+            settled: AtomicBool::new(false),
             done: Notify::new(),
         })
     }
@@ -114,7 +140,7 @@ impl CheckoutState {
     }
 
     pub(crate) fn is_completed(&self) -> bool {
-        self.completed.load(Ordering::SeqCst)
+        self.settled.load(Ordering::SeqCst)
     }
 
     pub(crate) fn checkout_is_current(&self) -> bool {
@@ -124,7 +150,7 @@ impl CheckoutState {
     }
 
     pub(crate) fn finish_return(&self) {
-        if self.completed.swap(true, Ordering::SeqCst) {
+        if self.taken.swap(true, Ordering::SeqCst) {
             return;
         }
         if let Some(pool) = self.pool.upgrade() {
@@ -135,11 +161,12 @@ impl CheckoutState {
                 &self.session,
             );
         }
+        self.settled.store(true, Ordering::SeqCst);
         self.done.notify_waiters();
     }
 
     pub(crate) fn finish_discard(&self) {
-        if self.completed.swap(true, Ordering::SeqCst) {
+        if self.taken.swap(true, Ordering::SeqCst) {
             return;
         }
         if let Some(pool) = self.pool.upgrade() {
@@ -147,6 +174,7 @@ impl CheckoutState {
         } else {
             spawn_close(Arc::clone(&self.session));
         }
+        self.settled.store(true, Ordering::SeqCst);
         self.done.notify_waiters();
     }
 }
@@ -171,7 +199,7 @@ impl SessionPool {
 
     /// Create a new session pool with custom configuration
     pub fn with_config(config: SessionPoolConfig) -> Self {
-        let inner = Arc::new(PoolInner {
+        let inner = Arc::new_cyclic(|weak| PoolInner {
             state: Mutex::new(PoolState {
                 generation: 0,
                 live: HashMap::new(),
@@ -180,6 +208,7 @@ impl SessionPool {
                 next_checkout: 1,
             }),
             config,
+            this: weak.clone(),
         });
         let pool = Self {
             inner,
@@ -382,6 +411,8 @@ impl PoolInner {
                     generation,
                     session_id,
                     checkout_id,
+                    pool: self.this.clone(),
+                    armed: true,
                 });
             }
         };
@@ -417,6 +448,8 @@ impl PoolInner {
             generation,
             session_id,
             checkout_id,
+            pool: self.this.clone(),
+            armed: true,
         })
     }
 
@@ -594,27 +627,16 @@ impl PoolInner {
             cleanup_span.record("remaining", state.idle.len() as u64);
             sessions
         };
+        // Spawn each close independently so aborting the cleanup task
+        // cannot drop already-evicted sessions without `Session::close`.
         for session in to_close {
-            if let Err(e) = session.close().await {
-                tracing::warn!("[SessionPool] Failed to close expired session: {e}");
-            }
+            spawn_close(session);
         }
     }
 }
 
 fn spawn_close(session: Arc<Session>) {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            handle.spawn(async move {
-                if let Err(e) = session.close().await {
-                    tracing::debug!("[SessionPool] Failed to close session: {e}");
-                }
-            });
-        }
-        Err(_) => tracing::warn!(
-            "[SessionPool] close requested without a tokio runtime; session may leak until drop"
-        ),
-    }
+    session.spawn_close();
 }
 
 #[cfg(test)]
@@ -886,14 +908,74 @@ mod tests {
             }));
         }
         let mut seen = Vec::new();
+        let mut checkouts = Vec::new();
         for handle in handles {
             let checkout = handle.await.unwrap().expect("idle available");
             seen.push(checkout.session.id());
+            checkouts.push(checkout);
         }
         seen.sort_unstable();
         seen.dedup();
         assert_eq!(seen.len(), 4, "each checkout must be a distinct session");
         assert_eq!(pool.idle_len(), 0);
         assert_eq!(pool.live_len(), 4);
+        drop(checkouts);
+    }
+
+    #[tokio::test]
+    async fn dropped_checkout_discards_and_closes() {
+        let pool = SessionPool::new();
+        let session = test_session();
+        register_idle(&pool, Arc::clone(&session));
+        let checkout = pool.checkout().expect("checkout");
+        assert_eq!(pool.live_len(), 1);
+        assert_eq!(pool.idle_len(), 0);
+        drop(checkout);
+        tokio::time::timeout(Duration::from_secs(5), session.wait_closed())
+            .await
+            .expect("dropped Checkout must close the session");
+        assert_eq!(pool.live_len(), 0);
+        assert_eq!(pool.idle_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn aborting_cleanup_closes_already_evicted_sessions() {
+        let pool = Arc::new(SessionPool::with_config(SessionPoolConfig {
+            check_interval: Duration::from_secs(60),
+            idle_timeout: Duration::ZERO,
+            min_idle_sessions: 0,
+        }));
+        let sessions: Vec<Arc<Session>> = (0..3).map(|_| test_session()).collect();
+        for session in &sessions {
+            register_idle(&pool, Arc::clone(session));
+        }
+        assert_eq!(pool.live_len(), 3);
+        assert_eq!(pool.idle_len(), 3);
+
+        let entered = Arc::new(Barrier::new(2));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        sessions[0].hold_close(Arc::clone(&entered), release_rx);
+
+        let cleanup = {
+            let pool = Arc::clone(&pool);
+            tokio::spawn(async move {
+                pool.cleanup_expired().await;
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), entered.wait())
+            .await
+            .expect("cleanup must start closing an evicted session");
+        cleanup.abort();
+        let _ = cleanup.await;
+        drop(release_tx);
+        drop(pool);
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            for session in &sessions {
+                session.wait_closed().await;
+            }
+        })
+        .await
+        .expect("aborting cleanup must still close every evicted session");
     }
 }
