@@ -291,8 +291,8 @@ impl TlsLayer {
     /// Like [`Self::new`], but the verify store is the Mozilla bundle plus a
     /// process-lifetime snapshot of the OS trust store.
     ///
-    /// Internal HTTPS (`meow-config::internal_http`) uses this when
-    /// `MEOW_HTTP_SYSTEM_CA=true`. Outbound proxy TLS stays on [`Self::new`].
+    /// Internal HTTPS (`meow-config::internal_http`) uses this unless
+    /// `MEOW_HTTP_SYSTEM_CA=false`. Outbound proxy TLS stays on [`Self::new`].
     /// Hostname, chain, and distrust checks are unchanged. Native anchors
     /// are loaded once; restart to pick up trust-store changes.
     pub fn with_system_roots(config: &TlsConfig) -> Result<Self> {

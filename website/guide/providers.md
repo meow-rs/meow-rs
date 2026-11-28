@@ -64,15 +64,16 @@ writes the cache; the file is read only when that fetch fails.
 
 HTTPS fetches (this provider URL, rule-provider URLs, subscriptions,
 geodata, and `external-ui-url`) verify the server certificate against the
-bundled Mozilla roots and check the hostname. They do **not** read the OS
-trust store by default — a private CA that `curl`/`openssl` trusts will
-still fail with `CERTIFICATE_VERIFY_FAILED`. Set `MEOW_HTTP_SYSTEM_CA=true`
-(exact, case-sensitive) to also trust native anchors the process can see
-(Windows CryptoAPI, macOS Keychain, Linux `/etc/ssl/certs` via OpenSSL
-discovery). `false` or unset stays Mozilla-only; any other value warns once
-and is ignored. Restart to pick up an env or trust-store change. Hostname
-and chain checks stay on; there is no `skip-cert-verify` for these
-downloads, and outbound proxy TLS is unchanged.
+bundled Mozilla roots plus the OS trust store and check the hostname
+(matching mihomo). A private CA that `curl`/`openssl` trusts is therefore
+trusted for these downloads by default. Set `MEOW_HTTP_SYSTEM_CA=false`
+(exact, case-sensitive) to restore Mozilla-only. Unset or `true` keeps
+Mozilla + native; any other value warns once and falls back to that
+default. Native anchors the process can see include Windows CryptoAPI,
+macOS Keychain, and Linux `/etc/ssl/certs` via OpenSSL discovery.
+Restart to pick up an env or trust-store change. Hostname and chain
+checks stay on; there is no `skip-cert-verify` for these downloads, and
+outbound proxy TLS is unchanged.
 
 A `subscription-userinfo` header on the response (plan traffic and expiry)
 is reported as the provider's `subscriptionInfo` in

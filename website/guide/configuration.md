@@ -61,9 +61,10 @@ Use it as a pre-flight check.
 | `geodata` | block | — | GeoIP / ASN / GeoSite databases — [Geodata](./geodata) |
 
 Internal HTTPS downloads (providers, subscriptions, geodata, `external-ui-url`)
-verify against bundled Mozilla roots. Set `MEOW_HTTP_SYSTEM_CA=true` to also
-trust the OS store; see [Providers](./providers#type-http). Outbound proxy
-TLS is not affected.
+verify against bundled Mozilla roots plus the OS trust store (mihomo-like).
+Set `MEOW_HTTP_SYSTEM_CA=false` to restore Mozilla-only; see
+[Providers](./providers#type-http). Hostname and chain checks stay on.
+Outbound proxy TLS is not affected.
 
 ## Tunnel modes
 

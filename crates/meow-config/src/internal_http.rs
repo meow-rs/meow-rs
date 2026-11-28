@@ -66,19 +66,20 @@ const RESERVED_HEADER_NAMES: [&str; 12] = [
 /// Trust mode for internal HTTPS (`MEOW_HTTP_SYSTEM_CA`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HttpSystemCa {
-    /// Mozilla roots only. Unset, `false`, or any invalid value.
+    /// Mozilla roots only. Exact `false`.
     Off,
-    /// Mozilla roots plus a native-store snapshot.
+    /// Mozilla roots plus a native-store snapshot. Unset, `true`, or invalid.
     On,
 }
 
-/// Parse `MEOW_HTTP_SYSTEM_CA`. Only the exact UTF-8 string `true` enables
-/// native roots. `false` and unset stay Mozilla-only. Empty, padded,
-/// other-cased, and non-Unicode values are invalid: warn and use Mozilla
-/// only. Tests pass `OsStr` values so they never mutate the process env.
+/// Parse `MEOW_HTTP_SYSTEM_CA`. Unset and the exact UTF-8 string `true`
+/// enable native roots (the default, matching mihomo). Exact `false` is
+/// Mozilla-only. Empty, padded, other-cased, and non-Unicode values are
+/// invalid: warn and keep the default (Mozilla plus native). Tests pass
+/// `OsStr` values so they never mutate the process env.
 fn parse_meow_http_system_ca(value: Option<&OsStr>) -> HttpSystemCa {
     match value {
-        None => HttpSystemCa::Off,
+        None => HttpSystemCa::On,
         Some(raw) => match raw.to_str() {
             Some("true") => HttpSystemCa::On,
             Some("false") => HttpSystemCa::Off,
@@ -86,16 +87,18 @@ fn parse_meow_http_system_ca(value: Option<&OsStr>) -> HttpSystemCa {
                 warn!(
                     value = other,
                     "MEOW_HTTP_SYSTEM_CA must be exactly `true` or `false` (case-sensitive); \
-                     ignoring and using Mozilla CA roots only for internal HTTPS"
+                     ignoring and using the default (Mozilla CA roots plus native store) \
+                     for internal HTTPS"
                 );
-                HttpSystemCa::Off
+                HttpSystemCa::On
             }
             None => {
                 warn!(
                     "MEOW_HTTP_SYSTEM_CA is not valid Unicode; \
-                     ignoring and using Mozilla CA roots only for internal HTTPS"
+                     ignoring and using the default (Mozilla CA roots plus native store) \
+                     for internal HTTPS"
                 );
-                HttpSystemCa::Off
+                HttpSystemCa::On
             }
         },
     }
@@ -460,8 +463,9 @@ async fn fetch_one(
 
     let mut stream = if is_https {
         // Same TlsLayer the proxies dial with (BoringSSL). Native OS
-        // roots are an explicit opt-in (`MEOW_HTTP_SYSTEM_CA=true`);
-        // outbound proxy TLS is unchanged (always Mozilla-only).
+        // roots are on by default for internal HTTPS (mihomo-like);
+        // `MEOW_HTTP_SYSTEM_CA=false` restores Mozilla-only. Outbound
+        // proxy TLS is unchanged (always Mozilla-only).
         let tls_config = TlsConfig::new(host.trim_start_matches('[').trim_end_matches(']'));
         let tls = match http_system_ca() {
             HttpSystemCa::On => TlsLayer::with_system_roots(&tls_config),
@@ -1554,7 +1558,7 @@ mod tests {
     #[test]
     fn parse_meow_http_system_ca_table() {
         use std::ffi::OsStr;
-        assert_eq!(parse_meow_http_system_ca(None), HttpSystemCa::Off);
+        assert_eq!(parse_meow_http_system_ca(None), HttpSystemCa::On);
         assert_eq!(
             parse_meow_http_system_ca(Some(OsStr::new("true"))),
             HttpSystemCa::On
@@ -1566,21 +1570,21 @@ mod tests {
         for invalid in ["", " true", "true ", "TRUE", "True", "1", "yes", "on"] {
             assert_eq!(
                 parse_meow_http_system_ca(Some(OsStr::new(invalid))),
-                HttpSystemCa::Off,
-                "{invalid:?} must be invalid"
+                HttpSystemCa::On,
+                "{invalid:?} must be invalid and fall back to the default"
             );
         }
         #[cfg(windows)]
         {
             use std::os::windows::ffi::OsStringExt;
             let invalid = std::ffi::OsString::from_wide(&[0xD800]);
-            assert_eq!(parse_meow_http_system_ca(Some(&invalid)), HttpSystemCa::Off);
+            assert_eq!(parse_meow_http_system_ca(Some(&invalid)), HttpSystemCa::On);
         }
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
             let invalid = std::ffi::OsString::from_vec(vec![0xff]);
-            assert_eq!(parse_meow_http_system_ca(Some(&invalid)), HttpSystemCa::Off);
+            assert_eq!(parse_meow_http_system_ca(Some(&invalid)), HttpSystemCa::On);
         }
     }
 
@@ -1796,9 +1800,10 @@ mod tests {
     }
 
     /// BEFORE: a matching-hostname leaf signed by a private CA is rejected
-    /// when the env var is unset (this process) or `false` (child, even
-    /// with `SSL_CERT_FILE` pointing at the CA — the native loader is not
-    /// invoked).
+    /// when `MEOW_HTTP_SYSTEM_CA=false` even if `SSL_CERT_FILE` points at
+    /// the CA (Mozilla-only; native loader not used). A CA that is not in
+    /// the native store also fails under default On (this process, env
+    /// unset, no `SSL_CERT_FILE`).
     #[tokio::test]
     async fn https_private_ca_rejected_without_system_ca() {
         if std::env::var_os(CHILD_KIND).is_some() {
@@ -1807,15 +1812,15 @@ mod tests {
         let ca = make_ca("provider-test CA");
         let leaf = make_leaf("127.0.0.1", &[], &["127.0.0.1"], &ca);
         let url = spawn_https_origin(&leaf, &[b"v1"]).await;
-        let err = fetch_direct(&url).await.expect_err("mozilla-only");
+        let err = fetch_direct(&url).await.expect_err("untrusted private CA");
         let msg = format!("{err:#}").to_ascii_lowercase();
         assert!(
             !msg.contains("timed out"),
-            "unset env must reject, not hang: {err:#}"
+            "a CA absent from the native store must reject, not hang: {err:#}"
         );
         assert!(
             msg.contains("tls") || msg.contains("certificate") || msg.contains("handshake"),
-            "unset env must reject the private CA: {err:#}"
+            "a CA absent from the native store must fail under default On: {err:#}"
         );
 
         let (_dir, pem) = write_ca_pem(&ca);
@@ -1823,10 +1828,10 @@ mod tests {
         assert_child_ok(&false_child);
     }
 
-    /// AFTER: `MEOW_HTTP_SYSTEM_CA=true` plus the CA visible to the native
-    /// loader (`SSL_CERT_FILE`) accepts the initial fetch and a refresh
-    /// with a changed payload. Wrong hostname and an untrusted CA still
-    /// fail.
+    /// AFTER: unset (default On) and `MEOW_HTTP_SYSTEM_CA=true` plus the
+    /// CA visible to the native loader (`SSL_CERT_FILE`) accept the initial
+    /// fetch and a refresh with a changed payload. Wrong hostname and an
+    /// untrusted CA still fail with On.
     #[tokio::test]
     async fn https_private_ca_accepted_with_system_ca() {
         if std::env::var_os(CHILD_KIND).is_some() {
@@ -1834,21 +1839,24 @@ mod tests {
         }
         let ca = make_ca("provider-test CA");
         let leaf = make_leaf("127.0.0.1", &[], &["127.0.0.1"], &ca);
-        let url = spawn_https_origin(&leaf, &[b"v1", b"v2"]).await;
+        let url_unset = spawn_https_origin(&leaf, &[b"v1", b"v2"]).await;
+        let url_true = spawn_https_origin(&leaf, &[b"v1", b"v2"]).await;
         let (_dir, pem) = write_ca_pem(&ca);
-        let accepted = run_system_ca_child("accept-refresh", &url, Some(&pem), Some("true")).await;
+        let default_on = run_system_ca_child("accept-refresh", &url_unset, Some(&pem), None).await;
+        assert_child_ok(&default_on);
+        let accepted =
+            run_system_ca_child("accept-refresh", &url_true, Some(&pem), Some("true")).await;
         assert_child_ok(&accepted);
 
         let wrong = make_leaf("wrong.example", &["wrong.example"], &[], &ca);
         let wrong_url = spawn_https_origin(&wrong, &[b"nope"]).await;
-        let wrong_child = run_system_ca_child("reject", &wrong_url, Some(&pem), Some("true")).await;
+        let wrong_child = run_system_ca_child("reject", &wrong_url, Some(&pem), None).await;
         assert_child_ok(&wrong_child);
 
         let other = make_ca("untrusted CA");
         let untrusted = make_leaf("127.0.0.1", &[], &["127.0.0.1"], &other);
         let untrusted_url = spawn_https_origin(&untrusted, &[b"nope"]).await;
-        let untrusted_child =
-            run_system_ca_child("reject", &untrusted_url, Some(&pem), Some("true")).await;
+        let untrusted_child = run_system_ca_child("reject", &untrusted_url, Some(&pem), None).await;
         assert_child_ok(&untrusted_child);
     }
 }
