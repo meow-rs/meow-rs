@@ -6688,4 +6688,28 @@ mod independent_wire_vectors {
             }
         }
     }
+    #[tokio::test]
+    async fn staged_bcover_capacity_measurement_counts_moved_prefix_and_direction_buffers() {
+        let (client_end, _client_peer) = tokio::io::duplex(1024);
+        let (target_end, _target_peer) = tokio::io::duplex(1024);
+        let download = Vec::with_capacity(65_537);
+        let upload = Vec::new();
+        let future = relay_cover_with_prefixes(
+            Box::new(client_end),
+            Box::new(target_end),
+            CoverRelayPrefixes {
+                upload,
+                download,
+                ..CoverRelayPrefixes::default()
+            },
+            CoverBandwidthLimit::default(),
+        );
+        let future_state_size = std::mem::size_of_val(&future);
+        let accounted = 65_537 + 2 * COVER_BUFFER;
+        assert_eq!(accounted, 98_305, "Bcover arithmetic");
+        eprintln!(
+            "bcover-measured moved_prefix_capacity=65537 direction_buffers=32768 accounted={accounted} Bcover=98305 cover_future_state_size={future_state_size}"
+        );
+        drop(future);
+    }
 }

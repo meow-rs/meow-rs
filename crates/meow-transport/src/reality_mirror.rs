@@ -1680,6 +1680,7 @@ mod tests {
     };
     use crate::reality_tls::{x25519_public_from_private, CipherSuite};
     use boring::mlkem::{Algorithm as MlKemAlgorithm, MlKemPrivateKey};
+    use tokio::io::AsyncWriteExt;
 
     const HRR_RANDOM: [u8; 32] = [
         0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8,
@@ -3390,6 +3391,79 @@ mod tests {
                 TARGET_SCAN_WIRE_LIMIT,
                 "{name}: sealed wire width"
             );
+            assert!(
+                wire.capacity() <= TARGET_SCAN_WIRE_LIMIT + 5,
+                "{name}: emit retained capacity {} exceeds W plus record-head slack",
+                wire.capacity()
+            );
+            eprintln!(
+                "bemit-measured {name}: retained_wire_len={} retained_wire_capacity={} Bemit=65536 commit_additional_allocation=0-by-ownership-chain",
+                wire.len(),
+                wire.capacity()
+            );
         }
+    }
+    #[tokio::test]
+    async fn staged_bfin_capacity_measurement_covers_sha384_max_record() {
+        for (name, cipher, hash_len) in [
+            ("sha256", CipherSuite::Aes128GcmSha256, 32usize),
+            ("sha384", CipherSuite::Aes256GcmSha384, 48usize),
+        ] {
+            let secret = vec![0x5au8; hash_len];
+            let mut sealing = RecordKey::new(cipher, &secret);
+            let mut opening = RecordKey::new(cipher, &secret);
+            let logical_len = 4 + hash_len;
+            let mut finished = Vec::with_capacity(logical_len);
+            finished.push(HS_FINISHED);
+            finished.extend_from_slice(&(hash_len as u32).to_be_bytes()[1..4]);
+            finished.resize(logical_len, 0x33);
+            let record_len = 16_401usize;
+            let pad = record_len - 16 - 1 - logical_len;
+            let mut wire = Vec::new();
+            sealing
+                .seal_with_padding_into(&mut wire, TLS_RECORD_HANDSHAKE, &finished, pad)
+                .expect("seal maximum finished record");
+            assert_eq!(wire.len(), 5 + record_len);
+
+            let (mut peer, server) = tokio::io::duplex(32 * 1024);
+            peer.write_all(&wire).await.expect("prefill finished wire");
+            drop(peer);
+            let mut inner: Box<dyn Stream> = Box::new(server);
+            crate::test_alloc::start_measurement();
+            let message = read_mirrored_client_finished(&mut inner, &mut opening, hash_len)
+                .await
+                .expect("maximum shaped Finished opens");
+            let (live, peak) = crate::test_alloc::measurement();
+            assert_eq!(message.len, logical_len);
+            assert!(
+                peak >= 16_401,
+                "{name}: allocator witness missed the in-place body: {peak}"
+            );
+            assert!(
+                peak <= 16_458,
+                "{name}: allocator-measured Finished peak {peak} exceeds Bfin"
+            );
+            eprintln!(
+                "bfin-measured {name}: peak={peak} live_after_return={live} record=16401 logical={logical_len} Bfin=16458"
+            );
+        }
+    }
+
+    #[test]
+    fn staged_fixed_state_and_crypto_backend_layout_measurements() {
+        crate::test_alloc::start_measurement();
+        let (_public, private) =
+            MlKemPrivateKey::generate(MlKemAlgorithm::MlKem768).expect("ML-KEM key generation");
+        let (mlkem_live, mlkem_peak) = crate::test_alloc::measurement();
+        let public_size = std::mem::size_of::<boring::mlkem::MlKemPublicKey>();
+        let private_size = std::mem::size_of::<boring::mlkem::MlKemPrivateKey>();
+        let completion_size = std::mem::size_of::<MirroredHandshakeCompletion>();
+        let prepared_size = std::mem::size_of::<PreparedFlight>();
+        let scanner_size = std::mem::size_of::<TargetFlightScanner<'_>>();
+        eprintln!(
+            "fixed-state-measured prepared={prepared_size} completion={completion_size} scanner={scanner_size} mlkem_public_wrapper={public_size} mlkem_private_wrapper={private_size} mlkem_keygen_heap_live={mlkem_live} mlkem_keygen_heap_peak={mlkem_peak}"
+        );
+        assert!(mlkem_peak > 0, "ML-KEM backend allocation witness missing");
+        drop(private);
     }
 }
