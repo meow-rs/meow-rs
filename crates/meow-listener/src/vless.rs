@@ -130,11 +130,28 @@ pub(crate) struct RealityRuntime {
     pub(crate) metrics: Arc<crate::vless_mimic::RealityV2Metrics>,
 }
 
+/// Whether a v6 wildcard socket also accepts IPv4 traffic. Linux and macOS
+/// default such sockets to dual-stack; a host or embedder can still create a
+/// v6-only socket, so the runtime guard records the real socket option instead
+/// of guessing from the bound address. Meaningless for non-v6-wildcards.
+#[derive(Clone, Copy)]
+struct BoundEndpointCoverage {
+    v6_wildcard_accepts_v4: bool,
+}
+
+impl BoundEndpointCoverage {
+    #[cfg(test)]
+    const CONSERVATIVE: Self = Self {
+        v6_wildcard_accepts_v4: true,
+    };
+}
+
 /// Bound endpoints of every live VLESS listener generation in this
 /// process. A cover target resolving to any of them would re-enter the
 /// REALITY classifier rather than reach a cover site. Weak refs keep a
 /// dropped listener from poisoning later independent generations.
-type EndpointSet = std::sync::RwLock<HashSet<SocketAddr>>;
+type EndpointSnapshot = HashMap<SocketAddr, BoundEndpointCoverage>;
+type EndpointSet = std::sync::RwLock<EndpointSnapshot>;
 type EndpointRegistry = parking_lot::Mutex<Vec<Weak<EndpointSet>>>;
 
 fn endpoint_registries() -> &'static EndpointRegistry {
@@ -149,12 +166,12 @@ fn endpoint_registries() -> &'static EndpointRegistry {
 /// it inserted; a port later reused by an unrelated service must not stay
 /// blacklisted as a cover target.
 struct EndpointRegistration {
-    set: Arc<std::sync::RwLock<HashSet<SocketAddr>>>,
+    set: Arc<EndpointSet>,
     addr: SocketAddr,
 }
 
 impl EndpointRegistration {
-    fn new(set: Arc<std::sync::RwLock<HashSet<SocketAddr>>>, addr: SocketAddr) -> Self {
+    fn new(set: Arc<EndpointSet>, addr: SocketAddr) -> Self {
         Self { set, addr }
     }
 }
@@ -180,7 +197,7 @@ pub struct VlessListener {
     conn_max: usize,
     tcp_keepalive: TcpKeepaliveConfig,
     route_override: Option<meow_common::InboundRouteOverride>,
-    bound_endpoints: Arc<std::sync::RwLock<HashSet<SocketAddr>>>,
+    bound_endpoints: Arc<EndpointSet>,
     vision_raw_read_switches: AtomicUsize,
     vision_raw_write_switches: AtomicUsize,
 }
@@ -290,7 +307,7 @@ impl VlessListener {
             .collect();
         let security = build_security_runtime(spec.security)?;
 
-        let bound_endpoints = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        let bound_endpoints = Arc::new(std::sync::RwLock::new(EndpointSnapshot::new()));
         endpoint_registries()
             .lock()
             .push(Arc::downgrade(&bound_endpoints));
@@ -337,12 +354,14 @@ impl VlessListener {
 
     /// Record an actually bound endpoint before accept tasks start. The
     /// runtime self-loop guard uses these endpoints; `port: 0` must be
-    /// passed only after `local_addr()` resolves it.
-    pub fn note_bound_endpoint(&self, addr: SocketAddr) {
+    /// passed only after `local_addr()` resolves it. `addr` must be that
+    /// socket's local address: the socket is inspected because a v6 wildcard's
+    /// `IPV6_V6ONLY` setting decides whether v4 loopback can re-enter it.
+    pub fn note_bound_endpoint(&self, socket: &TcpListener, addr: SocketAddr) {
         self.bound_endpoints
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(canonical_endpoint(addr));
+            .insert(canonical_endpoint(addr), endpoint_coverage(socket, addr));
     }
 
     /// Cumulative DIRECT switches observed on this listener, as
@@ -390,7 +409,7 @@ impl VlessListener {
         listener: TcpListener,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bound = listener.local_addr()?;
-        self.note_bound_endpoint(bound);
+        self.note_bound_endpoint(&listener, bound);
         let _endpoint_registration =
             EndpointRegistration::new(Arc::clone(&self.bound_endpoints), canonical_endpoint(bound));
         let in_port = bound.port();
@@ -834,24 +853,24 @@ impl VlessListener {
         }))
     }
 
-    fn all_bound_endpoints(&self) -> HashSet<SocketAddr> {
-        let mut out: HashSet<SocketAddr> = self
+    fn all_bound_endpoints(&self) -> EndpointSnapshot {
+        let mut out: EndpointSnapshot = self
             .bound_endpoints
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .copied()
+            .map(|(addr, coverage)| (*addr, *coverage))
             .collect();
         let mut registries = endpoint_registries().lock();
         registries.retain(|weak| {
             if let Some(set) = weak.upgrade() {
-                // This listener's own set is already merged; merging it
-                // again is harmless because the result is a set.
+                // This listener's own table is already merged; merging it
+                // again is harmless because the keys are endpoints.
                 out.extend(
                     set.read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .iter()
-                        .copied(),
+                        .map(|(addr, coverage)| (*addr, *coverage)),
                 );
                 true
             } else {
@@ -901,6 +920,17 @@ fn build_tcp_metadata(
 
 fn canonical_endpoint(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+fn endpoint_coverage(socket: &TcpListener, addr: SocketAddr) -> BoundEndpointCoverage {
+    let is_v6_wildcard = matches!(addr.ip(), IpAddr::V6(ip) if ip.is_unspecified());
+    let v6_wildcard_accepts_v4 = is_v6_wildcard
+        && socket2::SockRef::from(socket)
+            .only_v6()
+            .map_or(true, |only_v6| !only_v6);
+    BoundEndpointCoverage {
+        v6_wildcard_accepts_v4,
+    }
 }
 
 /// Snapshot local interface addresses for wildcard-bind self-loop checks.
@@ -1053,11 +1083,11 @@ fn local_interface_addrs_windows() -> Option<HashSet<IpAddr>> {
 
 fn endpoint_is_self(
     candidate: SocketAddr,
-    endpoints: &HashSet<SocketAddr>,
+    endpoints: &EndpointSnapshot,
     local_addrs: Option<&HashSet<IpAddr>>,
 ) -> bool {
     let ip = candidate.ip().to_canonical();
-    endpoints.iter().any(|bound| {
+    endpoints.iter().any(|(bound, coverage)| {
         if bound.port() != candidate.port() {
             return false;
         }
@@ -1068,8 +1098,20 @@ fn endpoint_is_self(
         if bind_ip.is_loopback() && ip.is_loopback() && bind_ip.is_ipv4() == ip.is_ipv4() {
             return true;
         }
-        bind_ip.is_unspecified()
-            && (ip.is_unspecified() || local_addrs.is_none_or(|addrs| addrs.contains(&ip)))
+        if !bind_ip.is_unspecified() {
+            return false;
+        }
+        // `to_canonical` has already folded v4-mapped spellings, so 127/8 is
+        // visible here in native v4 form. A v4 wildcard cannot receive v6; a
+        // v6 wildcard receives v4 only when its recorded socket is dual-stack.
+        let wildcard_covers_candidate = match bind_ip {
+            IpAddr::V4(_) => ip.is_ipv4(),
+            IpAddr::V6(_) => ip.is_ipv6() || coverage.v6_wildcard_accepts_v4,
+        };
+        wildcard_covers_candidate
+            && (ip.is_unspecified()
+                || ip.is_loopback()
+                || local_addrs.is_none_or(|addrs| addrs.contains(&ip)))
     })
 }
 
@@ -1105,7 +1147,8 @@ mod tests {
         Tunnel::new(resolver)
     }
 
-    fn test_reality_listener_with(
+    fn test_reality_listener_with_dest(
+        dest_host: &str,
         dest_port: u16,
         mimic: VlessRealityMimicSpec,
     ) -> Arc<VlessListener> {
@@ -1115,7 +1158,7 @@ mod tests {
                 uuid: [0x11; 16],
             }],
             security: VlessSecuritySpec::Reality(VlessRealitySpec {
-                dest_host: "127.0.0.1".into(),
+                dest_host: dest_host.into(),
                 dest_port,
                 private_key: [0x42; 32],
                 short_ids: vec![[0; 8]],
@@ -1128,6 +1171,13 @@ mod tests {
             udp: true,
         };
         Arc::new(VlessListener::new(test_tunnel(), "test".into(), spec).unwrap())
+    }
+
+    fn test_reality_listener_with(
+        dest_port: u16,
+        mimic: VlessRealityMimicSpec,
+    ) -> Arc<VlessListener> {
+        test_reality_listener_with_dest("127.0.0.1", dest_port, mimic)
     }
 
     fn test_reality_listener() -> Arc<VlessListener> {
@@ -1165,6 +1215,51 @@ mod tests {
         );
     }
 
+    static HOST_RESOLVER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct InstalledHostResolver;
+
+    impl Drop for InstalledHostResolver {
+        fn drop(&mut self) {
+            meow_common::clear_host_resolver();
+        }
+    }
+
+    fn install_host_resolver_for_test(
+        resolver: Arc<dyn meow_common::HostResolver>,
+    ) -> InstalledHostResolver {
+        meow_common::set_host_resolver(resolver);
+        InstalledHostResolver
+    }
+
+    struct LoopbackAliasResolver;
+
+    #[async_trait::async_trait]
+    impl meow_common::HostResolver for LoopbackAliasResolver {
+        async fn resolve(&self, host: &str) -> std::io::Result<IpAddr> {
+            self.resolve_all(host).await.map(|ips| ips[0])
+        }
+
+        async fn resolve_all(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            if host.eq_ignore_ascii_case("cover-loopback-alias.invalid") {
+                return Ok(vec![IpAddr::from([127, 0, 0, 2])]);
+            }
+            // The hook is process-global while this test holds it; unrelated
+            // parallel lookups keep their system-resolver behavior.
+            let ips: Vec<IpAddr> = tokio::net::lookup_host((host, 0))
+                .await?
+                .map(|addr| addr.ip())
+                .collect();
+            if ips.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "system resolver returned no addresses",
+                ));
+            }
+            Ok(ips)
+        }
+    }
+
     struct PendingHostResolver {
         started: AtomicUsize,
         started_notify: tokio::sync::Notify,
@@ -1196,6 +1291,7 @@ mod tests {
     /// TCP connect, so no target socket appears and the H permit is released.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reality_dial_first_resolver_cancellation_never_connects_after_completion() {
+        let _host_resolver_lock = HOST_RESOLVER_TEST_LOCK.lock().await;
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let target_port = target.local_addr().unwrap().port();
         let target_accepts = Arc::new(AtomicUsize::new(0));
@@ -1243,7 +1339,7 @@ mod tests {
         });
         let host_resolver: Arc<dyn meow_common::HostResolver> =
             Arc::<PendingHostResolver>::clone(&resolver);
-        meow_common::set_host_resolver(host_resolver);
+        let _host_resolver_guard = install_host_resolver_for_test(host_resolver);
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let probe_addr = probe.local_addr().unwrap();
@@ -1272,7 +1368,7 @@ mod tests {
         for _ in 0..20 {
             tokio::task::yield_now().await;
         }
-        meow_common::clear_host_resolver();
+        drop(_host_resolver_guard);
         drop(client);
 
         let mut snapshot = listener.reality_v2_metrics_snapshot().unwrap();
@@ -1303,6 +1399,55 @@ mod tests {
             snapshot.close_total
         );
         eprintln!("resolver-cancellation evidence: pending-resolver started=1 aborted-before-completion tcp-connect=0 target-accepts=0 H=0 close=read_and_dial/canceled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_first_loopback_alias_resolution_is_refused_before_recursive_connect() {
+        let _host_resolver_lock = HOST_RESOLVER_TEST_LOCK.lock().await;
+        let _host_resolver_guard = install_host_resolver_for_test(Arc::new(LoopbackAliasResolver));
+
+        let socket = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let listener = test_reality_listener_with_dest(
+            "cover-loopback-alias.invalid",
+            port,
+            VlessRealityMimicSpec::default(),
+        );
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+
+        // Dial-first starts the cover dial before any ClientHello byte.  The
+        // injected resolver answers the fixed target with a 127/8 alias that
+        // interface enumeration does not list; the guard must classify that
+        // resolution failure shape as Resolve before TCP connect starts.
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        assert!(
+            closed,
+            "loopback-alias cover resolution must close the admitting client"
+        );
+
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(
+            snapshot.close_total.get(&("read_and_dial", "resolve")),
+            Some(&1),
+            "loopback-alias candidate must be refused as resolution failure: {snapshot:?}"
+        );
+        assert_eq!(snapshot.tcp_connect_started_total, 0);
+        // Every recursively accepted connection would start another target
+        // dial. Exactly one dial total is therefore the accept-chain bound.
+        assert_eq!(snapshot.dial_started_total, 1);
+        assert_eq!(snapshot.active_handshakes, 0);
+        task.abort();
+        let _ = task.await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1562,7 +1707,7 @@ mod tests {
                 .bound_endpoints
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&addr)
+                .contains_key(&addr)
             {
                 break;
             }
@@ -1572,7 +1717,7 @@ mod tests {
             .bound_endpoints
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&addr));
+            .contains_key(&addr));
         task.abort();
         let _ = task.await;
         for _ in 0..100 {
@@ -1580,7 +1725,7 @@ mod tests {
                 .bound_endpoints
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&addr)
+                .contains_key(&addr)
             {
                 return;
             }
@@ -1590,12 +1735,97 @@ mod tests {
     }
 
     #[test]
-    fn self_loop_guard_matches_exact_loopback_and_wildcard_local_addresses() {
-        let mut endpoints = HashSet::new();
-        endpoints.insert(SocketAddr::new(
-            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            8443,
+    fn self_loop_guard_wildcard_covers_unenumerated_loopback_aliases() {
+        let local = HashSet::from([
+            "192.0.2.10".parse::<IpAddr>().unwrap(),
+            "::1".parse::<IpAddr>().unwrap(),
+        ]);
+        let mut endpoints = EndpointSnapshot::new();
+        endpoints.insert(
+            "0.0.0.0:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
+
+        for alias in ["127.0.0.2", "127.255.0.1"] {
+            assert!(
+                endpoint_is_self(
+                    SocketAddr::new(alias.parse::<IpAddr>().unwrap(), 443),
+                    &endpoints,
+                    Some(&local),
+                ),
+                "{alias} is a 127/8 loopback alias even when unenumerated"
+            );
+        }
+        assert!(
+            endpoint_is_self(
+                "[::ffff:127.0.0.2]:443".parse().unwrap(),
+                &endpoints,
+                Some(&local),
+            ),
+            "canonicalization folds the v4-mapped loopback alias before matching"
+        );
+        assert!(
+            !endpoint_is_self("[::1]:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a v4 wildcard cannot be reached through IPv6 loopback"
+        );
+
+        endpoints.clear();
+        endpoints.insert(
+            "[::]:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage {
+                v6_wildcard_accepts_v4: true,
+            },
+        );
+        assert!(endpoint_is_self(
+            "[::1]:443".parse().unwrap(),
+            &endpoints,
+            Some(&local),
         ));
+        assert!(
+            endpoint_is_self("127.0.0.2:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a dual-stack v6 wildcard accepts v4 peers as mapped"
+        );
+
+        endpoints.clear();
+        endpoints.insert(
+            "[::]:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage {
+                v6_wildcard_accepts_v4: false,
+            },
+        );
+        assert!(endpoint_is_self(
+            "[::1]:443".parse().unwrap(),
+            &endpoints,
+            Some(&local),
+        ));
+        assert!(
+            !endpoint_is_self("127.0.0.2:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a v6-only wildcard cannot be reached through v4 loopback"
+        );
+
+        endpoints.clear();
+        endpoints.insert(
+            "[::1]:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
+        assert!(endpoint_is_self(
+            "[::1]:443".parse().unwrap(),
+            &endpoints,
+            Some(&local),
+        ));
+        assert!(
+            !endpoint_is_self("127.0.0.2:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a specific v6 loopback bind has no v4 loopback pair"
+        );
+    }
+
+    #[test]
+    fn self_loop_guard_matches_exact_loopback_and_wildcard_local_addresses() {
+        let mut endpoints = EndpointSnapshot::new();
+        endpoints.insert(
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8443),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
         assert!(endpoint_is_self(
             SocketAddr::new("127.0.0.44".parse().unwrap(), 8443),
             &endpoints,
@@ -1608,10 +1838,10 @@ mod tests {
         ));
 
         endpoints.clear();
-        endpoints.insert(SocketAddr::new(
-            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            443,
-        ));
+        endpoints.insert(
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 443),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
         let local = HashSet::from(["192.0.2.10".parse::<IpAddr>().unwrap()]);
         assert!(endpoint_is_self(
             SocketAddr::new("192.0.2.10".parse().unwrap(), 443),

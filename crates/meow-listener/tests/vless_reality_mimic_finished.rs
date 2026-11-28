@@ -778,7 +778,7 @@ async fn start_listener(
     );
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bound = socket.local_addr().unwrap();
-    listener.note_bound_endpoint(bound);
+    listener.note_bound_endpoint(&socket, bound);
     let task_listener = Arc::clone(&listener);
     let task = tokio::spawn(async move {
         let _ = task_listener.run_on(socket).await;

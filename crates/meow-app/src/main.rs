@@ -2312,7 +2312,7 @@ async fn run(
                         .map(|s| {
                             s.local_addr()
                                 .map(|b| {
-                                    listener.note_bound_endpoint(b);
+                                    listener.note_bound_endpoint(s, b);
                                     (b.ip().to_string(), b.port())
                                 })
                                 .map_err(|e| {

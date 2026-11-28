@@ -133,7 +133,7 @@ async fn start_listener(
     let listener = Arc::new(VlessListener::new(tunnel, name.into(), spec).unwrap());
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let bound = socket.local_addr().unwrap();
-    listener.note_bound_endpoint(bound);
+    listener.note_bound_endpoint(&socket, bound);
     let task_listener = Arc::clone(&listener);
     let task = tokio::spawn(async move {
         let _ = task_listener.run_on(socket).await;
@@ -1152,7 +1152,7 @@ async fn xudp_fatal_teardown_is_bounded_when_writer_is_blocked() {
     );
     let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = socket.local_addr().unwrap().port();
-    listener.note_bound_endpoint(socket.local_addr().unwrap());
+    listener.note_bound_endpoint(&socket, socket.local_addr().unwrap());
     let task_listener = Arc::clone(&listener);
     let _task = tokio::spawn(async move {
         let _ = task_listener.run_on(socket).await;

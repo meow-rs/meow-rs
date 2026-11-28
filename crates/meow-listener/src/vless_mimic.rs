@@ -1617,7 +1617,22 @@ mod tests {
     }
 
     #[cfg(unix)]
+    fn inhibit_paused_time_auto_advance(
+    ) -> (std::sync::mpsc::Sender<()>, tokio::task::JoinHandle<()>) {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let task = tokio::task::spawn_blocking(move || {
+            let _ = rx.recv();
+        });
+        (tx, task)
+    }
+
+    #[cfg(unix)]
     async fn real_precommit_case(eof: bool) -> (RealityV2MetricsSnapshot, Vec<u8>, Vec<u8>) {
+        // A paused current_thread runtime otherwise auto-advances to the
+        // probe deadline while the test is merely parked on real loopback IO.
+        // A parked blocking task is tokio's supported inhibitor; dropping the
+        // sender releases it when the case ends.
+        let (inhibit_tx, inhibit_task) = inhibit_paused_time_auto_advance();
         let runtime = runtime();
         let ch = capture_client_hello().await;
         let (client, mut client_peer, writes) = scripted_client(&ch);
@@ -1691,6 +1706,8 @@ mod tests {
         machine.abort();
         SCAN_OBSERVER.with(|observer| observer.borrow_mut().take());
         drop(target_peer);
+        drop(inhibit_tx);
+        let _ = inhibit_task.await;
         (snap, written, flight)
     }
 
