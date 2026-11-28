@@ -1241,6 +1241,109 @@ mod tests {
         session.close().await.unwrap();
     }
 
+    struct PacketPoolDialer {
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct PacketPlainTls;
+
+    impl TlsConnect for PacketPlainTls {
+        fn connect(&self, _tcp: TcpStream) -> TlsConnectFuture<'_> {
+            Box::pin(async {
+                Err(anytls_rs::AnyTlsError::Protocol(
+                    "PlainTls: TcpStream path must not be reached".into(),
+                ))
+            })
+        }
+
+        fn connect_stream(&self, stream: Box<dyn SyncStream>) -> TlsConnectFuture<'_> {
+            Box::pin(async move { Ok(Box::new(stream) as Box<dyn AsyncStream>) })
+        }
+    }
+
+    impl anytls_rs::TransportDialer for PacketPoolDialer {
+        fn dial<'a>(&'a self, host: &'a str, port: u16) -> anytls_rs::TransportDialFuture<'a> {
+            Box::pin(async move {
+                assert_eq!((host, port), ("anytls.test", 443));
+                self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (client_half, peer_half) = tokio::io::duplex(64 * 1024);
+                let (mut peer_read, peer_write) = tokio::io::split(peer_half);
+                tokio::spawn(async move {
+                    let _peer_write = peer_write;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut peer_read, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+                Ok(Box::new(client_half) as Box<dyn SyncStream>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_from_pooled_drop_returns_session_without_redial() {
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = AnytlsClient::new(
+            "password",
+            "anytls.test:443".to_string(),
+            Arc::new(PacketPlainTls),
+            PaddingFactory::default(),
+        );
+        client.set_transport_dialer(Arc::new(PacketPoolDialer {
+            dials: Arc::clone(&dials),
+        }));
+        let metadata = metadata_for("192.0.2.2", Some("192.0.2.2".parse().unwrap()), 53);
+        let pooled = client
+            .create_proxy_stream_with_payload(
+                (UDP_OVER_TCP_MAGIC_ADDR.to_string(), 0),
+                Some(Bytes::from(encode_uot_request(&metadata))),
+            )
+            .await
+            .unwrap();
+        let conn = AnytlsPacketConn::from_pooled(pooled, None);
+        drop(conn);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client.session_pool().live_len() == 1 && client.session_pool().idle_len() == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("packet Drop must return the session to idle");
+        assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let pooled = client
+            .create_proxy_stream_with_payload(
+                (UDP_OVER_TCP_MAGIC_ADDR.to_string(), 0),
+                Some(Bytes::from(encode_uot_request(&metadata))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second UoT open must reuse the idle session"
+        );
+        assert_eq!(client.session_pool().live_len(), 1);
+        assert_eq!(client.session_pool().idle_len(), 0);
+        drop(AnytlsPacketConn::from_pooled(pooled, None));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client.session_pool().live_len() == 1 && client.session_pool().idle_len() == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second packet Drop must return the same session");
+    }
+
     /// Push one data frame into the session from the peer end.
     async fn push_frame(peer: &mut DuplexStream, stream_id: u32, data: &[u8]) {
         let mut frame = Vec::with_capacity(7 + data.len());

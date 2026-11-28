@@ -32,7 +32,7 @@ D3 — Server-side UDP proxy is documented dead code (issue #625)
 D4 — Session pool lifecycle hardening (issues #201, #535, #695, #1015)
   - `session_pool.rs`: exclusive checkout-and-return with a `live`
     index (Idle | CheckedOut(checkout_id)) and an `idle` index of
-    Idle entries only. `get` removes the newest idle session;
+    Idle entries only. `checkout()` removes the newest idle session;
     newly dialled sessions register as CheckedOut, not idle.
     Return requires a matching (generation, session_id, checkout_id)
     and a healthy session. `reset()` bumps generation, drains idle,

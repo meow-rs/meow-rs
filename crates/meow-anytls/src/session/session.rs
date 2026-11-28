@@ -212,6 +212,11 @@ pub struct Session {
     /// One-shot pool unregister, fired after `is_closed` is published.
     /// Weak-referenced by the pool so this cannot keep the pool alive.
     pool_close_notify: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
+
+    /// Test hook: the next [`open_stream`](Self::open_stream) returns Err
+    /// while the session stays open, so pooled checkout discard is observed.
+    #[cfg(test)]
+    fail_open_stream: std::sync::atomic::AtomicBool,
 }
 
 impl Session {
@@ -288,6 +293,8 @@ impl Session {
             pending_in: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             client_settings_received: std::sync::atomic::AtomicBool::new(false),
             pool_close_notify: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_open_stream: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -334,6 +341,8 @@ impl Session {
             pending_in: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             client_settings_received: std::sync::atomic::AtomicBool::new(false),
             pool_close_notify: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            fail_open_stream: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -357,6 +366,14 @@ impl Session {
     /// Check if session is closed
     pub fn is_closed(&self) -> bool {
         self.is_closed.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Make the next [`open_stream`](Self::open_stream) fail without closing
+    /// the session (pooled checkout-guard tests).
+    #[cfg(test)]
+    pub fn fail_next_open_stream(&self) {
+        self.fail_open_stream
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn initiate_close(&self) {
@@ -1265,6 +1282,13 @@ impl Session {
     pub async fn open_stream(
         self: &Arc<Self>,
     ) -> Result<(Arc<Stream>, tokio::sync::oneshot::Receiver<Result<()>>)> {
+        #[cfg(test)]
+        if self
+            .fail_open_stream
+            .swap(false, std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(AnyTlsError::Protocol("injected open_stream failure".into()));
+        }
         if self.is_closed() {
             tracing::warn!("[Session] Attempted to open stream on closed session");
             return Err(AnyTlsError::SessionClosed);

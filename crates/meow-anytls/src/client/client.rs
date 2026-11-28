@@ -572,8 +572,9 @@ impl Client {
         self.session_pool.stop_cleanup_task().await;
     }
 
-    #[cfg(test)]
-    pub(crate) fn session_pool(&self) -> &Arc<SessionPool> {
+    /// Session pool used by this client. Tests in other crates observe
+    /// live/idle counts through this accessor.
+    pub fn session_pool(&self) -> &SessionPool {
         &self.session_pool
     }
 
@@ -1261,13 +1262,35 @@ mod tests {
     async fn open_stream_failure_does_not_leak() {
         let stats = DialStats::new();
         let client = pooled_client(&stats);
-        let checkout = client.create_stream().await.unwrap();
-        checkout.session.close().await.unwrap();
-        let err =
-            Client::open_proxy_stream(&checkout.session, ("example.com".into(), 443), None).await;
-        assert!(err.is_err());
-        client.session_pool().discard_checkout(&checkout);
+        let first = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        let session = Arc::clone(first.session());
+        session.fail_next_open_stream();
+        first.close().await;
+        wait_pool(&client, 1, 1).await;
+        assert!(
+            !session.is_closed(),
+            "injected open_stream failure must hit a live session"
+        );
+        let err = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await;
+        assert!(
+            err.is_err(),
+            "create_proxy_stream must surface open_stream failure"
+        );
         wait_pool(&client, 0, 0).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.drops.load(Ordering::SeqCst) == 0
+                && stats.shutdowns.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("open_stream failure must close the transport");
     }
 
     #[tokio::test]
@@ -1451,19 +1474,24 @@ mod tests {
     async fn open_proxy_stream_cancel_discards_checkout() {
         let stats = DialStats::new();
         stats.drain_reads.store(false, Ordering::SeqCst);
-        let client = pooled_client(&stats);
-        let checkout = client.create_stream().await.unwrap();
-        let state = crate::client::session_pool::CheckoutState::from_checkout(
-            std::sync::Arc::downgrade(client.session_pool().inner()),
-            checkout.clone(),
-        );
-        let session = std::sync::Arc::clone(state.session());
+        let client = Arc::new(pooled_client(&stats));
+        let first = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        let session = Arc::clone(first.session());
+        first.close().await;
+        wait_pool(&client, 1, 1).await;
+
+        // Fill the writer budget so the next SYN enqueue parks inside
+        // production `open_proxy_stream` (fire-and-forget frames do not
+        // wait on pause_writes).
         session.enqueue_flush_marker().unwrap();
-        let (first_stream, _synack_rx) = session.open_stream().await.unwrap();
+        let (extra, _synack_rx) = session.open_stream().await.unwrap();
         loop {
             let r = tokio::time::timeout(
                 Duration::from_millis(100),
-                first_stream.send_data(Bytes::from_static(&[7u8; 256])),
+                extra.send_data(Bytes::from_static(&[7u8; 256])),
             )
             .await;
             match r {
@@ -1472,13 +1500,74 @@ mod tests {
                 Err(_) => break,
             }
         }
+
+        let task = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .create_proxy_stream(("example.com".into(), 443))
+                    .await
+            })
+        };
+        wait_pool(&client, 1, 0).await;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if !task.is_finished() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("create_proxy_stream must stay pending in open_proxy_stream");
+        task.abort();
+        wait_pool(&client, 0, 0).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.drops.load(Ordering::SeqCst) == 0
+                && stats.shutdowns.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled create_proxy_stream must close the transport");
+    }
+
+    #[tokio::test]
+    async fn synack_error_discards_pooled_session() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let stream = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        let sid = stream.id();
+        wait_pool(&client, 1, 0).await;
         {
-            let _open_guard = CheckoutGuard::new(std::sync::Arc::clone(&state));
-            let open = Client::open_proxy_stream(&session, ("example.com".into(), 443), None);
-            tokio::pin!(open);
-            let mut cx = Context::from_waker(Waker::noop());
-            assert!(matches!(open.as_mut().poll(&mut cx), Poll::Pending));
+            let mut peers = stats.peers.lock().await;
+            let peer = peers.last_mut().expect("peer");
+            let msg = b"refused";
+            let mut synack_err = Vec::with_capacity(7 + msg.len());
+            synack_err.push(u8::from(crate::protocol::Command::SynAck));
+            synack_err.extend_from_slice(&sid.to_be_bytes());
+            synack_err.extend_from_slice(&(msg.len() as u16).to_be_bytes());
+            synack_err.extend_from_slice(msg);
+            tokio::io::AsyncWriteExt::write_all(peer, &synack_err)
+                .await
+                .unwrap();
         }
         wait_pool(&client, 0, 0).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.drops.load(Ordering::SeqCst) == 0
+                && stats.shutdowns.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("SynAck-error eviction must close the transport");
+        drop(stream);
+        wait_pool(&client, 0, 0).await;
+        assert_eq!(stats.dials.load(Ordering::SeqCst), 1);
     }
 }
