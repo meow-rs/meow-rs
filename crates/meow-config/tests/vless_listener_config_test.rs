@@ -257,6 +257,16 @@ async fn vless_reality_mimic_valid_explicit_fields_and_mode_off() {
     assert_eq!(spec.quiescence_min_ms, 200);
     assert_eq!(spec.quiescence_max_ms, 500);
     assert_eq!(spec.max_concurrent_probes, 256);
+
+    let yaml = reality_doc_with_mimic(
+        "      mimic:\n        probe-timeout-ms: 500\n        quiescence-min-ms: 5\n        quiescence-max-ms: 10\n        max-concurrent-probes: 1\n",
+    );
+    let spec = reality_mimic(&yaml).await;
+    assert_eq!(spec.mode, meow_common::VlessRealityMimicMode::DialFirst);
+    assert_eq!(spec.probe_timeout_ms, 500);
+    assert_eq!(spec.quiescence_min_ms, 5);
+    assert_eq!(spec.quiescence_max_ms, 10);
+    assert_eq!(spec.max_concurrent_probes, 1);
 }
 
 #[tokio::test]
