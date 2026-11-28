@@ -1133,6 +1133,10 @@ mod tests {
 
     #[derive(Clone, Copy, Debug)]
     pub(super) enum ScanEvent {
+        #[allow(
+            dead_code,
+            reason = "read only by the cfg(unix) real-loopback scan-sync tests"
+        )]
         Bytes(usize),
         Freezable,
     }
