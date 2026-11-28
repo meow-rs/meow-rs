@@ -284,7 +284,10 @@ impl fmt::Debug for RealityServerConfig {
         f.debug_struct("RealityServerConfig")
             .field("private_key", &"<redacted>")
             .field("short_ids", &"<redacted>")
-            .field("server_names", &self.server_names)
+            .field(
+                "server_names",
+                &format_args!("[{} entries]", self.server_names.len()),
+            )
             .field("max_time_difference", &self.max_time_difference)
             .finish_non_exhaustive()
     }
@@ -2170,6 +2173,20 @@ mod tests {
         let _: &Zeroizing<[u8; 32]> = &hello.auth_key;
         let (context, _wire) = hello.into_mirror_upload().finish_upload();
         let _: &Zeroizing<[u8; 32]> = &context.auth_key;
+    }
+
+    #[test]
+    fn server_config_debug_redacts_admission_policy_names() {
+        let (private, _public) = keypair();
+        let debug = format!("{:?}", server_config(private));
+        assert!(
+            !debug.contains(SERVER_NAME),
+            "server name leaked into RealityServerConfig Debug: {debug}"
+        );
+        assert!(
+            !debug.contains(&format!("{SHORT_ID:?}")),
+            "short-id bytes leaked into RealityServerConfig Debug: {debug}"
+        );
     }
 
     fn verified_hello_for_zeroize_types() -> VerifiedHello {

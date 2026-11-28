@@ -1335,10 +1335,17 @@ impl MirroredHandshakeCompletion {
     }
 }
 
-#[derive(Debug)]
 struct MirroredFinishedMessage {
     len: usize,
     bytes: Zeroizing<[u8; 52]>,
+}
+
+impl fmt::Debug for MirroredFinishedMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("MirroredFinishedMessage")
+            .field("len", &self.len)
+            .finish_non_exhaustive()
+    }
 }
 
 async fn read_mirrored_client_finished(

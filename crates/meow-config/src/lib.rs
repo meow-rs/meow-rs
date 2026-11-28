@@ -423,11 +423,10 @@ pub struct VlessUser {
 
 impl std::fmt::Debug for VlessUser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The UUID is the bearer credential — the reality spec's redaction
-        // list keeps it out of Debug exactly like the private key; the
-        // username (not a wire value) is enough to identify the entry.
+        // Usernames identify principals and UUIDs are bearer credentials;
+        // the v2 diagnostic redaction list covers both.
         f.debug_struct("VlessUser")
-            .field("username", &self.username)
+            .field("username", &"[REDACTED]")
             .field("uuid", &"[REDACTED]")
             .finish()
     }
@@ -460,14 +459,14 @@ impl std::fmt::Debug for VlessSecurity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::StandardTls {
-                certificate,
+                certificate: _,
                 private_key: _,
                 alpn,
             } => f
                 .debug_struct("StandardTls")
-                .field("certificate", &certificate)
-                // Key material when the value is a PEM literal — redact
-                // unconditionally rather than only in that form.
+                // Both fields may be inline PEM rather than paths; redact
+                // unconditionally rather than trying to distinguish the form.
+                .field("certificate", &"[REDACTED]")
                 .field("private_key", &"[REDACTED]")
                 .field("alpn", &alpn)
                 .finish(),
@@ -516,16 +515,20 @@ pub struct VlessRealityConfig {
 
 impl std::fmt::Debug for VlessRealityConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Private key and short IDs are both on the reality spec's
-        // redaction list — only their presence/count may surface.
+        // The v2 diagnostic redaction list covers the cover identity,
+        // admission names, key material and short IDs; only non-identifying
+        // counts and numeric limits may surface.
         f.debug_struct("VlessRealityConfig")
-            .field("dest", &self.dest)
+            .field("dest", &"[REDACTED]")
             .field("private_key", &"[REDACTED]")
             .field(
                 "short_ids",
                 &format_args!("[{} entries]", self.short_ids.len()),
             )
-            .field("server_names", &self.server_names)
+            .field(
+                "server_names",
+                &format_args!("[{} entries]", self.server_names.len()),
+            )
             .field("max_time_difference_us", &self.max_time_difference_us)
             .field("limit_fallback_upload", &self.limit_fallback_upload)
             .field("limit_fallback_download", &self.limit_fallback_download)
@@ -16941,7 +16944,10 @@ mod listener_surface_tests {
     fn vless_users_roundtrip_and_redaction() {
         // The typed spec round-trips through serde with credentials intact
         // (persistence), while Debug redacts them (diagnostics).
-        let listeners = vless_named(&vless_reality_yaml()).unwrap();
+        let redaction_yaml = vless_reality_yaml()
+            .replace("www.example.com:443", "cover-target.invalid:443")
+            .replace("\"example.com\"", "\"sni-hidden.invalid\"");
+        let listeners = vless_named(&redaction_yaml).unwrap();
         let spec = listeners[0].spec.clone();
         let json = serde_json::to_string(&spec).unwrap();
         let back: ListenerSpec = serde_json::from_str(&json).unwrap();
@@ -16961,8 +16967,30 @@ mod listener_surface_tests {
             "short-id leaked into Debug: {debug}"
         );
         assert!(debug.contains("REDACTED"), "{debug}");
-        // Usernames are not wire secrets — they stay visible.
-        assert!(debug.contains("alice"), "{debug}");
+        for leaked in [
+            "alice",
+            "cover-target.invalid",
+            "cover-target.invalid:443",
+            "sni-hidden.invalid",
+        ] {
+            assert!(
+                !debug.contains(leaked),
+                "{leaked:?} leaked into Debug: {debug}"
+            );
+        }
+
+        let tls_listeners = vless_named(&vless_tls_yaml()).unwrap();
+        let tls_debug = format!("{:?}", tls_listeners[0].spec);
+        for leaked in [
+            "alice",
+            "-----BEGIN CERTIFICATE-----",
+            "-----BEGIN PRIVATE KEY-----",
+        ] {
+            assert!(
+                !tls_debug.contains(leaked),
+                "{leaked:?} leaked into standard-TLS Debug: {tls_debug}"
+            );
+        }
     }
 
     #[test]
