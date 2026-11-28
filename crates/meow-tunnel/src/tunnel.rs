@@ -13,7 +13,7 @@ use meow_dns::Resolver;
 use meow_proxy::DirectAdapter;
 use parking_lot::{Mutex, RwLock};
 use smol_str::SmolStr;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use tracing::{debug, info, warn};
@@ -1842,6 +1842,15 @@ pub struct Tunnel {
     inner: Arc<TunnelInner>,
 }
 
+#[inline(never)]
+fn dns_leaf_names(proxies: &HashMap<SmolStr, Arc<dyn Proxy>>) -> HashSet<SmolStr> {
+    proxies
+        .iter()
+        .filter(|(_, adapter)| adapter.adapter_type() == AdapterType::Dns)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 impl Tunnel {
     /// New tunnel with a private resolver slot — `set_resolver` swaps are
     /// visible to `inner.direct`, but adapters rebuilt with a different
@@ -2290,11 +2299,7 @@ impl Tunnel {
         // reconnect the leaf never needed, breaking open DNS streams on a
         // cold PUT (issue #974 review). The set is read off the NEW map:
         // a leaf retyped or removed by this swap still closes.
-        let dns_leaves: std::collections::HashSet<SmolStr> = proxies
-            .iter()
-            .filter(|(_, adapter)| adapter.adapter_type() == meow_common::AdapterType::Dns)
-            .map(|(name, _)| name.clone())
-            .collect();
+        let dns_leaves = dns_leaf_names(&proxies);
         let route = Arc::new(RouteTable::new(
             proxies,
             rules,
@@ -2327,6 +2332,7 @@ impl Tunnel {
     /// listener-owned flow holding a [`udp::UdpFlushWatch`] — those end on
     /// their own once signalled, including flows still dialling. Clients'
     /// next datagrams open fresh flows with fresh dials. Issue #695.
+    #[inline(never)]
     pub fn close_all_udp_sessions(&self) -> usize {
         let mut closed = 0;
         self.inner.nat_table.retain(|_, session| {
@@ -2374,12 +2380,7 @@ impl Tunnel {
         );
         // A `type: dns` leaf's conn owns no socket — an outbound-interface
         // rebinding cannot strand it (issue #974 review); keep such flows.
-        let dns_leaves: std::collections::HashSet<SmolStr> = route
-            .proxies
-            .iter()
-            .filter(|(_, adapter)| adapter.adapter_type() == meow_common::AdapterType::Dns)
-            .map(|(name, _)| name.clone())
-            .collect();
+        let dns_leaves = dns_leaf_names(&route.proxies);
         drop(route);
         let dns = self.resolver().reset_connections();
         meow_dns::reset_pooled_connections();
@@ -2407,6 +2408,19 @@ impl Tunnel {
              of {adapters} adapters"
         );
         flush
+    }
+
+    /// Cancel live outbound flows and join adapter cleanup with the runtime
+    /// still running. Include provider members outside the route graph in
+    /// `extra_roots`.
+    pub async fn shutdown_outbounds<I>(&self, extra_roots: I)
+    where
+        I: IntoIterator<Item = Arc<dyn Proxy>>,
+    {
+        let route = self.inner.route();
+        self.inner.stats.close_all_connections();
+        self.close_all_udp_sessions();
+        meow_common::shutdown_reachable(route.proxies.values().cloned().chain(extra_roots)).await;
     }
 
     fn install_routing(&self, route: Arc<RouteTable>) -> Arc<RouteTable> {
@@ -3919,6 +3933,7 @@ mod tests {
     /// non-empty.
     struct ResetCounting {
         resets: std::sync::atomic::AtomicUsize,
+        shutdowns: std::sync::atomic::AtomicUsize,
         members: Vec<Arc<dyn Proxy>>,
         health: meow_common::ProxyHealth,
     }
@@ -3927,6 +3942,7 @@ mod tests {
         fn new(members: Vec<Arc<dyn Proxy>>) -> Arc<Self> {
             Arc::new(Self {
                 resets: std::sync::atomic::AtomicUsize::new(0),
+                shutdowns: std::sync::atomic::AtomicUsize::new(0),
                 members,
                 health: meow_common::ProxyHealth::new(),
             })
@@ -3969,6 +3985,9 @@ mod tests {
         }
         fn reset_sessions(&self) {
             self.resets.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn shutdown(&self) {
+            self.shutdowns.fetch_add(1, Ordering::SeqCst);
         }
         fn health(&self) -> &meow_common::ProxyHealth {
             &self.health
@@ -4077,6 +4096,33 @@ mod tests {
             survivor.run_until_closed(async { "relay" }).await,
             Some("relay")
         );
+    }
+
+    #[tokio::test]
+    async fn shutdown_outbounds_joins_route_and_unreferenced_provider_members_once() {
+        let tunnel = test_tunnel();
+        let shared = ResetCounting::new(vec![]);
+        let provider_only = ResetCounting::new(vec![]);
+        let group = ResetCounting::new(vec![Arc::clone(&shared) as Arc<dyn Proxy>]);
+        let proxies = HashMap::from([
+            ("GROUP".into(), Arc::clone(&group) as Arc<dyn Proxy>),
+            ("SHARED".into(), Arc::clone(&shared) as Arc<dyn Proxy>),
+        ]);
+        tunnel.update_routing(proxies, vec![], Default::default(), Default::default());
+        let flow = tracked_tcp(&tunnel);
+        let listener_flow = tunnel.inner().udp_flush_watch();
+        tunnel
+            .shutdown_outbounds([
+                Arc::clone(&shared) as Arc<dyn Proxy>,
+                Arc::clone(&provider_only) as Arc<dyn Proxy>,
+            ])
+            .await;
+        for adapter in [&shared, &group, &provider_only] {
+            assert_eq!(adapter.shutdowns.load(Ordering::SeqCst), 1);
+            assert_eq!(adapter.resets(), 1);
+        }
+        assert!(flow.run_until_closed(async {}).await.is_none());
+        assert!(listener_flow.is_flushed());
     }
 
     fn fake_ip_tunnel(range: &str) -> Tunnel {

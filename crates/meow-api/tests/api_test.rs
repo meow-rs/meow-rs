@@ -975,6 +975,110 @@ async fn get_proxy_found() {
     assert_eq!(json["name"], "DIRECT");
 }
 
+mod outbound_lifecycle {
+    use super::*;
+    use meow_common::{
+        AdapterType, Metadata, ProxyAdapter, ProxyConn, ProxyHealth, ProxyPacketConn,
+    };
+    use meow_config::proxy_parser::{ChainedProxy, WrappedProxy};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicUsize;
+
+    #[derive(Default)]
+    struct Calls {
+        resets: AtomicUsize,
+        shutdowns: AtomicUsize,
+    }
+
+    struct Probe {
+        calls: Arc<Calls>,
+        health: ProxyHealth,
+    }
+
+    #[async_trait::async_trait]
+    impl ProxyAdapter for Probe {
+        fn name(&self) -> &str {
+            "probe"
+        }
+
+        fn adapter_type(&self) -> AdapterType {
+            AdapterType::Direct
+        }
+
+        fn addr(&self) -> &str {
+            ""
+        }
+
+        fn support_udp(&self) -> bool {
+            false
+        }
+
+        async fn dial_tcp(&self, _: &Metadata) -> meow_common::Result<Box<dyn ProxyConn>> {
+            unreachable!("lifecycle calls must not dial")
+        }
+
+        async fn dial_udp(&self, _: &Metadata) -> meow_common::Result<Box<dyn ProxyPacketConn>> {
+            unreachable!("lifecycle calls must not dial")
+        }
+
+        fn reset_sessions(&self) {
+            self.calls.resets.fetch_add(1, Ordering::SeqCst);
+        }
+
+        async fn shutdown(&self) {
+            self.calls.shutdowns.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn diagnostic_counters(&self) -> Option<BTreeMap<String, u64>> {
+            Some(BTreeMap::from([(
+                "resets".into(),
+                self.calls.resets.load(Ordering::SeqCst) as u64,
+            )]))
+        }
+
+        fn health(&self) -> &ProxyHealth {
+            &self.health
+        }
+    }
+
+    fn probe() -> (Arc<dyn Proxy>, Arc<Calls>) {
+        let calls = Arc::new(Calls::default());
+        let wrapped = WrappedProxy::new(Box::new(Probe {
+            calls: Arc::clone(&calls),
+            health: ProxyHealth::new(),
+        }));
+        (Arc::new(ChainedProxy::new(Arc::new(wrapped))), calls)
+    }
+
+    #[tokio::test]
+    async fn diagnostics_are_optional_and_wrappers_forward_lifecycle_hooks() {
+        let (adapter, calls) = probe();
+        let state = test_state_default();
+        let mut proxies = (*state.tunnel.route_snapshot().proxies).clone();
+        proxies.insert("probe".into(), Arc::clone(&adapter));
+        state.tunnel.update_proxies(proxies, Default::default());
+
+        let (status, list) = get_json(&state, "/proxies").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            list["proxies"]["probe"]["diagnostics"],
+            serde_json::json!({"resets": 0})
+        );
+        assert!(list["proxies"]["DIRECT"].get("diagnostics").is_none());
+
+        let (status, detail) = get_json(&state, "/proxies/probe").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(detail["diagnostics"], serde_json::json!({"resets": 0}));
+        let (status, detail) = get_json(&state, "/proxies/DIRECT").await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(detail.get("diagnostics").is_none());
+
+        assert_eq!(meow_common::shutdown_reachable([adapter]).await, 1);
+        assert_eq!(calls.resets.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.shutdowns.load(Ordering::SeqCst), 1);
+    }
+}
+
 // ── provider-name and provider members on /proxies ──────────────────
 
 async fn get_json(state: &Arc<AppState>, path: &str) -> (StatusCode, serde_json::Value) {
