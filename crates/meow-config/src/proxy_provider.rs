@@ -2136,10 +2136,12 @@ fn warn_initial_load_failure(provider: &ProxyProvider, error: &str) {
 /// mid-rewrite does not hard-fail strict mode (parity with the missing-file
 /// acquisition path, issue #533).
 ///
-/// Anything else is retried as a share-link list (see
-/// [`crate::provider_payload`]): airports keyed on `User-Agent` answer a
-/// `mihomo` UA with base64-encoded `ss://`/`vmess://`/... links instead of
-/// YAML, and mihomo's provider parser takes the same route
+/// A body that is already a YAML proxy document keeps its YAML error:
+/// falling through to the share-link scanner would harvest incidental
+/// `ss://` lines out of a `preview:` block (or similar) and drop fields
+/// such as `dialer-proxy`. Share-link fallback is only for a payload that
+/// is not a proxy YAML document — a plain or base64 list of `scheme://`
+/// links, the shape airports serve to a `mihomo` User-Agent
 /// (`convert.ConvertsV2Ray`). When both paths fail the YAML diagnosis is
 /// the one reported — it is the format the feed most likely meant to serve.
 fn parse_payload_maps(
@@ -2147,20 +2149,21 @@ fn parse_payload_maps(
 ) -> Result<Vec<HashMap<String, serde_json::Value>>, anyhow::Error> {
     let yaml_error = match crate::parse_yaml_value(content) {
         Ok(doc) => {
-            let list_val = match doc.get("proxies").cloned().unwrap_or_else(|| doc.clone()) {
-                serde_json::Value::Null => return Ok(Vec::new()),
-                value => value,
-            };
-            if list_val.is_array() {
-                match serde_json::from_value::<Vec<HashMap<String, serde_json::Value>>>(list_val) {
-                    Ok(maps) => return Ok(maps),
-                    Err(e) => format!("provider content is not a proxy list: {e}"),
-                }
-            } else {
-                "provider content is not a proxy list: expected a sequence".to_string()
+            if doc.is_null() {
+                return Ok(Vec::new());
             }
+            if doc.get("proxies").is_some() || doc.is_array() {
+                return yaml_proxy_list(doc);
+            }
+            "provider content is not a proxy list: expected a sequence".to_string()
         }
-        Err(e) => format!("provider YAML is malformed: {e}"),
+        Err(e) => {
+            let yaml_error = format!("provider YAML is malformed: {e}");
+            if looks_like_yaml_proxy_text(content) {
+                return Err(anyhow::anyhow!("{yaml_error}"));
+            }
+            yaml_error
+        }
     };
     match crate::provider_payload::parse_share_links(content) {
         Ok(maps) => Ok(maps),
@@ -2168,6 +2171,32 @@ fn parse_payload_maps(
             "{yaml_error}; and not a share-link list either: {link_error}"
         )),
     }
+}
+
+fn yaml_proxy_list(
+    doc: serde_json::Value,
+) -> Result<Vec<HashMap<String, serde_json::Value>>, anyhow::Error> {
+    let list_val = match doc.get("proxies").cloned().unwrap_or(doc) {
+        serde_json::Value::Null => return Ok(Vec::new()),
+        value => value,
+    };
+    if list_val.is_array() {
+        serde_json::from_value::<Vec<HashMap<String, serde_json::Value>>>(list_val)
+            .map_err(|e| anyhow::anyhow!("provider content is not a proxy list: {e}"))
+    } else {
+        Err(anyhow::anyhow!(
+            "provider content is not a proxy list: expected a sequence"
+        ))
+    }
+}
+
+/// A `proxies:` key at the start of a non-comment line — the feed meant
+/// YAML even when the parser rejected it (unresolved merge, bad alias).
+fn looks_like_yaml_proxy_text(content: &str) -> bool {
+    content.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with('#') && (trimmed == "proxies:" || trimmed.starts_with("proxies:"))
+    })
 }
 
 fn compile_opt_regex(
@@ -2826,6 +2855,109 @@ header:
         .unwrap();
         let provider = file_provider(tmp.path()).await;
         assert_eq!(slot_names(&provider.slot), ["A", "B"]);
+    }
+
+    /// A YAML provider document that fails to parse (unresolved merge) must
+    /// not fall back to harvesting `ss://` lines out of a `preview:` block.
+    #[test]
+    fn yaml_merge_error_does_not_harvest_preview_share_link() {
+        let yaml = "proxies:\n\
+                    - name: real\n\
+                      type: ss\n\
+                      server: a.example.com\n\
+                      port: 8388\n\
+                      cipher: aes-128-gcm\n\
+                      password: pass\n\
+                      dialer-proxy: front\n\
+                      <<: *missing\n\
+                    preview: |\n\
+                      ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n";
+        let err = parse_payload_maps(yaml)
+            .expect_err("an unresolved merge in a proxies: document must stay a YAML error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("YAML")
+                || msg.contains("malformed")
+                || msg.contains("merge")
+                || msg.contains("alias"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains("share-link"),
+            "must not harvest incidental ss:// lines: {msg}"
+        );
+    }
+
+    /// Same shape on refresh: last-good survives, the preview link is not imported.
+    #[tokio::test]
+    async fn yaml_merge_preview_refresh_keeps_last_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        write_provider_file(&path, &[("KeepMe", "ss")]);
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(dir.path()),
+            true,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(slot_names(&p.slot), ["KeepMe"]);
+
+        std::fs::write(
+            &path,
+            "proxies:\n\
+             - name: real\n\
+               type: ss\n\
+               server: a.example.com\n\
+               port: 8388\n\
+               cipher: aes-128-gcm\n\
+               password: pass\n\
+               dialer-proxy: front\n\
+               <<: *missing\n\
+             preview: |\n\
+               ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n",
+        )
+        .unwrap();
+        p.refresh()
+            .await
+            .expect_err("malformed YAML with a preview share-link must fail");
+        assert_eq!(
+            slot_names(&p.slot),
+            ["KeepMe"],
+            "last-good must survive; the preview link must not be imported"
+        );
+    }
+
+    /// One broken SS share-link in a mixed feed must not empty a strict
+    /// provider — the valid sibling is kept.
+    #[tokio::test]
+    async fn strict_refresh_skips_malformed_ss_share_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        std::fs::write(
+            &path,
+            "ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n\
+             ss://:@b.example.com:443#Broken\n",
+        )
+        .unwrap();
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(dir.path()),
+            true,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh()
+            .await
+            .expect("one broken SS line must not fail the whole payload");
+        assert_eq!(slot_names(&p.slot), ["A"]);
     }
 
     fn override_map(value: serde_json::Value) -> HashMap<String, serde_json::Value> {

@@ -27,13 +27,18 @@ fn decode_body(content: &str) -> String {
     if trimmed.contains("://") {
         return trimmed.to_string();
     }
+    // Go's encoding/base64 ignores interior CR/LF/space; Rust engines do not.
+    let compact: String = trimmed
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
     for engine in [
         &base64::engine::general_purpose::STANDARD,
         &base64::engine::general_purpose::STANDARD_NO_PAD,
         &base64::engine::general_purpose::URL_SAFE,
         &base64::engine::general_purpose::URL_SAFE_NO_PAD,
     ] {
-        let Ok(bytes) = engine.decode(trimmed) else {
+        let Ok(bytes) = engine.decode(&compact) else {
             continue;
         };
         let Ok(text) = String::from_utf8(bytes) else {
@@ -173,19 +178,64 @@ fn query_map(query: Option<&str>) -> HashMap<String, String> {
     map
 }
 
-/// Split `host:port`, honouring `[::1]:443`.
-fn split_host_port(input: &str) -> Result<(String, u16), String> {
-    let (host, port) = input
-        .rsplit_once(':')
-        .ok_or_else(|| format!("'{input}' has no port"))?;
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    if host.is_empty() {
-        return Err("empty host".to_string());
+/// Drop a trailing URI path (`/...`) from an authority. SIP002 and hy2
+/// links commonly write `host:port/?plugin=` / `host/?insecure=1`; after
+/// the query is split off, the `/` is still on the hostport.
+fn strip_authority_path(input: &str) -> &str {
+    let mut in_brackets = false;
+    for (i, c) in input.char_indices() {
+        match c {
+            '[' => in_brackets = true,
+            ']' => in_brackets = false,
+            '/' if !in_brackets => return &input[..i],
+            _ => {}
+        }
     }
-    let port: u16 = port
-        .parse()
-        .map_err(|_| format!("'{port}' is not a valid port"))?;
-    Ok((host.to_string(), port))
+    input
+}
+
+/// Split `host:port`, honouring `[::1]:443`. `default_port` is used when
+/// the authority has no port (hysteria2 URI → 443).
+fn split_host_port(input: &str) -> Result<(String, u16), String> {
+    split_host_port_opt(input, None)
+}
+
+fn split_host_port_opt(input: &str, default_port: Option<u16>) -> Result<(String, u16), String> {
+    let input = strip_authority_path(input);
+    if let Some(rest) = input.strip_prefix('[') {
+        let Some((host, after)) = rest.split_once(']') else {
+            return Err(format!("'{input}' is not a valid host:port"));
+        };
+        if host.is_empty() {
+            return Err("empty host".to_string());
+        }
+        if after.is_empty() {
+            let port = default_port.ok_or_else(|| format!("'{input}' has no port"))?;
+            return Ok((host.to_string(), port));
+        }
+        let port = after
+            .strip_prefix(':')
+            .ok_or_else(|| format!("'{input}' is not a valid host:port"))?;
+        let port: u16 = port
+            .parse()
+            .map_err(|_| format!("'{port}' is not a valid port"))?;
+        return Ok((host.to_string(), port));
+    }
+    match input.rsplit_once(':') {
+        Some((host, port)) if !host.is_empty() && !host.contains(':') => {
+            let port: u16 = port
+                .parse()
+                .map_err(|_| format!("'{port}' is not a valid port"))?;
+            Ok((host.to_string(), port))
+        }
+        _ => {
+            if input.is_empty() {
+                return Err("empty host".to_string());
+            }
+            let port = default_port.ok_or_else(|| format!("'{input}' has no port"))?;
+            Ok((input.to_string(), port))
+        }
+    }
 }
 
 fn node(kind: &str, name: &str, server: &str, port: u16) -> HashMap<String, Value> {
@@ -257,6 +307,9 @@ fn parse_ss(rest: &str) -> Result<HashMap<String, Value>, String> {
             (cipher.to_string(), password.to_string())
         }
     };
+    if cipher.is_empty() || password.is_empty() {
+        return Err("ss link has an empty cipher or password".to_string());
+    }
 
     let (server, port) = split_host_port(&hostport)?;
     let mut map = node("ss", &display_name(fragment, &server, port), &server, port);
@@ -279,6 +332,11 @@ fn apply_ss_plugin(
     let name = parts.next().unwrap_or("").trim();
     let mut opts: Map<String, Value> = Map::new();
     for part in parts {
+        let part = part.trim();
+        if part.eq_ignore_ascii_case("tls") {
+            opts.insert("tls".to_string(), Value::Bool(true));
+            continue;
+        }
         let Some((key, value)) = part.split_once('=') else {
             continue;
         };
@@ -493,7 +551,7 @@ fn parse_vless(rest: &str) -> Result<HashMap<String, Value>, String> {
         }
         map.insert("reality-opts".to_string(), Value::Object(reality));
     }
-    apply_tls_common(&mut map, &params);
+    apply_tls_common(&mut map, &params, false)?;
     apply_transport(&mut map, &params);
     Ok(map)
 }
@@ -515,14 +573,30 @@ fn parse_trojan(rest: &str) -> Result<HashMap<String, Value>, String> {
     );
     insert_str(&mut map, "password", &password);
     insert_bool(&mut map, "udp", true);
-    apply_tls_common(&mut map, &params);
+    apply_tls_common(&mut map, &params, false)?;
     apply_transport(&mut map, &params);
     Ok(map)
 }
 
-/// `sni` / `insecure` / `alpn` / `fp` — the TLS knobs all three schemes
-/// spell the same way.
-fn apply_tls_common(map: &mut HashMap<String, Value>, params: &HashMap<String, String>) {
+/// Certificate-pin query keys. `query_map` lowercases names, so hy2's
+/// `pinSHA256`, mihomo trojan's `pcs`, and anytls `hpkp` all land here.
+fn cert_pin_param(params: &HashMap<String, String>) -> Option<&str> {
+    ["pinsha256", "pcs", "hpkp"]
+        .into_iter()
+        .find_map(|key| params.get(key))
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+/// `sni` / `insecure` / `alpn` / `fp` / certificate pin — the TLS knobs
+/// the URI schemes share. `pin_supported` is true when the node parser
+/// already reads `fingerprint` as a SHA-256 pin (hysteria2, anytls).
+fn apply_tls_common(
+    map: &mut HashMap<String, Value>,
+    params: &HashMap<String, String>,
+    pin_supported: bool,
+) -> Result<(), String> {
     if let Some(sni) = params
         .get("sni")
         .or_else(|| params.get("peer"))
@@ -543,6 +617,15 @@ fn apply_tls_common(map: &mut HashMap<String, Value>, params: &HashMap<String, S
     if let Some(fingerprint) = params.get("fp") {
         insert_str(map, "client-fingerprint", fingerprint);
     }
+    if let Some(pin) = cert_pin_param(params) {
+        if !pin_supported {
+            return Err(
+                "share link requests a certificate pin this adapter cannot enforce".to_string(),
+            );
+        }
+        insert_str(map, "fingerprint", pin);
+    }
+    Ok(())
 }
 
 /// `type=` / `path=` / `host=` / `serviceName=` — the transport knobs.
@@ -601,7 +684,7 @@ fn parse_hysteria2(rest: &str) -> Result<HashMap<String, Value>, String> {
         .rsplit_once('@')
         .ok_or_else(|| "hysteria2 link has no '@'".to_string())?;
     let password = percent_decode(userinfo);
-    let (server, port) = split_host_port(hostport)?;
+    let (server, port) = split_host_port_opt(hostport, Some(443))?;
     let mut map = node(
         "hysteria2",
         &display_name(fragment, &server, port),
@@ -609,7 +692,7 @@ fn parse_hysteria2(rest: &str) -> Result<HashMap<String, Value>, String> {
         port,
     );
     insert_str(&mut map, "password", &password);
-    apply_tls_common(&mut map, &params);
+    apply_tls_common(&mut map, &params, true)?;
     if let Some(obfs) = params.get("obfs") {
         insert_str(&mut map, "obfs", obfs);
     }
@@ -641,7 +724,7 @@ fn parse_anytls(rest: &str) -> Result<HashMap<String, Value>, String> {
         port,
     );
     insert_str(&mut map, "password", &password);
-    apply_tls_common(&mut map, &params);
+    apply_tls_common(&mut map, &params, true)?;
     Ok(map)
 }
 
@@ -797,5 +880,125 @@ mod tests {
     #[test]
     fn malformed_payload_is_not_a_link_list() {
         assert!(parse_share_links("<html><body>blocked</body></html>").is_err());
+    }
+
+    /// Hysteria2 URI `pinSHA256` is a certificate pin (mihomo maps it onto
+    /// `fingerprint`). Dropping it while honouring `insecure=1` would dial
+    /// with skip-cert-verify and no pin.
+    #[test]
+    fn hysteria2_pinsha256_lands_on_fingerprint_with_insecure() {
+        let pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let link = format!("hy2://pass@hy2.example.com:443?insecure=1&pinSHA256={pin}#HY2");
+        let node = single(&link);
+        assert_eq!(string(&node, "type"), "hysteria2");
+        assert_eq!(string(&node, "fingerprint"), pin);
+        assert_eq!(
+            node.get("skip-cert-verify").and_then(Value::as_bool),
+            Some(true)
+        );
+    }
+
+    /// AnyTLS's mihomo-equivalent pin query key is `hpkp`; the adapter
+    /// already reads node `fingerprint`.
+    #[test]
+    fn anytls_hpkp_lands_on_fingerprint() {
+        let pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let link = format!("anytls://secret@any.example.com:443?hpkp={pin}#Any");
+        let node = single(&link);
+        assert_eq!(string(&node, "type"), "anytls");
+        assert_eq!(string(&node, "fingerprint"), pin);
+    }
+
+    /// Trojan has no certificate-pin field in the parser — a requested pin
+    /// must not be dropped.
+    #[test]
+    fn trojan_pin_is_rejected_rather_than_dropped() {
+        let pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let err = parse_share_links(&format!("trojan://pw@t.example.com:443?pinSHA256={pin}#T"))
+            .unwrap_err();
+        assert!(
+            err.contains("no share link") || err.contains("pin"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// VLESS likewise has no cert-pin field (`fingerprint` there is uTLS).
+    #[test]
+    fn vless_pin_is_rejected_rather_than_dropped() {
+        let pin = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let err = parse_share_links(&format!(
+            "vless://11111111-2222-3333-4444-555555555555@v.example.com:443\
+             ?security=tls&pinSHA256={pin}#V"
+        ))
+        .unwrap_err();
+        assert!(
+            err.contains("no share link") || err.contains("pin"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn malformed_ss_link_is_skipped_in_a_mixed_feed() {
+        let body = "ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n\
+                    ss://:@b.example.com:443#Broken\n";
+        let nodes = parse_share_links(body).expect("valid line must survive");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(string(&nodes[0], "name"), "A");
+        assert_eq!(string(&nodes[0], "cipher"), "aes-128-gcm");
+    }
+
+    #[test]
+    fn empty_ss_credentials_are_not_a_node() {
+        let err = parse_share_links("ss://:@b.example.com:443#Broken").unwrap_err();
+        assert!(err.contains("no share link"), "unexpected error: {err}");
+    }
+
+    /// SIP002 puts plugin options in the query; a leading `/` before `?`
+    /// must not be parsed as part of the port.
+    #[test]
+    fn parses_ss_sip002_with_slash_before_plugin_query() {
+        let link = "ss://YWVzLTEyOC1nY206cGFzcw==@example.com:8388/\
+                    ?plugin=obfs-local%3Bobfs%3Dhttp#A";
+        let node = single(link);
+        assert_eq!(string(&node, "server"), "example.com");
+        assert_eq!(node.get("port").and_then(Value::as_u64), Some(8388));
+        assert_eq!(string(&node, "plugin"), "obfs");
+    }
+
+    /// Hysteria2 URI omits the port → 443 (mihomo `ConvertsV2Ray`).
+    #[test]
+    fn hysteria2_omitted_port_defaults_to_443() {
+        let node = single("hysteria2://secret@hy2.example.com?sni=hy2.example.com#HY2");
+        assert_eq!(string(&node, "server"), "hy2.example.com");
+        assert_eq!(node.get("port").and_then(Value::as_u64), Some(443));
+    }
+
+    /// Bare `tls` in a v2ray-plugin option string is a flag, not a skipped token.
+    #[test]
+    fn v2ray_plugin_bare_tls_flag_is_true() {
+        let link = "ss://YWVzLTEyOC1nY206cGFzcw==@example.com:443\
+                    ?plugin=v2ray-plugin%3Btls%3Bhost%3Dexample.com%3Bpath%3D/ws#WS";
+        let node = single(link);
+        assert_eq!(string(&node, "plugin"), "v2ray-plugin");
+        let opts = node.get("plugin-opts").and_then(Value::as_object).unwrap();
+        assert_eq!(opts.get("tls").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            opts.get("host").and_then(Value::as_str),
+            Some("example.com")
+        );
+        assert_eq!(opts.get("path").and_then(Value::as_str), Some("/ws"));
+    }
+
+    /// Go's base64 decoder ignores interior CR/LF; Rust's engines do not.
+    #[test]
+    fn decodes_crlf_wrapped_base64_body() {
+        let body = "ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(body);
+        assert!(encoded.len() > 8, "fixture must be long enough to wrap");
+        let (head, tail) = encoded.split_at(encoded.len() / 2);
+        let wrapped = format!("{head}\r\n{tail}");
+        let nodes = parse_share_links(&wrapped).expect("wrapped base64 must decode");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(string(&nodes[0], "name"), "A");
     }
 }
