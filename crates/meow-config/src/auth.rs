@@ -15,6 +15,14 @@ pub fn parse_auth_config(
     let mut cred_map: HashMap<String, String> = HashMap::new();
 
     for entry in authentication.unwrap_or(&[]) {
+        // mihomo templates spell "no credentials" as `authentication: [""]`
+        // (the field is filled in only when a password is set), and mihomo
+        // accepts that entry. An entry with nothing in it carries no
+        // credential, so it is an empty list in disguise — not the typo the
+        // Class A rule below is aimed at.
+        if entry.trim().is_empty() {
+            continue;
+        }
         match entry.find(':') {
             None => {
                 // Class A: malformed entry with no colon — hard parse error.
@@ -124,6 +132,19 @@ mod tests {
         let cfg = make_auth(&["alice:hunter2", "bob:s3cr3t"]);
         assert!(cfg.credentials.verify("alice", "hunter2"));
         assert!(cfg.credentials.verify("bob", "s3cr3t"));
+    }
+
+    #[test]
+    fn parse_authentication_empty_entry_is_ignored() {
+        // The stock mihomo template ships `authentication: [""]`; treating it
+        // as a malformed entry made the whole config refuse to load.
+        let blank: Vec<String> = vec![String::new(), "   ".to_string()];
+        let cfg = parse_auth_config(Some(&blank), None).unwrap();
+        assert!(!cfg.credentials.verify("", ""));
+
+        let mixed: Vec<String> = vec![String::new(), "alice:hunter2".to_string()];
+        let cfg = parse_auth_config(Some(&mixed), None).unwrap();
+        assert!(cfg.credentials.verify("alice", "hunter2"));
     }
 
     #[test]

@@ -8,6 +8,49 @@ the canonical, in-repo source a release is cut from.
 
 ## [Unreleased]
 
+### Added
+
+- Proxy-provider payloads that are not YAML are retried as share-link
+  lists: the body is base64-decoded when needed and each line is parsed as
+  `ss://`, `vmess://`, `vless://`, `trojan://`, `hysteria2://`/`hy2://` or
+  `anytls://`. Airports key their response format on the request's
+  `User-Agent`, so a config setting `global-ua: "mihomo"` used to end up
+  with an empty provider on feeds that answer with links; mihomo reaches
+  the same nodes through `convert.ConvertsV2Ray`. Unsupported schemes and
+  malformed lines are skipped with a warning, and a body with no usable
+  link keeps the provider's last-good generation.
+
+- `proxy-providers.*.override` now applies mihomo's `OverrideSchema` field
+  set instead of only `dialer-proxy`: `additional-prefix`,
+  `additional-suffix`, `udp`, `tfo`, `mptcp`, `skip-cert-verify`,
+  `up`/`down`, `name-cert-verify`, `interface-name`, `ip-version` and
+  `routing-mark` are written into every member's mapping after the name
+  filters and before parsing, so airport configs that prefix node names or
+  force `skip-cert-verify` behave as they do on mihomo. `udp-over-tcp`,
+  `proxy-name` and `override-expr` still warn and skip, and a wrongly-typed
+  value fails the provider build.
+
+### Fixed
+
+- `proxy-providers.*.filter` / `exclude-filter` and the group-level fields
+  of the same name now compile with `fancy-regex`, which supports the
+  look-around assertions mihomo accepts. A config using the common airport
+  idiom `^(?!.*(剩余流量|到期|官网))` used to fail its provider build — the
+  provider and every group depending on it then vanished from the runtime
+  registry while the rules still pointed at them, so the traffic fell
+  through to `MATCH`/DIRECT. Plain patterns keep the linear-time `regex`
+  path; an evaluation-time backtracking failure is logged and treated as a
+  non-match.
+
+- `authentication: [""]` no longer fails the whole config. The stock mihomo
+  template leaves the field as a placeholder to fill in when a password is
+  set, and mihomo accepts the empty entry; the ADR-0002 Class A rule read it
+  as a missing-colon typo and rejected the config at load, which surfaced in
+  the app as a failed first sync with an empty profile list. An entry that is
+  empty after trimming is now skipped — it carries no credential, so the
+  result equals an empty list. A non-empty entry without a colon is still a
+  hard error.
+
 ## [0.30.0] - 2026-11-26
 
 ### Added

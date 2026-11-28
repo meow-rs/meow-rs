@@ -170,6 +170,23 @@ proxy-groups:
 | `proxy` | string | no | `""` | Route this provider's `http` fetches through the named proxy or group, resolved against the live route map at fetch time (issue #625). `DIRECT` or absent fetches directly; an unresolvable name fails the fetch (never silently direct); whitespace-only is a build error. A named value on `file` providers warns — no fetch to chain. |
 | `dialer-proxy` | string | no | `""` | Chain every node in this provider through the named front hop (issue #489). Distinct from `proxy`: that one routes the *fetch*, this one routes each node's *dials*. |
 
+#### Filter regex flavour
+
+`filter` and `exclude-filter` compile with `fancy-regex`, so the look-around
+assertions mihomo's engine accepts work as written — including the idiom
+airport configs use to drop info nodes:
+
+```yaml
+filter: '^(?!.*(剩余流量|到期|官网|客服))'
+```
+
+Plain patterns keep the linear-time `regex`-crate path inside fancy-regex;
+only a pattern that needs backtracking (look-around, back-references) runs on
+the backtracking VM. An evaluation-time failure — a pathological pattern
+exhausting the backtracking budget — is logged and treated as a non-match:
+the node is dropped by `filter` semantics and kept by `exclude-filter`
+semantics.
+
 ### Field reference — proxy-group additions
 
 | Field | Type | Required | Default | Meaning |
@@ -231,35 +248,70 @@ Consequently, under `strict: true` a subscription group may `use:` only
 providers declared in the local config; subscription-internal provider names
 fail the strict `use:` check (issue #533 review).
 
+### Payload formats
+
+A provider body is read as YAML first: either a `proxies:` wrapper or a bare
+sequence. A body that is not a proxy list is retried as a **share-link
+list**, which is what airports answer when the request carries a `mihomo`
+`User-Agent`: the text (base64-encoded or plain) is split into lines and each
+line is read as a link.
+
+| Scheme | Notes |
+|--------|-------|
+| `ss://` | SIP002 (`ss://base64(method:password)@host:port`) and the legacy fully-encoded form; SIP003 `plugin=` supports `obfs-local`/`simple-obfs` and `v2ray-plugin` |
+| `vmess://` | v2rayN "v2" JSON: `ws`/`grpc`/`h2` transports, `tls` + `sni` |
+| `vless://` | `security=tls|reality`, `flow`, `pbk`/`sid`, `ws`/`grpc`/`http` transports |
+| `trojan://` | `sni`, `allowInsecure`, `alpn`, `ws`/`grpc` transports |
+| `hysteria2://`, `hy2://` | `obfs`/`obfs-password`, `up`/`down`, `insecure` |
+| `anytls://` | `sni`, `insecure` |
+
+Unsupported schemes (`ssr://`, `tuic://`, ...) and malformed lines are
+skipped with a warning; a body that yields no usable link is a fetch-level
+failure, so the provider keeps its last-good generation — the same treatment
+a malformed YAML body gets.
+
+The fallback exists because the same subscription URL answers with YAML to a
+clash `User-Agent` and with base64 links to `mihomo`, and meow otherwise
+ended up with an empty provider. mihomo takes the same route through
+`convert.ConvertsV2Ray`.
+
 ### Override
 
-`override:` is a free-form map whose keys are proxy config field
-names. After a proxy is loaded from a provider, each key in the
-override map is applied, overwriting the corresponding field in the
-parsed proxy config struct.
+`override:` is mihomo's provider-level node default block
+(`OverrideSchema`). It is applied at parse time, after the name filters and
+before the node is parsed, in mihomo's order: the fields are written into the
+node's mapping unconditionally, then the affixes rewrite its name.
 
-Supported override keys in M1 (a bounded set, not arbitrary):
+| Override key | Type | Effect |
+|--------------|------|--------|
+| `additional-prefix` | string | Prefixed to every member's name |
+| `additional-suffix` | string | Appended to every member's name |
+| `udp` | bool | Node-level `udp` |
+| `tfo` | bool | Node-level `tfo` |
+| `mptcp` | bool | Node-level `mptcp` |
+| `skip-cert-verify` | bool | Node-level `skip-cert-verify` |
+| `up` / `down` | string | Node-level bandwidth hints |
+| `name-cert-verify` | string | Node-level `name-cert-verify` |
+| `interface-name` | string | Node-level `interface-name` |
+| `ip-version` | string | Node-level `ip-version` |
+| `routing-mark` | integer | Node-level `routing-mark` |
+| `dialer-proxy` | string | Rewrites the node's dialer chain (see below) |
+| `udp-over-tcp`, `proxy-name`, `override-expr` | — | Warn and skip: the first is not a meow node field, the other two need upstream's regexp2 / expression evaluator |
+| Any other key | — | Warn and skip (forward compatibility) |
 
-| Override key | Type | Applied to |
-|-------------|------|-----------|
-| `skip-cert-verify` | bool | All TLS-capable proxy types |
-| `udp` | bool | All proxy types |
-| `up-speed` / `down-speed` | integer | Ignored with warn (upstream Hysteria fields; not in scope) |
-| `ip-version` | string | Ignored with warn (upstream preference field; not in scope) |
-| Any unknown key | any | **warn-once, ignore.** Forward-compat. |
+A wrongly-typed value fails the provider build — upstream's YAML unmarshal
+rejects it as well, so a typo is a startup error rather than a silently
+missing default.
 
-Override is applied at parse time, not at dial time — the override
-mutates the parsed `ProxyConfig` struct before it is built into an
-adapter. This avoids per-connection overhead and keeps the override
-logic in one place.
+Because the affixes are applied after filtering, a provider that prefixes its
+node names is still filtered on the names its feed published (upstream order:
+`provider.go` filter → `OverrideSchema.Apply` → `ParseProxy`). The prefixed
+name is what groups and rules must reference.
 
-**Divergence from upstream** — upstream applies overrides at adapter-
-build time with reflection-like field lookup. We apply at config
-parse time to a typed struct, which means only the keys we
-explicitly support are honoured. Unknown keys warn and skip.
-Classification: Class B per ADR-0002 — user's traffic still routes
-correctly through the correct adapter; only unsupported keys are
-silently no-ops (with a warn). The warn makes the gap visible.
+**Divergence from upstream** — upstream resolves the two remaining keys with
+its own regex engine and expression language; this build warns and skips
+them. Classification: Class B per ADR-0002 — routing is unaffected, and the
+warn makes the gap visible.
 
 ## Internal design
 
@@ -554,6 +606,9 @@ handlers access providers through `State<Arc<AppState>>` as today.
 | 11 | `expected-status` grammar — upstream also tolerates bracketed entries (`[200]`) and inverted bounds, and caps the list at 28 ranges | B | We reject brackets and inverted ranges (the stricter direction is safe there), but enforce no range cap — the divergence runs both ways: a 29+-entry list that upstream's `NewUnsignedRanges` rejects parses fine here, so not everything we accept is upstream-legal. |
 | 12 | A `use:`ing group's own health-check registration onto the provider — upstream `registerHealthCheckTask` lets a group's url/expected-status/filter/interval extend the provider's sweep set (and inherits `testUrl`/`expectedStatus` onto the group when unset) | B | Not implemented: group and provider sweeps are independent. Wiring the provider map into group parsing is out of scope. |
 | 13 | `health-check.url` absent — upstream `NewHealthCheck` zeroes the interval (no sweep; `execute` skips an empty testUrl) | B | Same observable behaviour (no sweep, manual endpoint 204s), but reached differently: we keep the url trimmed (upstream `strings.TrimSpace`s it before the empty check and the probe; no gstatic default) and filter the sweep at spawn. `enable: true` with no url additionally warns, naming the provider. |
+| 14 | `filter` / `exclude-filter` — upstream splits the value on a backtick and AND-combines the resulting patterns | B | Not implemented: the value is treated as a single pattern, so the backtick form fails to compile and the provider build errors exactly as it did before. Single-pattern configs are unaffected, and no airport config this was ported from uses the backtick form. |
+| 15 | `override.proxy-name` / `override-expr` / `udp-over-tcp` — upstream applies them (regexp2 name replacement, expression evaluator, Shadowsocks UOT) | B | Warn and skip: .NET-style replacement semantics and the expression evaluator are not ported, and meow-rs has no Shadowsocks UOT transport at the config layer. The node still routes with its published name; only the rewrite/flag is absent. |
+| 16 | Share-link payload schemes `hysteria`, `tuic`, `ssr`, `socks`/`http`, `mierus` — upstream parses them through `convert.ConvertsV2Ray` | B | Skipped with a warning, one line at a time. A payload made only of those schemes reports "no share link" rather than silently emptying the provider, and a mixed feed still yields every node meow-rs can dial. |
 
 ## Acceptance criteria
 

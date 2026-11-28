@@ -94,6 +94,7 @@ maxminddb = { workspace = true }
 ipnet = { workspace = true, features = ["serde"] }
 base64 = { workspace = true }
 regex = { workspace = true }
+fancy-regex = { workspace = true }
 parking_lot = { workspace = true }
 hickory-proto = { workspace = true }
 smol_str = { workspace = true }

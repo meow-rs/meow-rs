@@ -19,6 +19,7 @@ pub mod external_ui;
 pub mod geodata;
 pub mod internal_http;
 mod private_file;
+mod provider_payload;
 pub mod proxy_parser;
 pub mod proxy_provider;
 pub mod proxy_provider_refresh;

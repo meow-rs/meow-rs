@@ -66,8 +66,8 @@ pub struct ProxyProvider {
     pub slot: ProviderSlot,
     pub vehicle_type: &'static str,
     vehicle: Vehicle,
-    filter: Option<regex::Regex>,
-    exclude_filter: Option<regex::Regex>,
+    filter: Option<fancy_regex::Regex>,
+    exclude_filter: Option<fancy_regex::Regex>,
     exclude_type: Vec<String>,
     pub health_check: Option<HealthCheckConfig>,
     updated_at: AtomicU,
@@ -150,6 +150,10 @@ pub struct ProxyProvider {
     /// every node unconditionally; the strongest of the three levels
     /// (override > provider > node) (issue #489).
     override_dialer: Option<String>,
+    /// The rest of mihomo's `override:` block: provider-level node
+    /// defaults plus the name affixes, written into every member's mapping
+    /// after filtering and before parsing (`OverrideSchema.Apply`).
+    node_override: NodeOverride,
     /// Serializes `refresh` so `slot`, `declared_dialers`, and `derived`
     /// can never be populated from different payload generations — the
     /// provider-refresh API endpoint is not serialized by the config
@@ -203,8 +207,8 @@ type WeakSlot = std::sync::Weak<RwLock<Vec<Arc<dyn Proxy>>>>;
 /// filter, also matching upstream (compatible providers are not filtered).
 #[derive(Clone, Debug)]
 pub struct GroupFilter {
-    filter: Option<regex::Regex>,
-    exclude_filter: Option<regex::Regex>,
+    filter: Option<fancy_regex::Regex>,
+    exclude_filter: Option<fancy_regex::Regex>,
     exclude_type: Vec<String>,
 }
 
@@ -228,12 +232,12 @@ impl GroupFilter {
     fn keep(&self, proxy: &dyn Proxy) -> bool {
         let name = proxy.name();
         if let Some(re) = &self.filter {
-            if !re.is_match(name) {
+            if !regex_matches(re, name) {
                 return false;
             }
         }
         if let Some(re) = &self.exclude_filter {
-            if re.is_match(name) {
+            if regex_matches(re, name) {
                 return false;
             }
         }
@@ -274,6 +278,136 @@ enum Vehicle {
         /// an on-disk cache; issue #429).
         cache_path: Option<PathBuf>,
     },
+}
+
+/// mihomo's `override:` block on a proxy-provider (`OverrideSchema`),
+/// minus `dialer-proxy` (that one feeds the dialer chain and lives in
+/// [`ProxyProvider::override_dialer`]).
+///
+/// Upstream applies it in `OverrideSchema.Apply`, which writes each field
+/// into the node's mapping unconditionally — a provider-level default that
+/// remote payloads cannot escape. The affixes are name rewrites, applied
+/// after the map fields and in the same order mihomo uses (prefix, then
+/// suffix). `proxy-name` and `override-expr` need upstream's regexp2 and
+/// expression evaluator; they warn at build instead of being silently
+/// ignored.
+#[derive(Default, Debug, Clone)]
+struct NodeOverride {
+    fields: Vec<(&'static str, serde_json::Value)>,
+    prefix: Option<String>,
+    suffix: Option<String>,
+}
+
+impl NodeOverride {
+    /// Fields mihomo writes, with the node-level key each one lands on.
+    const BOOL_FIELDS: [(&'static str, &'static str); 4] = [
+        ("tfo", "tfo"),
+        ("mptcp", "mptcp"),
+        ("udp", "udp"),
+        ("skip-cert-verify", "skip-cert-verify"),
+    ];
+    const STRING_FIELDS: [(&'static str, &'static str); 5] = [
+        ("up", "up"),
+        ("down", "down"),
+        ("name-cert-verify", "name-cert-verify"),
+        ("interface-name", "interface-name"),
+        ("ip-version", "ip-version"),
+    ];
+
+    /// Parse the block. Unknown keys, and the two constructs that need
+    /// machinery meow does not carry, warn; a wrongly-typed value is a
+    /// build error (upstream's YAML unmarshal rejects it too).
+    fn from_raw(provider: &str, raw: &HashMap<String, serde_json::Value>) -> Result<Self, String> {
+        let mut out = Self::default();
+        for (key, value) in raw {
+            match key.as_str() {
+                // Handled by the caller (dialer chain).
+                "dialer-proxy" => {}
+                "additional-prefix" => {
+                    out.prefix = Some(expect_string(provider, key, value)?.to_string());
+                }
+                "additional-suffix" => {
+                    out.suffix = Some(expect_string(provider, key, value)?.to_string());
+                }
+                "routing-mark" => {
+                    let mark = value.as_i64().ok_or_else(|| {
+                        format!(
+                            "proxy-provider '{provider}': override.routing-mark must be an integer"
+                        )
+                    })?;
+                    out.fields
+                        .push(("routing-mark", serde_json::Value::from(mark)));
+                }
+                "udp-over-tcp" | "proxy-name" | "override-expr" => {
+                    warn!(
+                        provider = %provider,
+                        "proxy-provider override key '{key}' is not supported"
+                    );
+                }
+                other => {
+                    if let Some((_, target)) = Self::BOOL_FIELDS
+                        .iter()
+                        .find(|(source, _)| *source == other)
+                    {
+                        let flag = value.as_bool().ok_or_else(|| {
+                            format!(
+                                "proxy-provider '{provider}': override.{other} must be a boolean"
+                            )
+                        })?;
+                        out.fields.push((target, serde_json::Value::Bool(flag)));
+                    } else if let Some((_, target)) = Self::STRING_FIELDS
+                        .iter()
+                        .find(|(source, _)| *source == other)
+                    {
+                        let text = expect_string(provider, other, value)?;
+                        out.fields
+                            .push((target, serde_json::Value::String(text.to_string())));
+                    } else {
+                        warn!(
+                            provider = %provider,
+                            "proxy-provider override key '{other}' is not supported"
+                        );
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.fields.is_empty() && self.prefix.is_none() && self.suffix.is_none()
+    }
+
+    /// Write the defaults into `map` and rewrite its name. Returns the
+    /// effective node name.
+    fn apply(&self, map: &mut HashMap<String, serde_json::Value>) -> String {
+        for (key, value) in &self.fields {
+            map.insert((*key).to_string(), value.clone());
+        }
+        let mut name = map
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if let Some(prefix) = &self.prefix {
+            name = format!("{prefix}{name}");
+        }
+        if let Some(suffix) = &self.suffix {
+            name = format!("{name}{suffix}");
+        }
+        map.insert("name".to_string(), serde_json::Value::String(name.clone()));
+        name
+    }
+}
+
+fn expect_string<'a>(
+    provider: &str,
+    key: &str,
+    value: &'a serde_json::Value,
+) -> Result<&'a str, String> {
+    value
+        .as_str()
+        .ok_or_else(|| format!("proxy-provider '{provider}': override.{key} must be a string"))
 }
 
 impl ProxyProvider {
@@ -442,18 +576,16 @@ impl ProxyProvider {
             }
         };
 
-        // mihomo `override:` — provider-level node defaults. Only
-        // `dialer-proxy` is honoured; every other key warns so a config
-        // relying on, say, `override.udp` does not silently diverge.
+        // mihomo `override:` — provider-level node defaults. `dialer-proxy`
+        // feeds the dialer chain below; the scalar fields and the name
+        // affixes are collected into `node_override` and written into each
+        // node's mapping at parse time (`OverrideSchema.Apply`).
         // `override.Apply` writes unconditionally — it outranks both the
         // provider-level field and node-level `dialer-proxy`.
         let mut override_dialer = None;
+        let mut node_override = NodeOverride::default();
         if let Some(over) = raw.override_.as_ref() {
-            for key in over.keys() {
-                if key != "dialer-proxy" {
-                    warn!(provider = %name, "proxy-provider override key '{key}' is not supported");
-                }
-            }
+            node_override = NodeOverride::from_raw(name, over)?;
             match over.get("dialer-proxy") {
                 // `""` is the upstream "clear the chain" knob:
                 // `OverrideSchema.Apply` writes the string unconditionally,
@@ -509,6 +641,7 @@ impl ProxyProvider {
             declared_dialers: RwLock::new(Vec::new()),
             provider_dialer,
             override_dialer,
+            node_override,
             refresh_lock: tokio::sync::Mutex::new(()),
             derived: RwLock::new(Vec::new()),
             def: Self::def_identity(raw),
@@ -1213,22 +1346,12 @@ impl ProxyProvider {
         // the main config and subscription parsers: a failed merge is a
         // parse failure, so the whole payload is dropped rather than
         // risking nodes losing their chained front hop.
-        let doc: serde_json::Value = crate::parse_yaml_value(content)
-            .map_err(|e| anyhow::anyhow!("provider YAML is malformed: {e}"))?;
-
-        // Accept both `proxies: [...]` wrapper and a bare list. A
-        // `Value::Null` document is an empty or comments-only file — treat
-        // it as an empty provider rather than a parse defect so an editor /
-        // external tool mid-rewrite doesn't hard-fail strict mode
-        // (parity with the missing-file acquisition path, issue #533).
-        let list_val = match doc.get("proxies").cloned().unwrap_or_else(|| doc.clone()) {
-            serde_json::Value::Null => serde_json::Value::Array(Vec::new()),
-            v => v,
-        };
-
-        let mut proxy_maps: Vec<HashMap<String, serde_json::Value>> =
-            serde_json::from_value(list_val)
-                .map_err(|e| anyhow::anyhow!("provider content is not a proxy list: {e}"))?;
+        //
+        // A body that is not a proxy list is retried as a share-link list:
+        // airports answer a `mihomo` User-Agent with base64-encoded
+        // `ss://`/`vmess://`/... links instead of YAML, and mihomo's
+        // provider parser has the same fallback (`convert.ConvertsV2Ray`).
+        let mut proxy_maps = parse_payload_maps(content)?;
 
         // Pre-resolve any DNS-sourced ECH configs into inline base64 — keeps
         // `parse_proxy` itself sync. An `ech-opts.enable: true` node with no
@@ -1268,12 +1391,12 @@ impl ProxyProvider {
                 .to_lowercase();
 
             if let Some(ref re) = self.filter {
-                if !re.is_match(raw_name) {
+                if !regex_matches(re, raw_name) {
                     continue;
                 }
             }
             if let Some(ref re) = self.exclude_filter {
-                if re.is_match(raw_name) {
+                if regex_matches(re, raw_name) {
                     continue;
                 }
             }
@@ -1281,11 +1404,28 @@ impl ProxyProvider {
                 continue;
             }
 
-            match self.parse_node(raw_map, raw_name, &mut declared) {
+            // mihomo applies `override:` after the name filters and before
+            // parsing (`provider.go`: filter, then `OverrideSchema.Apply`,
+            // then `ParseProxy`), so a provider that prefixes names is still
+            // filtered on the names its feed published.
+            let overridden = if self.node_override.is_empty() {
+                None
+            } else {
+                let mut map = raw_map.clone();
+                self.node_override.apply(&mut map);
+                Some(map)
+            };
+            let node_map = overridden.as_ref().unwrap_or(raw_map);
+            let node_name = node_map
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(raw_name);
+
+            match self.parse_node(node_map, node_name, &mut declared) {
                 Ok(proxy) => result.push(proxy),
                 Err(e) if strict => {
                     return Err(anyhow::anyhow!(
-                        "node '{raw_name}' failed to parse (strict mode): {e}"
+                        "node '{node_name}' failed to parse (strict mode): {e}"
                     ));
                 }
                 // Keep the slot entry as a dead placeholder instead of
@@ -1300,16 +1440,16 @@ impl ProxyProvider {
                 // built-in plugin transport missing from this build, stop
                 // the daemon from starting at all.
                 Err(e) => {
-                    if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_map) {
-                        let label = if raw_name.is_empty() {
+                    if let Some(declared) = proxy_parser::placeholder_adapter_type(node_map) {
+                        let label = if node_name.is_empty() {
                             "<unnamed>"
                         } else {
-                            raw_name
+                            node_name
                         };
                         warn!(provider = %self.name, proxy = label, error = %e, "keeping an unavailable node so nothing can dial past it");
                         result.push(crate::unavailable_placeholder(label, &e, declared));
                     } else {
-                        warn!(provider = %self.name, proxy = raw_name, error = %e, "failed to parse proxy");
+                        warn!(provider = %self.name, proxy = node_name, error = %e, "failed to parse proxy");
                     }
                 }
             }
@@ -1988,21 +2128,94 @@ fn warn_initial_load_failure(provider: &ProxyProvider, error: &str) {
     }
 }
 
+/// Provider payload → node maps, with the share-link fallback.
+///
+/// YAML is the primary format: a `proxies:` wrapper or a bare sequence. A
+/// `Value::Null` document is an empty or comments-only file — an empty
+/// provider rather than a parse defect, so an editor or external tool
+/// mid-rewrite does not hard-fail strict mode (parity with the missing-file
+/// acquisition path, issue #533).
+///
+/// A body that is already a YAML proxy document keeps its YAML error:
+/// falling through to the share-link scanner would harvest incidental
+/// `ss://` lines out of a `preview:` block (or similar) and drop fields
+/// such as `dialer-proxy`. Share-link fallback runs only when the decoded
+/// payload is a share-link list: every non-empty non-comment line contains
+/// `://` (plain or base64 `scheme://` links, the shape airports serve to a
+/// `mihomo` User-Agent via `convert.ConvertsV2Ray`). When both paths fail
+/// the YAML diagnosis is the one reported — it is the format the feed most
+/// likely meant to serve.
+fn parse_payload_maps(
+    content: &str,
+) -> Result<Vec<HashMap<String, serde_json::Value>>, anyhow::Error> {
+    let yaml_error = match crate::parse_yaml_value(content) {
+        Ok(doc) => {
+            if doc.is_null() {
+                return Ok(Vec::new());
+            }
+            if doc.get("proxies").is_some() || doc.is_array() {
+                return yaml_proxy_list(doc);
+            }
+            "provider content is not a proxy list: expected a sequence".to_string()
+        }
+        Err(e) => format!("provider YAML is malformed: {e}"),
+    };
+    if !crate::provider_payload::looks_like_share_link_list(content) {
+        return Err(anyhow::anyhow!("{yaml_error}"));
+    }
+    match crate::provider_payload::parse_share_links(content) {
+        Ok(maps) => Ok(maps),
+        Err(link_error) => Err(anyhow::anyhow!(
+            "{yaml_error}; and not a share-link list either: {link_error}"
+        )),
+    }
+}
+
+fn yaml_proxy_list(
+    doc: serde_json::Value,
+) -> Result<Vec<HashMap<String, serde_json::Value>>, anyhow::Error> {
+    let list_val = match doc.get("proxies").cloned().unwrap_or(doc) {
+        serde_json::Value::Null => return Ok(Vec::new()),
+        value => value,
+    };
+    if list_val.is_array() {
+        serde_json::from_value::<Vec<HashMap<String, serde_json::Value>>>(list_val)
+            .map_err(|e| anyhow::anyhow!("provider content is not a proxy list: {e}"))
+    } else {
+        Err(anyhow::anyhow!(
+            "provider content is not a proxy list: expected a sequence"
+        ))
+    }
+}
+
 fn compile_opt_regex(
     pattern: &Option<String>,
     field: &str,
-) -> Result<Option<regex::Regex>, String> {
+) -> Result<Option<fancy_regex::Regex>, String> {
     match pattern.as_deref() {
-        Some(p) => regex::Regex::new(p).map(Some).map_err(|e| {
-            let hint = if ["(?!", "(?=", "(?<"].iter().any(|la| p.contains(la)) {
-                "; look-around assertions are not supported — split the pattern \
-                 into `filter` + `exclude-filter` instead"
-            } else {
-                ""
-            };
-            format!("{field} regex error: {e}{hint}")
-        }),
+        Some(p) => fancy_regex::Regex::new(p)
+            .map(Some)
+            .map_err(|e| format!("{field} regex error: {e}")),
         None => Ok(None),
+    }
+}
+
+/// Evaluate a `filter`/`exclude-filter` fancy-regex against a node name.
+///
+/// fancy-regex compiles look-around assertions the way mihomo's Go regex
+/// engine does, but its backtracking VM can still fail at *evaluation*
+/// time (e.g. a pathological pattern overflows the backtrack limit). A
+/// failure is logged and treated as a non-match: the node is kept by
+/// `exclude-filter` semantics and dropped by `filter` semantics — the
+/// same default `regex::Regex::is_match` gave for plain patterns, with
+/// the failed case visible in the log instead of silently swallowed.
+fn regex_matches(re: &fancy_regex::Regex, name: &str) -> bool {
+    match re.is_match(name) {
+        Ok(matched) => matched,
+        Err(e) => {
+            warn!(error = %e, "filter regex evaluation failed; treating as no match");
+            false
+        }
     }
 }
 
@@ -2608,6 +2821,400 @@ header:
         p
     }
 
+    /// A payload that is not YAML is retried as a base64 share-link list —
+    /// the shape airports serve to a `mihomo` User-Agent (mihomo reaches the
+    /// same nodes through `convert.ConvertsV2Ray`).
+    ///
+    /// Both links are `ss://` on purpose: the `ss`-only CI leg compiles no
+    /// other scheme's adapter, and a node whose type is not in the build is
+    /// dropped with a warning instead of parsed, so a mixed list would make
+    /// this test's expected names depend on the feature set. Per-scheme
+    /// mapping is covered by `provider_payload`'s own tests, which build no
+    /// adapter and therefore run under every feature set.
+    #[tokio::test]
+    async fn provider_payload_accepts_base64_share_links() {
+        use base64::Engine as _;
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let links = "ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n\
+                     ss://YWVzLTI1Ni1nY206c2VjcmV0@b.example.com:443#B\n";
+        std::fs::write(
+            tmp.path(),
+            base64::engine::general_purpose::STANDARD.encode(links),
+        )
+        .unwrap();
+        let provider = file_provider(tmp.path()).await;
+        assert_eq!(slot_names(&provider.slot), ["A", "B"]);
+    }
+
+    /// A YAML provider document that fails to parse (unresolved merge) must
+    /// not fall back to harvesting `ss://` lines out of a `preview:` block.
+    #[test]
+    fn yaml_merge_error_does_not_harvest_preview_share_link() {
+        let yaml = "proxies:\n\
+                    - name: real\n\
+                      type: ss\n\
+                      server: a.example.com\n\
+                      port: 8388\n\
+                      cipher: aes-128-gcm\n\
+                      password: pass\n\
+                      dialer-proxy: front\n\
+                      <<: *missing\n\
+                    preview: |\n\
+                      ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n";
+        let err = parse_payload_maps(yaml)
+            .expect_err("an unresolved merge in a proxies: document must stay a YAML error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("YAML")
+                || msg.contains("malformed")
+                || msg.contains("merge")
+                || msg.contains("alias"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains("share-link"),
+            "must not harvest incidental ss:// lines: {msg}"
+        );
+    }
+
+    /// Successful ingest already accepts a bare YAML sequence (`doc.is_array()`).
+    /// A malformed one (unresolved merge, no `proxies:` wrapper) must keep
+    /// the YAML error instead of harvesting `ss://` out of a `preview:` block.
+    #[test]
+    fn yaml_bare_sequence_merge_error_does_not_harvest_preview_share_link() {
+        let yaml = "- name: real\n\
+                    type: ss\n\
+                    server: a.example.com\n\
+                    port: 8388\n\
+                    cipher: aes-128-gcm\n\
+                    password: pass\n\
+                    dialer-proxy: front\n\
+                    <<: *missing\n\
+                    preview: |\n\
+                      ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n";
+        let err = parse_payload_maps(yaml)
+            .expect_err("an unresolved merge in a bare YAML sequence must stay a YAML error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("YAML")
+                || msg.contains("malformed")
+                || msg.contains("merge")
+                || msg.contains("alias"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains("share-link"),
+            "must not harvest incidental ss:// lines: {msg}"
+        );
+    }
+
+    /// Same shape on refresh: last-good survives, the preview link is not imported.
+    #[tokio::test]
+    async fn yaml_merge_preview_refresh_keeps_last_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        write_provider_file(&path, &[("KeepMe", "ss")]);
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(dir.path()),
+            true,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(slot_names(&p.slot), ["KeepMe"]);
+
+        std::fs::write(
+            &path,
+            "proxies:\n\
+             - name: real\n\
+               type: ss\n\
+               server: a.example.com\n\
+               port: 8388\n\
+               cipher: aes-128-gcm\n\
+               password: pass\n\
+               dialer-proxy: front\n\
+               <<: *missing\n\
+             preview: |\n\
+               ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n",
+        )
+        .unwrap();
+        p.refresh()
+            .await
+            .expect_err("malformed YAML with a preview share-link must fail");
+        assert_eq!(
+            slot_names(&p.slot),
+            ["KeepMe"],
+            "last-good must survive; the preview link must not be imported"
+        );
+    }
+
+    /// Bare-sequence sibling of `yaml_merge_preview_refresh_keeps_last_good`.
+    #[tokio::test]
+    async fn yaml_bare_sequence_preview_refresh_keeps_last_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        write_provider_file(&path, &[("KeepMe", "ss")]);
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(dir.path()),
+            true,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(slot_names(&p.slot), ["KeepMe"]);
+
+        std::fs::write(
+            &path,
+            "- name: real\n\
+             type: ss\n\
+             server: a.example.com\n\
+             port: 8388\n\
+             cipher: aes-128-gcm\n\
+             password: pass\n\
+             dialer-proxy: front\n\
+             <<: *missing\n\
+             preview: |\n\
+               ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n",
+        )
+        .unwrap();
+        p.refresh()
+            .await
+            .expect_err("malformed bare YAML sequence with a preview share-link must fail");
+        assert_eq!(
+            slot_names(&p.slot),
+            ["KeepMe"],
+            "last-good must survive; the preview link must not be imported"
+        );
+    }
+
+    /// Quoted `'proxies':` plus an anchored item (`- &node`) is still YAML.
+    /// An unresolved merge must not fall through to harvesting the preview
+    /// `ss://` line (which would drop `dialer-proxy`).
+    #[test]
+    fn yaml_quoted_proxies_anchor_does_not_harvest_preview_share_link() {
+        let yaml = "'proxies':\n\
+                    - &node\n\
+                      name: real\n\
+                      type: ss\n\
+                      server: a.example.com\n\
+                      port: 8388\n\
+                      cipher: aes-128-gcm\n\
+                      password: pass\n\
+                      dialer-proxy: front\n\
+                      <<: *missing\n\
+                    preview: |\n\
+                      ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n";
+        let err = parse_payload_maps(yaml)
+            .expect_err("an unresolved merge under a quoted proxies: key must stay a YAML error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("YAML")
+                || msg.contains("malformed")
+                || msg.contains("merge")
+                || msg.contains("alias"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains("share-link"),
+            "must not harvest incidental ss:// lines: {msg}"
+        );
+    }
+
+    /// Last-good node A keeps `dialer-proxy: front`; a quoted-key YAML
+    /// refresh with a preview `ss://#A` must not replace it with a hop-less A.
+    #[tokio::test]
+    async fn yaml_quoted_proxies_preview_refresh_keeps_last_good_dialer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        std::fs::write(
+            &path,
+            "proxies:\n\
+             \x20 - {name: A, type: ss, server: a.example.com, port: 8388, \
+             cipher: aes-128-gcm, password: pass, dialer-proxy: front}\n",
+        )
+        .unwrap();
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(dir.path()),
+            true,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(slot_names(&p.slot), ["A"]);
+        assert_eq!(p.declared_dialer_names(), ["front"]);
+
+        std::fs::write(
+            &path,
+            "'proxies':\n\
+             - &node\n\
+               name: real\n\
+               type: ss\n\
+               server: a.example.com\n\
+               port: 8388\n\
+               cipher: aes-128-gcm\n\
+               password: pass\n\
+               dialer-proxy: front\n\
+               <<: *missing\n\
+             preview: |\n\
+               ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n",
+        )
+        .unwrap();
+        p.refresh()
+            .await
+            .expect_err("malformed quoted-key YAML with a preview share-link must fail");
+        assert_eq!(slot_names(&p.slot), ["A"]);
+        assert_eq!(
+            p.declared_dialer_names(),
+            ["front"],
+            "last-good must keep dialer-proxy; harvested ss://#A would drop the front hop"
+        );
+    }
+
+    /// One broken SS share-link in a mixed feed must not empty a strict
+    /// provider — the valid sibling is kept.
+    #[tokio::test]
+    async fn strict_refresh_skips_malformed_ss_share_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        std::fs::write(
+            &path,
+            "ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n\
+             ss://:@b.example.com:443#Broken\n",
+        )
+        .unwrap();
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(dir.path()),
+            true,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh()
+            .await
+            .expect("one broken SS line must not fail the whole payload");
+        assert_eq!(slot_names(&p.slot), ["A"]);
+    }
+
+    /// Empty-password trojan in a mixed share-link feed is skipped; the
+    /// valid SS sibling is kept even in strict mode.
+    #[tokio::test]
+    async fn strict_refresh_skips_empty_trojan_share_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        std::fs::write(
+            &path,
+            "ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n\
+             trojan://@b.example.com:443#Broken\n",
+        )
+        .unwrap();
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(dir.path()),
+            true,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh()
+            .await
+            .expect("one empty-password trojan must not fail the whole payload");
+        assert_eq!(slot_names(&p.slot), ["A"]);
+    }
+
+    fn override_map(value: serde_json::Value) -> HashMap<String, serde_json::Value> {
+        serde_json::from_value(value).expect("override object")
+    }
+
+    async fn provider_with_override(
+        path: &std::path::Path,
+        raw: RawProxyProvider,
+    ) -> ProxyProvider {
+        let cache_dir = path.parent().expect("temp file has a parent dir");
+        let p = ProxyProvider::new(
+            "car",
+            &raw,
+            Some(cache_dir),
+            true,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        p
+    }
+
+    #[tokio::test]
+    async fn provider_override_applies_fields_and_name_affixes() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_provider_file(tmp.path(), &[("US 1", "ss"), ("US 2", "ss")]);
+        let mut raw = raw_file_provider(tmp.path().to_str().unwrap());
+        raw.override_ = Some(override_map(serde_json::json!({
+            "additional-prefix": "[Car] ",
+            "additional-suffix": " ✈",
+            "udp": false,
+            "skip-cert-verify": true,
+            "ip-version": "ipv4"
+        })));
+        let provider = provider_with_override(tmp.path(), raw).await;
+        assert_eq!(slot_names(&provider.slot), ["[Car] US 1 ✈", "[Car] US 2 ✈"]);
+    }
+
+    /// Upstream order: the name filters run on the names the feed published,
+    /// then `override` rewrites them. Filtering after the affixes would drop
+    /// every node of a provider that prefixes its names.
+    #[tokio::test]
+    async fn provider_override_filters_on_the_original_name() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_provider_file(tmp.path(), &[("Car 01", "ss"), ("Other 01", "ss")]);
+        let mut raw = raw_file_provider(tmp.path().to_str().unwrap());
+        raw.filter = Some("^Car".to_string());
+        raw.override_ = Some(override_map(serde_json::json!({
+            "additional-prefix": "[X] "
+        })));
+        let provider = provider_with_override(tmp.path(), raw).await;
+        assert_eq!(slot_names(&provider.slot), ["[X] Car 01"]);
+    }
+
+    /// A wrongly-typed override is a build error, not a silent skip —
+    /// upstream's YAML unmarshal rejects it before any fetch happens.
+    #[test]
+    fn provider_override_rejects_wrong_type() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut raw = raw_file_provider(tmp.path().to_str().unwrap());
+        raw.override_ = Some(override_map(serde_json::json!({
+            "udp": "yes"
+        })));
+        let cache_dir = tmp.path().parent().expect("temp file has a parent dir");
+        let err = ProxyProvider::new(
+            "car",
+            &raw,
+            Some(cache_dir),
+            true,
+            false,
+            Default::default(),
+        )
+        .err()
+        .expect("a wrongly-typed override must fail the build");
+        assert!(err.contains("must be a boolean"), "unexpected error: {err}");
+    }
+
     #[tokio::test]
     async fn derived_slot_applies_group_filter() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
@@ -2679,16 +3286,50 @@ header:
         assert!(GroupFilter::from_raw_group(&raw).unwrap().is_none());
     }
 
-    #[test]
-    fn group_filter_lookahead_error_carries_hint() {
-        let raw = crate::raw::RawProxyGroup {
-            name: "g".to_string(),
-            group_type: "select".to_string(),
-            filter: Some("^(?!.*expat).*US".to_string()),
-            ..Default::default()
-        };
-        let err = GroupFilter::from_raw_group(&raw).unwrap_err();
-        assert!(err.contains("look-around"), "unexpected error: {err}");
+    #[tokio::test]
+    async fn group_filter_negative_lookahead_matches_mihomo_semantics() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_provider_file(
+            tmp.path(),
+            &[
+                ("US 1", "ss"),
+                ("剩余流量: 10G", "ss"),
+                ("到期: 2026", "ss"),
+            ],
+        );
+        let provider = file_provider(tmp.path()).await;
+
+        // The exact mihomo idiom airport configs use to drop info nodes.
+        let f = group_filter(Some("^(?!.*(流量|到期))"), None, None);
+        let derived = provider.derived_slot(&f);
+        assert_eq!(slot_names(&derived), ["US 1"]);
+    }
+
+    #[tokio::test]
+    async fn provider_filter_negative_lookahead_filters_payload() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        write_provider_file(
+            tmp.path(),
+            &[
+                ("US 1", "ss"),
+                ("剩余流量: 10G", "ss"),
+                ("官网 example.com", "ss"),
+            ],
+        );
+        let mut raw = raw_file_provider(tmp.path().to_str().unwrap());
+        raw.filter = Some("^(?!.*(流量|官网))".to_string());
+        let cache_dir = tmp.path().parent().expect("temp file has a parent dir");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(cache_dir),
+            true,
+            false,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(slot_names(&p.slot), ["US 1"]);
     }
 
     // ─── issue #489: provider-sourced nodes honour `dialer-proxy` ─────────
