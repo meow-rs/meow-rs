@@ -305,8 +305,19 @@ pub(crate) fn boring_roots() -> &'static [boring::x509::X509] {
 
 /// Build a fresh Mozilla-roots `X509StoreBuilder`, optionally seeded with extra
 /// DER roots. Called once per distinct connector cache key, not per proxy.
+/// Native OS anchors are **not** added here — restls and outbound TLS stay
+/// Mozilla-only; [`TlsLayer::with_system_roots`] goes through
+/// [`build_root_store_with`].
+#[cfg_attr(not(feature = "restls"), allow(dead_code))]
 pub(crate) fn build_root_store(
     additional_roots: &[Vec<u8>],
+) -> Result<boring::x509::store::X509StoreBuilder> {
+    build_root_store_with(additional_roots, false)
+}
+
+fn build_root_store_with(
+    additional_roots: &[Vec<u8>],
+    include_system_roots: bool,
 ) -> Result<boring::x509::store::X509StoreBuilder> {
     let mut builder = boring::x509::store::X509StoreBuilder::new()
         .map_err(|e| TransportError::Config(format!("X509StoreBuilder::new: {e}")))?;
@@ -314,6 +325,9 @@ pub(crate) fn build_root_store(
         builder
             .add_cert(cert.clone())
             .map_err(|e| TransportError::Config(format!("root store add_cert: {e}")))?;
+    }
+    if include_system_roots {
+        add_native_roots(&mut builder);
     }
     for der in additional_roots {
         let x509 = boring::x509::X509::from_der(der).map_err(|e| {
@@ -326,15 +340,106 @@ pub(crate) fn build_root_store(
     Ok(builder)
 }
 
+/// Process-global parsed native trust anchors. Loaded once, only when a
+/// connector is built with `include_system_roots`. Mozilla-only paths never
+/// call the loader. Each `X509` is refcount-shared, same as [`boring_roots`].
+static NATIVE_ROOTS: OnceLock<Vec<boring::x509::X509>> = OnceLock::new();
+
+/// Extra native anchors installed by unit tests. Merged at store-build time
+/// so a cache-key test that already loaded the OS snapshot cannot starve a
+/// later handshake test of its private CA (the handshake uses a distinct
+/// [`ConnectorKey`]).
+#[cfg(test)]
+static TEST_EXTRA_NATIVE_ROOTS: Mutex<Vec<boring::x509::X509>> = Mutex::new(Vec::new());
+
+fn native_roots() -> &'static [boring::x509::X509] {
+    NATIVE_ROOTS.get_or_init(load_native_roots)
+}
+
+/// Parse DER blobs as BoringSSL `X509`, keeping usable anchors and counting
+/// parse failures. Does not log certificate contents.
+fn parse_native_der_anchors<'a, I>(ders: I) -> (Vec<boring::x509::X509>, usize)
+where
+    I: IntoIterator<Item = &'a [u8]>,
+{
+    let mut usable = Vec::new();
+    let mut failed = 0usize;
+    for der in ders {
+        match boring::x509::X509::from_der(der) {
+            Ok(cert) => usable.push(cert),
+            Err(_) => failed += 1,
+        }
+    }
+    (usable, failed)
+}
+
+fn load_native_roots() -> Vec<boring::x509::X509> {
+    let loaded = rustls_native_certs::load_native_certs();
+    let load_errors = loaded.errors.len();
+    let (usable, parse_failures) = parse_native_der_anchors(loaded.certs.iter().map(AsRef::as_ref));
+    if load_errors > 0 || parse_failures > 0 || usable.is_empty() {
+        warn_native_roots_once(usable.len(), load_errors, parse_failures);
+    }
+    usable
+}
+
+fn warn_native_roots_once(usable: usize, load_errors: usize, parse_failures: usize) {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        if usable == 0 {
+            warn!(
+                load_errors,
+                parse_failures,
+                "native CA store produced no usable anchors; \
+                 internal HTTPS will use Mozilla roots only"
+            );
+        } else {
+            warn!(
+                usable,
+                load_errors,
+                parse_failures,
+                "native CA store: kept usable anchors and skipped unparsable entries; \
+                 internal HTTPS will use Mozilla roots plus the usable native anchors"
+            );
+        }
+    });
+}
+
+/// Append native anchors to an already Mozilla-seeded store. Duplicates
+/// (overlap with Mozilla, or repeated native entries) are harmless.
+fn add_native_roots(builder: &mut boring::x509::store::X509StoreBuilder) {
+    for cert in native_roots() {
+        if builder.add_cert(cert.clone()).is_err() {
+            let _ = boring::error::ErrorStack::get();
+        }
+    }
+    #[cfg(test)]
+    {
+        for cert in TEST_EXTRA_NATIVE_ROOTS
+            .lock()
+            .expect("test native roots poisoned")
+            .iter()
+        {
+            if builder.add_cert(cert.clone()).is_err() {
+                let _ = boring::error::ErrorStack::get();
+            }
+        }
+    }
+}
+
 /// Cache key for [`CONNECTOR_CACHE`] — the [`TlsConfig`] fields that shape
-/// the `SSL_CTX`.  SNI and ECH are per-connection (`ConnectConfiguration`),
-/// so they stay out of the key.
+/// the `SSL_CTX`, plus whether the store includes the native-root snapshot.
+/// SNI and ECH are per-connection (`ConnectConfiguration`), so they stay
+/// out of the key. The native-root bit is enough because that snapshot is
+/// immutable for the process lifetime; it is **not** enough for arbitrary
+/// `additional_roots` (those bypass the cache).
 #[derive(PartialEq, Eq, Hash)]
 struct ConnectorKey {
     fingerprint: Option<String>,
     curves: Option<String>,
     alpn: Vec<String>,
     skip_cert_verify: bool,
+    include_system_roots: bool,
 }
 
 /// FIFO store of `(server_name, session)` pairs shared between an
@@ -396,12 +501,18 @@ static CONNECTOR_CACHE: OnceLock<Mutex<HashMap<ConnectorKey, Arc<SharedConnector
 /// into the key.  `fingerprint = "random"` is also uncached because the
 /// profile is drawn at construction time and each layer should get its own
 /// draw.  Such configs get a private, uncached build.
-fn shared_connector(config: &TlsConfig) -> Result<Arc<SharedConnector>> {
+///
+/// `include_system_roots` is part of the cache key so Mozilla-only outbound
+/// TLS and opted-in internal HTTPS never share an `SSL_CTX`.
+fn shared_connector(
+    config: &TlsConfig,
+    include_system_roots: bool,
+) -> Result<Arc<SharedConnector>> {
     let cacheable = config.additional_roots.is_empty()
         && config.client_cert.is_none()
         && config.fingerprint.as_deref() != Some("random");
     if !cacheable {
-        return BoringInner::build_connector(config).map(Arc::new);
+        return BoringInner::build_connector(config, include_system_roots).map(Arc::new);
     }
 
     let key = ConnectorKey {
@@ -409,6 +520,7 @@ fn shared_connector(config: &TlsConfig) -> Result<Arc<SharedConnector>> {
         curves: config.curves.clone(),
         alpn: config.alpn.clone(),
         skip_cert_verify: config.skip_cert_verify,
+        include_system_roots,
     };
     let cache = CONNECTOR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     {
@@ -420,7 +532,7 @@ fn shared_connector(config: &TlsConfig) -> Result<Arc<SharedConnector>> {
     // Build outside the lock (SSL_CTX setup parses cipher/curve lists and
     // seeds the verify store); a racing builder for the same key just wins
     // or loses harmlessly.
-    let built = Arc::new(BoringInner::build_connector(config)?);
+    let built = Arc::new(BoringInner::build_connector(config, include_system_roots)?);
     let mut map = cache.lock().expect("boring connector cache poisoned");
     Ok(Arc::clone(map.entry(key).or_insert(built)))
 }
@@ -530,18 +642,23 @@ impl BoringInner {
             || config.client_cert.is_some()
             || config.curves.is_some()
         {
-            Self::build_connector(config)?;
+            Self::build_connector(config, false)?;
         }
         Ok(())
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn new(config: &TlsConfig) -> Result<Self> {
+        Self::new_with_system_roots(config, false)
+    }
+
+    fn new_with_system_roots(config: &TlsConfig, include_system_roots: bool) -> Result<Self> {
         let server_name = config.sni.clone().ok_or_else(|| {
             TransportError::Config(
                 "TlsLayer requires sni to be Some; None is reserved for non-TLS paths.".into(),
             )
         })?;
-        let ctx = shared_connector(config)?;
+        let ctx = shared_connector(config, include_system_roots)?;
         Ok(Self {
             ctx,
             server_name: unbracket_ip_literal(&server_name).to_owned(),
@@ -561,7 +678,7 @@ impl BoringInner {
     ///
     /// Callers should go through [`shared_connector`] so identical shaping
     /// keys share a single context; this is the uncached primitive.
-    fn build_connector(config: &TlsConfig) -> Result<SharedConnector> {
+    fn build_connector(config: &TlsConfig, include_system_roots: bool) -> Result<SharedConnector> {
         let mut b = boring::ssl::SslConnector::builder(boring::ssl::SslMethod::tls())
             .map_err(|e| TransportError::Config(format!("boring TLS init: {e}")))?;
 
@@ -628,12 +745,13 @@ impl BoringInner {
                 boring::ssl::SslVerifyMode::PEER,
                 super::distrust::verify_callback,
             );
-            // Mozilla CA bundle (plus any `additional_roots`) as the verify
-            // store, rebuilt per distinct connector cache key from the shared,
+            // Mozilla CA bundle (plus any `additional_roots`, plus a native
+            // snapshot when `include_system_roots`) as the verify store,
+            // rebuilt per distinct connector cache key from the shared,
             // pre-parsed root certs. `set_cert_store_builder` hands over the
             // builder as-is; boring 4.x deprecated the `X509Store` variant and
             // 5.x lifted that again, so either works.
-            let store = build_root_store(&config.additional_roots)?;
+            let store = build_root_store_with(&config.additional_roots, include_system_roots)?;
             b.set_cert_store_builder(store);
         }
 
@@ -1028,6 +1146,7 @@ fn handshake_failed_ech_rejected<S>(e: &tokio_boring::HandshakeError<S>) -> bool
 /// fail; if it does, the error is stored and returned from every `connect`.
 pub(super) struct LazyBoringInner {
     config: TlsConfig,
+    include_system_roots: bool,
     /// `Err` only if construction fails despite [`BoringInner::validate`]
     /// having passed (e.g. BoringSSL out of memory); surfaced as
     /// `TransportError::Config` on every connect rather than panicking.
@@ -1035,16 +1154,20 @@ pub(super) struct LazyBoringInner {
 }
 
 impl LazyBoringInner {
-    pub(super) fn new(config: TlsConfig) -> Self {
+    pub(super) fn new(config: TlsConfig, include_system_roots: bool) -> Self {
         Self {
             config,
+            include_system_roots,
             inner: OnceLock::new(),
         }
     }
 
     fn get_or_init(&self) -> Result<&BoringInner> {
         self.inner
-            .get_or_init(|| BoringInner::new(&self.config).map_err(|e| e.to_string()))
+            .get_or_init(|| {
+                BoringInner::new_with_system_roots(&self.config, self.include_system_roots)
+                    .map_err(|e| e.to_string())
+            })
             .as_ref()
             .map_err(|e| TransportError::Config(format!("boring TLS init: {e}")))
     }
@@ -1208,75 +1331,95 @@ fn verify_leaf_under_pinned_cert(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tls::TlsLayer;
+    use crate::Transport as _;
 
     fn same_ctx(a: &SharedConnector, b: &SharedConnector) -> bool {
         std::ptr::eq(a.connector.context(), b.connector.context())
     }
 
-    /// Same (fingerprint, curves, alpn, skip_cert_verify) → same shared
-    /// `SSL_CTX`; different key → different context; uncacheable configs
-    /// bypass the cache.
+    /// Same (fingerprint, curves, alpn, skip_cert_verify, system-roots bit)
+    /// → same shared `SSL_CTX`; different key → different context;
+    /// uncacheable configs bypass the cache.
     #[test]
     fn boring_connector_is_shared_per_key() {
-        let a = shared_connector(&TlsConfig::new("a.example")).expect("build a");
-        let b = shared_connector(&TlsConfig::new("b.example")).expect("build b");
+        let a = shared_connector(&TlsConfig::new("a.example"), false).expect("build a");
+        let b = shared_connector(&TlsConfig::new("b.example"), false).expect("build b");
         assert!(
             same_ctx(&a, &b),
             "same key (no fingerprint, no alpn, no skip-verify) must share one SSL_CTX"
         );
 
-        let alpn = shared_connector(&TlsConfig {
-            alpn: vec!["h2".into()],
-            ..TlsConfig::new("c.example")
-        })
+        let alpn = shared_connector(
+            &TlsConfig {
+                alpn: vec!["h2".into()],
+                ..TlsConfig::new("c.example")
+            },
+            false,
+        )
         .expect("build alpn");
         assert!(
             !same_ctx(&a, &alpn),
             "different alpn must build a distinct SSL_CTX"
         );
 
-        let fp = shared_connector(&TlsConfig {
-            fingerprint: Some("chrome".into()),
-            ..TlsConfig::new("d.example")
-        })
+        let fp = shared_connector(
+            &TlsConfig {
+                fingerprint: Some("chrome".into()),
+                ..TlsConfig::new("d.example")
+            },
+            false,
+        )
         .expect("build fp");
         assert!(
             !same_ctx(&a, &fp),
             "fingerprint must build a distinct SSL_CTX"
         );
-        let fp2 = shared_connector(&TlsConfig {
-            fingerprint: Some("chrome".into()),
-            ..TlsConfig::new("e.example")
-        })
+        let fp2 = shared_connector(
+            &TlsConfig {
+                fingerprint: Some("chrome".into()),
+                ..TlsConfig::new("e.example")
+            },
+            false,
+        )
         .expect("build fp2");
         assert!(
             same_ctx(&fp, &fp2),
             "same fingerprint must share the SSL_CTX"
         );
 
-        let curves = shared_connector(&TlsConfig {
-            curves: Some("X25519:P-256:P-384".into()),
-            ..TlsConfig::new("g.example")
-        })
+        let curves = shared_connector(
+            &TlsConfig {
+                curves: Some("X25519:P-256:P-384".into()),
+                ..TlsConfig::new("g.example")
+            },
+            false,
+        )
         .expect("build curves");
         assert!(
             !same_ctx(&a, &curves),
             "explicit curves must build a distinct SSL_CTX"
         );
-        let curves2 = shared_connector(&TlsConfig {
-            curves: Some("P-256:X25519".into()),
-            ..TlsConfig::new("h.example")
-        })
+        let curves2 = shared_connector(
+            &TlsConfig {
+                curves: Some("P-256:X25519".into()),
+                ..TlsConfig::new("h.example")
+            },
+            false,
+        )
         .expect("build curves2");
         assert!(
             !same_ctx(&curves, &curves2),
             "different curves lists must build distinct SSL_CTXs"
         );
 
-        let skip = shared_connector(&TlsConfig {
-            skip_cert_verify: true,
-            ..TlsConfig::new("f.example")
-        })
+        let skip = shared_connector(
+            &TlsConfig {
+                skip_cert_verify: true,
+                ..TlsConfig::new("f.example")
+            },
+            false,
+        )
         .expect("build skip");
         assert!(
             !same_ctx(&a, &skip),
@@ -1284,21 +1427,97 @@ mod tests {
         );
 
         // `random` draws a profile per construction — never shared.
-        let r1 = shared_connector(&TlsConfig {
-            fingerprint: Some("random".into()),
-            ..TlsConfig::new("g.example")
-        })
+        let r1 = shared_connector(
+            &TlsConfig {
+                fingerprint: Some("random".into()),
+                ..TlsConfig::new("g.example")
+            },
+            false,
+        )
         .expect("build r1");
-        let r2 = shared_connector(&TlsConfig {
-            fingerprint: Some("random".into()),
-            ..TlsConfig::new("h.example")
-        })
+        let r2 = shared_connector(
+            &TlsConfig {
+                fingerprint: Some("random".into()),
+                ..TlsConfig::new("h.example")
+            },
+            false,
+        )
         .expect("build r2");
         assert!(!same_ctx(&r1, &r2), "random fingerprint must not be cached");
 
         // Re-asking for an existing key hits the cache.
-        let a2 = shared_connector(&TlsConfig::new("i.example")).expect("build a2");
+        let a2 = shared_connector(&TlsConfig::new("i.example"), false).expect("build a2");
         assert!(same_ctx(&a, &a2));
+    }
+
+    /// Mozilla-only and system-roots connectors must never share an
+    /// `SSL_CTX`, in either warm-up order — otherwise outbound TLS and
+    /// opted-in internal HTTPS would reuse each other's trust store.
+    #[test]
+    fn connector_key_distinguishes_system_roots_either_order() {
+        let mozilla_first =
+            shared_connector(&TlsConfig::new("sysca-a.example"), false).expect("mozilla first");
+        let system_after = shared_connector(&TlsConfig::new("sysca-a.example"), true)
+            .expect("system after mozilla");
+        assert!(
+            !same_ctx(&mozilla_first, &system_after),
+            "mozilla-then-system must not reuse the Mozilla-only SSL_CTX"
+        );
+
+        let system_first =
+            shared_connector(&TlsConfig::new("sysca-b.example"), true).expect("system first");
+        let mozilla_after = shared_connector(&TlsConfig::new("sysca-b.example"), false)
+            .expect("mozilla after system");
+        assert!(
+            !same_ctx(&system_first, &mozilla_after),
+            "system-then-mozilla must not reuse the system-roots SSL_CTX"
+        );
+
+        assert!(
+            same_ctx(&mozilla_first, &mozilla_after),
+            "mozilla-only slots still share across warm-up order"
+        );
+        assert!(
+            same_ctx(&system_after, &system_first),
+            "system-roots slots still share across warm-up order"
+        );
+    }
+
+    /// Nonempty `additional_roots` must bypass the cache even when the
+    /// system-roots bit matches — the bit is not a hash of the extra DERs.
+    #[test]
+    fn additional_roots_bypass_connector_cache() {
+        let ca = make_cert("cache-bypass CA", &CA, None).0.to_der().unwrap();
+        let cfg = |sni: &str| TlsConfig {
+            additional_roots: vec![ca.clone()],
+            ..TlsConfig::new(sni)
+        };
+        let a = shared_connector(&cfg("a.example"), false).expect("a mozilla");
+        let b = shared_connector(&cfg("b.example"), false).expect("b mozilla");
+        assert!(
+            !same_ctx(&a, &b),
+            "nonempty additional_roots must not share an SSL_CTX"
+        );
+
+        let c = shared_connector(&cfg("c.example"), true).expect("c system");
+        let d = shared_connector(&cfg("d.example"), true).expect("d system");
+        assert!(
+            !same_ctx(&c, &d),
+            "nonempty additional_roots must stay uncached with system roots too"
+        );
+        assert!(!same_ctx(&a, &c));
+    }
+
+    #[test]
+    fn native_root_parse_keeps_usable_anchors() {
+        let good = make_cert("parse CA", &CA, None).0.to_der().unwrap();
+        let (usable, failed) = parse_native_der_anchors([&good[..], b"not-a-cert", &good[..]]);
+        assert_eq!(failed, 1, "garbage DER must count as a parse failure");
+        assert_eq!(
+            usable.len(),
+            2,
+            "valid anchors must be kept when a sibling fails to parse"
+        );
     }
 
     /// The shadow-tls v2 pin lifts for *known* fingerprints on the
@@ -1555,6 +1774,131 @@ mod tests {
         ..CertOpts::DEFAULT
     };
 
+    fn push_test_native_root(cert: &boring::x509::X509) {
+        TEST_EXTRA_NATIVE_ROOTS
+            .lock()
+            .expect("test native roots poisoned")
+            .push(cert.clone());
+    }
+
+    /// Distinct from the empty-curves slot cache-key tests populate, so
+    /// the store is built after `push_test_native_root` rather than
+    /// reused from a Mozilla+OS snapshot that lacks the private CA.
+    fn system_ca_handshake_config(sni: &str) -> TlsConfig {
+        TlsConfig {
+            curves: Some("X25519:P-256".into()),
+            ..TlsConfig::new(sni)
+        }
+    }
+
+    async fn spawn_tls_once(
+        leaf: boring::x509::X509,
+        key: boring::pkey::PKey<boring::pkey::Private>,
+    ) -> std::net::SocketAddr {
+        let mut builder =
+            boring::ssl::SslAcceptor::mozilla_intermediate_v5(boring::ssl::SslMethod::tls())
+                .expect("acceptor");
+        builder.set_certificate(&leaf).unwrap();
+        builder.set_private_key(&key).unwrap();
+        let acceptor = builder.build();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let acceptor = acceptor.clone();
+                tokio::spawn(async move {
+                    let _ = tokio_boring::accept(&acceptor, tcp).await;
+                });
+            }
+        });
+        addr
+    }
+
+    async fn handshake(layer: &TlsLayer, addr: std::net::SocketAddr) -> Result<()> {
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        layer.connect(Box::new(tcp)).await.map(|_| ())
+    }
+
+    /// Private-CA leaf: Mozilla-only rejects; system-roots (with the CA
+    /// in the native extras) accepts. Both warm-up orders, plus a
+    /// hostname mismatch and an untrusted CA, still fail.
+    #[tokio::test]
+    async fn system_roots_trust_native_ca_without_skipping_verify() {
+        let (ca, ca_key) = make_cert("native-test CA", &CA, None);
+        push_test_native_root(&ca);
+        let (leaf, leaf_key) = make_cert(
+            "localhost",
+            &CertOpts {
+                dns: &["localhost"],
+                ..CertOpts::DEFAULT
+            },
+            Some(("native-test CA", &ca, &ca_key)),
+        );
+        let addr = spawn_tls_once(leaf, leaf_key).await;
+        let cfg = system_ca_handshake_config("localhost");
+
+        // Mozilla first, then system roots.
+        let mozilla = TlsLayer::new(&cfg).expect("mozilla layer");
+        let mozilla_err = handshake(&mozilla, addr).await.expect_err("mozilla-only");
+        let mozilla_msg = mozilla_err.to_string();
+        assert!(
+            mozilla_msg.contains("tls")
+                || mozilla_msg.contains("handshake")
+                || mozilla_msg.contains("certificate"),
+            "mozilla-only error should mention TLS: {mozilla_msg}"
+        );
+
+        let system = TlsLayer::with_system_roots(&cfg).expect("system layer");
+        handshake(&system, addr)
+            .await
+            .expect("native CA must be trusted with system roots");
+
+        // System-roots already warm: a fresh Mozilla layer must still reject.
+        let mozilla_again = TlsLayer::new(&cfg).expect("mozilla again");
+        assert!(
+            handshake(&mozilla_again, addr).await.is_err(),
+            "warming the system-roots slot must not poison Mozilla-only"
+        );
+        let system_again = TlsLayer::with_system_roots(&cfg).expect("system again");
+        handshake(&system_again, addr)
+            .await
+            .expect("system-roots slot still trusts the native CA");
+
+        // Wrong hostname, same CA.
+        let (wrong_leaf, wrong_key) = make_cert(
+            "wrong.example",
+            &CertOpts {
+                dns: &["wrong.example"],
+                ..CertOpts::DEFAULT
+            },
+            Some(("native-test CA", &ca, &ca_key)),
+        );
+        let wrong_addr = spawn_tls_once(wrong_leaf, wrong_key).await;
+        assert!(
+            handshake(&system, wrong_addr).await.is_err(),
+            "hostname mismatch must fail even with the native CA trusted"
+        );
+
+        // Matching hostname, untrusted CA.
+        let (other_ca, other_key) = make_cert("other CA", &CA, None);
+        let (untrusted, untrusted_key) = make_cert(
+            "localhost",
+            &CertOpts {
+                dns: &["localhost"],
+                ..CertOpts::DEFAULT
+            },
+            Some(("other CA", &other_ca, &other_key)),
+        );
+        let untrusted_addr = spawn_tls_once(untrusted, untrusted_key).await;
+        assert!(
+            handshake(&system, untrusted_addr).await.is_err(),
+            "a CA absent from the native snapshot must fail"
+        );
+    }
+
     /// `FingerprintVerifier` i>0 arm: pinning a CA cert accepts a leaf
     /// that chains to it and matches the check name; a name mismatch or
     /// unrelated issuer must fail.
@@ -1760,10 +2104,11 @@ mod tests {
     }
 
     /// Roots pulled from the Mozilla store after a CA compromise, by the
-    /// SHA-256 of their DER. meow never consults the OS store, so the
-    /// `webpki-root-certs` floor in the workspace `Cargo.toml` is the only
-    /// thing that drops them; this keeps a loosened floor from quietly
-    /// trusting one again.
+    /// SHA-256 of their DER. Outbound TLS never consults the OS store, so
+    /// the `webpki-root-certs` floor in the workspace `Cargo.toml` is the
+    /// only thing that drops them from that path; this keeps a loosened
+    /// floor from quietly trusting one again. Native roots (internal HTTPS
+    /// opt-in) cannot suppress the distrust callback.
     const DISTRUSTED_ROOTS: &[(&str, &str)] = &[
         // eMudhra intermediate key compromise (Mozilla bug 2083449): the
         // EM DV/OV/EV TLS CA - G3B/G3C keys are recoverable from the

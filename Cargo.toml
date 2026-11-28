@@ -136,11 +136,17 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 # `boring` crate's vendored copy via `boringssl-boring-crate`, so no rustls and
 # no second crypto lib. `qlog` off; congestion control + h3 are in defaults.
 quiche = { version = "0.30", default-features = false, features = ["boringssl-boring-crate"] }
-# The Mozilla roots every TLS verify path trusts. meow never reads the OS
-# store, so a root distrust only reaches users through this floor: 1.0.10
-# drops emSign ECC Root CA - G3 after the eMudhra intermediate key
-# compromise (Mozilla bug 2083449).
+# The Mozilla roots every TLS verify path trusts. Outbound proxy TLS never
+# reads the OS store, so a root distrust only reaches those connections
+# through this floor: 1.0.10 drops emSign ECC Root CA - G3 after the
+# eMudhra intermediate key compromise (Mozilla bug 2083449). Internal HTTPS
+# (`MEOW_HTTP_SYSTEM_CA=true`) may add a native-store snapshot on top;
+# BoringSSL still verifies, and the distrust callback still runs.
 webpki-root-certs = "1.0.10"
+# Loads OS trust anchors for the internal-HTTPS opt-in above. Certificate
+# bytes only — not a production rustls verifier. Optional under
+# meow-transport's `tls` feature (ADR-0001: transport stays a leaf).
+rustls-native-certs = "0.8"
 
 # DNS — only hickory-proto for wire-format encode/decode; the upstream
 # transport (UDP/TCP/DoT/DoH) is implemented in-tree in `meow-dns::client`
