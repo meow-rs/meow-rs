@@ -16,8 +16,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 
-use anytls_rs::client::Client as AnytlsClient;
-use anytls_rs::client::UDP_OVER_TCP_MAGIC_ADDR;
+use anytls_rs::client::{Client as AnytlsClient, PooledStream, UDP_OVER_TCP_MAGIC_ADDR};
 use anytls_rs::padding::PaddingFactory;
 use anytls_rs::session::{Session, Stream as AnytlsStream};
 use anytls_rs::{AsyncStream, SyncStream, TlsConnect, TlsConnectFuture};
@@ -223,6 +222,13 @@ impl AnytlsAdapter {
             .set_transport_dialer(Arc::new(ChainedTransportDialer(dialer)));
         self
     }
+
+    /// Live and idle session counts `(live, idle)`. Integration tests wait
+    /// for idle return after Drop before asserting sequential reuse.
+    pub fn pool_counts(&self) -> (usize, usize) {
+        let pool = self.client.session_pool();
+        (pool.live_len(), pool.idle_len())
+    }
 }
 
 #[async_trait]
@@ -246,12 +252,12 @@ impl ProxyAdapter for AnytlsAdapter {
     async fn dial_tcp(&self, metadata: &Metadata) -> Result<Box<dyn ProxyConn>> {
         let host = anytls_tcp_destination(metadata)?;
         let port = metadata.dst_port;
-        let (stream, session) = self
+        let pooled = self
             .client
             .create_proxy_stream((host, port))
             .await
             .map_err(|e| anytls_err("dial", e))?;
-        Ok(Box::new(AnytlsConn::new(stream, session)))
+        Ok(Box::new(AnytlsConn::from_pooled(pooled)))
     }
 
     /// Run TLS + the AnyTLS session handshake over an existing stream
@@ -316,7 +322,7 @@ impl ProxyAdapter for AnytlsAdapter {
             }
             None => None,
         };
-        let (stream, session) = self
+        let pooled = self
             .client
             .create_proxy_stream_with_payload(
                 (UDP_OVER_TCP_MAGIC_ADDR.to_string(), 0),
@@ -324,9 +330,8 @@ impl ProxyAdapter for AnytlsAdapter {
             )
             .await
             .map_err(|e| anytls_err("udp dial", e))?;
-        Ok(Box::new(AnytlsPacketConn::new(
-            stream,
-            session,
+        Ok(Box::new(AnytlsPacketConn::from_pooled(
+            pooled,
             write_target,
         )))
     }
@@ -372,12 +377,12 @@ fn anytls_tcp_destination(metadata: &Metadata) -> Result<String> {
         .ok_or_else(|| MeowError::Proxy("anytls dial: missing destination host and IP".to_string()))
 }
 
-/// Bridge `(Arc<Stream>, Arc<Session>)` into a `ProxyConn`-shaped value.
+/// Bridge a pooled (or unpooled) AnyTLS stream into a `ProxyConn`.
 ///
 /// The upstream `Stream` impls `AsyncRead`/`AsyncWrite` on `Pin<&mut Self>`,
-/// but `create_proxy_stream` only hands us an `Arc<Stream>` — we can never
-/// obtain `&mut Stream`. So we re-implement the traits against its public
-/// reader and cancellation-safe writer-channel APIs.
+/// but the client hands us an `Arc<Stream>` — we can never obtain `&mut Stream`.
+/// So we re-implement the traits against its public reader and
+/// cancellation-safe writer-channel APIs.
 // The pending read future is `Send` but not `Sync`; `ProxyConn` requires
 // `Sync`, so it is wrapped in `parking_lot::Mutex`. Its output is the
 // scratch Vec (returned for reuse) plus the read result.
@@ -388,6 +393,9 @@ struct AnytlsConn {
     // Keep the owning session alive even if the adapter is dropped while
     // this connection is still in use.
     session: Arc<Session>,
+    /// Pooled checkout guard. Taken on FIN so Drop does not close a
+    /// session that should return to idle.
+    pooled: Mutex<Option<PooledStream>>,
     /// `true` when the session was built for this conn alone (relay
     /// `connect_over`) and is not shared through the client's pool — it is
     /// closed when the conn drops rather than living until the transport
@@ -400,10 +408,23 @@ struct AnytlsConn {
 }
 
 impl AnytlsConn {
+    #[cfg(test)]
     fn new(stream: Arc<AnytlsStream>, session: Arc<Session>) -> Self {
         Self {
             stream,
             session,
+            pooled: Mutex::new(None),
+            session_owned: false,
+            pending_read: Mutex::new(None),
+            read_scratch: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn from_pooled(pooled: PooledStream) -> Self {
+        Self {
+            stream: Arc::clone(pooled.stream()),
+            session: Arc::clone(pooled.session()),
+            pooled: Mutex::new(Some(pooled)),
             session_owned: false,
             pending_read: Mutex::new(None),
             read_scratch: Arc::new(Mutex::new(Vec::new())),
@@ -416,6 +437,7 @@ impl AnytlsConn {
         Self {
             stream,
             session,
+            pooled: Mutex::new(None),
             session_owned: true,
             pending_read: Mutex::new(None),
             read_scratch: Arc::new(Mutex::new(Vec::new())),
@@ -425,9 +447,13 @@ impl AnytlsConn {
     /// Best-effort FIN for just this stream, idempotent across `poll_shutdown`
     /// and `Drop`. Emits a `Fin` control frame so the server releases the
     /// proxied target connection and evicts the per-stream map entry (issue
-    /// #201 item 4). The session is pooled and multiplexes other streams, so
-    /// this must never close the session itself.
+    /// #201 item 4). A pooled checkout is transferred to the FIN waiter so
+    /// a healthy session can return to idle instead of being closed.
     fn fin_stream(&self) {
+        if let Some(mut pooled) = self.pooled.lock().take() {
+            pooled.start_close();
+            return;
+        }
         // `Stream::close` uses the same FIFO as `send_data`, so all accepted
         // data is written before FIN. It is synchronous and idempotent.
         self.stream.close();
@@ -681,6 +707,7 @@ struct AnytlsPacketConn {
     stream: Arc<AnytlsStream>,
     // See `AnytlsConn::session`.
     _session: Arc<Session>,
+    pooled: Mutex<Option<PooledStream>>,
     /// Set once a frame read is torn by cancellation or error — the
     /// stream's framing is then unrecoverable, so every later packet op must fail
     /// fast rather than misdeliver (issue #514).
@@ -692,6 +719,7 @@ struct AnytlsPacketConn {
 }
 
 impl AnytlsPacketConn {
+    #[cfg(test)]
     fn new(
         stream: Arc<AnytlsStream>,
         session: Arc<Session>,
@@ -700,6 +728,17 @@ impl AnytlsPacketConn {
         Self {
             stream,
             _session: session,
+            pooled: Mutex::new(None),
+            poisoned: std::sync::atomic::AtomicBool::new(false),
+            write_target,
+        }
+    }
+
+    fn from_pooled(pooled: PooledStream, write_target: Option<(smol_str::SmolStr, u16)>) -> Self {
+        Self {
+            stream: Arc::clone(pooled.stream()),
+            _session: Arc::clone(pooled.session()),
+            pooled: Mutex::new(Some(pooled)),
             poisoned: std::sync::atomic::AtomicBool::new(false),
             write_target,
         }
@@ -709,6 +748,10 @@ impl AnytlsPacketConn {
     /// release the server's UDP socket and the session's stream-map entry
     /// without tearing down the pooled session.
     fn fin_stream(&self) {
+        if let Some(mut pooled) = self.pooled.lock().take() {
+            pooled.start_close();
+            return;
+        }
         self.stream.close();
     }
 }
@@ -1166,6 +1209,20 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owned_session_drop_closes_the_transport() {
+        let (session, mut peer) = test_session().await;
+        let (stream, _) = session.open_stream().await.unwrap();
+        assert_eq!(wire_frame(&mut peer).await.0, Command::Syn);
+        let conn = AnytlsConn::new_owned(stream, Arc::clone(&session));
+        drop(conn);
+        let mut drained = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut drained))
+            .await
+            .expect("session_owned Drop must close the transport")
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn udp_data_and_fin_use_the_stream_writer_fifo() {
         let (session, mut peer) = test_session().await;
         let (stream, _) = session.open_stream().await.unwrap();
@@ -1189,6 +1246,109 @@ mod tests {
         );
         assert_eq!(wire_frame(&mut peer).await, (Command::Fin, id, vec![]));
         session.close().await.unwrap();
+    }
+
+    struct PacketPoolDialer {
+        dials: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct PacketPlainTls;
+
+    impl TlsConnect for PacketPlainTls {
+        fn connect(&self, _tcp: TcpStream) -> TlsConnectFuture<'_> {
+            Box::pin(async {
+                Err(anytls_rs::AnyTlsError::Protocol(
+                    "PlainTls: TcpStream path must not be reached".into(),
+                ))
+            })
+        }
+
+        fn connect_stream(&self, stream: Box<dyn SyncStream>) -> TlsConnectFuture<'_> {
+            Box::pin(async move { Ok(Box::new(stream) as Box<dyn AsyncStream>) })
+        }
+    }
+
+    impl anytls_rs::TransportDialer for PacketPoolDialer {
+        fn dial<'a>(&'a self, host: &'a str, port: u16) -> anytls_rs::TransportDialFuture<'a> {
+            Box::pin(async move {
+                assert_eq!((host, port), ("anytls.test", 443));
+                self.dials.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let (client_half, peer_half) = tokio::io::duplex(64 * 1024);
+                let (mut peer_read, peer_write) = tokio::io::split(peer_half);
+                tokio::spawn(async move {
+                    let _peer_write = peer_write;
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut peer_read, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) => {}
+                        }
+                    }
+                });
+                Ok(Box::new(client_half) as Box<dyn SyncStream>)
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn packet_from_pooled_drop_returns_session_without_redial() {
+        let dials = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut client = AnytlsClient::new(
+            "password",
+            "anytls.test:443".to_string(),
+            Arc::new(PacketPlainTls),
+            PaddingFactory::default(),
+        );
+        client.set_transport_dialer(Arc::new(PacketPoolDialer {
+            dials: Arc::clone(&dials),
+        }));
+        let metadata = metadata_for("192.0.2.2", Some("192.0.2.2".parse().unwrap()), 53);
+        let pooled = client
+            .create_proxy_stream_with_payload(
+                (UDP_OVER_TCP_MAGIC_ADDR.to_string(), 0),
+                Some(Bytes::from(encode_uot_request(&metadata))),
+            )
+            .await
+            .unwrap();
+        let conn = AnytlsPacketConn::from_pooled(pooled, None);
+        drop(conn);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client.session_pool().live_len() == 1 && client.session_pool().idle_len() == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("packet Drop must return the session to idle");
+        assert_eq!(dials.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let pooled = client
+            .create_proxy_stream_with_payload(
+                (UDP_OVER_TCP_MAGIC_ADDR.to_string(), 0),
+                Some(Bytes::from(encode_uot_request(&metadata))),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dials.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "second UoT open must reuse the idle session"
+        );
+        assert_eq!(client.session_pool().live_len(), 1);
+        assert_eq!(client.session_pool().idle_len(), 0);
+        drop(AnytlsPacketConn::from_pooled(pooled, None));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client.session_pool().live_len() == 1 && client.session_pool().idle_len() == 1 {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second packet Drop must return the same session");
     }
 
     /// Push one data frame into the session from the peer end.

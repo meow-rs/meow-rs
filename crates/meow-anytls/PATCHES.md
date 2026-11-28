@@ -29,16 +29,30 @@ D3 — Server-side UDP proxy is documented dead code (issue #625)
   in-source notes explain why it stays (cheap verbatim surface for
   future parity work); do not delete it on refresh.
 
-D4 — Session pool lifecycle hardening (issues #201, #535, #695)
-  - `session_pool.rs`: pooled sessions carry a generation stamp;
-    `reset_sessions()` bumps it so in-flight dials from an older
-    generation are never pooled (the #201 FD-leak root cause; #695's
-    network-change reset).
+D4 — Session pool lifecycle hardening (issues #201, #535, #695, #1015)
+  - `session_pool.rs`: exclusive checkout-and-return with a `live`
+    index (Idle | CheckedOut(checkout_id)) and an `idle` index of
+    Idle entries only. `checkout()` removes the newest idle session;
+    newly dialled sessions register as CheckedOut, not idle.
+    Return requires a matching (generation, session_id, checkout_id)
+    and a healthy session. Dropping an armed `Checkout` discards
+    (closes) that session. `reset()` bumps generation, drains idle,
+    takes every live session (including in-use) and closes them
+    outside the lock; old-generation dials close and are not
+    delivered (#201 FD-leak; #695 network-change reset; #1015
+    exclusive checkout). Idle cleanup spawns each close independently
+    so aborting the sweep cannot strand already-evicted sessions.
+    `spawn_close` uses the Handle captured on the session at
+    construction, so off-runtime Drop still closes. Checkout
+    waiters (`finish_return` / `finish_discard`) publish completion
+    only after the pool transition.
   - `client.rs` stream open: a new stream no longer waits for the
     server SYNACK before returning (issue #535) — it is handed out
     right after the destination address like anytls-go/sing-anytls;
     an error SYNACK still kills the stream and the 3 s session
-    watchdog still applies.
+    watchdog still applies. Pooled opens return `PooledStream` so
+    a checkout guard outlives the session's strong `Arc<Stream>`
+    map entry.
   Files: src/client/session_pool.rs, src/client/client.rs
 
 D5 — Pluggable dialers (meow-rs `dialer-proxy`)
