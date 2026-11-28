@@ -82,13 +82,13 @@ The workspace has 17 crates (see also [ADR-0009](docs/adr/0009-cleanup-scope.md)
 | `meow-listener` | Inbound protocol handlers (Mixed/HTTP/SOCKS5/TProxy, plus TUN behind `listener-tun`, WireGuard behind `listener-wireguard`, AnyTLS behind `listener-anytls`, and the VLESS Vision/REALITY server behind `listener-vless`) |
 | `meow-config` | YAML configuration parsing into typed structs |
 | `meow-api` | REST API server (Axum) for proxies, rules, connections, configs, traffic, DNS query |
-| `meow-app` | CLI entry point (`main.rs`) — wires config → tunnel → listeners → DNS → API → health checks → subscription refresh |
+| `meow-app` | CLI implementation (`cli.rs`) — wires config → tunnel → listeners → DNS → API → health checks → subscription refresh |
 | `meow-cli` | `meow-cli` binary: controls a running meow over its REST API (plain HTTP client; of the engine crates it links only `meow-common`, for `controller_file`, the 0600 file meow writes once its `external-controller` is bound and meow-cli reads to find it with no options); ships its agent skill at `skills/meow-cli/SKILL.md`, which the desktop release archives carry as `skills/meow-cli/` (`desktop: true` in `build.yml`). Unpublished: the crates.io name belongs to an unrelated crate |
 | `meow-bench` | Standalone benchmark binary (throughput, latency, connection-rate, DNS, memory, binary-size, config-reload, idle/steady footprint, proxied-outbound via sing-box) |
 
 ### Startup Flow
 
-`meow-app/src/main.rs` → parse CLI args → `meow_config::load_config()` → create `Tunnel` → spawn health checks for fallback/url-test groups → spawn DNS server, API server, and every configured listener (Mixed/SOCKS/HTTP/TProxy/TUN plus feature-gated server inbounds) as tokio tasks → await SIGINT/SIGTERM.
+`meow_app::run_cli()` → parse CLI args → `meow_config::load_config()` → create `Tunnel` → spawn health checks for fallback/url-test groups → spawn DNS server, API server, and every configured listener (Mixed/SOCKS/HTTP/TProxy/TUN plus feature-gated server inbounds) as tokio tasks → await SIGINT/SIGTERM.
 
 ### Transparent-proxy gateway
 

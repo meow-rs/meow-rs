@@ -134,6 +134,7 @@ impl NtpSupervisor {
 
     fn spawn(&self, cfg: meow_config::NtpConfig, gen: u64) -> JoinHandle<()> {
         info!(
+            target: "meow::ntp",
             server = %cfg.server,
             port = cfg.port,
             interval = cfg.interval_minutes,
@@ -220,6 +221,7 @@ async fn run_worker(
                 Ok(Err(e)) => {
                     if attempt == MAX_ATTEMPTS {
                         warn!(
+                            target: "meow::ntp",
                             error = %e,
                             "ntp: poll failed after {MAX_ATTEMPTS} attempts; keeping last offset"
                         );
@@ -227,7 +229,7 @@ async fn run_worker(
                 }
                 Err(_) => {
                     if attempt == MAX_ATTEMPTS {
-                        warn!("ntp: poll timed out after {MAX_ATTEMPTS} attempts; keeping last offset");
+                        warn!(target: "meow::ntp", "ntp: poll timed out after {MAX_ATTEMPTS} attempts; keeping last offset");
                     }
                 }
             }
