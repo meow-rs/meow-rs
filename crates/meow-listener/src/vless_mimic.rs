@@ -434,12 +434,8 @@ impl TargetIo for TcpStream {
                 buf.len(),
             )
         };
-        // One retry bounds EINTR rather than looping inside the synchronous
-        // prepare window: a second interruption is returned to the caller,
-        // which already treats it as target I/O failure instead of spinning.
-        // One retry bounds total kernel attempts at two: EINTR means the
-        // first recv returned no bytes, but a signal storm must not turn
-        // this synchronous precommit poll into an unbounded retry loop.
+        // EINTR returned no bytes, so retry once; a second interruption is
+        // target I/O failure rather than a signal-storm retry loop.
         match socket.recv(uninit) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => socket.recv(uninit),
             result => result,
