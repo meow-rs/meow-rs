@@ -1442,9 +1442,7 @@ async fn anytls_connect_over_runs_tls_auth_and_stream() {
 async fn wait_pool(adapter: &AnytlsAdapter, live: usize, idle: usize) {
     timeout(T, async {
         loop {
-            if adapter.session_pool().live_len() == live
-                && adapter.session_pool().idle_len() == idle
-            {
+            if adapter.pool_counts() == (live, idle) {
                 return;
             }
             tokio::task::yield_now().await;
@@ -1452,11 +1450,8 @@ async fn wait_pool(adapter: &AnytlsAdapter, live: usize, idle: usize) {
     })
     .await
     .unwrap_or_else(|_| {
-        panic!(
-            "pool did not reach live={live} idle={idle} (live={} idle={})",
-            adapter.session_pool().live_len(),
-            adapter.session_pool().idle_len()
-        )
+        let (got_live, got_idle) = adapter.pool_counts();
+        panic!("pool did not reach live={live} idle={idle} (live={got_live} idle={got_idle})")
     });
 }
 

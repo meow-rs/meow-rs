@@ -223,10 +223,11 @@ impl AnytlsAdapter {
         self
     }
 
-    /// Session pool used by this adapter. Integration tests wait for idle
-    /// return after Drop before asserting sequential reuse.
-    pub fn session_pool(&self) -> &anytls_rs::client::SessionPool {
-        self.client.session_pool()
+    /// Live and idle session counts `(live, idle)`. Integration tests wait
+    /// for idle return after Drop before asserting sequential reuse.
+    pub fn pool_counts(&self) -> (usize, usize) {
+        let pool = self.client.session_pool();
+        (pool.live_len(), pool.idle_len())
     }
 }
 
