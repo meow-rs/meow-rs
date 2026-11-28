@@ -157,7 +157,9 @@ async fn adapter_echo(adapter: &VlessAdapter, target: SocketAddr, payload: &[u8]
     .expect("client echo timeout");
 }
 
-fn mimic_flight(session_id: &[u8; 32]) -> Vec<u8> {
+const MIRRORED_ENCRYPTED_RECORD_LENS: [u16; 4] = [25, 3217, 281, 69];
+
+fn mimic_flight(session_id: &[u8]) -> Vec<u8> {
     fn ext(kind: u16, body: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&kind.to_be_bytes());
@@ -170,7 +172,7 @@ fn mimic_flight(session_id: &[u8; 32]) -> Vec<u8> {
     let mut sh_body = Vec::new();
     sh_body.extend_from_slice(&[0x03, 0x03]);
     sh_body.extend_from_slice(&[0x66; 32]);
-    sh_body.push(32);
+    sh_body.push(u8::try_from(session_id.len()).expect("TLS session id length"));
     sh_body.extend_from_slice(session_id);
     sh_body.extend_from_slice(&0x1301u16.to_be_bytes());
     sh_body.push(0);
@@ -194,7 +196,7 @@ fn mimic_flight(session_id: &[u8; 32]) -> Vec<u8> {
     flight.extend_from_slice(&(sh.len() as u16).to_be_bytes());
     flight.extend_from_slice(&sh);
     flight.extend_from_slice(&[0x14, 0x03, 0x03, 0x00, 0x01, 0x01]);
-    for len in [25u16, 3217, 281, 69] {
+    for len in MIRRORED_ENCRYPTED_RECORD_LENS {
         flight.extend_from_slice(&[0x17, 0x03, 0x03]);
         flight.extend_from_slice(&len.to_be_bytes());
         flight.resize(flight.len() + usize::from(len), 0x5a);
@@ -205,8 +207,47 @@ fn mimic_flight(session_id: &[u8; 32]) -> Vec<u8> {
 #[derive(Default)]
 struct MimicTargetState {
     tcp_accepts: usize,
+    target_closes: usize,
     preflight_parses: usize,
     uploaded_ch_records: Vec<Vec<u8>>,
+    server_flights: Vec<Vec<u8>>,
+}
+
+async fn serve_mimic_target_connection(mut stream: TcpStream, state: Arc<Mutex<MimicTargetState>>) {
+    let mut head = [0u8; 5];
+    if stream.read_exact(&mut head).await.is_err() {
+        return;
+    }
+    let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+    let mut body = vec![0u8; len];
+    if stream.read_exact(&mut body).await.is_err() {
+        return;
+    }
+    let mut first = head.to_vec();
+    first.extend_from_slice(&body);
+    if first.len() >= 5 + 39 && first[0] == 0x16 && first[5] == 0x01 {
+        let session_id_len = usize::from(first[5 + 38]);
+        if session_id_len <= 32 && first.len() >= 5 + 39 + session_id_len {
+            let session_id = first[5 + 39..5 + 39 + session_id_len].to_vec();
+            let flight = {
+                let mut locked = state.lock().unwrap();
+                locked.preflight_parses += 1;
+                locked.uploaded_ch_records.push(first.clone());
+                mimic_flight(&session_id)
+            };
+            if stream.write_all(&flight).await.is_ok() {
+                state.lock().unwrap().server_flights.push(flight);
+                let _ = stream.flush().await;
+            }
+        }
+    }
+    let mut sink = [0u8; 1024];
+    loop {
+        match stream.read(&mut sink).await {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
+        }
+    }
 }
 
 async fn start_counting_mimic_target(
@@ -219,42 +260,14 @@ async fn start_counting_mimic_target(
         let early_dials = Arc::clone(&early_dials);
         let state = Arc::clone(&state);
         async move {
-            while let Ok((mut stream, _)) = listener.accept().await {
+            while let Ok((stream, _)) = listener.accept().await {
                 early_dials.fetch_add(1, Ordering::SeqCst);
                 state.lock().unwrap().tcp_accepts += 1;
                 tokio::spawn({
                     let state = Arc::clone(&state);
                     async move {
-                        let mut head = [0u8; 5];
-                        if stream.read_exact(&mut head).await.is_err() {
-                            return;
-                        }
-                        let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
-                        let mut body = vec![0u8; len];
-                        if stream.read_exact(&mut body).await.is_err() {
-                            return;
-                        }
-                        let mut first = head.to_vec();
-                        first.extend_from_slice(&body);
-                        if first.len() >= 71 && first[0] == 0x16 && first[5] == 0x01 {
-                            let flight = {
-                                let mut locked = state.lock().unwrap();
-                                locked.preflight_parses += 1;
-                                locked.uploaded_ch_records.push(first.clone());
-                                let session_id: [u8; 32] =
-                                    first[5 + 39..5 + 71].try_into().unwrap();
-                                mimic_flight(&session_id)
-                            };
-                            let _ = stream.write_all(&flight).await;
-                            let _ = stream.flush().await;
-                        }
-                        let mut sink = [0u8; 1024];
-                        loop {
-                            match stream.read(&mut sink).await {
-                                Ok(0) | Err(_) => break,
-                                Ok(_) => {}
-                            }
-                        }
+                        serve_mimic_target_connection(stream, Arc::clone(&state)).await;
+                        state.lock().unwrap().target_closes += 1;
                     }
                 });
             }
@@ -263,10 +276,22 @@ async fn start_counting_mimic_target(
     (addr, early_dials, state)
 }
 
-async fn start_wire_tap(server: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8>>>>) {
+#[derive(Default)]
+struct WireTapStream {
+    client_to_server: Vec<u8>,
+    server_to_client: Vec<u8>,
+}
+
+fn append_tap_bytes(captured: &mut Vec<u8>, bytes: &[u8]) {
+    const CAP: usize = 64 * 1024;
+    let take = CAP.saturating_sub(captured.len()).min(bytes.len());
+    captured.extend_from_slice(&bytes[..take]);
+}
+
+async fn start_wire_tap(server: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<WireTapStream>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let streams = Arc::new(Mutex::new(Vec::<Vec<u8>>::new()));
+    let streams = Arc::new(Mutex::new(Vec::<WireTapStream>::new()));
     tokio::spawn({
         let streams = Arc::clone(&streams);
         async move {
@@ -278,13 +303,33 @@ async fn start_wire_tap(server: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8
                     };
                     let index = {
                         let mut locked = streams.lock().unwrap();
-                        locked.push(Vec::new());
+                        locked.push(WireTapStream::default());
                         locked.len() - 1
                     };
                     let (mut crd, mut cwr) = tokio::io::split(client);
                     let (mut srd, mut swr) = tokio::io::split(server_stream);
-                    let downstream = tokio::spawn(async move {
-                        let _ = tokio::io::copy(&mut srd, &mut cwr).await;
+                    let downstream = tokio::spawn({
+                        let streams = Arc::clone(&streams);
+                        async move {
+                            let mut buf = [0u8; 4096];
+                            loop {
+                                match srd.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        {
+                                            let mut locked = streams.lock().unwrap();
+                                            append_tap_bytes(
+                                                &mut locked[index].server_to_client,
+                                                &buf[..n],
+                                            );
+                                        }
+                                        if cwr.write_all(&buf[..n]).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     });
                     let mut buf = [0u8; 4096];
                     loop {
@@ -293,9 +338,10 @@ async fn start_wire_tap(server: SocketAddr) -> (SocketAddr, Arc<Mutex<Vec<Vec<u8
                             Ok(n) => {
                                 {
                                     let mut locked = streams.lock().unwrap();
-                                    if locked[index].len() < 64 * 1024 {
-                                        locked[index].extend_from_slice(&buf[..n]);
-                                    }
+                                    append_tap_bytes(
+                                        &mut locked[index].client_to_server,
+                                        &buf[..n],
+                                    );
                                 }
                                 if swr.write_all(&buf[..n]).await.is_err() {
                                     break;
@@ -321,6 +367,200 @@ fn first_tls_record(bytes: &[u8]) -> Vec<u8> {
     bytes[..5 + len].to_vec()
 }
 
+fn handshake_len(record: &[u8]) -> usize {
+    (usize::from(record[6]) << 16) | (usize::from(record[7]) << 8) | usize::from(record[8])
+}
+
+fn first_client_hello_record(bytes: &[u8]) -> Vec<u8> {
+    let record = first_tls_record(bytes);
+    assert!(
+        record.len() >= 9,
+        "ClientHello record lacks a handshake header"
+    );
+    assert_eq!(record[0], 0x16, "client prefix is not a handshake record");
+    assert_eq!(
+        record[5], 0x01,
+        "client prefix does not begin with ClientHello"
+    );
+    assert_eq!(
+        record.len(),
+        5 + 4 + handshake_len(&record),
+        "the uploaded client prefix must be exactly one record carrying one complete logical ClientHello"
+    );
+    record
+}
+
+fn hello_session_id(hello_record: &[u8]) -> &[u8] {
+    assert!(
+        hello_record.len() >= 44,
+        "hello record ends inside the session id"
+    );
+    let sid_len = usize::from(hello_record[43]);
+    assert!(sid_len <= 32, "TLS session id length exceeds 32");
+    assert!(
+        hello_record.len() >= 44 + sid_len,
+        "hello record ends inside the session id bytes"
+    );
+    &hello_record[44..44 + sid_len]
+}
+
+fn target_flight_envelope(target_flight: &[u8]) -> (Vec<u8>, Vec<[u8; 5]>) {
+    assert!(
+        target_flight.windows(32).any(|window| window == [0x66; 32]),
+        "fixture target flight does not contain its unpatched random positive control"
+    );
+    let fixture_share = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([9u8; 32]));
+    assert!(
+        target_flight
+            .windows(32)
+            .any(|window| window == fixture_share.as_bytes()),
+        "fixture target flight does not contain its unpatched key-share positive control"
+    );
+
+    let sh = first_tls_record(target_flight);
+    let mut pos = sh.len();
+    assert!(
+        target_flight.len() >= pos + 6,
+        "target flight ends before its CCS"
+    );
+    let ccs = target_flight[pos..pos + 6].to_vec();
+    assert_eq!(
+        ccs,
+        [0x14, 0x03, 0x03, 0x00, 0x01, 0x01],
+        "fixture target CCS shape"
+    );
+    pos += 6;
+    let mut heads = Vec::new();
+    while pos < target_flight.len() {
+        assert!(
+            target_flight.len() >= pos + 5,
+            "target flight ends inside a record header"
+        );
+        let head: [u8; 5] = target_flight[pos..pos + 5].try_into().unwrap();
+        let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+        pos += 5;
+        assert!(
+            target_flight.len() >= pos + len,
+            "target flight ends inside a record body"
+        );
+        pos += len;
+        heads.push(head);
+    }
+    assert!(
+        !heads.is_empty(),
+        "target flight carries no encrypted records"
+    );
+    (ccs, heads)
+}
+
+fn assert_mirrored_downstream_flight(download: &[u8], client_hello: &[u8], target_flight: &[u8]) {
+    let (target_ccs, target_record_heads) = target_flight_envelope(target_flight);
+    let sh = first_tls_record(download);
+    assert!(sh.len() >= 9, "ServerHello record lacks a handshake header");
+    assert_eq!(sh[0], 0x16, "downstream prefix is not a handshake record");
+    assert_eq!(
+        sh[5], 0x02,
+        "downstream prefix does not begin with ServerHello"
+    );
+    assert_eq!(
+        sh.len(),
+        5 + 4 + handshake_len(&sh),
+        "the downstream ServerHello record must carry one complete logical ServerHello"
+    );
+    assert_eq!(&sh[9..11], &[0x03, 0x03], "ServerHello legacy version");
+    assert_ne!(
+        &sh[11..43],
+        &[0x66; 32],
+        "the fixture target ServerHello random reached the client unpatched"
+    );
+
+    let mut pos = 43;
+    let sid_len = usize::from(sh[pos]);
+    pos += 1 + sid_len;
+    assert_eq!(
+        &sh[44..44 + sid_len],
+        hello_session_id(client_hello),
+        "mirrored ServerHello must echo the client session id"
+    );
+    assert_eq!(
+        &sh[pos..pos + 2],
+        &0x1301u16.to_be_bytes(),
+        "fixture cipher"
+    );
+    pos += 2;
+    assert_eq!(sh[pos], 0, "fixture compression");
+    pos += 1;
+    let extensions_len = usize::from(u16::from_be_bytes([sh[pos], sh[pos + 1]]));
+    pos += 2;
+    let extensions_end = pos + extensions_len;
+    assert_eq!(extensions_end, sh.len(), "ServerHello extension length");
+    let mut saw_supported_versions = false;
+    let mut server_share = None;
+    while pos < extensions_end {
+        let kind = u16::from_be_bytes([sh[pos], sh[pos + 1]]);
+        let len = usize::from(u16::from_be_bytes([sh[pos + 2], sh[pos + 3]]));
+        pos += 4;
+        let end = pos + len;
+        assert!(end <= extensions_end, "ServerHello extension overruns");
+        match kind {
+            0x002b => {
+                assert_eq!(&sh[pos..end], &[0x03, 0x04], "TLS 1.3 selected version");
+                saw_supported_versions = true;
+            }
+            0x0033 => {
+                assert_eq!(&sh[pos..pos + 2], &0x001du16.to_be_bytes(), "fixture group");
+                let share_len = usize::from(u16::from_be_bytes([sh[pos + 2], sh[pos + 3]]));
+                assert_eq!(share_len, 32, "fixture x25519 share length");
+                assert_eq!(pos + 4 + share_len, end, "key_share extension shape");
+                server_share = Some(sh[pos + 4..end].to_vec());
+            }
+            other => panic!("unexpected fixture ServerHello extension 0x{other:04x}"),
+        }
+        pos = end;
+    }
+    assert!(saw_supported_versions, "missing supported_versions");
+    let server_share = server_share.expect("missing key_share");
+    let fixture_share = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from([9u8; 32]));
+    assert_ne!(
+        server_share.as_slice(),
+        fixture_share.as_bytes(),
+        "the fixture target key share reached the client unpatched"
+    );
+
+    let mut pos = sh.len();
+    assert!(
+        download.len() >= pos + 6,
+        "downstream capture ended before the mirrored CCS"
+    );
+    assert_eq!(
+        &download[pos..pos + 6],
+        target_ccs.as_slice(),
+        "mirrored CCS must match the same probe's target flight byte-for-byte"
+    );
+    pos += 6;
+    for target_head in target_record_heads {
+        assert!(
+            download.len() >= pos + 5,
+            "downstream capture ended inside the mirrored flight header"
+        );
+        assert_eq!(
+            &download[pos..pos + 5],
+            target_head,
+            "mirrored encrypted record header must match the same probe's target flight"
+        );
+        let len = usize::from(u16::from_be_bytes([target_head[3], target_head[4]]));
+        assert!(
+            download.len() >= pos + 5 + len,
+            "downstream capture ended inside a mirrored encrypted record"
+        );
+        pos += 5 + len;
+    }
+    assert!(
+        download.len() > pos,
+        "wire tap stopped at the handshake flight and cannot account for the authenticated echo"
+    );
+}
+
 async fn wait_count(counter: &AtomicUsize, expected: usize, what: &str) {
     timeout(Duration::from_secs(3), async {
         while counter.load(Ordering::SeqCst) < expected {
@@ -329,6 +569,16 @@ async fn wait_count(counter: &AtomicUsize, expected: usize, what: &str) {
     })
     .await
     .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+async fn wait_target_closes(state: &Arc<Mutex<MimicTargetState>>, expected: usize) {
+    timeout(Duration::from_secs(3), async {
+        while state.lock().unwrap().target_closes < expected {
+            sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {expected} target connection closes"));
 }
 
 async fn run_dial_first_case(mimic_block: &str) {
@@ -355,7 +605,7 @@ async fn run_dial_first_case(mimic_block: &str) {
     let bare = TcpStream::connect(tap).await.expect("bare tap connect");
     wait_count(&early_dials, 1, "bare-connection early dial").await;
     drop(bare);
-    sleep(Duration::from_millis(50)).await;
+    wait_target_closes(&target_state, 1).await;
     assert_eq!(
         target_state.lock().unwrap().preflight_parses,
         0,
@@ -366,29 +616,45 @@ async fn run_dial_first_case(mimic_block: &str) {
     adapter_echo(&adapter, echo, b"t6 dial-first vision echo").await;
 
     wait_count(&early_dials, 2, "authenticated-connection early dial").await;
-    let (uploads, accepts, parses) = {
+    wait_target_closes(&target_state, 2).await;
+    let (uploads, target_flights, accepts, parses, closes) = {
         let locked = target_state.lock().unwrap();
         (
             locked.uploaded_ch_records.clone(),
+            locked.server_flights.clone(),
             locked.tcp_accepts,
             locked.preflight_parses,
+            locked.target_closes,
         )
     };
+    assert_eq!(
+        closes, 2,
+        "both target connections reached their close barrier"
+    );
     assert_eq!(accepts, 2, "exactly the bare and authenticated dials");
     assert_eq!(parses, 1, "exactly one ClientHello preflight parse");
     assert_eq!(uploads.len(), 1, "the original prefix must upload once");
-    let client_first = {
+    assert_eq!(
+        target_flights.len(),
+        1,
+        "the mimic target must emit exactly one server flight"
+    );
+    let (client_first, downstream) = {
         let locked = client_streams.lock().unwrap();
         let ch_stream = locked
             .iter()
-            .find(|bytes| bytes.len() >= 5 && bytes[0] == 0x16)
+            .find(|stream| stream.client_to_server.len() >= 5 && stream.client_to_server[0] == 0x16)
             .expect("client wire tap captured no ClientHello");
-        first_tls_record(ch_stream)
+        (
+            first_client_hello_record(&ch_stream.client_to_server),
+            ch_stream.server_to_client.clone(),
+        )
     };
     assert_eq!(
         uploads[0], client_first,
         "mirror target did not receive the client's original prefix byte-for-byte"
     );
+    assert_mirrored_downstream_flight(&downstream, &client_first, &target_flights[0]);
     let _ = child.kill().await;
 }
 
@@ -532,7 +798,7 @@ async fn t6b_mode_off_keeps_v1_auth_independent_and_cover_dialing_ordinary() {
         .await
         .expect("cover probe connect");
     probe
-        .write_all(b"\x16\x03\x01\x00\x02\x01\x00not-a-real-client-hello")
+        .write_all(b"\x16\x03\x01\x00\x04\x01\x00\x00\x00not-a-real-client-hello")
         .await
         .expect("cover probe write");
     wait_count(&accepts, 1, "ordinary cover dial").await;
@@ -543,12 +809,18 @@ async fn t6b_mode_off_keeps_v1_auth_independent_and_cover_dialing_ordinary() {
     })
     .await
     .expect("ordinary cover bytes");
+    wait_count(&preflight_parses, 1, "ordinary-cover ClientHello parse").await;
+    assert_eq!(
+        preflight_parses.load(Ordering::SeqCst),
+        1,
+        "ordinary cover is the positive control for exactly one target-side preflight parse"
+    );
     drop(probe);
     let _ = child2.kill().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn reality_mimic_config_test_never_dials_cover_target() {
+async fn reality_mimic_config_test_produces_no_cover_target_tcp_accept() {
     let (target, accepts, _bytes, _preflight_parses) = start_counting_sink().await;
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.yaml");
@@ -587,10 +859,13 @@ async fn reality_mimic_config_test_never_dials_cover_target() {
         String::from_utf8_lossy(&output.stderr)
     );
     sleep(Duration::from_millis(100)).await;
+    // The sink can witness only the absence of a TCP accept. It cannot
+    // distinguish every resolver or health-check implementation detail that
+    // stops before a connect reaches this dest.
     assert_eq!(
         accepts.load(Ordering::SeqCst),
         0,
-        "-t must not health-check or dial the cover target"
+        "-t produced no cover-target TCP accept"
     );
 
     let bad = dir.path().join("bad.yaml");
