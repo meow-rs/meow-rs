@@ -415,8 +415,11 @@ not enable `listener-anytls` or the outbound REALITY feature separately.
   is fixed at `decryption: none`; security belongs to the outer TLS/REALITY
   transport.
 - **Startup validation is not a cover health check.** `-t` and startup do not
-  resolve or dial `dest`; a dead cover does not block authenticated REALITY
-  service.
+  resolve or dial `dest`, so a dead cover never blocks startup itself. With the
+  default `dial-first` mimic mode, however, an individual authenticated
+  connection's availability does depend on reaching `dest` and obtaining a
+  compatible template; explicit `mode: off` restores the v1 behavior in which
+  authenticated service is independent of cover reachability.
 - **`-t` shares startup's security construction, files included.** Beyond
   the typed shape, feature gate, users and bind syntax, `-t` runs the same
   security-material validation startup runs. Standard TLS loads the
