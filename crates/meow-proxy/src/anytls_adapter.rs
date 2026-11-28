@@ -222,6 +222,12 @@ impl AnytlsAdapter {
             .set_transport_dialer(Arc::new(ChainedTransportDialer(dialer)));
         self
     }
+
+    /// Session pool used by this adapter. Integration tests wait for idle
+    /// return after Drop before asserting sequential reuse.
+    pub fn session_pool(&self) -> &anytls_rs::client::SessionPool {
+        self.client.session_pool()
+    }
 }
 
 #[async_trait]

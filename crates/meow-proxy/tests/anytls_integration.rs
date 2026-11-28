@@ -1439,6 +1439,27 @@ async fn anytls_connect_over_runs_tls_auth_and_stream() {
     assert_eq!(&buf[..], payload, "echo payload must match what we wrote");
 }
 
+async fn wait_pool(adapter: &AnytlsAdapter, live: usize, idle: usize) {
+    timeout(T, async {
+        loop {
+            if adapter.session_pool().live_len() == live
+                && adapter.session_pool().idle_len() == idle
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "pool did not reach live={live} idle={idle} (live={} idle={})",
+            adapter.session_pool().live_len(),
+            adapter.session_pool().idle_len()
+        )
+    });
+}
+
 // ── `dialer-proxy` injection (PR #972, Batch-2 parity) ──────────────────
 
 /// A `dialer-proxy` front stand-in: reports `is_proxy()` and counts every
@@ -1523,6 +1544,7 @@ async fn anytls_injected_dialer_chains_tcp_and_pools_sessions() {
         .expect("chained echo must succeed");
     assert_eq!(&buf[..], payload);
     drop(conn);
+    wait_pool(&adapter, 1, 1).await;
 
     // Second dial reuses the pooled session — the front is not re-dialed.
     let conn2 = timeout(T, adapter.dial_tcp(&metadata))
@@ -1535,6 +1557,7 @@ async fn anytls_injected_dialer_chains_tcp_and_pools_sessions() {
         "a pooled session must not re-dial the front"
     );
     drop(conn2);
+    wait_pool(&adapter, 1, 1).await;
 
     // `connect_over` is the unpooled relay path: it bypasses the injected
     // dialer entirely, so the count stays put and its session can never
