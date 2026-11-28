@@ -1165,6 +1165,144 @@ mod tests {
         );
     }
 
+    struct PendingHostResolver {
+        started: AtomicUsize,
+        started_notify: tokio::sync::Notify,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::HostResolver for PendingHostResolver {
+        async fn resolve(&self, host: &str) -> std::io::Result<IpAddr> {
+            self.resolve_all(host).await.map(|ips| ips[0])
+        }
+
+        async fn resolve_all(&self, _host: &str) -> std::io::Result<Vec<IpAddr>> {
+            self.started.fetch_add(1, Ordering::Relaxed);
+            self.started_notify.notify_one();
+            let mut release = self.release.clone();
+            while !*release.borrow() {
+                release.changed().await.map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Interrupted, "resolver release closed")
+                })?;
+            }
+            Ok(vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)])
+        }
+    }
+
+    /// T3 residue: cancellation while the target hostname is still inside a
+    /// controllable pending resolver must drop the whole dial future.  When
+    /// the resolver later completes there is no continuation that can start
+    /// TCP connect, so no target socket appears and the H permit is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reality_dial_first_resolver_cancellation_never_connects_after_completion() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let target_accepts = Arc::new(AtomicUsize::new(0));
+        tokio::spawn({
+            let target_accepts = Arc::clone(&target_accepts);
+            async move {
+                while let Ok((_stream, _)) = target.accept().await {
+                    target_accepts.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+
+        let spec = VlessListenerSpec {
+            users: vec![VlessUserSpec {
+                username: "alice".into(),
+                uuid: [0x11; 16],
+            }],
+            security: VlessSecuritySpec::Reality(VlessRealitySpec {
+                dest_host: "pending-resolver.invalid".into(),
+                dest_port: target_port,
+                private_key: [0x42; 32],
+                short_ids: vec![[0; 8]],
+                server_names: vec!["localhost".into()],
+                max_time_difference_us: 0,
+                limit_fallback_upload: VlessFallbackLimit::default(),
+                limit_fallback_download: VlessFallbackLimit::default(),
+                mimic: VlessRealityMimicSpec::default(),
+            }),
+            udp: true,
+        };
+        let listener =
+            Arc::new(VlessListener::new(test_tunnel(), "resolver-cancel".into(), spec).unwrap());
+        let SecurityRuntime::Reality(reality) = &listener.security else {
+            panic!("test listener must be REALITY");
+        };
+        let permit = Arc::clone(&reality.handshake_slots)
+            .try_acquire_owned()
+            .unwrap();
+
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let resolver = Arc::new(PendingHostResolver {
+            started: AtomicUsize::new(0),
+            started_notify: tokio::sync::Notify::new(),
+            release: release_rx,
+        });
+        meow_common::set_host_resolver(Arc::clone(&resolver));
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe_addr = probe.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(probe_addr).await.unwrap();
+        let (server, peer) = probe.accept().await.unwrap();
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            task_listener
+                .handle_conn(
+                    server,
+                    peer,
+                    443,
+                    Some(permit),
+                    tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT,
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), resolver.started_notify.notified())
+            .await
+            .expect("dial-first resolver did not start");
+        assert_eq!(resolver.started.load(Ordering::Relaxed), 1);
+
+        task.abort();
+        let _ = task.await;
+        release_tx.send(true).expect("release pending resolver");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        meow_common::clear_host_resolver();
+        drop(client);
+
+        let mut snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        for _ in 0..50 {
+            if snapshot.close_total.values().sum::<usize>() != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        }
+        assert_eq!(
+            snapshot.tcp_connect_started_total, 0,
+            "late resolver completion restarted TCP connect"
+        );
+        assert_eq!(
+            target_accepts.load(Ordering::Relaxed),
+            0,
+            "late resolver completion produced a target socket"
+        );
+        assert_eq!(
+            snapshot.active_handshakes, 0,
+            "cancelled resolver dial retained H"
+        );
+        assert_eq!(
+            snapshot.close_total.get(&("read_and_dial", "canceled")),
+            Some(&1),
+            "unexpected close classification: {:?}",
+            snapshot.close_total
+        );
+        eprintln!("resolver-cancellation evidence: pending-resolver started=1 aborted-before-completion tcp-connect=0 target-accepts=0 H=0 close=read_and_dial/canceled");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reality_classification_admission_refuses_overflow_sockets() {
         let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
