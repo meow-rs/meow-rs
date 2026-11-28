@@ -286,6 +286,21 @@ fn cover_dial_budget(
         .map(|remaining| remaining.min(COVER_DIAL_TIMEOUT))
 }
 
+/// An unspecified address is not a routable remote host, so it can never
+/// be a REALITY cover site no matter what meaning the local stack gives
+/// `connect()` to it. Canonicalize first: the v4-mapped spelling
+/// `::ffff:0.0.0.0` must not bypass the v4 unspecified check.
+fn cover_candidate_is_dialable(addr: &SocketAddr) -> bool {
+    !addr.ip().to_canonical().is_unspecified()
+}
+
+/// Filter per candidate rather than poisoning the whole DNS answer: a mixed
+/// answer still contains valid routes to the configured cover host, while its
+/// unspecified entries have no remote meaning at all.
+fn dialable_cover_candidates(candidates: Vec<SocketAddr>) -> impl Iterator<Item = SocketAddr> {
+    candidates.into_iter().filter(cover_candidate_is_dialable)
+}
+
 impl VlessListener {
     /// Build the listener and validate/load all security material eagerly:
     /// a bad PEM/key pair or malformed REALITY parameter is a startup
@@ -797,8 +812,7 @@ impl VlessListener {
             .map_err(|_| crate::vless_mimic::DialFirstDialError::Resolve)?;
         let endpoints = self.all_bound_endpoints();
         let local_addrs = local_addr_snapshot();
-        let Some(addr) = candidates
-            .into_iter()
+        let Some(addr) = dialable_cover_candidates(candidates)
             .find(|addr| !endpoint_is_self(*addr, &endpoints, local_addrs.as_ref()))
         else {
             return Err(crate::vless_mimic::DialFirstDialError::Resolve);
@@ -825,7 +839,7 @@ impl VlessListener {
         let local_addrs = local_addr_snapshot();
         let mut last_err = None;
         let mut looped = false;
-        for addr in candidates {
+        for addr in dialable_cover_candidates(candidates) {
             if endpoint_is_self(addr, &endpoints, local_addrs.as_ref()) {
                 looped = true;
                 warn!(
@@ -1095,7 +1109,14 @@ fn endpoint_is_self(
         if ip == bind_ip {
             return true;
         }
-        if bind_ip.is_loopback() && ip.is_loopback() && bind_ip.is_ipv4() == ip.is_ipv4() {
+        // Where connect(unspecified) is accepted it selects loopback, so a
+        // same-family loopback bind is the endpoint such a candidate reaches.
+        // Where the stack rejects that dial the extra refusal is still exact:
+        // an unspecified candidate has no remote-cover meaning.
+        if bind_ip.is_loopback()
+            && (ip.is_loopback() || ip.is_unspecified())
+            && bind_ip.is_ipv4() == ip.is_ipv4()
+        {
             return true;
         }
         if !bind_ip.is_unspecified() {
@@ -1232,6 +1253,22 @@ mod tests {
         InstalledHostResolver
     }
 
+    async fn system_resolve_all_for_test(host: &str) -> std::io::Result<Vec<IpAddr>> {
+        // The hook is process-global while a test holds it; unrelated parallel
+        // lookups keep their system-resolver behavior.
+        let ips: Vec<IpAddr> = tokio::net::lookup_host((host, 0))
+            .await?
+            .map(|addr| addr.ip())
+            .collect();
+        if ips.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "system resolver returned no addresses",
+            ));
+        }
+        Ok(ips)
+    }
+
     struct LoopbackAliasResolver;
 
     #[async_trait::async_trait]
@@ -1244,19 +1281,29 @@ mod tests {
             if host.eq_ignore_ascii_case("cover-loopback-alias.invalid") {
                 return Ok(vec![IpAddr::from([127, 0, 0, 2])]);
             }
-            // The hook is process-global while this test holds it; unrelated
-            // parallel lookups keep their system-resolver behavior.
-            let ips: Vec<IpAddr> = tokio::net::lookup_host((host, 0))
-                .await?
-                .map(|addr| addr.ip())
-                .collect();
-            if ips.is_empty() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::NotFound,
-                    "system resolver returned no addresses",
-                ));
+            system_resolve_all_for_test(host).await
+        }
+    }
+
+    struct ScriptedCoverResolver {
+        answers: Vec<(String, Vec<IpAddr>)>,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::HostResolver for ScriptedCoverResolver {
+        async fn resolve(&self, host: &str) -> std::io::Result<IpAddr> {
+            self.resolve_all(host).await.map(|ips| ips[0])
+        }
+
+        async fn resolve_all(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            if let Some((_, ips)) = self
+                .answers
+                .iter()
+                .find(|(answer_host, _)| answer_host.eq_ignore_ascii_case(host))
+            {
+                return Ok(ips.clone());
             }
-            Ok(ips)
+            system_resolve_all_for_test(host).await
         }
     }
 
@@ -1448,6 +1495,169 @@ mod tests {
         assert_eq!(snapshot.active_handshakes, 0);
         task.abort();
         let _ = task.await;
+    }
+
+    async fn assert_unspecified_resolution_is_refused(host: &str) {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let listener =
+            test_reality_listener_with_dest(host, port, VlessRealityMimicSpec::default());
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        assert!(
+            closed,
+            "{host} cover resolution must close the admitting client"
+        );
+
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(
+            snapshot.close_total.get(&("read_and_dial", "resolve")),
+            Some(&1),
+            "{host} unspecified candidate must be refused as resolution failure: {snapshot:?}"
+        );
+        assert_eq!(
+            snapshot.tcp_connect_started_total, 0,
+            "{host} unspecified candidate started TCP connect"
+        );
+        assert_eq!(
+            snapshot.dial_started_total, 1,
+            "{host} recursive accepts would start additional cover dials"
+        );
+        assert_eq!(snapshot.active_handshakes, 0);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_first_unspecified_resolution_is_refused_before_recursive_connect() {
+        let _host_resolver_lock = HOST_RESOLVER_TEST_LOCK.lock().await;
+        let _host_resolver_guard =
+            install_host_resolver_for_test(Arc::new(ScriptedCoverResolver {
+                answers: vec![
+                    (
+                        "cover-unspecified-v4.invalid".into(),
+                        vec![IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)],
+                    ),
+                    (
+                        "cover-unspecified-v6.invalid".into(),
+                        vec![IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)],
+                    ),
+                    (
+                        "cover-unspecified-mapped-v4.invalid".into(),
+                        vec!["::ffff:0.0.0.0".parse::<IpAddr>().unwrap()],
+                    ),
+                ],
+            }));
+
+        for host in [
+            "cover-unspecified-v4.invalid",
+            "cover-unspecified-v6.invalid",
+            "cover-unspecified-mapped-v4.invalid",
+        ] {
+            assert_unspecified_resolution_is_refused(host).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_first_mixed_resolution_skips_unspecified_and_dials_legal_candidate() {
+        let _host_resolver_lock = HOST_RESOLVER_TEST_LOCK.lock().await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let _host_resolver_guard =
+            install_host_resolver_for_test(Arc::new(ScriptedCoverResolver {
+                answers: vec![(
+                    "cover-mixed-unspecified.invalid".into(),
+                    vec![
+                        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    ],
+                )],
+            }));
+        let listener = test_reality_listener_with_dest(
+            "cover-mixed-unspecified.invalid",
+            target_port,
+            VlessRealityMimicSpec::default(),
+        );
+        let SecurityRuntime::Reality(reality) = &listener.security else {
+            panic!("test listener must be REALITY");
+        };
+
+        let dialed = listener
+            .dial_first_target(reality)
+            .await
+            .expect("mixed resolution must retain the legal loopback candidate");
+        assert_eq!(
+            dialed.stream.peer_addr().unwrap().ip(),
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        let (_, peer) = tokio::time::timeout(Duration::from_secs(2), target.accept())
+            .await
+            .expect("legal candidate did not reach the target listener")
+            .unwrap();
+        assert_eq!(peer.ip(), IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(snapshot.dial_started_total, 1);
+        assert_eq!(snapshot.tcp_connect_started_total, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cover_dial_unspecified_resolution_has_no_dialable_candidate() {
+        let _host_resolver_lock = HOST_RESOLVER_TEST_LOCK.lock().await;
+        // The listener is dialable through loopback when unspecified is not
+        // filtered, so an Ok here would prove the v1 cover path dialed it.
+        let loopback_target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = loopback_target.local_addr().unwrap().port();
+        let _host_resolver_guard =
+            install_host_resolver_for_test(Arc::new(ScriptedCoverResolver {
+                answers: vec![(
+                    "cover-only-unspecified.invalid".into(),
+                    vec![
+                        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                    ],
+                )],
+            }));
+        let listener = test_reality_listener_with_dest(
+            "cover-only-unspecified.invalid",
+            target_port,
+            VlessRealityMimicSpec::off(),
+        );
+        let SecurityRuntime::Reality(reality) = &listener.security else {
+            panic!("test listener must be REALITY");
+        };
+
+        let Err(err) = listener.dial_cover_target(reality).await else {
+            panic!("unspecified-only resolution produced a cover target")
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn cover_candidate_filter_drops_every_unspecified_spelling() {
+        let legal_v4 = "192.0.2.10:443".parse::<SocketAddr>().unwrap();
+        let legal_v6 = "[2001:db8::10]:443".parse::<SocketAddr>().unwrap();
+        let candidates = vec![
+            "0.0.0.0:443".parse::<SocketAddr>().unwrap(),
+            "[::]:443".parse::<SocketAddr>().unwrap(),
+            "[::ffff:0.0.0.0]:443".parse::<SocketAddr>().unwrap(),
+            legal_v4,
+            legal_v6,
+        ];
+
+        let retained: Vec<_> = dialable_cover_candidates(candidates).collect();
+        assert_eq!(retained, vec![legal_v4, legal_v6]);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1785,6 +1995,14 @@ mod tests {
             endpoint_is_self("127.0.0.2:443".parse().unwrap(), &endpoints, Some(&local),),
             "a dual-stack v6 wildcard accepts v4 peers as mapped"
         );
+        assert!(
+            endpoint_is_self("0.0.0.0:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a dual-stack v6 wildcard accepts v4 unspecified as mapped"
+        );
+        assert!(
+            endpoint_is_self("[::]:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v6 unspecified is the v6 wildcard itself regardless of v4 coverage"
+        );
 
         endpoints.clear();
         endpoints.insert(
@@ -1802,6 +2020,14 @@ mod tests {
             !endpoint_is_self("127.0.0.2:443".parse().unwrap(), &endpoints, Some(&local),),
             "a v6-only wildcard cannot be reached through v4 loopback"
         );
+        assert!(
+            !endpoint_is_self("0.0.0.0:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a v6-only wildcard cannot be reached through v4 unspecified"
+        );
+        assert!(
+            endpoint_is_self("[::]:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v6 unspecified remains the exact v6 wildcard on a v6-only socket"
+        );
 
         endpoints.clear();
         endpoints.insert(
@@ -1816,6 +2042,56 @@ mod tests {
         assert!(
             !endpoint_is_self("127.0.0.2:443".parse().unwrap(), &endpoints, Some(&local),),
             "a specific v6 loopback bind has no v4 loopback pair"
+        );
+    }
+
+    #[test]
+    fn self_loop_guard_unspecified_candidates_follow_loopback_dial_semantics() {
+        let local = HashSet::new();
+        let mut endpoints = EndpointSnapshot::new();
+        endpoints.insert(
+            "127.0.0.1:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
+        assert!(
+            endpoint_is_self("0.0.0.0:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v4 unspecified reaches a same-port v4 loopback bind where the stack accepts it"
+        );
+        assert!(
+            endpoint_is_self(
+                "[::ffff:0.0.0.0]:443".parse().unwrap(),
+                &endpoints,
+                Some(&local),
+            ),
+            "canonicalization folds v4-mapped unspecified before the family check"
+        );
+        assert!(
+            !endpoint_is_self("[::]:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v6 unspecified cannot reach a v4 loopback bind"
+        );
+
+        endpoints.clear();
+        endpoints.insert(
+            "[::1]:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
+        assert!(
+            endpoint_is_self("[::]:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v6 unspecified reaches a same-port v6 loopback bind where the stack accepts it"
+        );
+        assert!(
+            !endpoint_is_self("0.0.0.0:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v4 unspecified cannot reach a v6 loopback bind"
+        );
+
+        endpoints.clear();
+        endpoints.insert(
+            "192.0.2.10:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
+        assert!(
+            !endpoint_is_self("0.0.0.0:443".parse().unwrap(), &endpoints, Some(&local),),
+            "unspecified dial semantics select loopback, not a non-loopback bind"
         );
     }
 
