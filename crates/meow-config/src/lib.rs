@@ -18,6 +18,7 @@ pub mod ech_dns;
 pub mod external_ui;
 pub mod geodata;
 pub mod internal_http;
+pub mod outbound_registry;
 mod private_file;
 mod provider_payload;
 pub mod proxy_parser;
@@ -3196,6 +3197,13 @@ pub(crate) fn unavailable_placeholder(
     )))
 }
 
+// Keep the tracing machinery for these parse failures in one place.
+#[cold]
+#[inline(never)]
+fn warn_unavailable_proxy(message: std::fmt::Arguments<'_>) {
+    warn!("{message}");
+}
+
 /// What one `proxies:` block resolved to in [`insert_parsed_leaves`]: the
 /// value to bind under the block's key, plus whether it is an unavailable
 /// placeholder (which fills only a vacant slot) rather than a live adapter.
@@ -3264,7 +3272,7 @@ fn parse_dialered_leaf(
     let target = meow_proxy::dialer::DialerTarget::new(dialer.clone(), registry);
     let proxy_dialer: Arc<dyn meow_proxy::dialer::TcpDialer> =
         Arc::new(meow_proxy::dialer::NamedProxyDialer::new(target.clone()).owned_by(key.clone()));
-    match proxy_parser::parse_proxy_with_dialer_and_fp(
+    let chain_err = match proxy_parser::parse_proxy_with_dialer_and_fp(
         raw_proxy,
         &proxy_dialer,
         ipv6,
@@ -3276,75 +3284,86 @@ fn parse_dialered_leaf(
         // injected leaf carries no `DialerProxyAdapter` to report the
         // configured chain, so the UDP probe would otherwise read it as a
         // plain `udp: false` node and slide a matched flow to a later rule.
-        Ok(built) => Ok(Some((
-            Arc::new(proxy_parser::ChainedProxy::new(built)) as Arc<dyn Proxy>,
-            false,
-        ))),
+        Ok(built) => {
+            let chained = Arc::new(proxy_parser::ChainedProxy::new(built));
+            return Ok(Some((chained, false)));
+        }
         Err(chain_err) if strict => {
             // Under `strict` the dial-time failure the relay wrapper defers
             // to is not acceptable — surface it at load, exactly as the old
             // post-build pass did.
-            Err(anyhow::anyhow!(
+            return Err(anyhow::anyhow!(
                 "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
                  (strict mode): {chain_err}"
-            ))
+            ));
         }
-        Err(chain_err) => match proxy_parser::parse_static_proxy(
-            raw_proxy,
-            ipv6,
-            resolver,
-            global_client_fingerprint,
-            Some(dns_cell),
-        ) {
-            Ok(inner) => {
-                warn!(
-                    "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+        Err(chain_err) => chain_err,
+    };
+    if let Some(declared) = proxy_parser::external_adapter_type(raw_proxy) {
+        warn_unavailable_proxy(format_args!(
+            "proxy '{name}': cannot inject dialer-proxy '{dialer}' ({chain_err}); keeping the name bound to an unavailable node"
+        ));
+        return Ok(Some((
+            unavailable_placeholder(name, &chain_err, declared),
+            true,
+        )));
+    }
+    match proxy_parser::parse_static_proxy(
+        raw_proxy,
+        ipv6,
+        resolver,
+        global_client_fingerprint,
+        Some(dns_cell),
+    ) {
+        Ok(inner) => {
+            warn!(
+                "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
                      ({chain_err}); falling back to the relay-based wrapper"
-                );
-                let wrapped: Arc<dyn Proxy> =
-                    Arc::new(meow_proxy::DialerProxyAdapter::new(inner, target));
-                Ok(Some((wrapped, false)))
-            }
-            Err(parse_err) => {
-                if let Some(existing) = proxies.get(&key) {
-                    if placeholder_names.contains(&key) {
-                        debug!(
-                            "proxy '{name}': dialer-proxy '{dialer}' not applied; \
+            );
+            let wrapped: Arc<dyn Proxy> =
+                Arc::new(meow_proxy::DialerProxyAdapter::new(inner, target));
+            Ok(Some((wrapped, false)))
+        }
+        Err(parse_err) => {
+            if let Some(existing) = proxies.get(&key) {
+                if placeholder_names.contains(&key) {
+                    debug!(
+                        "proxy '{name}': dialer-proxy '{dialer}' not applied; \
                              the node is an unavailable placeholder \
                              ({chain_err}); the block itself also failed to parse \
                              ({parse_err})"
-                        );
-                        Ok(None)
-                    } else {
-                        warn!(
-                            "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
+                    );
+                    Ok(None)
+                } else {
+                    warn!(
+                        "proxy '{name}': cannot inject dialer-proxy '{dialer}' \
                              ({chain_err}); the block itself also failed to parse \
                              ({parse_err}); falling back to the relay-based \
                              wrapper over the earlier same-name binding"
-                        );
-                        let wrapped: Arc<dyn Proxy> = Arc::new(
-                            meow_proxy::DialerProxyAdapter::new(Arc::clone(existing), target),
-                        );
-                        Ok(Some((wrapped, false)))
-                    }
-                } else if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) {
-                    warn!(
-                        "proxies: '{name}' failed to parse ({parse_err}); keeping the name bound \
-                         to an unavailable node so no dial can fall back past it"
                     );
-                    Ok(Some((
-                        unavailable_placeholder(name, &parse_err, declared),
-                        true,
-                    )))
-                } else {
-                    warn!(
-                        "proxy '{name}': dialer-proxy '{dialer}' not applied \
-                         ({parse_err}); the outbound itself failed to parse"
-                    );
-                    Ok(None)
+                    let wrapped: Arc<dyn Proxy> = Arc::new(meow_proxy::DialerProxyAdapter::new(
+                        Arc::clone(existing),
+                        target,
+                    ));
+                    Ok(Some((wrapped, false)))
                 }
+            } else if let Some(declared) = proxy_parser::placeholder_adapter_type(raw_proxy) {
+                warn_unavailable_proxy(format_args!(
+                    "proxies: '{name}' failed to parse ({parse_err}); keeping the name bound \
+                         to an unavailable node so no dial can fall back past it"
+                ));
+                Ok(Some((
+                    unavailable_placeholder(name, &parse_err, declared),
+                    true,
+                )))
+            } else {
+                warn!(
+                    "proxy '{name}': dialer-proxy '{dialer}' not applied \
+                         ({parse_err}); the outbound itself failed to parse"
+                );
+                Ok(None)
             }
-        },
+        }
     }
 }
 
@@ -3433,10 +3452,10 @@ fn insert_parsed_leaves(
                             .get("name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("<unnamed>");
-                        warn!(
+                        warn_unavailable_proxy(format_args!(
                             "proxies: '{name}' failed to parse ({e}); keeping the name bound \
                          to an unavailable node so no dial can fall back past it"
-                        );
+                        ));
                         (unavailable_placeholder(name, &e, declared), true)
                     } else {
                         warn!("Failed to parse proxy: {}", e);

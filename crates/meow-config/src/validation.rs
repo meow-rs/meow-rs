@@ -428,8 +428,9 @@ const VMESS_NODE_KEYS: &[&str] = &[
 
 /// The known-key inventory for a `proxies:` entry's `type`, or `None`
 /// when the type is unrecognized (the leaf parse reports that separately;
-/// warning on every key would bury it).
-fn known_node_keys(proxy_type: &str) -> Option<&'static [&'static str]> {
+/// warning on every key would bury it). Registered out-of-tree
+/// types have no built-in inventory because their factories validate them.
+pub(crate) fn known_node_keys(proxy_type: &str) -> Option<&'static [&'static str]> {
     let per_type: &[&str] = match proxy_type {
         "ss" => SS_NODE_KEYS,
         "trojan" => TROJAN_NODE_KEYS,

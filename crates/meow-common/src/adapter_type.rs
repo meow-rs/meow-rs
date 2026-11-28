@@ -42,6 +42,11 @@ pub enum AdapterType {
     /// flow's DNS payload from the kernel's own resolver; the nominal
     /// destination is never contacted.
     Dns,
+    /// An out-of-tree outbound identified by its registered type name.
+    /// This runtime variant is created by registration, so serde
+    /// deserialization only accepts the built-in variants.
+    #[serde(skip_deserializing)]
+    External(&'static str),
 }
 
 impl fmt::Display for AdapterType {
@@ -71,6 +76,7 @@ impl fmt::Display for AdapterType {
             AdapterType::Compatible => write!(f, "Compatible"),
             AdapterType::Rematch => write!(f, "Rematch"),
             AdapterType::Dns => write!(f, "Dns"),
+            AdapterType::External(name) => f.write_str(name),
         }
     }
 }
