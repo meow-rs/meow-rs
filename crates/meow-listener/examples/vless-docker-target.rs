@@ -143,7 +143,7 @@ async fn tcp_tls_listener(listener: TcpListener, acceptor: tokio_rustls::TlsAcce
 }
 
 async fn bind_tcp(port: u16, service: TcpService) {
-    for ip in [Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()] {
+    for ip in [Ipv6Addr::UNSPECIFIED.into(), Ipv4Addr::UNSPECIFIED.into()] {
         let addr = SocketAddr::new(ip, port);
         match TcpListener::bind(addr).await {
             Ok(listener) => {
@@ -155,7 +155,7 @@ async fn bind_tcp(port: u16, service: TcpService) {
 }
 
 async fn bind_tls_tcp(port: u16, acceptor: tokio_rustls::TlsAcceptor) {
-    for ip in [Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()] {
+    for ip in [Ipv6Addr::UNSPECIFIED.into(), Ipv4Addr::UNSPECIFIED.into()] {
         let addr = SocketAddr::new(ip, port);
         match TcpListener::bind(addr).await {
             Ok(listener) => {
@@ -184,7 +184,7 @@ async fn udp_echo(socket: Arc<UdpSocket>) {
 }
 
 async fn bind_udp(port: u16) {
-    for ip in [Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()] {
+    for ip in [Ipv6Addr::UNSPECIFIED.into(), Ipv4Addr::UNSPECIFIED.into()] {
         let addr = SocketAddr::new(ip, port);
         match UdpSocket::bind(addr).await {
             Ok(socket) => {
@@ -343,7 +343,7 @@ async fn main() {
     bind_udp(UDP_B).await;
     bind_udp(UDP_443).await;
     for (port, spec) in reality_t5_target::docker_t5_specs() {
-        for ip in [Ipv4Addr::UNSPECIFIED.into(), Ipv6Addr::UNSPECIFIED.into()] {
+        for ip in [Ipv6Addr::UNSPECIFIED.into(), Ipv4Addr::UNSPECIFIED.into()] {
             let addr = SocketAddr::new(ip, port);
             match TcpListener::bind(addr).await {
                 Ok(listener) => {
