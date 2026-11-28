@@ -713,6 +713,7 @@ fn put_configs_vless_mimic_equivalence_and_restart_warning() {
         "      mimic:\n        mode: dial-first\n        probe-timeout-ms: 3000\n        quiescence-min-ms: 15\n        quiescence-max-ms: 40\n        max-concurrent-probes: 64\n",
     );
     let empty = with_mimic("      mimic: {}\n");
+    let numeric_only = with_mimic("      mimic:\n        probe-timeout-ms: 4000\n");
     let off = with_mimic("      mimic:\n        mode: off\n");
 
     let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
@@ -753,6 +754,26 @@ fn put_configs_vless_mimic_equivalence_and_restart_warning() {
                 }
 
                 assert_eq!(
+                    put_configs_payload(&state, &numeric_only, "")
+                        .await
+                        .status(),
+                    StatusCode::NO_CONTENT
+                );
+                let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+                assert!(
+                    logs.contains("listeners: changed") && logs.contains("restart meow"),
+                    "a numeric-only mimic change must produce the restart warning: {logs}"
+                );
+                sink.0.lock().unwrap().clear();
+
+                assert_eq!(
+                    put_configs_payload(&state, vless_reality_document(), "")
+                        .await
+                        .status(),
+                    StatusCode::NO_CONTENT
+                );
+                sink.0.lock().unwrap().clear();
+                assert_eq!(
                     put_configs_payload(&state, &off, "").await.status(),
                     StatusCode::NO_CONTENT
                 );
@@ -762,9 +783,10 @@ fn put_configs_vless_mimic_equivalence_and_restart_warning() {
                     "mode off must produce the startup-snapshot restart warning: {logs}"
                 );
 
-                // The committed running listener snapshot and its sockets are
-                // untouched by all three PUTs: this endpoint only ever reflects
-                // the startup snapshot owned by AppState.
+                // These assertions are the narrow witness available here:
+                // AppState still publishes the original startup listener row's
+                // name and bound port. They do not attempt to prove socket
+                // ownership or every typed field.
                 assert_eq!(state.listeners.len(), 1);
                 assert_eq!(state.listeners[0].name, "running-vision");
                 assert_eq!(state.listeners[0].port, 18443);
