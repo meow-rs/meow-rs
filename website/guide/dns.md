@@ -38,6 +38,43 @@ still used internally so rules and proxies can resolve names.
 | `store-fake-ip` | bool | `false` | Persist the fake-IP map across restarts |
 | `use-hosts` | bool | `true` | Honor the top-level `hosts:` map |
 | `use-system-hosts` | bool | `true` | Merge the OS hosts file (`/etc/hosts`, or `%SystemRoot%\System32\drivers\etc\hosts` on Windows) |
+| `respect-rules` | bool | `false` | Dial untagged upstreams through the rule engine (mihomo parity; requires `proxy-server-nameserver`) |
+
+## Rule-routed upstreams (`respect-rules`)
+
+`dns.respect-rules: true` dials every nameserver entry that carries no explicit
+`?proxy=`/`#PROXY` tag through the tunnel's rule engine, matching mihomo's
+`respect-rules`. The rules see the **upstream DNS server** — its address and
+port, with `metadata.type = inner` — not the domain being queried, so a
+`GEOIP,CN,DIRECT` rule keeps a domestic upstream on the local link while
+`8.8.8.8` rides a node:
+
+```yaml
+dns:
+  enable: true
+  respect-rules: true
+  nameserver: [223.5.5.5, 8.8.8.8]
+  proxy-server-nameserver: [223.5.5.5]   # required
+rules:
+  - GEOIP,CN,DIRECT
+  - MATCH,PROXY
+```
+
+- An entry that carries its own `?proxy=`/`#PROXY` tag keeps it; the flag only
+  fills the untagged ones.
+- `proxy-server-nameserver` is **required** (as in mihomo). It resolves
+  proxy-server hostnames for the rule-routed dial, which is what keeps that
+  dial from re-entering the resolver it serves. `proxy-server-nameserver` and
+  `direct-nameserver` are themselves never rule-routed.
+- Hostname upstreams (`https://dns.google/dns-query`) are resolved once at
+  config build through `default-nameserver` (falling back to the platform
+  resolvers when the config has no IP-literal bootstrap), so rule matching
+  normally sees a stable IP; mihomo resolves them per dial. An unresolvable
+  name is not a load error: the entry stays rule-routed and the dial resolves
+  it per query, which means IP/GEOIP rules will not match that upstream.
+- The decision is made per dial against the live route table, so `rules:` /
+  `proxies:` edits apply to the next query without rebuilding the resolver.
+  (`PUT /configs` still rebuilds it, like any other `#PROXY` reference.)
 
 ## Ordered response rules
 

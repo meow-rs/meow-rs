@@ -220,6 +220,11 @@ pub struct DnsConfig {
     /// `ProxyServerHostResolver`). `None` when the option is unset or DNS is
     /// disabled — proxy server hostnames then resolve via `resolver`.
     pub proxy_resolver: Option<Arc<Resolver>>,
+    /// `dns.respect-rules` indirection. `Some` when the option is on: every
+    /// rule-routed nameserver dials through the proxy published here, and the
+    /// owning application must install its tunnel-backed dialer (startup and
+    /// each DNS install) or those dials fail.
+    pub respect_rules_cell: Option<meow_dns::RespectRulesCell>,
 }
 
 /// Listener specification — the `type:` field of a `listeners:` entry together

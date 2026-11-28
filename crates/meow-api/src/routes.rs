@@ -3104,6 +3104,15 @@ pub fn install_resolver_everywhere(
         CONFIG_MUTATION.try_lock().is_err(),
         "caller must hold the CONFIG_MUTATION lane"
     );
+    // `dns.respect-rules`: fill the generation's cell *before* the resolver
+    // becomes reachable, or a query racing `set_resolver` fails its
+    // rule-routed dial ("dialer has not been installed yet"). The dialer holds
+    // a weak tunnel handle and re-reads the route table per dial, so later
+    // `rules:`/`proxies:` swaps need no republish — only a DNS rebuild (a new
+    // cell) lands here again.
+    if let Some(cell) = &dns.respect_rules_cell {
+        meow_tunnel::rules_dialer::publish(cell, tunnel);
+    }
     tunnel.set_resolver(Arc::clone(&dns.resolver), dns.enabled);
 
     // Bind the dns-outbound indirection to the tunnel's live slot
@@ -7286,6 +7295,64 @@ mod tests {
         // `len` differs, so this is the `ma.len() == mb.len()` guard's pin.
         assert!(!dns_inputs_equal(&raw_ab, &raw_a));
         assert!(!dns_inputs_equal(&raw_a, &raw_ab));
+    }
+
+    /// `dns.respect-rules` binds the resolver to the route generation at dial
+    /// time, so `dns_uses_proxy_refs` must report it: a commit that swaps the
+    /// generation has to rebuild the resolver, and flipping the key itself is
+    /// a DNS-input change.
+    #[test]
+    fn dns_inputs_equal_sees_respect_rules() {
+        let off: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  nameserver: [1.1.1.1]\n  proxy-server-nameserver: [223.5.5.5]\n",
+        )
+        .unwrap();
+        let on: RawConfig = serde_saphyr::from_str(
+            "dns:\n  enable: true\n  respect-rules: true\n  nameserver: [1.1.1.1]\n  proxy-server-nameserver: [223.5.5.5]\n",
+        )
+        .unwrap();
+        assert!(!dns_inputs_equal(&off, &on));
+        assert!(!dns_inputs_equal(&on, &off));
+        // Deliberately NOT a runtime ref: the resolver's nameserver holds a
+        // forwarding cell whose dialer re-reads the live route table per dial
+        // (`meow_tunnel::rules_dialer`), so a retained resolver stays correct
+        // across a `rules:`/`proxies:` swap. Reporting it here would rebuild
+        // DNS (and re-run the bootstrap lookups) on every commit.
+        assert!(!dns_uses_proxy_refs(&off));
+        assert!(!dns_uses_proxy_refs(&on));
+    }
+
+    /// The runtime contract the flag depends on: installing a DNS generation
+    /// fills its cell before the generation becomes reachable.
+    #[tokio::test]
+    async fn install_resolver_everywhere_publishes_the_respect_rules_dialer() {
+        use parking_lot::RwLock as PlRwLock;
+        let raw: RawConfig = meow_config::parse_raw_yaml(
+            "mode: rule\nrules:\n  - MATCH,DIRECT\ndns:\n  enable: true\n  respect-rules: true\n  \
+             nameserver: [1.1.1.1]\n  proxy-server-nameserver: [223.5.5.5]\n",
+        )
+        .unwrap();
+        let dns = meow_config::parse_dns_from_raw(
+            &raw,
+            None,
+            &std::collections::HashMap::new(),
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("dns build");
+        let cell = dns
+            .respect_rules_cell
+            .clone()
+            .expect("cell for respect-rules");
+        let tunnel = Tunnel::new(std::sync::Arc::clone(&dns.resolver));
+        let dns_server = PlRwLock::new(None);
+        let _mutation = CONFIG_MUTATION.lock().await;
+        install_resolver_everywhere(&tunnel, &dns_server, &dns);
+        let published = cell.read().clone().expect("cell must be published");
+        assert_eq!(published.name(), meow_dns::RESPECT_RULES_PROXY);
     }
 
     /// Issue #533 review: `swap_config_and_reconcile_tun` compares the TUN

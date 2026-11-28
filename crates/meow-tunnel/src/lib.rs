@@ -10,6 +10,7 @@ pub mod nftset;
 pub mod relay;
 pub mod rule_ir;
 pub mod rule_stats;
+pub mod rules_dialer;
 mod sniff;
 pub mod statistics;
 pub mod tcp;
