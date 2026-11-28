@@ -22,7 +22,8 @@ use meow_common::{connect_tcp_host, ConnType, Network};
 use meow_transport::tls::{TlsConfig, TlsLayer};
 use meow_transport::Transport as _;
 use smol_str::SmolStr;
-use std::sync::Arc;
+use std::ffi::OsStr;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tracing::{debug, warn};
@@ -61,6 +62,56 @@ const RESERVED_HEADER_NAMES: [&str; 12] = [
     "proxy-authenticate",
     "proxy-authorization",
 ];
+
+/// Trust mode for internal HTTPS (`MEOW_HTTP_SYSTEM_CA`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HttpSystemCa {
+    /// Mozilla roots only. Exact `false`.
+    Off,
+    /// Mozilla roots plus a native-store snapshot. Unset, `true`, or invalid.
+    On,
+}
+
+/// Parse `MEOW_HTTP_SYSTEM_CA`. Unset and the exact UTF-8 string `true`
+/// enable native roots (the default, matching mihomo). Exact `false` is
+/// Mozilla-only. Empty, padded, other-cased, and non-Unicode values are
+/// invalid: warn and keep the default (Mozilla plus native). Tests pass
+/// `OsStr` values so they never mutate the process env.
+fn parse_meow_http_system_ca(value: Option<&OsStr>) -> HttpSystemCa {
+    match value {
+        None => HttpSystemCa::On,
+        Some(raw) => match raw.to_str() {
+            Some("true") => HttpSystemCa::On,
+            Some("false") => HttpSystemCa::Off,
+            Some(other) => {
+                warn!(
+                    value = other,
+                    "MEOW_HTTP_SYSTEM_CA must be exactly `true` or `false` (case-sensitive); \
+                     ignoring and using the default (Mozilla CA roots plus native store) \
+                     for internal HTTPS"
+                );
+                HttpSystemCa::On
+            }
+            None => {
+                warn!(
+                    "MEOW_HTTP_SYSTEM_CA is not valid Unicode; \
+                     ignoring and using the default (Mozilla CA roots plus native store) \
+                     for internal HTTPS"
+                );
+                HttpSystemCa::On
+            }
+        },
+    }
+}
+
+/// Process-lifetime decision. First internal HTTPS request wins; restart
+/// to pick up an env change.
+fn http_system_ca() -> HttpSystemCa {
+    static DECISION: OnceLock<HttpSystemCa> = OnceLock::new();
+    *DECISION.get_or_init(|| {
+        parse_meow_http_system_ca(std::env::var_os("MEOW_HTTP_SYSTEM_CA").as_deref())
+    })
+}
 
 fn is_reserved_header(name: &str) -> bool {
     RESERVED_HEADER_NAMES
@@ -411,10 +462,15 @@ async fn fetch_one(
     request.push_str("\r\n");
 
     let mut stream = if is_https {
-        // Same TlsLayer the proxies dial with (BoringSSL).
-        let tls = TlsLayer::new(&TlsConfig::new(
-            host.trim_start_matches('[').trim_end_matches(']'),
-        ))
+        // Same TlsLayer the proxies dial with (BoringSSL). Native OS
+        // roots are on by default for internal HTTPS (mihomo-like);
+        // `MEOW_HTTP_SYSTEM_CA=false` restores Mozilla-only. Outbound
+        // proxy TLS is unchanged (always Mozilla-only).
+        let tls_config = TlsConfig::new(host.trim_start_matches('[').trim_end_matches(']'));
+        let tls = match http_system_ca() {
+            HttpSystemCa::On => TlsLayer::with_system_roots(&tls_config),
+            HttpSystemCa::Off => TlsLayer::new(&tls_config),
+        }
         .map_err(|e| anyhow!("invalid TLS server name '{host}': {e}"))?;
         tokio::time::timeout(CONNECT_TIMEOUT, tls.connect(conn))
             .await
@@ -1497,5 +1553,310 @@ mod tests {
             err.to_string().contains("HTTP 500"),
             "the post-dial 5xx must stay loud, no direct retry: {err}"
         );
+    }
+
+    #[test]
+    fn parse_meow_http_system_ca_table() {
+        use std::ffi::OsStr;
+        assert_eq!(parse_meow_http_system_ca(None), HttpSystemCa::On);
+        assert_eq!(
+            parse_meow_http_system_ca(Some(OsStr::new("true"))),
+            HttpSystemCa::On
+        );
+        assert_eq!(
+            parse_meow_http_system_ca(Some(OsStr::new("false"))),
+            HttpSystemCa::Off
+        );
+        for invalid in ["", " true", "true ", "TRUE", "True", "1", "yes", "on"] {
+            assert_eq!(
+                parse_meow_http_system_ca(Some(OsStr::new(invalid))),
+                HttpSystemCa::On,
+                "{invalid:?} must be invalid and fall back to the default"
+            );
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::ffi::OsStringExt;
+            let invalid = std::ffi::OsString::from_wide(&[0xD800]);
+            assert_eq!(parse_meow_http_system_ca(Some(&invalid)), HttpSystemCa::On);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let invalid = std::ffi::OsString::from_vec(vec![0xff]);
+            assert_eq!(parse_meow_http_system_ca(Some(&invalid)), HttpSystemCa::On);
+        }
+    }
+
+    const CHILD_KIND: &str = "MEOW_INTERNAL_HTTP_CA_CHILD";
+    const CHILD_URL: &str = "MEOW_INTERNAL_HTTP_CA_URL";
+
+    struct TestCert {
+        cert: boring::x509::X509,
+        key: boring::pkey::PKey<boring::pkey::Private>,
+    }
+
+    fn make_ca(cn: &str) -> TestCert {
+        make_test_cert(cn, true, &[], &[], None)
+    }
+
+    fn make_leaf(cn: &str, dns: &[&str], ips: &[&str], issuer: &TestCert) -> TestCert {
+        make_test_cert(cn, false, dns, ips, Some(issuer))
+    }
+
+    fn make_test_cert(
+        cn: &str,
+        is_ca: bool,
+        dns: &[&str],
+        ips: &[&str],
+        issuer: Option<&TestCert>,
+    ) -> TestCert {
+        use boring::{
+            asn1::{Asn1Integer, Asn1Time},
+            bn::BigNum,
+            ec::{EcGroup, EcKey},
+            hash::MessageDigest,
+            nid::Nid,
+            pkey::PKey,
+            x509::{
+                extension::{BasicConstraints, KeyUsage, SubjectAlternativeName},
+                X509Name, X509,
+            },
+        };
+        let key = PKey::from_ec_key(
+            EcKey::generate(&EcGroup::from_curve_name(Nid::X9_62_PRIME256V1).unwrap()).unwrap(),
+        )
+        .unwrap();
+        let mut name_b = X509Name::builder().unwrap();
+        name_b.append_entry_by_text("CN", cn).unwrap();
+        let subject = name_b.build();
+        let mut b = X509::builder().unwrap();
+        b.set_version(2).unwrap();
+        let serial = Asn1Integer::from_bn(&BigNum::from_u32(7).unwrap()).unwrap();
+        b.set_serial_number(&serial).unwrap();
+        b.set_not_before(&Asn1Time::days_from_now(0).unwrap())
+            .unwrap();
+        b.set_not_after(&Asn1Time::days_from_now(30).unwrap())
+            .unwrap();
+        b.set_pubkey(&key).unwrap();
+        b.set_subject_name(&subject).unwrap();
+        match issuer {
+            Some(iss) => b.set_issuer_name(iss.cert.subject_name()).unwrap(),
+            None => b.set_issuer_name(&subject).unwrap(),
+        }
+        if is_ca {
+            b.append_extension(&BasicConstraints::new().critical().ca().build().unwrap())
+                .unwrap();
+            b.append_extension(
+                &KeyUsage::new()
+                    .critical()
+                    .key_cert_sign()
+                    .crl_sign()
+                    .build()
+                    .unwrap(),
+            )
+            .unwrap();
+        } else {
+            let mut san = SubjectAlternativeName::new();
+            for name in dns {
+                san.dns(name);
+            }
+            for ip in ips {
+                san.ip(ip);
+            }
+            let ctx = b.x509v3_context(issuer.map(|iss| &*iss.cert), None);
+            b.append_extension(&san.build(&ctx).unwrap()).unwrap();
+        }
+        let issuer_key = issuer.map_or(&key, |iss| &iss.key);
+        b.sign(issuer_key, MessageDigest::sha256()).unwrap();
+        TestCert {
+            cert: b.build(),
+            key,
+        }
+    }
+
+    impl TestCert {
+        fn pem_pair(&self) -> (Vec<u8>, Vec<u8>) {
+            (
+                self.cert.to_pem().unwrap(),
+                self.key.private_key_to_pem_pkcs8().unwrap(),
+            )
+        }
+    }
+
+    async fn spawn_https_origin(leaf: &TestCert, bodies: &'static [&'static [u8]]) -> String {
+        use meow_transport::tls::server::{TlsServer, TlsServerConfig};
+        let (cert_pem, key_pem) = leaf.pem_pair();
+        let server = TlsServer::new(&TlsServerConfig {
+            certificate_chain_pem: cert_pem,
+            private_key_pem: key_pem,
+            alpn: Vec::new(),
+        })
+        .expect("tls server");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let hits = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        tokio::spawn(async move {
+            loop {
+                let Ok((tcp, _)) = listener.accept().await else {
+                    return;
+                };
+                let server = server.clone();
+                let hits = std::sync::Arc::clone(&hits);
+                tokio::spawn(async move {
+                    let Ok(mut stream) = server.accept(Box::new(tcp)).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 1024];
+                    let _ = stream.read(&mut buf).await;
+                    let i = hits
+                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                        .min(bodies.len().saturating_sub(1));
+                    let body = bodies[i];
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        format!("https://127.0.0.1:{}/", addr.port())
+    }
+
+    fn write_ca_pem(ca: &TestCert) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ca.pem");
+        std::fs::write(&path, ca.cert.to_pem().unwrap()).unwrap();
+        (dir, path)
+    }
+
+    async fn run_system_ca_child(
+        kind: &str,
+        url: &str,
+        ca_pem: Option<&std::path::Path>,
+        system_ca: Option<&str>,
+    ) -> std::process::Output {
+        let mut cmd = tokio::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args([
+            "internal_http::tests::https_system_ca_child",
+            "--exact",
+            "--nocapture",
+        ]);
+        cmd.env(CHILD_KIND, kind);
+        cmd.env(CHILD_URL, url);
+        cmd.env_remove("MEOW_HTTP_SYSTEM_CA");
+        cmd.env_remove("SSL_CERT_FILE");
+        cmd.env_remove("SSL_CERT_DIR");
+        if let Some(value) = system_ca {
+            cmd.env("MEOW_HTTP_SYSTEM_CA", value);
+        }
+        if let Some(path) = ca_pem {
+            cmd.env("SSL_CERT_FILE", path);
+        }
+        cmd.output().await.expect("spawn system-ca child")
+    }
+
+    fn assert_child_ok(output: &std::process::Output) {
+        assert!(
+            output.status.success(),
+            "child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    /// Child entry for env-sensitive HTTPS fetches. No-op in the parent
+    /// suite; the parent re-executes this binary with `--exact`.
+    #[tokio::test]
+    async fn https_system_ca_child() {
+        let Ok(kind) = std::env::var(CHILD_KIND) else {
+            return;
+        };
+        let url = std::env::var(CHILD_URL).expect("child url");
+        match kind.as_str() {
+            "accept-refresh" => {
+                let first = fetch_direct(&url).await.expect("first fetch");
+                let second = fetch_direct(&url).await.expect("refresh fetch");
+                assert_eq!(first, b"v1");
+                assert_eq!(second, b"v2");
+            }
+            "reject" => {
+                let err = fetch_direct(&url).await.expect_err("must reject");
+                let msg = format!("{err:#}").to_ascii_lowercase();
+                assert!(
+                    !msg.contains("timed out"),
+                    "reject must be a verify failure, not a hang: {err:#}"
+                );
+                assert!(
+                    msg.contains("tls") || msg.contains("certificate") || msg.contains("handshake"),
+                    "expected a TLS failure, got {err:#}"
+                );
+            }
+            other => panic!("unknown child kind {other}"),
+        }
+    }
+
+    /// BEFORE: a matching-hostname leaf signed by a private CA is rejected
+    /// when `MEOW_HTTP_SYSTEM_CA=false` even if `SSL_CERT_FILE` points at
+    /// the CA (Mozilla-only; native loader not used). A CA that is not in
+    /// the native store also fails under default On (this process, env
+    /// unset, no `SSL_CERT_FILE`).
+    #[tokio::test]
+    async fn https_private_ca_rejected_without_system_ca() {
+        if std::env::var_os(CHILD_KIND).is_some() {
+            return;
+        }
+        let ca = make_ca("provider-test CA");
+        let leaf = make_leaf("127.0.0.1", &[], &["127.0.0.1"], &ca);
+        let url = spawn_https_origin(&leaf, &[b"v1"]).await;
+        let err = fetch_direct(&url).await.expect_err("untrusted private CA");
+        let msg = format!("{err:#}").to_ascii_lowercase();
+        assert!(
+            !msg.contains("timed out"),
+            "a CA absent from the native store must reject, not hang: {err:#}"
+        );
+        assert!(
+            msg.contains("tls") || msg.contains("certificate") || msg.contains("handshake"),
+            "a CA absent from the native store must fail under default On: {err:#}"
+        );
+
+        let (_dir, pem) = write_ca_pem(&ca);
+        let false_child = run_system_ca_child("reject", &url, Some(&pem), Some("false")).await;
+        assert_child_ok(&false_child);
+    }
+
+    /// AFTER: unset (default On) and `MEOW_HTTP_SYSTEM_CA=true` plus the
+    /// CA visible to the native loader (`SSL_CERT_FILE`) accept the initial
+    /// fetch and a refresh with a changed payload. Wrong hostname and an
+    /// untrusted CA still fail with On.
+    #[tokio::test]
+    async fn https_private_ca_accepted_with_system_ca() {
+        if std::env::var_os(CHILD_KIND).is_some() {
+            return;
+        }
+        let ca = make_ca("provider-test CA");
+        let leaf = make_leaf("127.0.0.1", &[], &["127.0.0.1"], &ca);
+        let url_unset = spawn_https_origin(&leaf, &[b"v1", b"v2"]).await;
+        let url_true = spawn_https_origin(&leaf, &[b"v1", b"v2"]).await;
+        let (_dir, pem) = write_ca_pem(&ca);
+        let default_on = run_system_ca_child("accept-refresh", &url_unset, Some(&pem), None).await;
+        assert_child_ok(&default_on);
+        let accepted =
+            run_system_ca_child("accept-refresh", &url_true, Some(&pem), Some("true")).await;
+        assert_child_ok(&accepted);
+
+        let wrong = make_leaf("wrong.example", &["wrong.example"], &[], &ca);
+        let wrong_url = spawn_https_origin(&wrong, &[b"nope"]).await;
+        let wrong_child = run_system_ca_child("reject", &wrong_url, Some(&pem), None).await;
+        assert_child_ok(&wrong_child);
+
+        let other = make_ca("untrusted CA");
+        let untrusted = make_leaf("127.0.0.1", &[], &["127.0.0.1"], &other);
+        let untrusted_url = spawn_https_origin(&untrusted, &[b"nope"]).await;
+        let untrusted_child = run_system_ca_child("reject", &untrusted_url, Some(&pem), None).await;
+        assert_child_ok(&untrusted_child);
     }
 }

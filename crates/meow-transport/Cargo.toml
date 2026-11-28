@@ -29,6 +29,7 @@ tls = [
     "dep:foreign-types",
     "dep:rand",
     "dep:webpki-root-certs",
+    "dep:rustls-native-certs",
 ]
 # boring-tls: compatibility alias for `tls` (+ `reality`, which it always
 # implied) so existing `--features boring-tls` invocations and downstream
@@ -218,6 +219,11 @@ foreign-types      = { workspace = true, optional = true }
 # parity with rustls and makes verification work uniformly across
 # platforms. Adds ~150 KB of DER blobs to the .rlib.
 webpki-root-certs  = { workspace = true, optional = true }
+# Optional native trust anchors for `TlsLayer::with_system_roots` (internal
+# HTTPS). Loads certificates; BoringSSL still verifies. Not a rustls
+# verifier. Platform discovery is the crate's (schannel / Keychain /
+# openssl-probe) — no hardcoded bundle path.
+rustls-native-certs = { workspace = true, optional = true }
 
 [dev-dependencies]
 # `test-util` enables paused-time tests (start_paused / time::advance) —

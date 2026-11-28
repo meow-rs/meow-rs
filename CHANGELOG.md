@@ -30,6 +30,14 @@ the canonical, in-repo source a release is cut from.
   `proxy-name` and `override-expr` still warn and skip, and a wrongly-typed
   value fails the provider build.
 
+- Internal HTTPS downloads (proxy/rule providers, subscriptions, geodata,
+  external UI) now trust Mozilla roots plus native CAs already installed
+  for the meow process, matching mihomo's default SystemCertPool. Set
+  `MEOW_HTTP_SYSTEM_CA=false` (exact, case-sensitive) to restore
+  Mozilla-only. Unset or `true` keeps the default; any other value warns
+  once and falls back to Mozilla + native. Hostname and chain verification
+  stay on; outbound proxy TLS is unchanged. (#1031)
+
 ### Fixed
 
 - `proxy-providers.*.filter` / `exclude-filter` and the group-level fields

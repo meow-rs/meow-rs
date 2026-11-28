@@ -37,7 +37,8 @@
 //!
 //! The per-process BoringSSL `SSL_CTX` is memoised keyed on the
 //! [`TlsConfig`] fields that shape it (`fingerprint`, `curves`,
-//! `alpn`, `skip_cert_verify`).  A subscription with hundreds of TLS
+//! `alpn`, `skip_cert_verify`) plus whether [`TlsLayer::with_system_roots`]
+//! asked for a native-store snapshot.  A subscription with hundreds of TLS
 //! proxies therefore costs one context per distinct key rather than
 //! one per proxy.
 //! Configs carrying `additional_roots` / `client_cert` (or the
@@ -284,6 +285,21 @@ impl TlsLayer {
     /// * [`TransportError::Config`] — `client_cert` PEM is unparseable.
     /// * [`TransportError::Tls`] — client cert + key don't match.
     pub fn new(config: &TlsConfig) -> Result<Self> {
+        Self::from_config(config, false)
+    }
+
+    /// Like [`Self::new`], but the verify store is the Mozilla bundle plus a
+    /// process-lifetime snapshot of the OS trust store.
+    ///
+    /// Internal HTTPS (`meow-config::internal_http`) uses this unless
+    /// `MEOW_HTTP_SYSTEM_CA=false`. Outbound proxy TLS stays on [`Self::new`].
+    /// Hostname, chain, and distrust checks are unchanged. Native anchors
+    /// are loaded once; restart to pick up trust-store changes.
+    pub fn with_system_roots(config: &TlsConfig) -> Result<Self> {
+        Self::from_config(config, true)
+    }
+
+    fn from_config(config: &TlsConfig, include_system_roots: bool) -> Result<Self> {
         #[cfg(not(feature = "reality"))]
         if config.reality.is_some() {
             return Err(crate::TransportError::Config(
@@ -328,11 +344,15 @@ impl TlsLayer {
             fingerprint = ?config.fingerprint,
             ech = config.ech.is_some(),
             sni = ?config.sni,
+            include_system_roots,
             "TLS: BoringSSL backend (lazy init)"
         );
         let fingerprint = config.fingerprint.clone();
         Ok(Self {
-            backend: TlsBackend::Boring(Box::new(LazyBoringInner::new(config))),
+            backend: TlsBackend::Boring(Box::new(LazyBoringInner::new(
+                config,
+                include_system_roots,
+            ))),
             fingerprint,
         })
     }
