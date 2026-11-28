@@ -1241,7 +1241,9 @@ mod tests {
             started_notify: tokio::sync::Notify::new(),
             release: release_rx,
         });
-        meow_common::set_host_resolver(Arc::clone(&resolver));
+        let host_resolver: Arc<dyn meow_common::HostResolver> =
+            Arc::<PendingHostResolver>::clone(&resolver);
+        meow_common::set_host_resolver(host_resolver);
 
         let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let probe_addr = probe.local_addr().unwrap();
