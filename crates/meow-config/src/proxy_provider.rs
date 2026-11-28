@@ -2190,13 +2190,25 @@ fn yaml_proxy_list(
     }
 }
 
-/// A `proxies:` key at the start of a non-comment line — the feed meant
-/// YAML even when the parser rejected it (unresolved merge, bad alias).
+/// A `proxies:` key or a bare YAML sequence of proxy mappings — the feed
+/// meant YAML even when the parser rejected it (unresolved merge, bad alias).
 fn looks_like_yaml_proxy_text(content: &str) -> bool {
     content.lines().any(|line| {
         let trimmed = line.trim();
-        !trimmed.starts_with('#') && (trimmed == "proxies:" || trimmed.starts_with("proxies:"))
+        !trimmed.starts_with('#')
+            && (trimmed == "proxies:"
+                || trimmed.starts_with("proxies:")
+                || looks_like_yaml_proxy_sequence_item(trimmed))
     })
+}
+
+/// `- name:` / `- type:` / `- {` — a sequence item that is a proxy mapping.
+fn looks_like_yaml_proxy_sequence_item(trimmed: &str) -> bool {
+    let Some(rest) = trimmed.strip_prefix('-') else {
+        return false;
+    };
+    let rest = rest.trim_start();
+    rest.starts_with('{') || rest.starts_with("name:") || rest.starts_with("type:")
 }
 
 fn compile_opt_regex(
@@ -2888,6 +2900,37 @@ header:
         );
     }
 
+    /// Successful ingest already accepts a bare YAML sequence (`doc.is_array()`).
+    /// A malformed one (unresolved merge, no `proxies:` wrapper) must keep
+    /// the YAML error instead of harvesting `ss://` out of a `preview:` block.
+    #[test]
+    fn yaml_bare_sequence_merge_error_does_not_harvest_preview_share_link() {
+        let yaml = "- name: real\n\
+                    type: ss\n\
+                    server: a.example.com\n\
+                    port: 8388\n\
+                    cipher: aes-128-gcm\n\
+                    password: pass\n\
+                    dialer-proxy: front\n\
+                    <<: *missing\n\
+                    preview: |\n\
+                      ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n";
+        let err = parse_payload_maps(yaml)
+            .expect_err("an unresolved merge in a bare YAML sequence must stay a YAML error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("YAML")
+                || msg.contains("malformed")
+                || msg.contains("merge")
+                || msg.contains("alias"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains("share-link"),
+            "must not harvest incidental ss:// lines: {msg}"
+        );
+    }
+
     /// Same shape on refresh: last-good survives, the preview link is not imported.
     #[tokio::test]
     async fn yaml_merge_preview_refresh_keeps_last_good() {
@@ -2925,6 +2968,49 @@ header:
         p.refresh()
             .await
             .expect_err("malformed YAML with a preview share-link must fail");
+        assert_eq!(
+            slot_names(&p.slot),
+            ["KeepMe"],
+            "last-good must survive; the preview link must not be imported"
+        );
+    }
+
+    /// Bare-sequence sibling of `yaml_merge_preview_refresh_keeps_last_good`.
+    #[tokio::test]
+    async fn yaml_bare_sequence_preview_refresh_keeps_last_good() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        write_provider_file(&path, &[("KeepMe", "ss")]);
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(dir.path()),
+            true,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(slot_names(&p.slot), ["KeepMe"]);
+
+        std::fs::write(
+            &path,
+            "- name: real\n\
+             type: ss\n\
+             server: a.example.com\n\
+             port: 8388\n\
+             cipher: aes-128-gcm\n\
+             password: pass\n\
+             dialer-proxy: front\n\
+             <<: *missing\n\
+             preview: |\n\
+               ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n",
+        )
+        .unwrap();
+        p.refresh()
+            .await
+            .expect_err("malformed bare YAML sequence with a preview share-link must fail");
         assert_eq!(
             slot_names(&p.slot),
             ["KeepMe"],

@@ -551,7 +551,7 @@ fn parse_vless(rest: &str) -> Result<HashMap<String, Value>, String> {
         }
         map.insert("reality-opts".to_string(), Value::Object(reality));
     }
-    apply_tls_common(&mut map, &params, false)?;
+    apply_tls_common(&mut map, &params, false, "servername")?;
     apply_transport(&mut map, &params);
     Ok(map)
 }
@@ -573,7 +573,7 @@ fn parse_trojan(rest: &str) -> Result<HashMap<String, Value>, String> {
     );
     insert_str(&mut map, "password", &password);
     insert_bool(&mut map, "udp", true);
-    apply_tls_common(&mut map, &params, false)?;
+    apply_tls_common(&mut map, &params, false, "sni")?;
     apply_transport(&mut map, &params);
     Ok(map)
 }
@@ -592,17 +592,20 @@ fn cert_pin_param(params: &HashMap<String, String>) -> Option<&str> {
 /// `sni` / `insecure` / `alpn` / `fp` / certificate pin — the TLS knobs
 /// the URI schemes share. `pin_supported` is true when the node parser
 /// already reads `fingerprint` as a SHA-256 pin (hysteria2, anytls).
+/// `sni_key` is the YAML field the node parser actually reads (`sni` for
+/// trojan/hy2/anytls, `servername` for vless).
 fn apply_tls_common(
     map: &mut HashMap<String, Value>,
     params: &HashMap<String, String>,
     pin_supported: bool,
+    sni_key: &'static str,
 ) -> Result<(), String> {
     if let Some(sni) = params
         .get("sni")
         .or_else(|| params.get("peer"))
         .or_else(|| params.get("servername"))
     {
-        insert_str(map, "sni", sni);
+        insert_str(map, sni_key, sni);
     }
     if truthy(params.get("allowinsecure")) || truthy(params.get("insecure")) {
         insert_bool(map, "skip-cert-verify", true);
@@ -692,7 +695,7 @@ fn parse_hysteria2(rest: &str) -> Result<HashMap<String, Value>, String> {
         port,
     );
     insert_str(&mut map, "password", &password);
-    apply_tls_common(&mut map, &params, true)?;
+    apply_tls_common(&mut map, &params, true, "sni")?;
     if let Some(obfs) = params.get("obfs") {
         insert_str(&mut map, "obfs", obfs);
     }
@@ -724,7 +727,7 @@ fn parse_anytls(rest: &str) -> Result<HashMap<String, Value>, String> {
         port,
     );
     insert_str(&mut map, "password", &password);
-    apply_tls_common(&mut map, &params, true)?;
+    apply_tls_common(&mut map, &params, true, "sni")?;
     Ok(map)
 }
 
@@ -806,6 +809,11 @@ mod tests {
         assert_eq!(node.get("tls").and_then(Value::as_bool), Some(true));
         assert_eq!(string(&node, "flow"), "xtls-rprx-vision");
         assert_eq!(string(&node, "client-fingerprint"), "chrome");
+        assert_eq!(string(&node, "servername"), "www.microsoft.com");
+        assert!(
+            !node.contains_key("sni"),
+            "vless parser reads servername, not sni"
+        );
         let reality = node.get("reality-opts").and_then(Value::as_object).unwrap();
         assert_eq!(
             reality.get("public-key").and_then(Value::as_str),
