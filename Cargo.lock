@@ -2513,6 +2513,7 @@ dependencies = [
  "meow-listener",
  "meow-proxy",
  "meow-rules",
+ "meow-transport",
  "meow-trie",
  "meow-tunnel",
  "mimalloc",
@@ -2528,6 +2529,7 @@ dependencies = [
  "tracing-subscriber",
  "windows-service",
  "windows-sys 0.61.2",
+ "x25519-dalek",
  "zstd",
 ]
 
@@ -2673,6 +2675,7 @@ dependencies = [
 name = "meow-listener"
 version = "0.30.0"
 dependencies = [
+ "aes-gcm 0.10.3",
  "anyhow",
  "async-trait",
  "base64 0.22.1",
@@ -2680,6 +2683,7 @@ dependencies = [
  "bytes",
  "futures",
  "hex",
+ "hmac",
  "ipnet",
  "libc",
  "meow-anytls",
@@ -2857,6 +2861,7 @@ dependencies = [
  "twofish",
  "webpki-root-certs",
  "x25519-dalek",
+ "zeroize",
 ]
 
 [[package]]

@@ -73,6 +73,7 @@ listeners:
       short-id: ["0123456789abcdef"]
       server-names: ["www.example.com"]
       max-time-difference: 120000000   # microseconds; optional, this is the default
+      # mimic: {}                     # optional; absent/empty means the dial-first defaults below
       limit-fallback-upload:
         after-bytes: 65536
         bytes-per-sec: 32768
@@ -129,6 +130,7 @@ bug. Keys belonging to other listener types (`cipher`, `password`,
 | `short-id` | list of strings | ✓ | Non-empty list. Each item is even-length hex of at most 16 characters, decoded and right-zero-padded to 8 bytes. Empty strings and all-zero values are rejected; duplicates are compared after padding (`"ab"` and `"ab00"` collide). Runtime accepts at most 64 entries. |
 | `server-names` | list of strings | ✓ | Exact-match SNI allowlist compared case-insensitively after ASCII lowercasing: non-empty ASCII DNS A-labels, no wildcards, IP literals, leading/trailing dots, or duplicates (case-insensitive). Runtime accepts at most 64 entries. The wire SNI is never rewritten. |
 | `max-time-difference` | integer | — | Microseconds. Absent/null means `120_000_000` (120 seconds); explicit `0` disables the freshness check; negative or non-integer values hard-error. The wire timestamp is whole Unix seconds, but the skew against the server clock is compared in the microsecond domain — a sub-second window keeps its precision, in either direction, and the boundary is inclusive. |
+| `mimic` | map | `{}` | REALITY v2 target-handshake mirroring. Absent and `{}` both mean `mode: dial-first`, `probe-timeout-ms: 3000` (`500..=15000`), `quiescence-min-ms: 15` (`5..=200`), `quiescence-max-ms: 40` (`10..=500`), and `max-concurrent-probes: 64` (`1..=256`), with `min <= max < probe-timeout-ms`. `mode` is literal `dial-first` or `off`. Explicit `null`, non-maps, unknown/duplicate keys, non-integers and out-of-range values are hard errors; explicit numeric fields are validated even in `off`. |
 | `limit-fallback-upload` / `limit-fallback-download` | map | — | Optional cover-only rate limits with `after-bytes`, `bytes-per-sec`, `burst-bytes-per-sec`, all non-negative integers in bytes or bytes/second. `bytes-per-sec: 0` disables shaping for that direction. Unknown keys hard-error. A burst below the rate is raised to the rate; the current transport interface shares the larger of the two configured burst values across both directions. |
 | `proxy` | — | — | Unsupported nested cover-dial control; hard-errors. The top-level listener `proxy`/`rule` still applies to authenticated VLESS flows. |
 | `xver`, client-version pins, `show`, key logs, ML-DSA keys | — | — | Xray extensions meow does not serve; hard-errors. |
@@ -140,6 +142,25 @@ process, with wildcard/loopback combinations treated conservatively; looping
 candidates are skipped and a target with no remaining dialable address fails
 closed. This does not make a domain `dest` a routing decision — the cover
 target is fixed administrator configuration.
+
+### REALITY v2 mirror mode
+
+With the default `mimic.mode: dial-first`, accepting a TCP connection starts
+one bounded resolution/connect attempt to the fixed `dest` concurrently with
+ClientHello preflight — potentially before any ClientHello byte has arrived.
+After REALITY authentication and profile admission, the original pre-read
+prefix is uploaded once on that same connection. A compatible target
+ServerHello/CCS/encrypted-record prefix supplies only the outer record shape:
+meow replaces the ServerHello random and complete key share, uses its own
+REALITY certificate and transcript keys, verifies the client Finished, and
+then enters VLESS. An incompatible or late target answer consumes the one
+fallback decision and the same socket becomes the ordinary cover relay when
+admission permits; there is no second target dial and no silent v2→v1 local
+handshake downgrade.
+
+`mode: off` is an explicit pre-handshake rollback to the v1 local REALITY
+server handshake, for staged rollout and baseline comparison. It is not an
+automatic error fallback. All mimic fields remain validated in that mode.
 
 ## Wire contract
 
@@ -318,7 +339,10 @@ exact pre-read wire prefix is written to the fixed `dest` first, byte-for-byte
 and once; then both directions relay with 16 KiB buffers and half-close
 support. meow neither rewrites SNI/ALPN nor fetches/copies the target's
 certificate — a probing TLS client completes its handshake with the target
-itself. Authenticated REALITY clients never dial the cover target.
+itself. In explicit `mimic.mode: off`, authenticated REALITY clients never
+dial the cover target. In the default dial-first mode the bounded early dial
+above is the deliberate exception for every admitted connection; authenticated
+traffic still never selects or re-dials a different cover target.
 
 Cover work is resource-bounded independently of `max-connections`: at most
 256 concurrent REALITY classification/handshakes and 64 active cover relays.
@@ -344,10 +368,15 @@ stamped `ConnType::Vless`, matchable via `IN-TYPE,VLESS` as well as
 `IN-NAME`, `IN-PORT`, `IN-USER`, or the listener's `proxy:`/`rule:`
 override.
 
-`PUT /configs` validates the same typed shape. A `type: vless` entry on a
-build without the `listener-vless` feature is rejected with 400 even under
-`?force=true`; listener and security identity changes are committed for the
-next boot rather than hot-swapped.
+`PUT /configs` validates the same typed shape, including malformed mimic
+values even under `?force=true`. A `type: vless` entry on a build without the
+`listener-vless` feature is rejected with 400 even under `?force=true`;
+listener and security identity changes are committed for the next boot rather
+than hot-swapped. The comparison uses the normalized typed listener, so absent
+`mimic`, `mimic: {}` and an explicit default-valued block are equivalent and
+produce no restart notice; an effective change such as `mode: off` does warn
+that restart is required and leaves active sockets, quotas and handshakes
+untouched.
 
 `listener-vless` is in `full`/`default` and out of `minimal`. It pulls in the
 server-side VLESS/Vision and REALITY transport pieces it needs; operators do
@@ -361,11 +390,13 @@ not enable `listener-anytls` or the outbound REALITY feature separately.
 - **No passive fallback chain.** REALITY has exactly one fixed cover `dest`;
   standard TLS has no cover branch. There is no VLESS-level fallback after
   the outer handshake and no byte replay into arbitrary fallback targets.
-- **No target shape mimicry.** The REALITY server emits meow's own standards-
-  compliant TLS 1.3 flight and per-connection HMAC certificate. It does not
-  sample, cache, or imitate the cover site's certificate chain, TLS library,
-  record sizes, or failure behaviour. This is a deliberate v1 boundary, not a
-  claim of byte-identical mimicry.
+- **Only bounded handshake-record shape mimicry.** Default dial-first mirrors
+  the target's TLS 1.3 ServerHello/CCS/encrypted-record envelope within the v2
+  template rules, while replacing the random and key share and using meow's
+  own certificate and keys. It does not copy the target certificate chain,
+  target secrets, ALPN behaviour, timing, failure behaviour, or arbitrary TLS
+  implementation quirks; incompatible templates become cover before any local
+  TLS byte is emitted. `mode: off` keeps the stricter v1 local-flight boundary.
 - **XUDP control/data separation.** Unlike xray freedom's one-flow-per-sid
   model, meow evaluates UDP routing per `(sid, target)`. Flows can die and
   respawn beneath a long-lived sid; this preserves per-destination routing
@@ -384,8 +415,11 @@ not enable `listener-anytls` or the outbound REALITY feature separately.
   is fixed at `decryption: none`; security belongs to the outer TLS/REALITY
   transport.
 - **Startup validation is not a cover health check.** `-t` and startup do not
-  resolve or dial `dest`; a dead cover does not block authenticated REALITY
-  service.
+  resolve or dial `dest`, so a dead cover never blocks startup itself. With the
+  default `dial-first` mimic mode, however, an individual authenticated
+  connection's availability does depend on reaching `dest` and obtaining a
+  compatible template; explicit `mode: off` restores the v1 behavior in which
+  authenticated service is independent of cover reachability.
 - **`-t` shares startup's security construction, files included.** Beyond
   the typed shape, feature gate, users and bind syntax, `-t` runs the same
   security-material validation startup runs. Standard TLS loads the
@@ -393,8 +427,9 @@ not enable `listener-anytls` or the outbound REALITY feature separately.
   deliberate exception to the config test's no-I/O rule, because the pair's
   syntax and key match cannot be checked from the YAML shape — parses both
   and verifies they form a pair. REALITY validates the cover `dest` shape,
-  the `1..=64` short-ID/server-name cardinality and the server names, and
-  constructs the REALITY acceptor. What `-t` still never does: bind a
+  the `1..=64` short-ID/server-name cardinality, server names and normalized
+  mimic contract, and constructs the REALITY acceptor. What `-t` still never
+  does: bind a
   socket, resolve or dial the cover target, or touch the network.
 
 ## Interoperability evidence

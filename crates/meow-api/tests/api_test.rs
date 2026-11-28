@@ -492,6 +492,7 @@ fn vless_reality_named_listener(
                 max_time_difference_us: 120_000_000,
                 limit_fallback_upload: RealityLimitFallback::default(),
                 limit_fallback_download: RealityLimitFallback::default(),
+                mimic: meow_common::VlessRealityMimicSpec::default(),
             }),
             udp: true,
             addresses,
@@ -532,6 +533,7 @@ async fn listeners_endpoint_redacts_vless_credentials() {
         reality_key.as_str(),
         "private-key",
         "short-id",
+        "mimic",
         "users",
         "uuid",
     ] {
@@ -643,6 +645,153 @@ async fn put_configs_persists_vless_secrets_with_owner_only_file_modes() {
         std::fs::read_to_string(config_path.with_extension("yaml.bak")).unwrap(),
         "mode: rule\n"
     );
+}
+
+/// `reality-config.mimic` is REALITY runtime configuration, not an
+/// environment defect. Both plain and forced PUT admission use the same
+/// typed parser startup uses, so malformed or out-of-range values can
+/// never be persisted into the next boot.
+#[tokio::test]
+async fn put_configs_rejects_vless_reality_mimic_even_force() {
+    let _globals_lane = process_globals_lane().await;
+    let state = test_state_default();
+    for mimic in [
+        "      mimic: null\n",
+        "      mimic:\n        mode: sideways\n",
+        "      mimic:\n        probe-timeout-ms: 499\n",
+        "      mimic:\n        mode: off\n        max-concurrent-probes: 0\n",
+        "      mimic:\n        quiescence-min-ms: 41\n        quiescence-max-ms: 40\n",
+    ] {
+        let yaml = vless_reality_document().replace(
+            "      server-names: [\"www.example.com\"]\n",
+            &format!("      server-names: [\"www.example.com\"]\n{mimic}"),
+        );
+        for query in ["", "?force=true"] {
+            let resp = put_configs_payload(&state, &yaml, query).await;
+            assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{mimic} {query}");
+            let body = body_string(resp).await;
+            assert!(body.contains("mimic"), "{body}");
+        }
+    }
+    assert!(
+        state.raw_config.read().listeners.is_none(),
+        "every malformed mimic candidate must be refused before commit"
+    );
+}
+
+/// Listener comparison is semantic after normalization: absent, `{}` and
+/// explicit default mimic are the same startup snapshot, while a real
+/// mode change still earns the restart warning. The test observes the
+/// warning itself rather than inferring it from a deserialized enum.
+#[test]
+fn put_configs_vless_mimic_equivalence_and_restart_warning() {
+    #[derive(Clone)]
+    struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
+        type Writer = Sink;
+        fn make_writer(&'a self) -> Sink {
+            self.clone()
+        }
+    }
+
+    let with_mimic = |mimic: &str| {
+        vless_reality_document().replace(
+            "      server-names: [\"www.example.com\"]\n",
+            &format!("      server-names: [\"www.example.com\"]\n{mimic}"),
+        )
+    };
+    let explicit_defaults = with_mimic(
+        "      mimic:\n        mode: dial-first\n        probe-timeout-ms: 3000\n        quiescence-min-ms: 15\n        quiescence-max-ms: 40\n        max-concurrent-probes: 64\n",
+    );
+    let empty = with_mimic("      mimic: {}\n");
+    let numeric_only = with_mimic("      mimic:\n        probe-timeout-ms: 4000\n");
+    let off = with_mimic("      mimic:\n        mode: off\n");
+
+    let sink = Sink(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(sink.clone())
+        .with_ansi(false)
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    tracing::subscriber::with_default(subscriber, || {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let _globals_lane = process_globals_lane().await;
+                let mut state = test_state_default();
+                Arc::get_mut(&mut state).unwrap().listeners =
+                    vec![vless_reality_named_listener("running-vision", 18443, None)];
+                assert_eq!(
+                    put_configs_payload(&state, vless_reality_document(), "")
+                        .await
+                        .status(),
+                    StatusCode::NO_CONTENT
+                );
+                sink.0.lock().unwrap().clear();
+
+                for equivalent in [empty, explicit_defaults] {
+                    assert_eq!(
+                        put_configs_payload(&state, &equivalent, "").await.status(),
+                        StatusCode::NO_CONTENT
+                    );
+                    let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+                    assert!(
+                        !logs.contains("listeners: changed"),
+                        "equivalent normalized mimic must not warn: {logs}"
+                    );
+                    sink.0.lock().unwrap().clear();
+                }
+
+                assert_eq!(
+                    put_configs_payload(&state, &numeric_only, "")
+                        .await
+                        .status(),
+                    StatusCode::NO_CONTENT
+                );
+                let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+                assert!(
+                    logs.contains("listeners: changed") && logs.contains("restart meow"),
+                    "a numeric-only mimic change must produce the restart warning: {logs}"
+                );
+                sink.0.lock().unwrap().clear();
+
+                assert_eq!(
+                    put_configs_payload(&state, vless_reality_document(), "")
+                        .await
+                        .status(),
+                    StatusCode::NO_CONTENT
+                );
+                sink.0.lock().unwrap().clear();
+                assert_eq!(
+                    put_configs_payload(&state, &off, "").await.status(),
+                    StatusCode::NO_CONTENT
+                );
+                let logs = String::from_utf8_lossy(&sink.0.lock().unwrap()).into_owned();
+                assert!(
+                    logs.contains("listeners: changed") && logs.contains("restart meow"),
+                    "mode off must produce the startup-snapshot restart warning: {logs}"
+                );
+
+                // These assertions are the narrow witness available here:
+                // AppState still publishes the original startup listener row's
+                // name and bound port. They do not attempt to prove socket
+                // ownership or every typed field.
+                assert_eq!(state.listeners.len(), 1);
+                assert_eq!(state.listeners[0].name, "running-vision");
+                assert_eq!(state.listeners[0].port, 18443);
+            });
+    });
 }
 
 #[tokio::test]

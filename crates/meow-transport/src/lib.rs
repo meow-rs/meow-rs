@@ -42,9 +42,14 @@ pub mod tls;
 #[cfg(all(feature = "tls", feature = "reality"))]
 mod reality_hello;
 #[cfg(all(feature = "tls", feature = "reality"))]
+pub mod reality_mirror;
+#[cfg(all(feature = "tls", feature = "reality"))]
 pub mod reality_server;
 #[cfg(all(feature = "tls", feature = "reality"))]
 mod reality_tls;
+
+#[cfg(all(test, feature = "reality"))]
+mod test_alloc;
 
 #[cfg(feature = "ws")]
 pub mod ws;

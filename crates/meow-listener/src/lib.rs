@@ -61,6 +61,8 @@ pub mod tun;
 #[cfg(feature = "listener-vless")]
 pub mod vless;
 #[cfg(feature = "listener-vless")]
+pub(crate) mod vless_mimic;
+#[cfg(feature = "listener-vless")]
 pub(crate) mod vless_xudp;
 #[cfg(feature = "listener-wireguard")]
 pub mod wireguard;
@@ -87,8 +89,11 @@ pub use tun::{OutboundBinding, TunListener, TunListenerConfig, TunReady, TunRout
 #[cfg(feature = "listener-vless")]
 pub use vless::{
     validate_security_spec as validate_vless_security_spec, VlessFallbackLimit, VlessListener,
-    VlessListenerSpec, VlessRealitySpec, VlessSecuritySpec, VlessUserSpec,
+    VlessListenerSpec, VlessRealityMimicMode, VlessRealityMimicSpec, VlessRealitySpec,
+    VlessSecuritySpec, VlessUserSpec,
 };
+#[cfg(feature = "listener-vless")]
+pub use vless_mimic::RealityV2MetricsSnapshot;
 #[cfg(feature = "listener-wireguard")]
 pub use wireguard::{WgListenerSpec, WgPeerSpec, WireGuardListener, WireGuardListenerGuard};
 

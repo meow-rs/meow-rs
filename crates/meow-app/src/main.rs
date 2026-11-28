@@ -886,6 +886,7 @@ fn vless_security_spec(security: &meow_config::VlessSecurity) -> meow_listener::
                     bytes_per_sec: reality.limit_fallback_download.bytes_per_sec,
                     burst_bytes_per_sec: reality.limit_fallback_download.burst_bytes_per_sec,
                 },
+                mimic: reality.mimic,
             })
         }
     }
@@ -2311,7 +2312,7 @@ async fn run(
                         .map(|s| {
                             s.local_addr()
                                 .map(|b| {
-                                    listener.note_bound_endpoint(b);
+                                    listener.note_bound_endpoint(s, b);
                                     (b.ip().to_string(), b.port())
                                 })
                                 .map_err(|e| {

@@ -188,3 +188,185 @@ async fn anytls_users_mapping_round_trip_unchanged() {
         ]
     );
 }
+
+fn reality_doc_with_mimic(mimic: &str) -> String {
+    reality_doc().replace(
+        "      max-time-difference: 60000000\n",
+        &format!("      max-time-difference: 60000000\n{mimic}"),
+    )
+}
+
+async fn reality_mimic(yaml: &str) -> meow_common::VlessRealityMimicSpec {
+    let config = load_config_from_str(yaml)
+        .await
+        .unwrap_or_else(|e| panic!("config must load: {e:#}\nyaml:\n{yaml}"));
+    let ListenerSpec::Vless(cfg) = &config.listeners.named[0].spec else {
+        panic!("expected vless");
+    };
+    let meow_config::VlessSecurity::Reality(rc) = &cfg.security else {
+        panic!("expected reality");
+    };
+    rc.mimic
+}
+
+#[tokio::test]
+async fn vless_reality_mimic_absent_empty_and_explicit_defaults_are_identical() {
+    use meow_common::{VlessRealityMimicMode, VlessRealityMimicSpec};
+
+    let absent = reality_mimic(&reality_doc()).await;
+    assert_eq!(absent, VlessRealityMimicSpec::default());
+    assert_eq!(absent.mode, VlessRealityMimicMode::DialFirst);
+    assert_eq!(absent.probe_timeout_ms, 3_000);
+    assert_eq!(absent.quiescence_min_ms, 15);
+    assert_eq!(absent.quiescence_max_ms, 40);
+    assert_eq!(absent.max_concurrent_probes, 64);
+
+    for suffix in ["      mimic: {}\n"] {
+        let yaml = reality_doc_with_mimic(suffix);
+        assert_eq!(reality_mimic(&yaml).await, absent, "suffix {suffix:?}");
+    }
+
+    let explicit = reality_doc_with_mimic(
+        "      mimic:\n        mode: dial-first\n        probe-timeout-ms: 3000\n        quiescence-min-ms: 15\n        quiescence-max-ms: 40\n        max-concurrent-probes: 64\n",
+    );
+    assert_eq!(reality_mimic(&explicit).await, absent);
+
+    // Serde persistence of the typed listener carries the normalized form,
+    // including for an originally absent block.
+    let json = serde_json::to_value(absent).unwrap();
+    assert_eq!(
+        json,
+        serde_json::json!({
+            "mode": "dial-first",
+            "probe-timeout-ms": 3000,
+            "quiescence-min-ms": 15,
+            "quiescence-max-ms": 40,
+            "max-concurrent-probes": 64,
+        })
+    );
+}
+
+#[tokio::test]
+async fn vless_reality_mimic_valid_explicit_fields_and_mode_off() {
+    let yaml = reality_doc_with_mimic(
+        "      mimic:\n        mode: off\n        probe-timeout-ms: 15000\n        quiescence-min-ms: 200\n        quiescence-max-ms: 500\n        max-concurrent-probes: 256\n",
+    );
+    let spec = reality_mimic(&yaml).await;
+    assert_eq!(spec.mode, meow_common::VlessRealityMimicMode::Off);
+    assert_eq!(spec.probe_timeout_ms, 15_000);
+    assert_eq!(spec.quiescence_min_ms, 200);
+    assert_eq!(spec.quiescence_max_ms, 500);
+    assert_eq!(spec.max_concurrent_probes, 256);
+
+    let yaml = reality_doc_with_mimic(
+        "      mimic:\n        probe-timeout-ms: 500\n        quiescence-min-ms: 5\n        quiescence-max-ms: 10\n        max-concurrent-probes: 1\n",
+    );
+    let spec = reality_mimic(&yaml).await;
+    assert_eq!(spec.mode, meow_common::VlessRealityMimicMode::DialFirst);
+    assert_eq!(spec.probe_timeout_ms, 500);
+    assert_eq!(spec.quiescence_min_ms, 5);
+    assert_eq!(spec.quiescence_max_ms, 10);
+    assert_eq!(spec.max_concurrent_probes, 1);
+}
+
+#[tokio::test]
+async fn vless_reality_mimic_rejection_matrix() {
+    let cases: &[(&str, &str)] = &[
+        ("      mimic: null\n", "null"),
+        ("      mimic: 5\n", "mapping"),
+        ("      mimic: []\n", "mapping"),
+        ("      mimic:\n        unknown: 1\n", "unknown"),
+        ("      mimic:\n        mode: null\n", "mode"),
+        ("      mimic:\n        mode: auto\n", "mode"),
+        ("      mimic:\n        probe-timeout-ms: null\n", "null"),
+        (
+            "      mimic:\n        probe-timeout-ms: 499\n",
+            "probe-timeout-ms",
+        ),
+        (
+            "      mimic:\n        probe-timeout-ms: 15001\n",
+            "probe-timeout-ms",
+        ),
+        (
+            "      mimic:\n        probe-timeout-ms: 3000.0\n",
+            "integer",
+        ),
+        (
+            "      mimic:\n        probe-timeout-ms: \"3000\"\n",
+            "integer",
+        ),
+        (
+            "      mimic:\n        quiescence-min-ms: 4\n",
+            "quiescence-min-ms",
+        ),
+        (
+            "      mimic:\n        quiescence-min-ms: 201\n",
+            "quiescence-min-ms",
+        ),
+        (
+            "      mimic:\n        quiescence-max-ms: 9\n",
+            "quiescence-max-ms",
+        ),
+        (
+            "      mimic:\n        quiescence-max-ms: 501\n",
+            "quiescence-max-ms",
+        ),
+        (
+            "      mimic:\n        quiescence-min-ms: 41\n        quiescence-max-ms: 40\n",
+            "quiescence-min",
+        ),
+        (
+            "      mimic:\n        probe-timeout-ms: 500\n        quiescence-max-ms: 500\n",
+            "probe-timeout",
+        ),
+        (
+            "      mimic:\n        max-concurrent-probes: 0\n",
+            "max-concurrent-probes",
+        ),
+        (
+            "      mimic:\n        max-concurrent-probes: 257\n",
+            "max-concurrent-probes",
+        ),
+        // Explicit numeric fields are validated even in the rollback mode.
+        (
+            "      mimic:\n        mode: off\n        max-concurrent-probes: 0\n",
+            "max-concurrent-probes",
+        ),
+        (
+            "      mimic:\n        mode: off\n        quiescence-min-ms: 41\n",
+            "quiescence-min",
+        ),
+    ];
+    for (mimic, hint) in cases {
+        let err = err_of(&reality_doc_with_mimic(mimic)).await;
+        assert!(
+            err.contains(hint),
+            "expected {hint:?} in {err:?}\ncase:\n{mimic}"
+        );
+    }
+
+    // YAML duplicate keys fail before semantic parsing, on the same shared path.
+    let err = err_of(&reality_doc_with_mimic(
+        "      mimic:\n        mode: off\n        mode: off\n",
+    ))
+    .await;
+    assert!(err.contains("duplicate"), "{err}");
+}
+
+#[tokio::test]
+async fn vless_mimic_is_reality_only_not_standard_tls_surface() {
+    // A same-named top-level key on the standard-TLS listener is not a
+    // spelling variant of reality-config.mimic and must remain an error.
+    let yaml = tls_doc().replace("    users:\n", "    mimic:\n      mode: off\n    users:\n");
+    let err = err_of(&yaml).await;
+    assert!(err.contains("mimic"), "{err}");
+
+    // Nested under the wrong security surface is rejected by the existing
+    // TLS/REALITY exclusivity gate rather than reinterpreted.
+    let yaml = tls_doc().replace(
+        "    users:\n",
+        "    reality-config:\n      mimic:\n        mode: off\n    users:\n",
+    );
+    let err = err_of(&yaml).await;
+    assert!(err.contains("mutually exclusive"), "{err}");
+}

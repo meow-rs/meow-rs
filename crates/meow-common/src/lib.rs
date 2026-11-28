@@ -51,6 +51,7 @@ pub mod tcp_opts;
 pub mod traffic;
 pub mod traffic_ledger;
 pub mod tunnel_mode;
+pub mod vless_reality;
 // Shared YAML-ingest guard used by meow-config and meow-cli — internal
 // plumbing, not part of this published crate's documented API surface.
 #[doc(hidden)]
@@ -119,6 +120,12 @@ pub use socket_protect::{
 pub use socket_protect::{clear_bootstrap_host_resolver, set_bootstrap_host_resolver};
 pub use traffic::{ProxyTraffic, ProxyTrafficSource};
 pub use tunnel_mode::TunnelMode;
+pub use vless_reality::{
+    VlessRealityMimicMode, VlessRealityMimicSpec, MIMIC_DEFAULT_MAX_CONCURRENT_PROBES,
+    MIMIC_DEFAULT_PROBE_TIMEOUT_MS, MIMIC_DEFAULT_QUIESCENCE_MAX_MS,
+    MIMIC_DEFAULT_QUIESCENCE_MIN_MS, MIMIC_MAX_CONCURRENT_PROBES_RANGE,
+    MIMIC_PROBE_TIMEOUT_MS_RANGE, MIMIC_QUIESCENCE_MAX_MS_RANGE, MIMIC_QUIESCENCE_MIN_MS_RANGE,
+};
 
 pub mod health_check;
 pub use health_check::HealthCheckSpec;

@@ -352,8 +352,12 @@ Migration traps:
   the whole sid. Xray GlobalID bytes are parsed for compatibility but do not
   migrate sessions between connections.
 - REALITY cover is one fixed transparent TCP relay to `dest`; an ordinary or
-  unauthenticated TLS client talks to that target itself. This is not target
-  TLS shape mimicry. Authenticated REALITY clients never dial `dest`.
+  unauthenticated TLS client talks to that target itself. Default REALITY v2
+  `mimic.mode: dial-first` deliberately starts one bounded target dial when a
+  connection is accepted, before the ClientHello has necessarily been read, and
+  an authenticated compatible connection uploads the original prefix once so
+  the target's handshake-record envelope can be mirrored. With explicit
+  `mimic.mode: off`, authenticated REALITY clients never dial `dest`.
 - REALITY self-loops are rejected statically where possible and filtered at
   runtime after address resolution; a target with no non-looping candidate
   fails closed.
@@ -363,6 +367,43 @@ Migration traps:
   keeps is that it binds nothing and never resolves or dials `dest`.
 - See [specs/listener-vless.md](specs/listener-vless.md) for the complete
   field table, wire limits, rejection matrix and interoperability evidence.
+
+
+#### Upgrading REALITY vless listeners to v2 dial-first
+
+Existing configurations need no new key: absent `reality-config.mimic` and
+`mimic: {}` both select the default `dial-first` posture. That is an
+availability change, not just a parser default. An authenticated connection
+that is eligible for mirroring now depends on the fixed cover `dest` being
+reachable through its first non-looping resolved address, on the target
+presenting a TLS 1.3 flight inside the supported template, and on the
+listener's handshake/probe admission quotas. If the target cannot be dialed
+the connection closes or follows the pre-commit cover rules; there is no
+silent fallback to the old local v1 server handshake after mirroring starts.
+
+Dial-first also has an operational cost before authentication: merely opening
+a TCP connection can start DNS resolution, a TCP SYN, or a short-lived empty
+connection to `dest` before any ClientHello byte is read. The per-listener
+handshake cap, fixed target and absolute deadlines bound occupancy, but this
+is not a per-second scan-rate governor. Point `dest` only at infrastructure
+you control or are authorized to probe, and rate-limit hostile ingress at the
+deployment edge when needed.
+
+To restore the v1 behavior deliberately, set:
+
+```yaml
+reality-config:
+  # ...
+  mimic:
+    mode: off
+```
+
+and restart meow. `off` is chosen before the handshake and preserves the v1
+local REALITY handshake plus ordinary unauthenticated cover dialing. Editing
+the committed config through `PUT /configs` does not hot-swap an active
+listener: absent, `{}` and explicit default-valued mimic blocks compare as the
+same startup snapshot, while a real mode change only produces the restart
+notice and leaves running sockets, quotas and handshakes untouched.
 
 ### HTTP CONNECT outbound
 

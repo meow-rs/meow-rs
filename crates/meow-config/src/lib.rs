@@ -423,11 +423,10 @@ pub struct VlessUser {
 
 impl std::fmt::Debug for VlessUser {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // The UUID is the bearer credential — the reality spec's redaction
-        // list keeps it out of Debug exactly like the private key; the
-        // username (not a wire value) is enough to identify the entry.
+        // Usernames identify principals and UUIDs are bearer credentials;
+        // the v2 diagnostic redaction list covers both.
         f.debug_struct("VlessUser")
-            .field("username", &self.username)
+            .field("username", &"[REDACTED]")
             .field("uuid", &"[REDACTED]")
             .finish()
     }
@@ -460,14 +459,14 @@ impl std::fmt::Debug for VlessSecurity {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::StandardTls {
-                certificate,
+                certificate: _,
                 private_key: _,
                 alpn,
             } => f
                 .debug_struct("StandardTls")
-                .field("certificate", &certificate)
-                // Key material when the value is a PEM literal — redact
-                // unconditionally rather than only in that form.
+                // Both fields may be inline PEM rather than paths; redact
+                // unconditionally rather than trying to distinguish the form.
+                .field("certificate", &"[REDACTED]")
                 .field("private_key", &"[REDACTED]")
                 .field("alpn", &alpn)
                 .finish(),
@@ -508,23 +507,32 @@ pub struct VlessRealityConfig {
     /// fields disable the corresponding limiter.
     pub limit_fallback_upload: RealityLimitFallback,
     pub limit_fallback_download: RealityLimitFallback,
+    /// REALITY v2 mirror orchestration, normalized at build time. The
+    /// default is dial-first; `off` is the explicit v1 rollback.
+    #[serde(default)]
+    pub mimic: meow_common::VlessRealityMimicSpec,
 }
 
 impl std::fmt::Debug for VlessRealityConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Private key and short IDs are both on the reality spec's
-        // redaction list — only their presence/count may surface.
+        // The v2 diagnostic redaction list covers the cover identity,
+        // admission names, key material and short IDs; only non-identifying
+        // counts and numeric limits may surface.
         f.debug_struct("VlessRealityConfig")
-            .field("dest", &self.dest)
+            .field("dest", &"[REDACTED]")
             .field("private_key", &"[REDACTED]")
             .field(
                 "short_ids",
                 &format_args!("[{} entries]", self.short_ids.len()),
             )
-            .field("server_names", &self.server_names)
+            .field(
+                "server_names",
+                &format_args!("[{} entries]", self.server_names.len()),
+            )
             .field("max_time_difference_us", &self.max_time_difference_us)
             .field("limit_fallback_upload", &self.limit_fallback_upload)
             .field("limit_fallback_download", &self.limit_fallback_download)
+            .field("mimic", &self.mimic)
             .finish()
     }
 }
@@ -7162,6 +7170,10 @@ pub fn validate_vless_security_identity(security: &VlessSecurity) -> Result<(), 
             for (i, name) in reality.server_names.iter().enumerate() {
                 validate_server_name(name, &format!("reality-config.server-names[{i}]"))?;
             }
+            reality
+                .mimic
+                .validate()
+                .map_err(|e| anyhow::anyhow!("reality-config.mimic: {e}"))?;
         }
     }
     Ok(())
@@ -7209,6 +7221,112 @@ fn parse_limit_fallback(
     Ok(out)
 }
 
+/// Parse `reality-config.mimic` into the normalized shared runtime spec.
+/// Absent and `{}` both mean the complete default; every explicit key is
+/// validated even when `mode: off` selects the v1 path.
+fn parse_vless_reality_mimic(
+    obj: &serde_json::Map<String, serde_json::Value>,
+    ctx: &str,
+) -> Result<meow_common::VlessRealityMimicSpec, anyhow::Error> {
+    use meow_common::{
+        VlessRealityMimicMode, VlessRealityMimicSpec, MIMIC_MAX_CONCURRENT_PROBES_RANGE,
+        MIMIC_PROBE_TIMEOUT_MS_RANGE, MIMIC_QUIESCENCE_MAX_MS_RANGE, MIMIC_QUIESCENCE_MIN_MS_RANGE,
+    };
+
+    let mut out = VlessRealityMimicSpec::default();
+    let Some(value) = obj.get("mimic") else {
+        return Ok(out);
+    };
+    let mctx = format!("{ctx}.mimic");
+    if value.is_null() {
+        anyhow::bail!("{mctx}: explicit null is not accepted — omit it or use a mapping");
+    }
+    let Some(mimic) = value.as_object() else {
+        anyhow::bail!("{mctx}: must be a mapping");
+    };
+    for key in mimic.keys() {
+        if !matches!(
+            key.as_str(),
+            "mode"
+                | "probe-timeout-ms"
+                | "quiescence-min-ms"
+                | "quiescence-max-ms"
+                | "max-concurrent-probes"
+        ) {
+            anyhow::bail!("{mctx}.{key}: unknown key");
+        }
+    }
+
+    if let Some(value) = mimic.get("mode") {
+        let serde_json::Value::String(mode) = value else {
+            anyhow::bail!("{mctx}.mode: must be exactly `dial-first` or `off`");
+        };
+        out.mode = match mode.as_str() {
+            "dial-first" => VlessRealityMimicMode::DialFirst,
+            "off" => VlessRealityMimicMode::Off,
+            _ => anyhow::bail!("{mctx}.mode: must be exactly `dial-first` or `off`"),
+        };
+    }
+
+    fn integer_field(
+        mimic: &serde_json::Map<String, serde_json::Value>,
+        key: &str,
+        range: std::ops::RangeInclusive<u64>,
+        ctx: &str,
+    ) -> Result<Option<u64>, anyhow::Error> {
+        let Some(value) = mimic.get(key) else {
+            return Ok(None);
+        };
+        if value.is_null() {
+            anyhow::bail!("{ctx}.{key}: explicit null is not accepted — omit the key");
+        }
+        let Some(v) = value.as_u64() else {
+            anyhow::bail!("{ctx}.{key}: must be an integer in {range:?}");
+        };
+        if !range.contains(&v) {
+            anyhow::bail!("{ctx}.{key}: outside {range:?}");
+        }
+        Ok(Some(v))
+    }
+
+    if let Some(v) = integer_field(
+        mimic,
+        "probe-timeout-ms",
+        MIMIC_PROBE_TIMEOUT_MS_RANGE,
+        &mctx,
+    )? {
+        out.probe_timeout_ms = v;
+    }
+    if let Some(v) = integer_field(
+        mimic,
+        "quiescence-min-ms",
+        MIMIC_QUIESCENCE_MIN_MS_RANGE,
+        &mctx,
+    )? {
+        out.quiescence_min_ms = v;
+    }
+    if let Some(v) = integer_field(
+        mimic,
+        "quiescence-max-ms",
+        MIMIC_QUIESCENCE_MAX_MS_RANGE,
+        &mctx,
+    )? {
+        out.quiescence_max_ms = v;
+    }
+    if let Some(v) = integer_field(
+        mimic,
+        "max-concurrent-probes",
+        (*MIMIC_MAX_CONCURRENT_PROBES_RANGE.start() as u64)
+            ..=(*MIMIC_MAX_CONCURRENT_PROBES_RANGE.end() as u64),
+        &mctx,
+    )? {
+        out.max_concurrent_probes = usize::try_from(v).expect("bounded by [1,256]");
+    }
+
+    out.validate().map_err(|e| anyhow::anyhow!("{mctx}: {e}"))?;
+    Ok(out)
+}
+
 /// Build the `reality-config` block of a `type: vless` listener. Every
 /// key rule follows the mihomo `RealityConfig` shape as the spec
 /// adjudicates it: `dest`/`private-key`/`short-id`/`server-names`
@@ -7242,6 +7360,7 @@ fn build_vless_reality_config(
             | "short-id"
             | "server-names"
             | "max-time-difference"
+            | "mimic"
             | "limit-fallback-upload"
             | "limit-fallback-download" => {}
             "target" => anyhow::bail!(
@@ -7264,11 +7383,11 @@ fn build_vless_reality_config(
             | "server-name" | "short_ids" | "short-ids" => anyhow::bail!(
                 "{ctx}.{key}: not a meow REALITY server key — supported keys are \
                  `dest`, `private-key`, `short-id`, `server-names`, \
-                 `max-time-difference`, `limit-fallback-upload`, `limit-fallback-download`"
+                 `max-time-difference`, `mimic`, `limit-fallback-upload`, `limit-fallback-download`"
             ),
             other => anyhow::bail!(
                 "{ctx}.{other}: unknown key — supported keys are `dest`, `private-key`, \
-                 `short-id`, `server-names`, `max-time-difference`, \
+                 `short-id`, `server-names`, `max-time-difference`, `mimic`, \
                  `limit-fallback-upload`, `limit-fallback-download`"
             ),
         }
@@ -7392,6 +7511,7 @@ fn build_vless_reality_config(
         obj.get("limit-fallback-download"),
         &format!("{ctx}.limit-fallback-download"),
     )?;
+    let mimic = parse_vless_reality_mimic(obj, &ctx)?;
 
     Ok(VlessRealityConfig {
         dest: dest.to_string(),
@@ -7403,6 +7523,7 @@ fn build_vless_reality_config(
         max_time_difference_us,
         limit_fallback_upload,
         limit_fallback_download,
+        mimic,
     })
 }
 
@@ -16823,7 +16944,10 @@ mod listener_surface_tests {
     fn vless_users_roundtrip_and_redaction() {
         // The typed spec round-trips through serde with credentials intact
         // (persistence), while Debug redacts them (diagnostics).
-        let listeners = vless_named(&vless_reality_yaml()).unwrap();
+        let redaction_yaml = vless_reality_yaml()
+            .replace("www.example.com:443", "cover-target.invalid:443")
+            .replace("\"example.com\"", "\"sni-hidden.invalid\"");
+        let listeners = vless_named(&redaction_yaml).unwrap();
         let spec = listeners[0].spec.clone();
         let json = serde_json::to_string(&spec).unwrap();
         let back: ListenerSpec = serde_json::from_str(&json).unwrap();
@@ -16843,8 +16967,30 @@ mod listener_surface_tests {
             "short-id leaked into Debug: {debug}"
         );
         assert!(debug.contains("REDACTED"), "{debug}");
-        // Usernames are not wire secrets — they stay visible.
-        assert!(debug.contains("alice"), "{debug}");
+        for leaked in [
+            "alice",
+            "cover-target.invalid",
+            "cover-target.invalid:443",
+            "sni-hidden.invalid",
+        ] {
+            assert!(
+                !debug.contains(leaked),
+                "{leaked:?} leaked into Debug: {debug}"
+            );
+        }
+
+        let tls_listeners = vless_named(&vless_tls_yaml()).unwrap();
+        let tls_debug = format!("{:?}", tls_listeners[0].spec);
+        for leaked in [
+            "alice",
+            "-----BEGIN CERTIFICATE-----",
+            "-----BEGIN PRIVATE KEY-----",
+        ] {
+            assert!(
+                !tls_debug.contains(leaked),
+                "{leaked:?} leaked into standard-TLS Debug: {tls_debug}"
+            );
+        }
     }
 
     #[test]

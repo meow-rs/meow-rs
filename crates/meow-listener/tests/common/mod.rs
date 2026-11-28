@@ -183,3 +183,5 @@ pub async fn issue_734_tunnel() -> (meow_tunnel::Tunnel, Arc<std::sync::atomic::
     tunnel.update_rules(res.rules);
     (tunnel, accepts)
 }
+
+pub mod reality_t5_target;

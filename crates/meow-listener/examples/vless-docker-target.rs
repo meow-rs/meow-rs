@@ -10,6 +10,9 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::timeout;
 
+#[path = "../tests/common/reality_t5_target.rs"]
+mod reality_t5_target;
+
 const PLAIN_TCP: u16 = 10080;
 const SERVER_FIRST_TCP: u16 = 10025;
 const TLS13_TCP: u16 = 10113;
@@ -201,6 +204,99 @@ async fn probe_connect(ip: IpAddr, port: u16) {
     }
 }
 
+fn tap_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn tap_append(dst: &mut Vec<u8>, bytes: &[u8]) {
+    let take = (96 * 1024usize).saturating_sub(dst.len()).min(bytes.len());
+    dst.extend_from_slice(&bytes[..take]);
+}
+
+async fn serve_tap(listen_port: u16, target: SocketAddr, snapshot_at: usize) {
+    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, listen_port))
+        .await
+        .unwrap_or_else(|e| panic!("tap bind {listen_port}: {e}"));
+    println!("t5 tap ready listen={listen_port}");
+    let mut next = 0usize;
+    while let Ok((client, _)) = listener.accept().await {
+        next += 1;
+        let connection = next;
+        tokio::spawn(async move {
+            let Ok(server) = TcpStream::connect(target).await else {
+                eprintln!("t5 tap connect {target} failed");
+                return;
+            };
+            let c2s = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let s2c = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let snapshot_sent = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let print_snapshot =
+                |connection: usize,
+                 c2s: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+                 s2c: &std::sync::Arc<std::sync::Mutex<Vec<u8>>>| {
+                    println!(
+                    "t5-tap-stream {{\"connection\":{connection},\"c2s_hex\":\"{}\",\"s2c_hex\":\"{}\"}}",
+                    tap_hex(&c2s.lock().unwrap()),
+                    tap_hex(&s2c.lock().unwrap())
+                );
+                };
+            let (mut crd, mut cwr) = tokio::io::split(client);
+            let (mut srd, mut swr) = tokio::io::split(server);
+            let down = tokio::spawn({
+                let c2s = std::sync::Arc::clone(&c2s);
+                let s2c = std::sync::Arc::clone(&s2c);
+                let snapshot_sent = std::sync::Arc::clone(&snapshot_sent);
+                async move {
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match tokio::io::AsyncReadExt::read(&mut srd, &mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                tap_append(&mut s2c.lock().unwrap(), &buf[..n]);
+                                if tokio::io::AsyncWriteExt::write_all(&mut cwr, &buf[..n])
+                                    .await
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                                if s2c.lock().unwrap().len() >= snapshot_at
+                                    && !snapshot_sent
+                                        .swap(true, std::sync::atomic::Ordering::Relaxed)
+                                {
+                                    println!(
+                                        "t5-tap-stream {{\"connection\":{connection},\"c2s_hex\":\"{}\",\"s2c_hex\":\"{}\"}}",
+                                        tap_hex(&c2s.lock().unwrap()),
+                                        tap_hex(&s2c.lock().unwrap())
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            });
+            let mut buf = [0u8; 8192];
+            loop {
+                match tokio::io::AsyncReadExt::read(&mut crd, &mut buf).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        tap_append(&mut c2s.lock().unwrap(), &buf[..n]);
+                        if tokio::io::AsyncWriteExt::write_all(&mut swr, &buf[..n])
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }
+            }
+            down.abort();
+            if !snapshot_sent.load(std::sync::atomic::Ordering::Relaxed) {
+                print_snapshot(connection, &c2s, &s2c);
+            }
+        });
+    }
+}
+
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
     let args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -209,6 +305,18 @@ async fn main() {
         let ip = args[1].parse::<IpAddr>().expect("probe IP");
         let port = args[2].parse::<u16>().expect("probe port");
         probe_connect(ip, port).await;
+        return;
+    }
+
+    if args.first().is_some_and(|arg| arg == "--tap") {
+        assert!(
+            args.len() == 4,
+            "usage: --tap <listen-port> <target-ip:port> <snapshot-at>"
+        );
+        let listen_port = args[1].parse::<u16>().expect("tap listen port");
+        let target = args[2].parse::<SocketAddr>().expect("tap target address");
+        let snapshot_at = args[3].parse::<usize>().expect("tap snapshot byte count");
+        serve_tap(listen_port, target, snapshot_at).await;
         return;
     }
 
@@ -234,6 +342,17 @@ async fn main() {
     bind_udp(UDP_A).await;
     bind_udp(UDP_B).await;
     bind_udp(UDP_443).await;
+    for (port, spec) in reality_t5_target::docker_t5_specs() {
+        for ip in [Ipv6Addr::UNSPECIFIED.into(), Ipv4Addr::UNSPECIFIED.into()] {
+            let addr = SocketAddr::new(ip, port);
+            match TcpListener::bind(addr).await {
+                Ok(listener) => {
+                    tokio::spawn(reality_t5_target::bind_t5_target(listener, port, spec));
+                }
+                Err(e) => eprintln!("t5 target bind {addr} failed: {e}"),
+            }
+        }
+    }
 
     println!(
         "target ready tcp={PLAIN_TCP},{SERVER_FIRST_TCP},{TLS13_TCP},{TLS12_TCP} udp={UDP_A},{UDP_B},{UDP_443}"

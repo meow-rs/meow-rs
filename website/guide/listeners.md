@@ -149,6 +149,7 @@ own OS-assigned port.
         private-key: "dwdtCnMYpX08FsFyUbJmRd9ML4frwJkqsXf7pR25LCo"  # example only
         short-id: ["0123456789abcdef"]
         server-names: ["www.example.com"]
+        # mimic: {}                  # optional; default is dial-first v2 mirroring
       users:
         - username: alice          # list form — not username: uuid mapping
           uuid: "71884bd4-d6a0-4e19-9895-3e1d8b469317"
@@ -160,7 +161,12 @@ own OS-assigned port.
   required and the two modes are mutually exclusive. Wrong UUIDs close
   without a response or target dial; unauthenticated REALITY-looking or
   ordinary TLS traffic is transparently relayed to the fixed cover `dest`.
-  The authenticated username is available to `IN-USER`, and `IN-TYPE,VLESS`
+  REALITY v2 defaults to `mimic.mode: dial-first`: accepting a connection may
+  start one bounded cover-target dial before the ClientHello is complete, and
+  authenticated compatible connections reuse that connection to mirror the
+  target handshake-record envelope. Set `mimic.mode: off` and restart to keep
+  the v1 behavior in which authenticated clients never dial `dest`; there is
+  no automatic v2-to-v1 downgrade. The authenticated username is available to `IN-USER`, and `IN-TYPE,VLESS`
   matches the inbound alongside `IN-NAME`, `IN-PORT`, or a listener
   `proxy:`/`rule:` override. See
   [docs/specs/listener-vless.md](https://github.com/meow-rs/meow-rs/blob/main/docs/specs/listener-vless.md)

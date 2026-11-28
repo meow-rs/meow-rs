@@ -67,6 +67,18 @@ jobs:
           path: tests/dashboard/test-results/
           retention-days: 7
 
+  reality-vector-oracle:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Verify REALITY independent vectors reproduce byte-for-byte
+        run: |
+          python3 -m pip install cryptography==50.0.0
+          python3 crates/meow-transport/tests/generate_reality_independent_vectors.py --check
+
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -521,9 +533,11 @@ jobs:
       - name: VLESS Vision hermetic suites (wire fixtures, allocation bounds, listener integration)
         run: |
           cargo nextest run -p meow-proxy --features vless-vision             --test vision_direct_wire --test vision_server_alloc --test vless_integration             --retries 2 --no-fail-fast
-          cargo nextest run -p meow-listener --features listener-vless             --test vless_listener_integration --retries 2 --no-fail-fast
+          cargo nextest run -p meow-listener --features listener-vless             --test vless_listener_integration --test vless_reality_mimic_finished --retries 2 --no-fail-fast
           cargo nextest run -p meow-config --test vless_listener_config_test             --retries 2 --no-fail-fast
-          cargo nextest run -p meow-transport --features reality             --test tls_server_test --retries 2 --no-fail-fast
+          cargo test -p meow-transport --features reality --lib
+          cargo nextest run -p meow-transport --features reality             --test tls_server_test --test reality_mirror_public_test --retries 2 --no-fail-fast
+          cargo nextest run -p meow-app --features listener-vless             --test vless_reality_mimic_runtime --retries 2 --no-fail-fast
 
       - name: "Docker integration tests (VLESS Vision reverse interop: xray/mihomo clients -> meow server)"
         env:

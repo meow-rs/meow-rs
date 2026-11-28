@@ -17,11 +17,13 @@ use base64::Engine as _;
 use meow_common::{Metadata, Network, ProxyAdapter};
 use meow_dns::Resolver;
 use meow_listener::{
-    VlessFallbackLimit, VlessListener, VlessListenerSpec, VlessRealitySpec, VlessSecuritySpec,
-    VlessUserSpec,
+    VlessFallbackLimit, VlessListener, VlessListenerSpec, VlessRealityMimicSpec, VlessRealitySpec,
+    VlessSecuritySpec, VlessUserSpec,
 };
 use meow_proxy::dialer::DirectDialer;
 use meow_proxy::Socks5Adapter;
+use meow_transport::tls::{RealityConfig, TlsConfig, TlsLayer};
+use meow_transport::Transport;
 use meow_tunnel::Tunnel;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName};
 use serde_json::{json, Value};
@@ -30,6 +32,9 @@ use tempfile::TempDir;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::time::{sleep, timeout, Instant};
+
+mod common;
+use common::reality_t5_target as t5;
 
 // Tags are documentation only; Docker resolves these immutable multi-arch
 // index digests. The frozen interop report names the mihomo commit, which is
@@ -45,6 +50,7 @@ const IMAGE_MIHOMO: &str =
 const MIHOMO_TAG_COMMIT: &str = "0455d0d28c4526937380505153e65a843d8612e8";
 const CLIENT_SOCKS_PORT: u16 = 1080;
 const TARGET_TLS13_TCP: u16 = 10113;
+const TARGET_PLAIN_TCP: u16 = 10080;
 const TARGET_UDP_A: u16 = 10053;
 const TARGET_UDP_B: u16 = 10054;
 const TARGET_UDP_443: u16 = 443;
@@ -1386,7 +1392,7 @@ fn tls_spec(certificate: String, private_key: String) -> VlessListenerSpec {
     }
 }
 
-fn reality_spec(dest: &str) -> VlessListenerSpec {
+fn reality_spec_with_mimic(dest: &str, mimic: VlessRealityMimicSpec) -> VlessListenerSpec {
     VlessListenerSpec {
         users: vec![VlessUserSpec {
             username: "alice".into(),
@@ -1401,9 +1407,14 @@ fn reality_spec(dest: &str) -> VlessListenerSpec {
             max_time_difference_us: 120_000_000,
             limit_fallback_upload: VlessFallbackLimit::default(),
             limit_fallback_download: VlessFallbackLimit::default(),
+            mimic,
         }),
         udp: true,
     }
+}
+
+fn reality_spec(dest: &str) -> VlessListenerSpec {
+    reality_spec_with_mimic(dest, VlessRealityMimicSpec::off())
 }
 
 async fn start_vless_listener(
@@ -1914,13 +1925,13 @@ async fn positive_udp(
         });
     let domain = security.udp_domain();
     let mut expected = Vec::new();
-    for index in 0..6 {
+    for (index, size) in [21usize, 300, 1400, 158, 569, 706].into_iter().enumerate() {
         let port = if index % 2 == 0 {
             echo_a.port()
         } else {
             echo_b.port()
         };
-        let payload = patterned(21 + index * 137, 21 + index as u8);
+        let payload = patterned(size, 21 + index as u8);
         timeout(T, association.send_domain(domain, port, &payload))
             .await
             .expect("UDP send timeout")
@@ -2191,13 +2202,13 @@ async fn real_app_xudp_matrix(
         .expect("real-app UDP associate");
     let domain = security.udp_domain();
     let mut expected = Vec::new();
-    for index in 0..6 {
+    for (index, size) in [21usize, 300, 1400, 158, 569, 706].into_iter().enumerate() {
         let port = if index % 2 == 0 {
             TARGET_UDP_A
         } else {
             TARGET_UDP_B
         };
-        let payload = patterned(64 + index * 173, 120 + index as u8);
+        let payload = patterned(size, 120 + index as u8);
         timeout(T, association.send_domain(domain, port, &payload))
             .await
             .expect("real-app XUDP send timeout")
@@ -2605,5 +2616,1094 @@ async fn reverse_vless_vision_real_app_isolated_matrix() {
             real_app_positive_tcp(client, security, &target_ca.der().clone()).await;
             real_app_xudp_matrix(client, security, target_ipv6).await;
         }
+    }
+}
+
+// ─── REALITY v2 T5 controlled-target harness ─────────────────────────────
+
+#[derive(Clone, Default)]
+struct T5TapBytes {
+    c2s: Vec<u8>,
+    s2c: Vec<u8>,
+}
+
+fn t5_append(dst: &mut Vec<u8>, bytes: &[u8]) {
+    let take = (96 * 1024usize).saturating_sub(dst.len()).min(bytes.len());
+    dst.extend_from_slice(&bytes[..take]);
+}
+
+async fn start_t5_tap(server: SocketAddr) -> (SocketAddr, Arc<std::sync::Mutex<Vec<T5TapBytes>>>) {
+    let listener = TcpListener::bind((Ipv4Addr::UNSPECIFIED, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let streams = Arc::new(std::sync::Mutex::new(Vec::<T5TapBytes>::new()));
+    tokio::spawn({
+        let streams = Arc::clone(&streams);
+        async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let streams = Arc::clone(&streams);
+                tokio::spawn(async move {
+                    let Ok(server_stream) = TcpStream::connect(server).await else {
+                        return;
+                    };
+                    let index = {
+                        let mut locked = streams.lock().unwrap();
+                        locked.push(T5TapBytes::default());
+                        locked.len() - 1
+                    };
+                    let (mut crd, mut cwr) = tokio::io::split(client);
+                    let (mut srd, mut swr) = tokio::io::split(server_stream);
+                    let down = tokio::spawn({
+                        let streams = Arc::clone(&streams);
+                        async move {
+                            let mut buf = [0u8; 8192];
+                            loop {
+                                match srd.read(&mut buf).await {
+                                    Ok(0) | Err(_) => break,
+                                    Ok(n) => {
+                                        t5_append(
+                                            &mut streams.lock().unwrap()[index].s2c,
+                                            &buf[..n],
+                                        );
+                                        if cwr.write_all(&buf[..n]).await.is_err() {
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    });
+                    let mut buf = [0u8; 8192];
+                    loop {
+                        match crd.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => {
+                                t5_append(&mut streams.lock().unwrap()[index].c2s, &buf[..n]);
+                                if swr.write_all(&buf[..n]).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    down.abort();
+                });
+            }
+        }
+    });
+    (addr, streams)
+}
+
+fn t5_first_record(bytes: &[u8]) -> Vec<u8> {
+    assert!(bytes.len() >= 5, "tap has no TLS record header");
+    let len = usize::from(u16::from_be_bytes([bytes[3], bytes[4]]));
+    assert!(bytes.len() >= 5 + len, "tap truncated first TLS record");
+    bytes[..5 + len].to_vec()
+}
+
+fn t5_ch_record(bytes: &[u8]) -> Vec<u8> {
+    let record = t5_first_record(bytes);
+    assert_eq!(record[0], 0x16);
+    assert_eq!(record[5], 0x01);
+    record
+}
+
+fn t5_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+fn t5_unhex(text: &str) -> Vec<u8> {
+    (0..text.len() / 2)
+        .map(|i| u8::from_str_radix(&text[2 * i..2 * i + 2], 16).unwrap())
+        .collect()
+}
+
+struct T5ObservedSh {
+    masked_record: Vec<u8>,
+    session_id: Vec<u8>,
+    group: u16,
+    cipher: u16,
+}
+
+fn t5_parse_mask_sh(record: &[u8]) -> T5ObservedSh {
+    assert_eq!(record[0], 0x16, "server prefix is not a handshake record");
+    assert_eq!(&record[1..3], &[3, 3], "SH record legacy version");
+    assert_eq!(record[5], 0x02, "first server handshake is not SH");
+    let hello_len =
+        (usize::from(record[6]) << 16) | (usize::from(record[7]) << 8) | usize::from(record[8]);
+    assert_eq!(
+        record.len(),
+        5 + 4 + hello_len,
+        "SH record must carry exactly one logical SH"
+    );
+    assert_eq!(&record[9..11], &[3, 3], "SH legacy_version");
+    let mut masked = record.to_vec();
+    masked[11..43].fill(0);
+    let mut pos = 43;
+    let sid_len = usize::from(record[pos]);
+    pos += 1;
+    let session_id = record[pos..pos + sid_len].to_vec();
+    pos += sid_len;
+    let cipher = u16::from_be_bytes([record[pos], record[pos + 1]]);
+    pos += 2;
+    assert_eq!(record[pos], 0, "SH compression");
+    pos += 1;
+    let ext_len = usize::from(u16::from_be_bytes([record[pos], record[pos + 1]]));
+    pos += 2;
+    let end = pos + ext_len;
+    assert_eq!(
+        end,
+        record.len(),
+        "SH extension vector closes at record end"
+    );
+    let mut group = None;
+    while pos < end {
+        let kind = u16::from_be_bytes([record[pos], record[pos + 1]]);
+        let len = usize::from(u16::from_be_bytes([record[pos + 2], record[pos + 3]]));
+        pos += 4;
+        let data_end = pos + len;
+        assert!(data_end <= end, "SH extension overruns");
+        match kind {
+            0x002b => assert_eq!(&record[pos..data_end], &[3, 4], "selected version"),
+            0x0033 => {
+                assert!(len >= 4, "SH key_share shape");
+                let share_len = usize::from(u16::from_be_bytes([record[pos + 2], record[pos + 3]]));
+                assert_eq!(4 + share_len, len, "SH key_share exact length");
+                group = Some(u16::from_be_bytes([record[pos], record[pos + 1]]));
+                masked[pos + 4..data_end].fill(0);
+            }
+            0x0029 => {}
+            other => panic!("unexpected mirrored SH extension 0x{other:04x}"),
+        }
+        pos = data_end;
+    }
+    T5ObservedSh {
+        masked_record: masked,
+        session_id,
+        group: group.expect("SH key_share"),
+        cipher,
+    }
+}
+
+fn t5_json_string(value: &Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("target observation lacks {key}"))
+        .to_string()
+}
+
+fn assert_t5_shape(download: &[u8], client_hello: &[u8], observation: &Value) {
+    let sh = t5_parse_mask_sh(&t5_first_record(download));
+    assert_eq!(
+        t5_hex(&sh.masked_record),
+        t5_json_string(observation, "sh_record_masked_hex"),
+        "masked SH differs from same probe target output"
+    );
+    let ch = t5_ch_record(client_hello);
+    let sid_len = usize::from(ch[43]);
+    assert_eq!(
+        sh.session_id,
+        ch[44..44 + sid_len],
+        "SH must echo the CH session id"
+    );
+    let hello_sha = hex::encode(Sha256::digest(&ch));
+    let hello = observation.get("hello").unwrap();
+    assert_eq!(
+        hello_sha,
+        hello.get("sha256").and_then(Value::as_str).unwrap(),
+        "target did not receive the exact original CH prefix"
+    );
+    let selected_group = t5_json_string(observation, "selected_group");
+    let selected_cipher = t5_json_string(observation, "selected_cipher");
+    assert_eq!(
+        format!("0x{:04x}", sh.group),
+        selected_group,
+        "client-visible selected group"
+    );
+    assert_eq!(
+        format!("0x{:04x}", sh.cipher),
+        selected_cipher,
+        "client-visible selected cipher"
+    );
+
+    let mut pos = 5 + usize::from(u16::from_be_bytes([download[3], download[4]]));
+    if let Some(ccs_hex) = observation.get("ccs_hex").and_then(Value::as_str) {
+        let ccs = t5_unhex(ccs_hex);
+        assert!(
+            download.len() >= pos + ccs.len(),
+            "download truncated before CCS"
+        );
+        assert_eq!(
+            &download[pos..pos + ccs.len()],
+            ccs.as_slice(),
+            "CCS byte mismatch"
+        );
+        pos += ccs.len();
+    }
+    let heads = observation
+        .get("record_heads_hex")
+        .and_then(Value::as_array)
+        .unwrap();
+    assert!(
+        !heads.is_empty(),
+        "controlled target emitted no encrypted records"
+    );
+    for head in heads {
+        let head = t5_unhex(head.as_str().unwrap());
+        assert_eq!(head.len(), 5);
+        assert!(
+            download.len() >= pos + 5,
+            "download truncated in record head"
+        );
+        assert_eq!(
+            &download[pos..pos + 5],
+            head.as_slice(),
+            "encrypted record head mismatch"
+        );
+        let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+        assert!(
+            download.len() >= pos + 5 + len,
+            "download truncated in encrypted record body"
+        );
+        pos += 5 + len;
+    }
+    assert!(
+        download.len() > pos,
+        "tap stops at the mirrored flight; no authenticated data followed"
+    );
+}
+
+fn t5_target_observations(logs: &str, port: u16) -> Vec<Value> {
+    logs.lines()
+        .filter_map(|line| line.strip_prefix("t5-target-observation "))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|value| value.get("port").and_then(Value::as_u64) == Some(u64::from(port)))
+        .collect()
+}
+
+async fn wait_t5_target_observation(target: &ManagedContainer, port: u16, count: usize) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let observations = t5_target_observations(&target.logs(), port);
+        if observations.len() >= count {
+            return observations[observations.len() - 1].clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "controlled target port {port} produced {} observations, expected {count}; logs:\n{}",
+            observations.len(),
+            target.logs()
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+#[derive(Clone)]
+struct T5Combo {
+    target_port: u16,
+    group: u16,
+    cipher: u16,
+    domain: String,
+}
+
+struct T5App {
+    combo: T5Combo,
+    app: ManagedContainer,
+    tap: ManagedContainer,
+    tap_ip: String,
+    target_ip: String,
+    _config_dir: TempDir,
+}
+
+fn t5_real_app_config(target_ip: &str, reality_dest_port: u16) -> String {
+    let reality_private = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(REALITY_PRIVATE);
+    format!(
+        "log-level: debug\nmode: rule\nipv6: false\nallow-lan: true\n\nhosts:\n  t5-inner.test: \"{target_ip}\"\n  t5-11101.test: \"{target_ip}\"\n  t5-11102.test: \"{target_ip}\"\n  t5-11103.test: \"{target_ip}\"\n  t5-11104.test: \"{target_ip}\"\n  reality-udp.test: \"{target_ip}\"\n\nlisteners:\n  - name: reality-in\n    type: vless\n    listen: 0.0.0.0\n    port: {MEOW_REALITY_PORT}\n    reality-config:\n      dest: \"{target_ip}:{reality_dest_port}\"\n      private-key: \"{reality_private}\"\n      short-id: [\"{SHORT_ID_HEX}\"]\n      server-names: [\"{REALITY_NAME}\"]\n      max-time-difference: 120000000\n    udp: true\n    users:\n      - username: alice\n        uuid: \"{VALID_UUID}\"\n        flow: xtls-rprx-vision\n\nrules:\n  - MATCH,DIRECT\n"
+    )
+}
+
+async fn start_t5_apps(
+    target_ip: &str,
+    app_image: &str,
+    tap_image: &str,
+    client_network: &TestNetwork,
+    target_network: &TestNetwork,
+) -> Result<Vec<T5App>, String> {
+    let specs = t5::docker_t5_specs();
+    let mut out = Vec::new();
+    for (target_port, spec) in specs {
+        let config_dir = TempDir::new().map_err(|e| format!("t5 config tempdir: {e}"))?;
+        std::fs::write(
+            config_dir.path().join("config.yaml"),
+            t5_real_app_config(target_ip, target_port),
+        )
+        .map_err(|e| format!("write t5 meow config: {e}"))?;
+        let app = run_managed_container(
+            "t5-meow",
+            app_image,
+            client_network,
+            vec![
+                "-v".into(),
+                format!("{}:/etc/meow:ro", config_dir.path().display()),
+            ],
+            vec![],
+        )?;
+        connect_network(target_network, &app.name)?;
+        wait_container_log(&app, "VLESS listener 'reality-in'").await?;
+        let (app_client_ip, _) = container_network_ips(&app.name, client_network)?;
+        let tap = run_managed_container(
+            "t5-tap",
+            tap_image,
+            client_network,
+            vec![],
+            vec![
+                "--tap".into(),
+                "19444".into(),
+                format!("{app_client_ip}:{MEOW_REALITY_PORT}"),
+                (t5::build_t5_flight(&[0; 32], spec).wire.len() + 1).to_string(),
+            ],
+        )?;
+        wait_container_log(&tap, "t5 tap ready").await?;
+        let (tap_ip, _) = container_network_ips(&tap.name, client_network)?;
+        out.push(T5App {
+            combo: T5Combo {
+                target_port,
+                group: spec.group,
+                cipher: spec.cipher,
+                domain: format!("t5-{target_port}.test"),
+            },
+            app,
+            tap,
+            tap_ip,
+            target_ip: target_ip.into(),
+            _config_dir: config_dir,
+        });
+    }
+    Ok(out)
+}
+
+fn t5_reality_public() -> String {
+    let public = x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(REALITY_PRIVATE));
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public.as_bytes())
+}
+
+fn t5_xray_config(_server: &str, apps: &[T5App]) -> Value {
+    let public = t5_reality_public();
+    let mut outbounds = Vec::new();
+    let mut rules = Vec::new();
+    for app in apps {
+        let tag = format!("t5-{}", app.combo.target_port);
+        let fixture = ClientFixture {
+            tls_port: 0,
+            reality_port: 19444,
+            server: app.tap_ip.clone(),
+            udp_hosts_ip: String::new(),
+            outer_ca_pin: String::new(),
+            reality_public_key: public.clone(),
+        };
+        outbounds.push(xray_vless_outbound(
+            &tag,
+            19444,
+            VALID_UUID,
+            Some("xtls-rprx-vision"),
+            "reality",
+            &fixture,
+        ));
+        rules.push(json!({"type":"field","domain":[format!("full:{}",app.combo.domain)],"outboundTag":tag}));
+    }
+    json!({
+        "log":{"loglevel":"warning"},
+        "inbounds":[{"listen":"0.0.0.0","port":CLIENT_SOCKS_PORT,"protocol":"socks","settings":{"auth":"noauth","udp":true,"ip":"127.0.0.1"}}],
+        "outbounds":outbounds,
+        "routing":{"domainStrategy":"AsIs","rules":rules},
+    })
+}
+
+fn t5_mihomo_config(_server: &str, apps: &[T5App]) -> String {
+    let public = t5_reality_public();
+    let mut proxies = String::new();
+    let mut rules = String::new();
+    for app in apps {
+        let tag = format!("t5-{}", app.combo.target_port);
+        let hybrid = app.combo.group == t5::GROUP_X25519MLKEM768;
+        writeln!(proxies, "  - name: {tag}\n    type: vless\n    server: {}\n    port: {}\n    uuid: \"{VALID_UUID}\"\n    udp: true\n    tls: true\n    client-fingerprint: chrome\n    flow: xtls-rprx-vision\n    servername: {REALITY_NAME}\n    reality-opts:\n      public-key: \"{public}\"\n      short-id: \"{SHORT_ID_HEX}\"\n      support-x25519mlkem768: {hybrid}\n", app.tap_ip, 19444).unwrap();
+        writeln!(rules, "  - DOMAIN,{},{}", app.combo.domain, tag).unwrap();
+    }
+    format!("log-level: warning\nipv6: false\nmode: rule\nallow-lan: true\nsocks-port: {CLIENT_SOCKS_PORT}\n\nhosts:\n  reality-udp.test: \"{}\"\n\nproxies:\n{proxies}\nrules:\n{rules}  - MATCH,t5-{}\n", apps[0].target_ip, apps[0].combo.target_port)
+}
+
+fn assert_t5_ch_evidence(
+    client: ClientKind,
+    combo: &T5Combo,
+    observation: &Value,
+    ed25519_absent: &mut bool,
+) {
+    let hello = observation.get("hello").unwrap();
+    let ciphers: Vec<_> = hello
+        .get("cipher_suites")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .map(Value::as_str)
+        .collect();
+    assert!(
+        ciphers.contains(&Some("0x1301"))
+            && ciphers.contains(&Some("0x1302"))
+            && ciphers.contains(&Some("0x1303")),
+        "online CH TLS1.3 cipher advertisement incomplete: {ciphers:?}"
+    );
+    assert!(
+        ciphers.contains(&Some(format!("0x{:04x}", combo.cipher).as_str())),
+        "online CH does not offer the selected cipher"
+    );
+    let groups: Vec<_> = hello
+        .get("supported_groups")
+        .and_then(Value::as_array)
+        .unwrap()
+        .iter()
+        .map(Value::as_str)
+        .collect();
+    let shares = hello.get("key_shares").and_then(Value::as_array).unwrap();
+    let share = |group: &str| {
+        shares
+            .iter()
+            .find(|v| v.get("group").and_then(Value::as_str) == Some(group))
+            .and_then(|v| v.get("len").and_then(Value::as_u64))
+    };
+    assert!(
+        groups.contains(&Some("0x001d")),
+        "online CH supported_groups lacks x25519: {groups:?}"
+    );
+    assert_eq!(share("0x001d"), Some(32), "online CH x25519 share length");
+    let hybrid_advertised = groups.contains(&Some("0x11ec")) || share("0x11ec").is_some();
+    match client {
+        ClientKind::Mihomo if combo.group == t5::GROUP_X25519 => {
+            assert!(
+                !hybrid_advertised,
+                "mihomo with hybrid disabled still carried 0x11ec online"
+            );
+        }
+        ClientKind::Mihomo => {
+            assert_eq!(
+                share("0x11ec"),
+                Some(1216),
+                "mihomo hybrid support did not provide a 1216-byte online share"
+            );
+        }
+        ClientKind::Xray => {
+            if hello
+                .get("signature_algorithms_has_ed25519")
+                .and_then(Value::as_bool)
+                == Some(false)
+            {
+                *ed25519_absent = true;
+            }
+        }
+    }
+    if combo.group == t5::GROUP_X25519MLKEM768 {
+        assert_eq!(
+            share("0x11ec"),
+            Some(1216),
+            "selected hybrid group lacks a real online client share"
+        );
+    }
+    assert_eq!(
+        hello.get("has_pre_shared_key").and_then(Value::as_bool),
+        Some(false)
+    );
+    assert_eq!(
+        hello.get("has_early_data").and_then(Value::as_bool),
+        Some(false)
+    );
+}
+
+fn t5_tap_streams(logs: &str) -> Vec<T5TapBytes> {
+    logs.lines()
+        .filter_map(|line| line.strip_prefix("t5-tap-stream "))
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .map(|value| T5TapBytes {
+            c2s: t5_unhex(value.get("c2s_hex").and_then(Value::as_str).unwrap_or("")),
+            s2c: t5_unhex(value.get("s2c_hex").and_then(Value::as_str).unwrap_or("")),
+        })
+        .collect()
+}
+
+async fn wait_t5_tap_stream(tap: &ManagedContainer, index: usize) -> T5TapBytes {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let streams = t5_tap_streams(&tap.logs());
+        if streams.len() > index {
+            return streams[index].clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "wire tap container produced {} streams, expected index {index}; logs:
+{}",
+            streams.len(),
+            tap.logs()
+        );
+        sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn drive_t5_short_echo(
+    client: &ClientContainer,
+    app: &T5App,
+    tap_index: usize,
+    observation_count: usize,
+    target: &ManagedContainer,
+    ed25519_absent: &mut bool,
+) {
+    let adapter = socks_adapter(client);
+    let mut conn = timeout(
+        T,
+        adapter.dial_tcp(&metadata_domain(
+            &app.combo.domain,
+            TARGET_PLAIN_TCP,
+            Network::Tcp,
+        )),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "{} {}: T5 SOCKS timeout\n{}",
+            client.kind.label(),
+            app.combo.domain,
+            client.logs()
+        )
+    })
+    .unwrap_or_else(|e| {
+        panic!(
+            "{} {}: T5 SOCKS failed {e}\n{}",
+            client.kind.label(),
+            app.combo.domain,
+            client.logs()
+        )
+    });
+    let payload = patterned(517, app.combo.target_port as u8);
+    timeout(T, conn.write_all(&payload))
+        .await
+        .expect("t5 write timeout")
+        .expect("t5 write");
+    timeout(T, conn.flush())
+        .await
+        .expect("t5 flush timeout")
+        .expect("t5 flush");
+    let mut echoed = vec![0u8; payload.len()];
+    if let Err(error) = timeout(T, conn.read_exact(&mut echoed)).await {
+        let taps = t5_tap_streams(&app.tap.logs()).len();
+        panic!(
+            "t5 echo timeout {error:?}: {} {} port={} taps={taps}\n--- client logs ---\n{}\n--- app logs ---\n{}\n--- target logs ---\n{}",
+            client.kind.label(),
+            app.combo.domain,
+            app.combo.target_port,
+            client.logs(),
+            app.app.logs(),
+            target.logs()
+        );
+    }
+    assert_eq!(echoed, payload, "short TCP echo corrupted");
+    drop(conn);
+    let observation =
+        wait_t5_target_observation(target, app.combo.target_port, observation_count).await;
+    let _tap_index_is_per_client = tap_index;
+    let tap = wait_t5_tap_stream(&app.tap, tap_index).await;
+    assert_t5_shape(&tap.s2c, &tap.c2s, &observation);
+    assert_t5_ch_evidence(client.kind, &app.combo, &observation, ed25519_absent);
+    eprintln!("t5 matrix evidence: {} port={} group=0x{:04x} cipher=0x{:04x} short-echo=517B shape=matched", client.kind.label(), app.combo.target_port, app.combo.group, app.combo.cipher);
+}
+
+fn start_t5_client_container(
+    kind: ClientKind,
+    config_name: &str,
+    contents: String,
+    args: Vec<String>,
+    network: &TestNetwork,
+) -> Result<ClientContainer, String> {
+    static CONTAINERS: AtomicUsize = AtomicUsize::new(0);
+    let dir = TempDir::new().map_err(|e| format!("t5 client tempdir: {e}"))?;
+    let host_config = dir.path().join(config_name);
+    std::fs::write(&host_config, contents).map_err(|e| format!("write t5 client config: {e}"))?;
+    let container_config = format!("/{config_name}");
+    let name = format!(
+        "meow-vless-t5-{}-{}-{}",
+        kind.label(),
+        std::process::id(),
+        CONTAINERS.fetch_add(1, Ordering::Relaxed)
+    );
+    let out = Command::new("docker")
+        .args([
+            "run".into(),
+            "-d".into(),
+            "--name".into(),
+            name.clone(),
+            "--network".into(),
+            network.name.clone(),
+            "-v".into(),
+            format!("{}:{container_config}:ro", host_config.display()),
+            "-p".into(),
+            format!("127.0.0.1:0:{CLIENT_SOCKS_PORT}/tcp"),
+            "-p".into(),
+            format!("127.0.0.1:0:{CLIENT_SOCKS_PORT}/udp"),
+            kind.image().into(),
+        ])
+        .args(args)
+        .output()
+        .map_err(|e| format!("docker run t5 {}: {e}", kind.label()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "docker run t5 {} failed: {}",
+            kind.label(),
+            String::from_utf8_lossy(&out.stderr)
+        ));
+    }
+    Ok(ClientContainer {
+        tcp_port: published_port(&name, &format!("{CLIENT_SOCKS_PORT}/tcp"))?,
+        udp_port: published_port(&name, &format!("{CLIENT_SOCKS_PORT}/udp"))?,
+        name,
+        kind,
+        _dir: dir,
+    })
+}
+
+#[tokio::test]
+async fn reverse_vless_reality_v2_t5_controlled_target_matrix() {
+    if let Err(reason) = docker_prerequisites() {
+        skip_or_panic(reason);
+        return;
+    }
+    let _lane = DOCKER_TEST_LANE.lock().await;
+    eprintln!("t5 pin evidence: xray ghcr.io/xtls/xray-core@sha256:592ec4d11f656db95598d01e76dbcc6e002d67360b96a5436500a938230f52c7; mihomo metacubex/mihomo@sha256:4c2495d705f152897a58eac410350f243835fd01ce2fe44949a571faa824d532 commit {MIHOMO_TAG_COMMIT}");
+    let artifacts =
+        build_linux_artifacts().unwrap_or_else(|e| panic!("linux artifact build failed: {e}"));
+    let target_image = build_test_image(
+        "t5-target-image",
+        &artifacts.target,
+        "vless-docker-target",
+        &["/vless-docker-target"],
+    )
+    .unwrap_or_else(|e| panic!("target image build failed: {e}"));
+    let app_image = build_test_image(
+        "t5-app-image",
+        &artifacts.meow,
+        "meow",
+        &["/meow", "-f", "/etc/meow/config.yaml"],
+    )
+    .unwrap_or_else(|e| panic!("meow image build failed: {e}"));
+    let client_network = create_network("t5-clients", false, false)
+        .unwrap_or_else(|e| panic!("create t5 client network: {e}"));
+    let target_network = create_network("t5-targets", true, true)
+        .unwrap_or_else(|e| panic!("create t5 target network: {e}"));
+
+    let (target_ca, target_ca_key) = new_test_ca("meow T5 target CA");
+    let target_cert = issue_cert(&target_ca, &target_ca_key, vec!["t5-inner.test".into()]);
+    let cert_dir = TempDir::new().expect("t5 target cert tempdir");
+    std::fs::write(cert_dir.path().join("chain.pem"), &target_cert.chain_pem).unwrap();
+    std::fs::write(cert_dir.path().join("key.pem"), &target_cert.key_pem).unwrap();
+    let target = run_managed_container(
+        "t5-target",
+        &target_image.tag,
+        &target_network,
+        vec![
+            "-v".into(),
+            format!("{}:/certs:ro", cert_dir.path().display()),
+        ],
+        vec![
+            "--cert".into(),
+            "/certs/chain.pem".into(),
+            "--key".into(),
+            "/certs/key.pem".into(),
+        ],
+    )
+    .unwrap_or_else(|e| panic!("start t5 target: {e}"));
+    wait_container_log(&target, "target ready")
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let (target_ip, _) = container_network_ips(&target.name, &target_network)
+        .unwrap_or_else(|e| panic!("inspect t5 target ip: {e}"));
+    let apps = start_t5_apps(
+        &target_ip,
+        &app_image.tag,
+        &target_image.tag,
+        &client_network,
+        &target_network,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("start t5 apps: {e}"));
+    for app in &apps {
+        container_network_ips(&app.app.name, &target_network)
+            .unwrap_or_else(|e| panic!("meow t5 app missing target-network attachment: {e}"));
+    }
+    assert!(
+        container_network_ips(&target.name, &client_network).is_err(),
+        "T5 target must not attach to client network"
+    );
+    assert_no_direct_target_path(
+        &client_network,
+        &target_image.tag,
+        &target_ip,
+        t5::T5_X25519_1301_PORT,
+    )
+    .unwrap_or_else(|e| panic!("T5 client-network bypass probe failed: {e}"));
+    eprintln!("t5 topology evidence: target network is --internal; meow apps are the only dual-attached containers; active bypass probe to controlled target port failed");
+
+    let host_server = inprocess_host_server(&client_network)
+        .unwrap_or_else(|e| panic!("host server mapping: {e}"));
+    let xray_config = t5_xray_config(&host_server, &apps).to_string();
+    let xray = start_t5_client_container(
+        ClientKind::Xray,
+        "config.json",
+        xray_config,
+        vec!["run".into(), "-c".into(), "/config.json".into()],
+        &client_network,
+    )
+    .unwrap_or_else(|e| panic!("start t5 xray: {e}"));
+    wait_client_ready(&xray)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+    let mihomo_config = t5_mihomo_config(&host_server, &apps);
+    let mihomo = start_t5_client_container(
+        ClientKind::Mihomo,
+        "config.yaml",
+        mihomo_config,
+        vec!["-f".into(), "/config.yaml".into()],
+        &client_network,
+    )
+    .unwrap_or_else(|e| panic!("start t5 mihomo: {e}"));
+    wait_client_ready(&mihomo)
+        .await
+        .unwrap_or_else(|e| panic!("{e}"));
+
+    let mut ed25519_absent = false;
+    for (client_index, client) in [&xray, &mihomo].into_iter().enumerate() {
+        for app in &apps {
+            drive_t5_short_echo(
+                client,
+                app,
+                client_index,
+                client_index + 1,
+                &target,
+                &mut ed25519_absent,
+            )
+            .await;
+        }
+    }
+    assert!(ed25519_absent, "at least one pinned xray row must prove the Chrome CH omits signature algorithm 0x0807 while Ed25519 CertificateVerify still verifies");
+    let (_, target_ipv6) = container_network_ips(&target.name, &target_network)
+        .unwrap_or_else(|e| panic!("inspect t5 target ipv6: {e}"));
+    let target_ipv6 = target_ipv6.and_then(|text| text.parse::<Ipv6Addr>().ok());
+    for client in [&xray, &mihomo] {
+        real_app_xudp_matrix(client, Security::Reality, target_ipv6).await;
+    }
+    eprintln!(
+        "t5 matrix evidence: rows=8 tcp-echo=8 shape-matches=8 real-app-xudp=2-clients source-exact-21/300/1400"
+    );
+}
+
+async fn start_host_t5_target(
+    spec: t5::T5TargetSpec,
+) -> (
+    SocketAddr,
+    Arc<tokio::sync::Mutex<Vec<t5::T5TargetObservation>>>,
+) {
+    let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let observations = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+    tokio::spawn(t5::serve_host_t5_target(
+        listener,
+        addr.port(),
+        spec,
+        Arc::clone(&observations),
+    ));
+    (addr, observations)
+}
+
+async fn capture_t5_production_ch() -> Vec<u8> {
+    let reality_public =
+        x25519_dalek::PublicKey::from(&x25519_dalek::StaticSecret::from(REALITY_PRIVATE));
+    let tls = TlsConfig {
+        reality: Some(RealityConfig {
+            public_key: *reality_public.as_bytes(),
+            short_id: SHORT_ID,
+            support_x25519_mlkem768: false,
+            protocol_clock: None,
+        }),
+        ..TlsConfig::new(REALITY_NAME)
+    };
+    let layer = TlsLayer::new(&tls).expect("capture REALITY client layer");
+    let (client_end, mut server_end) = tokio::io::duplex(128 * 1024);
+    let task = tokio::spawn(async move { layer.connect(Box::new(client_end)).await });
+    let mut head = [0u8; 5];
+    server_end
+        .read_exact(&mut head)
+        .await
+        .expect("capture CH head");
+    let len = usize::from(u16::from_be_bytes([head[3], head[4]]));
+    let mut body = vec![0u8; len];
+    server_end
+        .read_exact(&mut body)
+        .await
+        .expect("capture CH body");
+    task.abort();
+    let mut wire = head.to_vec();
+    wire.extend_from_slice(&body);
+    wire
+}
+
+async fn run_t5_negative_fixture(
+    spec: t5::T5TargetSpec,
+    label: &str,
+    accepted_cover_reasons: &[&str],
+) {
+    let (target, _observations) = start_host_t5_target(spec).await;
+    let tunnel = tunnel_with_hosts(&[]);
+    let (port, listener) = start_vless_listener(
+        reality_spec_with_mimic(
+            &format!("{}:{}", target.ip(), target.port()),
+            VlessRealityMimicSpec::default(),
+        ),
+        tunnel,
+        &format!("t5-negative-{label}"),
+    )
+    .await;
+    let ch = capture_t5_production_ch().await;
+    let evidence = t5::parse_client_hello_record(&ch).expect("captured CH parses");
+    let expected = t5::build_t5_flight(&evidence.session_id, spec);
+
+    let mut stream = TcpStream::connect((Ipv4Addr::LOCALHOST, port))
+        .await
+        .unwrap();
+    stream.write_all(&ch).await.unwrap();
+    stream.flush().await.unwrap();
+    let mut received = vec![0u8; expected.wire.len()];
+    timeout(T, stream.read_exact(&mut received))
+        .await
+        .unwrap_or_else(|_| panic!("{label}: fallback flight timeout"))
+        .unwrap_or_else(|e| panic!("{label}: fallback flight read: {e}"));
+    assert_eq!(
+        received, expected.wire,
+        "{label}: fallback must relay the original target bytes without local REALITY patching"
+    );
+    stream.shutdown().await.unwrap();
+    drop(stream);
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        if snapshot.cover_total.values().sum::<usize>() == 1 && snapshot.active_covers == 0 {
+            assert_eq!(
+                snapshot.committed_total, 0,
+                "{label}: negative fixture committed local REALITY"
+            );
+            assert_eq!(
+                snapshot.mimic_hit_total, 0,
+                "{label}: negative fixture established local REALITY/VLESS"
+            );
+            assert!(
+                accepted_cover_reasons
+                    .iter()
+                    .any(|reason| snapshot.cover_total.get(reason) == Some(&1)),
+                "{label}: cover reason {:?} not in {accepted_cover_reasons:?}",
+                snapshot.cover_total
+            );
+            eprintln!(
+                "t5 negative evidence: {label} original-flight={}B cover={:?} committed=0 hit=0",
+                expected.wire.len(),
+                snapshot.cover_total
+            );
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{label}: cover did not finish cleanly: {:?}",
+            listener.reality_v2_metrics_snapshot().unwrap()
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reality_v2_t5_negative_fixtures_original_byte_fallback() {
+    for (label, spec, reasons) in [
+        (
+            "hrr",
+            t5::T5TargetSpec::negative(
+                t5::GROUP_X25519,
+                t5::TLS_AES_128_GCM_SHA256,
+                t5::T5ShVariant::Hrr,
+            ),
+            &["hrr"][..],
+        ),
+        (
+            "server-psk",
+            t5::T5TargetSpec::negative(
+                t5::GROUP_X25519,
+                t5::TLS_AES_128_GCM_SHA256,
+                t5::T5ShVariant::PreSharedKey,
+            ),
+            &["unsupported_ext", "dest_profile"][..],
+        ),
+        (
+            "unknown-group",
+            t5::T5TargetSpec::negative(
+                t5::GROUP_X25519,
+                t5::TLS_AES_128_GCM_SHA256,
+                t5::T5ShVariant::UnknownGroup,
+            ),
+            &["unsupported_group", "dest_profile"][..],
+        ),
+        (
+            "unoffered-hybrid",
+            t5::T5TargetSpec::negative(
+                t5::GROUP_X25519MLKEM768,
+                t5::TLS_AES_256_GCM_SHA384,
+                t5::T5ShVariant::Normal,
+            ),
+            &["unsupported_group", "dest_profile"][..],
+        ),
+    ] {
+        run_t5_negative_fixture(spec, label, reasons).await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reverse_vless_reality_v2_t5_full_data_plane_inprocess() {
+    if let Err(reason) = docker_prerequisites() {
+        skip_or_panic(reason);
+        return;
+    }
+    let _lane = DOCKER_TEST_LANE.lock().await;
+
+    let (cover, cover_ca) = start_tls13_http_cover().await;
+    let (cover_port, cover_listener) = start_vless_listener(
+        reality_spec_with_mimic(
+            &format!("{}:{}", cover.ip(), cover.port()),
+            VlessRealityMimicSpec::default(),
+        ),
+        tunnel_with_hosts(&[]),
+        "t5-real-cover",
+    )
+    .await;
+    reality_cover_https(cover_port, &cover_ca).await;
+    let cover_snapshot = cover_listener.reality_v2_metrics_snapshot().unwrap();
+    assert_eq!(
+        cover_snapshot.cover_total.get("auth_failed"),
+        Some(&1),
+        "ordinary TLS client must use the v2 cover path"
+    );
+    eprintln!("t5 real-cover evidence: local-CA TLS1.3 certificate validated; HTTPS body exact; cover=auth_failed");
+
+    let (inner_echo, inner_ca, inner_handshakes) =
+        start_tls13_echo(vec![REALITY_INNER_DOMAIN.to_string()]).await;
+    let (udp_echo_a, _) = start_udp_echo().await;
+    let (udp_echo_b, _) = start_udp_echo().await;
+    let (udp_echo_v6, _) = start_udp_echo_on(IpAddr::V6(Ipv6Addr::LOCALHOST)).await;
+    let client_network = create_network("t5-data-clients", false, true)
+        .unwrap_or_else(|e| panic!("create t5 data client network: {e}"));
+    let host_server = inprocess_host_server(&client_network)
+        .unwrap_or_else(|e| panic!("inspect t5 data host address: {e}"));
+
+    for kind in [ClientKind::Xray, ClientKind::Mihomo] {
+        let hybrid = kind == ClientKind::Xray;
+        let spec = if hybrid {
+            t5::T5TargetSpec::normal(
+                t5::GROUP_X25519MLKEM768,
+                t5::TLS_AES_256_GCM_SHA384,
+                t5::T5RecordPlan::Multi,
+                false,
+            )
+        } else {
+            t5::T5TargetSpec::normal(
+                t5::GROUP_X25519,
+                t5::TLS_AES_128_GCM_SHA256,
+                t5::T5RecordPlan::Single,
+                true,
+            )
+        };
+        let (target, observations) = start_host_t5_target(spec).await;
+        let tunnel = tunnel_with_hosts(&[
+            (REALITY_INNER_DOMAIN, inner_echo.ip()),
+            (REALITY_UDP_DOMAIN, udp_echo_a.ip()),
+        ]);
+        let (listener_port, listener) = start_vless_listener(
+            reality_spec_with_mimic(
+                &format!("{}:{}", target.ip(), target.port()),
+                VlessRealityMimicSpec::default(),
+            ),
+            tunnel,
+            &format!("t5-data-{}", kind.label()),
+        )
+        .await;
+        let (tap, taps) = start_t5_tap(SocketAddr::new(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            listener_port,
+        ))
+        .await;
+        let fixture = ClientFixture {
+            tls_port: tap.port(),
+            reality_port: tap.port(),
+            server: host_server.clone(),
+            udp_hosts_ip: "127.0.0.1".into(),
+            outer_ca_pin: String::new(),
+            reality_public_key: t5_reality_public(),
+        };
+        let client = start_client_container(kind, &fixture, Some(&client_network))
+            .unwrap_or_else(|e| panic!("{} t5 data client setup failed: {e}", kind.label()));
+        wait_client_ready(&client)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        positive_tcp(
+            &client,
+            Security::Reality,
+            &listener,
+            inner_echo,
+            &inner_ca,
+            &inner_handshakes,
+        )
+        .await;
+        positive_udp(
+            &client,
+            Security::Reality,
+            &listener,
+            udp_echo_a,
+            udp_echo_b,
+            udp_echo_v6,
+        )
+        .await;
+
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if !observations.lock().await.is_empty() && !taps.lock().unwrap().is_empty() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "{}: controlled target/tap observation missing",
+                kind.label()
+            );
+            sleep(Duration::from_millis(20)).await;
+        }
+        let observation = observations.lock().await[0].to_json();
+        let tap = taps.lock().unwrap()[0].clone();
+        assert_t5_shape(&tap.s2c, &tap.c2s, &observation);
+        let mut ed = false;
+        assert_t5_ch_evidence(
+            kind,
+            &T5Combo {
+                target_port: target.port(),
+                group: spec.group,
+                cipher: spec.cipher,
+                domain: REALITY_INNER_DOMAIN.into(),
+            },
+            &observation,
+            &mut ed,
+        );
+        assert_eq!(
+            observation.get("selected_group").and_then(Value::as_str),
+            Some(if hybrid { "0x11ec" } else { "0x001d" }),
+            "{} full data-plane group",
+            kind.label()
+        );
+        eprintln!("t5 full-data-plane evidence: {} group={} tcp=>1MiB+777 inner TLS exact raw +1/+1; xudp sizes include 21/300/1400 source-exact no-raw; shape=matched", kind.label(), observation.get("selected_group").and_then(Value::as_str).unwrap());
+        drop(client);
     }
 }

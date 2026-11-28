@@ -99,6 +99,9 @@ pub struct VlessRealitySpec {
     pub max_time_difference_us: u64,
     pub limit_fallback_upload: VlessFallbackLimit,
     pub limit_fallback_download: VlessFallbackLimit,
+    /// REALITY v2 mirror orchestration, normalized and validated by the
+    /// shared config/runtime contract in `meow-common`.
+    pub mimic: VlessRealityMimicSpec,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -108,25 +111,47 @@ pub struct VlessFallbackLimit {
     pub burst_bytes_per_sec: u64,
 }
 
-enum SecurityRuntime {
+pub use meow_common::{VlessRealityMimicMode, VlessRealityMimicSpec};
+
+pub(crate) enum SecurityRuntime {
     StandardTls(TlsServer),
     Reality(RealityRuntime),
 }
 
-struct RealityRuntime {
-    server: RealityServer,
-    dest_host: String,
-    dest_port: u16,
-    cover_limit: CoverBandwidthLimit,
-    handshake_slots: Arc<Semaphore>,
-    cover_slots: Arc<Semaphore>,
+pub(crate) struct RealityRuntime {
+    pub(crate) server: RealityServer,
+    pub(crate) dest_host: String,
+    pub(crate) dest_port: u16,
+    pub(crate) cover_limit: CoverBandwidthLimit,
+    pub(crate) handshake_slots: Arc<Semaphore>,
+    pub(crate) probe_slots: Arc<Semaphore>,
+    pub(crate) cover_slots: Arc<Semaphore>,
+    pub(crate) mimic: VlessRealityMimicSpec,
+    pub(crate) metrics: Arc<crate::vless_mimic::RealityV2Metrics>,
+}
+
+/// Whether a v6 wildcard socket also accepts IPv4 traffic. Linux and macOS
+/// default such sockets to dual-stack; a host or embedder can still create a
+/// v6-only socket, so the runtime guard records the real socket option instead
+/// of guessing from the bound address. Meaningless for non-v6-wildcards.
+#[derive(Clone, Copy)]
+struct BoundEndpointCoverage {
+    v6_wildcard_accepts_v4: bool,
+}
+
+impl BoundEndpointCoverage {
+    #[cfg(test)]
+    const CONSERVATIVE: Self = Self {
+        v6_wildcard_accepts_v4: true,
+    };
 }
 
 /// Bound endpoints of every live VLESS listener generation in this
 /// process. A cover target resolving to any of them would re-enter the
 /// REALITY classifier rather than reach a cover site. Weak refs keep a
 /// dropped listener from poisoning later independent generations.
-type EndpointSet = std::sync::RwLock<HashSet<SocketAddr>>;
+type EndpointSnapshot = HashMap<SocketAddr, BoundEndpointCoverage>;
+type EndpointSet = std::sync::RwLock<EndpointSnapshot>;
 type EndpointRegistry = parking_lot::Mutex<Vec<Weak<EndpointSet>>>;
 
 fn endpoint_registries() -> &'static EndpointRegistry {
@@ -141,12 +166,12 @@ fn endpoint_registries() -> &'static EndpointRegistry {
 /// it inserted; a port later reused by an unrelated service must not stay
 /// blacklisted as a cover target.
 struct EndpointRegistration {
-    set: Arc<std::sync::RwLock<HashSet<SocketAddr>>>,
+    set: Arc<EndpointSet>,
     addr: SocketAddr,
 }
 
 impl EndpointRegistration {
-    fn new(set: Arc<std::sync::RwLock<HashSet<SocketAddr>>>, addr: SocketAddr) -> Self {
+    fn new(set: Arc<EndpointSet>, addr: SocketAddr) -> Self {
         Self { set, addr }
     }
 }
@@ -172,7 +197,7 @@ pub struct VlessListener {
     conn_max: usize,
     tcp_keepalive: TcpKeepaliveConfig,
     route_override: Option<meow_common::InboundRouteOverride>,
-    bound_endpoints: Arc<std::sync::RwLock<HashSet<SocketAddr>>>,
+    bound_endpoints: Arc<EndpointSet>,
     vision_raw_read_switches: AtomicUsize,
     vision_raw_write_switches: AtomicUsize,
 }
@@ -198,6 +223,9 @@ fn build_security_runtime(
             Ok(SecurityRuntime::StandardTls(server))
         }
         VlessSecuritySpec::Reality(spec) => {
+            spec.mimic
+                .validate()
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { Box::new(e) })?;
             let dest_host = spec.dest_host.clone();
             let dest_port = spec.dest_port;
             let server = RealityServer::new(&RealityServerConfig {
@@ -229,7 +257,10 @@ fn build_security_runtime(
                     burst_bytes,
                 },
                 handshake_slots: Arc::new(Semaphore::new(REALITY_HANDSHAKE_SLOTS)),
+                probe_slots: Arc::new(Semaphore::new(spec.mimic.max_concurrent_probes)),
                 cover_slots: Arc::new(Semaphore::new(REALITY_COVER_SLOTS)),
+                mimic: spec.mimic,
+                metrics: Arc::new(crate::vless_mimic::RealityV2Metrics::new()),
             }))
         }
     }
@@ -255,6 +286,21 @@ fn cover_dial_budget(
         .map(|remaining| remaining.min(COVER_DIAL_TIMEOUT))
 }
 
+/// An unspecified address is not a routable remote host, so it can never
+/// be a REALITY cover site no matter what meaning the local stack gives
+/// `connect()` to it. Canonicalize first: the v4-mapped spelling
+/// `::ffff:0.0.0.0` must not bypass the v4 unspecified check.
+fn cover_candidate_is_dialable(addr: &SocketAddr) -> bool {
+    !addr.ip().to_canonical().is_unspecified()
+}
+
+/// Filter per candidate rather than poisoning the whole DNS answer: a mixed
+/// answer still contains valid routes to the configured cover host, while its
+/// unspecified entries have no remote meaning at all.
+fn dialable_cover_candidates(candidates: Vec<SocketAddr>) -> impl Iterator<Item = SocketAddr> {
+    candidates.into_iter().filter(cover_candidate_is_dialable)
+}
+
 impl VlessListener {
     /// Build the listener and validate/load all security material eagerly:
     /// a bad PEM/key pair or malformed REALITY parameter is a startup
@@ -276,7 +322,7 @@ impl VlessListener {
             .collect();
         let security = build_security_runtime(spec.security)?;
 
-        let bound_endpoints = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        let bound_endpoints = Arc::new(std::sync::RwLock::new(EndpointSnapshot::new()));
         endpoint_registries()
             .lock()
             .push(Arc::downgrade(&bound_endpoints));
@@ -323,12 +369,14 @@ impl VlessListener {
 
     /// Record an actually bound endpoint before accept tasks start. The
     /// runtime self-loop guard uses these endpoints; `port: 0` must be
-    /// passed only after `local_addr()` resolves it.
-    pub fn note_bound_endpoint(&self, addr: SocketAddr) {
+    /// passed only after `local_addr()` resolves it. `addr` must be that
+    /// socket's local address: the socket is inspected because a v6 wildcard's
+    /// `IPV6_V6ONLY` setting decides whether v4 loopback can re-enter it.
+    pub fn note_bound_endpoint(&self, socket: &TcpListener, addr: SocketAddr) {
         self.bound_endpoints
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .insert(canonical_endpoint(addr));
+            .insert(canonical_endpoint(addr), endpoint_coverage(socket, addr));
     }
 
     /// Cumulative DIRECT switches observed on this listener, as
@@ -340,6 +388,25 @@ impl VlessListener {
             self.vision_raw_read_switches.load(Ordering::Relaxed),
             self.vision_raw_write_switches.load(Ordering::Relaxed),
         )
+    }
+
+    /// Internal fixed-label REALITY v2 counter snapshot.  This is diagnostic
+    /// surface for in-process verification, not a public metrics API.
+    #[doc(hidden)]
+    pub fn reality_v2_metrics_snapshot(
+        &self,
+    ) -> Option<crate::vless_mimic::RealityV2MetricsSnapshot> {
+        let SecurityRuntime::Reality(reality) = &self.security else {
+            return None;
+        };
+        Some(reality.metrics.snapshot(
+            &reality.handshake_slots,
+            REALITY_HANDSHAKE_SLOTS,
+            &reality.probe_slots,
+            reality.mimic.max_concurrent_probes,
+            &reality.cover_slots,
+            REALITY_COVER_SLOTS,
+        ))
     }
 
     /// Serve on an already-bound socket. Multi-address listeners spawn
@@ -357,7 +424,7 @@ impl VlessListener {
         listener: TcpListener,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let bound = listener.local_addr()?;
-        self.note_bound_endpoint(bound);
+        self.note_bound_endpoint(&listener, bound);
         let _endpoint_registration =
             EndpointRegistration::new(Arc::clone(&self.bound_endpoints), canonical_endpoint(bound));
         let in_port = bound.port();
@@ -444,8 +511,15 @@ impl VlessListener {
                             match Arc::clone(&reality.handshake_slots).try_acquire_owned() {
                                 Ok(p) => Some(p),
                                 Err(_) => {
+                                    if matches!(reality.mimic.mode, VlessRealityMimicMode::DialFirst)
+                                    {
+                                        reality.metrics.inc_close(
+                                            crate::vless_mimic::ClosePhase::Admission,
+                                            crate::vless_mimic::CloseReason::HandshakeSaturated,
+                                        );
+                                    }
                                     debug!(
-                                        "vless listener '{}' REALITY classification saturated at {} slots; refusing {peer}",
+                                        "vless listener '{}' REALITY classification saturated at {} slots; refusing a peer",
                                         self.name, REALITY_HANDSHAKE_SLOTS
                                     );
                                     continue;
@@ -456,13 +530,20 @@ impl VlessListener {
                     };
 
                     crate::keepalive::apply(&stream, self.tcp_keepalive, &self.name);
+                    // d_hs starts at admission, not at the first poll of the
+                    // spawned task: executor queueing time is part of the
+                    // handshake budget.
+                    let handshake_deadline =
+                        tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT;
                     let listener = Arc::clone(self);
                     conns.spawn(async move {
                         listener
-                            .handle_conn(stream, peer, in_port, handshake_permit)
+                            .handle_conn(stream, peer, in_port, handshake_permit, handshake_deadline)
                             .await;
                         drop(permit);
                     });
+                    #[cfg(test)]
+                    tests::after_connection_spawn_for_test().await;
                 }
             }
         }
@@ -474,14 +555,14 @@ impl VlessListener {
         peer: SocketAddr,
         in_port: u16,
         handshake_permit: Option<tokio::sync::OwnedSemaphorePermit>,
+        deadline: tokio::time::Instant,
     ) {
         // TLS/REALITY accept and the bounded VLESS request share ONE
         // absolute deadline. Splitting them would double the time a
         // silent peer can retain a connection slot.
-        let deadline = tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT;
-        let inner: Box<dyn Stream> = Box::new(stream);
         let accepted = match &self.security {
             SecurityRuntime::StandardTls(server) => {
+                let inner: Box<dyn Stream> = Box::new(stream);
                 match tokio::time::timeout_at(deadline, server.accept(inner)).await {
                     Ok(Ok(stream)) => Some(stream),
                     Ok(Err(e)) => {
@@ -497,44 +578,59 @@ impl VlessListener {
                     }
                 }
             }
-            SecurityRuntime::Reality(reality) => {
-                // The classification permit was acquired at admission,
-                // before this task existed; it is held through the
-                // handshake exactly as before and released right after
-                // classification — never for the relay's lifetime.
-                let accepted =
-                    match tokio::time::timeout_at(deadline, reality.server.accept(inner)).await {
-                        Ok(Ok(accept)) => Some(accept),
-                        Ok(Err(e)) => {
-                            debug!(
-                                "vless listener '{}' REALITY accept from {peer}: {e}",
-                                self.name
-                            );
-                            None
-                        }
-                        Err(_) => {
-                            debug!(
-                                "vless listener '{}' REALITY accept from {peer} timed out",
-                                self.name
-                            );
-                            None
-                        }
-                    };
-                drop(handshake_permit);
-                match accepted {
-                    Some(RealityServerAccept::Authenticated(stream)) => Some(stream),
-                    Some(RealityServerAccept::Cover(relay)) => {
-                        // Boxed: the cover relay's two 16 KiB direction
-                        // scratches live across its copy-loop awaits, so
-                        // an unboxed relay future would embed them in
-                        // EVERY connection task's future — including the
-                        // authenticated majority that never covers.
-                        Box::pin(self.run_cover(reality, relay, peer, deadline)).await;
-                        None
-                    }
-                    None => None,
+            SecurityRuntime::Reality(reality) => match reality.mimic.mode {
+                VlessRealityMimicMode::DialFirst => {
+                    let dial = self.dial_first_target(reality);
+                    crate::vless_mimic::run_dial_first(
+                        reality,
+                        Box::new(stream),
+                        deadline,
+                        handshake_permit,
+                        dial,
+                    )
+                    .await
                 }
-            }
+                VlessRealityMimicMode::Off => {
+                    let inner: Box<dyn Stream> = Box::new(stream);
+                    // The classification permit was acquired at admission,
+                    // before this task existed; it is held through the
+                    // handshake exactly as before and released right after
+                    // classification — never for the relay's lifetime.
+                    let accepted =
+                        match tokio::time::timeout_at(deadline, reality.server.accept(inner)).await
+                        {
+                            Ok(Ok(accept)) => Some(accept),
+                            Ok(Err(e)) => {
+                                debug!(
+                                    "vless listener '{}' REALITY accept from {peer}: {e}",
+                                    self.name
+                                );
+                                None
+                            }
+                            Err(_) => {
+                                debug!(
+                                    "vless listener '{}' REALITY accept from {peer} timed out",
+                                    self.name
+                                );
+                                None
+                            }
+                        };
+                    drop(handshake_permit);
+                    match accepted {
+                        Some(RealityServerAccept::Authenticated(stream)) => Some(stream),
+                        Some(RealityServerAccept::Cover(relay)) => {
+                            // Boxed: the cover relay's two 16 KiB direction
+                            // scratches live across its copy-loop awaits, so
+                            // an unboxed relay future would embed them in
+                            // EVERY connection task's future — including the
+                            // authenticated majority that never covers.
+                            Box::pin(self.run_cover(reality, relay, peer, deadline)).await;
+                            None
+                        }
+                        None => None,
+                    }
+                }
+            },
         };
         let Some(mut stream) = accepted else {
             return;
@@ -706,6 +802,33 @@ impl VlessListener {
         drop(cover_permit);
     }
 
+    async fn dial_first_target(
+        &self,
+        reality: &RealityRuntime,
+    ) -> Result<crate::vless_mimic::DialedTarget, crate::vless_mimic::DialFirstDialError> {
+        reality.metrics.inc_dial_started();
+        let candidates = meow_common::resolve_host_all(&reality.dest_host, reality.dest_port)
+            .await
+            .map_err(|_| crate::vless_mimic::DialFirstDialError::Resolve)?;
+        let endpoints = self.all_bound_endpoints();
+        let local_addrs = local_addr_snapshot();
+        let Some(addr) = dialable_cover_candidates(candidates)
+            .find(|addr| !endpoint_is_self(*addr, &endpoints, local_addrs.as_ref()))
+        else {
+            return Err(crate::vless_mimic::DialFirstDialError::Resolve);
+        };
+        reality.metrics.inc_tcp_connect_started();
+        let tcp_start = tokio::time::Instant::now();
+        let stream = meow_common::connect_tcp(addr)
+            .await
+            .map_err(|_| crate::vless_mimic::DialFirstDialError::Connect)?;
+        let tcp_ready = tokio::time::Instant::now();
+        Ok(crate::vless_mimic::DialedTarget {
+            stream,
+            connect_elapsed: tcp_ready.saturating_duration_since(tcp_start),
+        })
+    }
+
     async fn dial_cover_target(
         &self,
         reality: &RealityRuntime,
@@ -716,7 +839,7 @@ impl VlessListener {
         let local_addrs = local_addr_snapshot();
         let mut last_err = None;
         let mut looped = false;
-        for addr in candidates {
+        for addr in dialable_cover_candidates(candidates) {
             if endpoint_is_self(addr, &endpoints, local_addrs.as_ref()) {
                 looped = true;
                 warn!(
@@ -744,24 +867,24 @@ impl VlessListener {
         }))
     }
 
-    fn all_bound_endpoints(&self) -> HashSet<SocketAddr> {
-        let mut out: HashSet<SocketAddr> = self
+    fn all_bound_endpoints(&self) -> EndpointSnapshot {
+        let mut out: EndpointSnapshot = self
             .bound_endpoints
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .iter()
-            .copied()
+            .map(|(addr, coverage)| (*addr, *coverage))
             .collect();
         let mut registries = endpoint_registries().lock();
         registries.retain(|weak| {
             if let Some(set) = weak.upgrade() {
-                // This listener's own set is already merged; merging it
-                // again is harmless because the result is a set.
+                // This listener's own table is already merged; merging it
+                // again is harmless because the keys are endpoints.
                 out.extend(
                     set.read()
                         .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .iter()
-                        .copied(),
+                        .map(|(addr, coverage)| (*addr, *coverage)),
                 );
                 true
             } else {
@@ -811,6 +934,17 @@ fn build_tcp_metadata(
 
 fn canonical_endpoint(addr: SocketAddr) -> SocketAddr {
     SocketAddr::new(addr.ip().to_canonical(), addr.port())
+}
+
+fn endpoint_coverage(socket: &TcpListener, addr: SocketAddr) -> BoundEndpointCoverage {
+    let is_v6_wildcard = matches!(addr.ip(), IpAddr::V6(ip) if ip.is_unspecified());
+    let v6_wildcard_accepts_v4 = is_v6_wildcard
+        && socket2::SockRef::from(socket)
+            .only_v6()
+            .map_or(true, |only_v6| !only_v6);
+    BoundEndpointCoverage {
+        v6_wildcard_accepts_v4,
+    }
 }
 
 /// Snapshot local interface addresses for wildcard-bind self-loop checks.
@@ -963,11 +1097,11 @@ fn local_interface_addrs_windows() -> Option<HashSet<IpAddr>> {
 
 fn endpoint_is_self(
     candidate: SocketAddr,
-    endpoints: &HashSet<SocketAddr>,
+    endpoints: &EndpointSnapshot,
     local_addrs: Option<&HashSet<IpAddr>>,
 ) -> bool {
     let ip = candidate.ip().to_canonical();
-    endpoints.iter().any(|bound| {
+    endpoints.iter().any(|(bound, coverage)| {
         if bound.port() != candidate.port() {
             return false;
         }
@@ -975,18 +1109,52 @@ fn endpoint_is_self(
         if ip == bind_ip {
             return true;
         }
-        if bind_ip.is_loopback() && ip.is_loopback() && bind_ip.is_ipv4() == ip.is_ipv4() {
+        // Where connect(unspecified) is accepted it selects loopback, so a
+        // same-family loopback bind is the endpoint such a candidate reaches.
+        // Where the stack rejects that dial the extra refusal is still exact:
+        // an unspecified candidate has no remote-cover meaning.
+        if bind_ip.is_loopback()
+            && (ip.is_loopback() || ip.is_unspecified())
+            && bind_ip.is_ipv4() == ip.is_ipv4()
+        {
             return true;
         }
-        bind_ip.is_unspecified()
-            && (ip.is_unspecified() || local_addrs.is_none_or(|addrs| addrs.contains(&ip)))
+        if !bind_ip.is_unspecified() {
+            return false;
+        }
+        // `to_canonical` has already folded v4-mapped spellings, so 127/8 is
+        // visible here in native v4 form. A v4 wildcard cannot receive v6; a
+        // v6 wildcard receives v4 only when its recorded socket is dual-stack.
+        let wildcard_covers_candidate = match bind_ip {
+            IpAddr::V4(_) => ip.is_ipv4(),
+            IpAddr::V6(_) => ip.is_ipv6() || coverage.v6_wildcard_accepts_v4,
+        };
+        wildcard_covers_candidate
+            && (ip.is_unspecified()
+                || ip.is_loopback()
+                || local_addrs.is_none_or(|addrs| addrs.contains(&ip)))
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use meow_transport::Transport;
     use tokio::io::AsyncReadExt;
+
+    thread_local! {
+        static ADVANCE_AFTER_CONNECTION_SPAWN: std::cell::RefCell<Option<Duration>> =
+            const { std::cell::RefCell::new(None) };
+        static CONNECTION_SPAWN_HOOKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    pub(super) async fn after_connection_spawn_for_test() {
+        CONNECTION_SPAWN_HOOKS.with(|cell| cell.set(cell.get() + 1));
+        let advance_by = ADVANCE_AFTER_CONNECTION_SPAWN.with(|cell| cell.borrow_mut().take());
+        if let Some(advance_by) = advance_by {
+            tokio::time::advance(advance_by).await;
+        }
+    }
 
     fn test_tunnel() -> Tunnel {
         let resolver = Arc::new(meow_dns::Resolver::new(
@@ -1000,25 +1168,41 @@ mod tests {
         Tunnel::new(resolver)
     }
 
-    fn test_reality_listener() -> Arc<VlessListener> {
+    fn test_reality_listener_with_dest(
+        dest_host: &str,
+        dest_port: u16,
+        mimic: VlessRealityMimicSpec,
+    ) -> Arc<VlessListener> {
         let spec = VlessListenerSpec {
             users: vec![VlessUserSpec {
                 username: "alice".into(),
                 uuid: [0x11; 16],
             }],
             security: VlessSecuritySpec::Reality(VlessRealitySpec {
-                dest_host: "127.0.0.1".into(),
-                dest_port: 9,
+                dest_host: dest_host.into(),
+                dest_port,
                 private_key: [0x42; 32],
                 short_ids: vec![[0; 8]],
                 server_names: vec!["localhost".into()],
                 max_time_difference_us: 0,
                 limit_fallback_upload: VlessFallbackLimit::default(),
                 limit_fallback_download: VlessFallbackLimit::default(),
+                mimic,
             }),
             udp: true,
         };
         Arc::new(VlessListener::new(test_tunnel(), "test".into(), spec).unwrap())
+    }
+
+    fn test_reality_listener_with(
+        dest_port: u16,
+        mimic: VlessRealityMimicSpec,
+    ) -> Arc<VlessListener> {
+        test_reality_listener_with_dest("127.0.0.1", dest_port, mimic)
+    }
+
+    fn test_reality_listener() -> Arc<VlessListener> {
+        test_reality_listener_with(9, VlessRealityMimicSpec::off())
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1029,7 +1213,13 @@ mod tests {
         let client = tokio::net::TcpStream::connect(probe_addr).await.unwrap();
         let (server, peer) = probe.accept().await.unwrap();
         drop(client);
-        let fut = listener.handle_conn(server, peer, 443, None);
+        let fut = listener.handle_conn(
+            server,
+            peer,
+            443,
+            None,
+            tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT,
+        );
         let size = std::mem::size_of_val(&fut);
         eprintln!("handle_conn future size: {size}");
         drop(fut);
@@ -1046,9 +1236,441 @@ mod tests {
         );
     }
 
+    static HOST_RESOLVER_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct InstalledHostResolver;
+
+    impl Drop for InstalledHostResolver {
+        fn drop(&mut self) {
+            meow_common::clear_host_resolver();
+        }
+    }
+
+    fn install_host_resolver_for_test(
+        resolver: Arc<dyn meow_common::HostResolver>,
+    ) -> InstalledHostResolver {
+        meow_common::set_host_resolver(resolver);
+        InstalledHostResolver
+    }
+
+    async fn system_resolve_all_for_test(host: &str) -> std::io::Result<Vec<IpAddr>> {
+        // The hook is process-global while a test holds it; unrelated parallel
+        // lookups keep their system-resolver behavior.
+        let ips: Vec<IpAddr> = tokio::net::lookup_host((host, 0))
+            .await?
+            .map(|addr| addr.ip())
+            .collect();
+        if ips.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "system resolver returned no addresses",
+            ));
+        }
+        Ok(ips)
+    }
+
+    struct LoopbackAliasResolver;
+
+    #[async_trait::async_trait]
+    impl meow_common::HostResolver for LoopbackAliasResolver {
+        async fn resolve(&self, host: &str) -> std::io::Result<IpAddr> {
+            self.resolve_all(host).await.map(|ips| ips[0])
+        }
+
+        async fn resolve_all(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            if host.eq_ignore_ascii_case("cover-loopback-alias.invalid") {
+                return Ok(vec![IpAddr::from([127, 0, 0, 2])]);
+            }
+            system_resolve_all_for_test(host).await
+        }
+    }
+
+    struct ScriptedCoverResolver {
+        answers: Vec<(String, Vec<IpAddr>)>,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::HostResolver for ScriptedCoverResolver {
+        async fn resolve(&self, host: &str) -> std::io::Result<IpAddr> {
+            self.resolve_all(host).await.map(|ips| ips[0])
+        }
+
+        async fn resolve_all(&self, host: &str) -> std::io::Result<Vec<IpAddr>> {
+            if let Some((_, ips)) = self
+                .answers
+                .iter()
+                .find(|(answer_host, _)| answer_host.eq_ignore_ascii_case(host))
+            {
+                return Ok(ips.clone());
+            }
+            system_resolve_all_for_test(host).await
+        }
+    }
+
+    struct PendingHostResolver {
+        started: AtomicUsize,
+        started_notify: tokio::sync::Notify,
+        release: tokio::sync::watch::Receiver<bool>,
+    }
+
+    #[async_trait::async_trait]
+    impl meow_common::HostResolver for PendingHostResolver {
+        async fn resolve(&self, host: &str) -> std::io::Result<IpAddr> {
+            self.resolve_all(host).await.map(|ips| ips[0])
+        }
+
+        async fn resolve_all(&self, _host: &str) -> std::io::Result<Vec<IpAddr>> {
+            self.started.fetch_add(1, Ordering::Relaxed);
+            self.started_notify.notify_one();
+            let mut release = self.release.clone();
+            while !*release.borrow() {
+                release.changed().await.map_err(|_| {
+                    std::io::Error::new(std::io::ErrorKind::Interrupted, "resolver release closed")
+                })?;
+            }
+            Ok(vec![IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)])
+        }
+    }
+
+    /// T3 residue: cancellation while the target hostname is still inside a
+    /// controllable pending resolver must drop the whole dial future.  When
+    /// the resolver later completes there is no continuation that can start
+    /// TCP connect, so no target socket appears and the H permit is released.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reality_dial_first_resolver_cancellation_never_connects_after_completion() {
+        let _host_resolver_lock = HOST_RESOLVER_TEST_LOCK.lock().await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let target_accepts = Arc::new(AtomicUsize::new(0));
+        tokio::spawn({
+            let target_accepts = Arc::clone(&target_accepts);
+            async move {
+                while let Ok((_stream, _)) = target.accept().await {
+                    target_accepts.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        });
+
+        let spec = VlessListenerSpec {
+            users: vec![VlessUserSpec {
+                username: "alice".into(),
+                uuid: [0x11; 16],
+            }],
+            security: VlessSecuritySpec::Reality(VlessRealitySpec {
+                dest_host: "pending-resolver.invalid".into(),
+                dest_port: target_port,
+                private_key: [0x42; 32],
+                short_ids: vec![[0; 8]],
+                server_names: vec!["localhost".into()],
+                max_time_difference_us: 0,
+                limit_fallback_upload: VlessFallbackLimit::default(),
+                limit_fallback_download: VlessFallbackLimit::default(),
+                mimic: VlessRealityMimicSpec::default(),
+            }),
+            udp: true,
+        };
+        let listener =
+            Arc::new(VlessListener::new(test_tunnel(), "resolver-cancel".into(), spec).unwrap());
+        let SecurityRuntime::Reality(reality) = &listener.security else {
+            panic!("test listener must be REALITY");
+        };
+        let permit = Arc::clone(&reality.handshake_slots)
+            .try_acquire_owned()
+            .unwrap();
+
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+        let resolver = Arc::new(PendingHostResolver {
+            started: AtomicUsize::new(0),
+            started_notify: tokio::sync::Notify::new(),
+            release: release_rx,
+        });
+        let host_resolver: Arc<dyn meow_common::HostResolver> =
+            Arc::<PendingHostResolver>::clone(&resolver);
+        let _host_resolver_guard = install_host_resolver_for_test(host_resolver);
+
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe_addr = probe.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(probe_addr).await.unwrap();
+        let (server, peer) = probe.accept().await.unwrap();
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            task_listener
+                .handle_conn(
+                    server,
+                    peer,
+                    443,
+                    Some(permit),
+                    tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT,
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), resolver.started_notify.notified())
+            .await
+            .expect("dial-first resolver did not start");
+        assert_eq!(resolver.started.load(Ordering::Relaxed), 1);
+
+        task.abort();
+        let _ = task.await;
+        release_tx.send(true).expect("release pending resolver");
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        drop(_host_resolver_guard);
+        drop(client);
+
+        let mut snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        for _ in 0..50 {
+            if snapshot.close_total.values().sum::<usize>() != 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(2)).await;
+            snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        }
+        assert_eq!(
+            snapshot.tcp_connect_started_total, 0,
+            "late resolver completion restarted TCP connect"
+        );
+        assert_eq!(
+            target_accepts.load(Ordering::Relaxed),
+            0,
+            "late resolver completion produced a target socket"
+        );
+        assert_eq!(
+            snapshot.active_handshakes, 0,
+            "cancelled resolver dial retained H"
+        );
+        assert_eq!(
+            snapshot.close_total.get(&("read_and_dial", "canceled")),
+            Some(&1),
+            "unexpected close classification: {:?}",
+            snapshot.close_total
+        );
+        eprintln!("resolver-cancellation evidence: pending-resolver started=1 aborted-before-completion tcp-connect=0 target-accepts=0 H=0 close=read_and_dial/canceled");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_first_loopback_alias_resolution_is_refused_before_recursive_connect() {
+        let _host_resolver_lock = HOST_RESOLVER_TEST_LOCK.lock().await;
+        let _host_resolver_guard = install_host_resolver_for_test(Arc::new(LoopbackAliasResolver));
+
+        let socket = TcpListener::bind("0.0.0.0:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let listener = test_reality_listener_with_dest(
+            "cover-loopback-alias.invalid",
+            port,
+            VlessRealityMimicSpec::default(),
+        );
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+
+        // Dial-first starts the cover dial before any ClientHello byte.  The
+        // injected resolver answers the fixed target with a 127/8 alias that
+        // interface enumeration does not list; the guard must classify that
+        // resolution failure shape as Resolve before TCP connect starts.
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        assert!(
+            closed,
+            "loopback-alias cover resolution must close the admitting client"
+        );
+
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(
+            snapshot.close_total.get(&("read_and_dial", "resolve")),
+            Some(&1),
+            "loopback-alias candidate must be refused as resolution failure: {snapshot:?}"
+        );
+        assert_eq!(snapshot.tcp_connect_started_total, 0);
+        // Every recursively accepted connection would start another target
+        // dial. Exactly one dial total is therefore the accept-chain bound.
+        assert_eq!(snapshot.dial_started_total, 1);
+        assert_eq!(snapshot.active_handshakes, 0);
+        task.abort();
+        let _ = task.await;
+    }
+
+    async fn assert_unspecified_resolution_is_refused(host: &str) {
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let listener =
+            test_reality_listener_with_dest(host, port, VlessRealityMimicSpec::default());
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+
+        let mut client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let closed = matches!(
+            tokio::time::timeout(Duration::from_secs(2), client.read(&mut byte)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        assert!(
+            closed,
+            "{host} cover resolution must close the admitting client"
+        );
+
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(
+            snapshot.close_total.get(&("read_and_dial", "resolve")),
+            Some(&1),
+            "{host} unspecified candidate must be refused as resolution failure: {snapshot:?}"
+        );
+        assert_eq!(
+            snapshot.tcp_connect_started_total, 0,
+            "{host} unspecified candidate started TCP connect"
+        );
+        assert_eq!(
+            snapshot.dial_started_total, 1,
+            "{host} recursive accepts would start additional cover dials"
+        );
+        assert_eq!(snapshot.active_handshakes, 0);
+        task.abort();
+        let _ = task.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_first_unspecified_resolution_is_refused_before_recursive_connect() {
+        let _host_resolver_lock = HOST_RESOLVER_TEST_LOCK.lock().await;
+        let _host_resolver_guard =
+            install_host_resolver_for_test(Arc::new(ScriptedCoverResolver {
+                answers: vec![
+                    (
+                        "cover-unspecified-v4.invalid".into(),
+                        vec![IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)],
+                    ),
+                    (
+                        "cover-unspecified-v6.invalid".into(),
+                        vec![IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)],
+                    ),
+                    (
+                        "cover-unspecified-mapped-v4.invalid".into(),
+                        vec!["::ffff:0.0.0.0".parse::<IpAddr>().unwrap()],
+                    ),
+                ],
+            }));
+
+        for host in [
+            "cover-unspecified-v4.invalid",
+            "cover-unspecified-v6.invalid",
+            "cover-unspecified-mapped-v4.invalid",
+        ] {
+            assert_unspecified_resolution_is_refused(host).await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_first_mixed_resolution_skips_unspecified_and_dials_legal_candidate() {
+        let _host_resolver_lock = HOST_RESOLVER_TEST_LOCK.lock().await;
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let _host_resolver_guard =
+            install_host_resolver_for_test(Arc::new(ScriptedCoverResolver {
+                answers: vec![(
+                    "cover-mixed-unspecified.invalid".into(),
+                    vec![
+                        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                        IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    ],
+                )],
+            }));
+        let listener = test_reality_listener_with_dest(
+            "cover-mixed-unspecified.invalid",
+            target_port,
+            VlessRealityMimicSpec::default(),
+        );
+        let SecurityRuntime::Reality(reality) = &listener.security else {
+            panic!("test listener must be REALITY");
+        };
+
+        let dialed = listener
+            .dial_first_target(reality)
+            .await
+            .expect("mixed resolution must retain the legal loopback candidate");
+        assert_eq!(
+            dialed.stream.peer_addr().unwrap().ip(),
+            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
+        );
+        let (_, peer) = tokio::time::timeout(Duration::from_secs(2), target.accept())
+            .await
+            .expect("legal candidate did not reach the target listener")
+            .unwrap();
+        assert_eq!(peer.ip(), IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(snapshot.dial_started_total, 1);
+        assert_eq!(snapshot.tcp_connect_started_total, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cover_dial_unspecified_resolution_has_no_dialable_candidate() {
+        let _host_resolver_lock = HOST_RESOLVER_TEST_LOCK.lock().await;
+        // The listener is dialable through loopback when unspecified is not
+        // filtered, so an Ok here would prove the v1 cover path dialed it.
+        let loopback_target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = loopback_target.local_addr().unwrap().port();
+        let _host_resolver_guard =
+            install_host_resolver_for_test(Arc::new(ScriptedCoverResolver {
+                answers: vec![(
+                    "cover-only-unspecified.invalid".into(),
+                    vec![
+                        IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED),
+                    ],
+                )],
+            }));
+        let listener = test_reality_listener_with_dest(
+            "cover-only-unspecified.invalid",
+            target_port,
+            VlessRealityMimicSpec::off(),
+        );
+        let SecurityRuntime::Reality(reality) = &listener.security else {
+            panic!("test listener must be REALITY");
+        };
+
+        let Err(err) = listener.dial_cover_target(reality).await else {
+            panic!("unspecified-only resolution produced a cover target")
+        };
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn cover_candidate_filter_drops_every_unspecified_spelling() {
+        let legal_v4 = "192.0.2.10:443".parse::<SocketAddr>().unwrap();
+        let legal_v6 = "[2001:db8::10]:443".parse::<SocketAddr>().unwrap();
+        let candidates = vec![
+            "0.0.0.0:443".parse::<SocketAddr>().unwrap(),
+            "[::]:443".parse::<SocketAddr>().unwrap(),
+            "[::ffff:0.0.0.0]:443".parse::<SocketAddr>().unwrap(),
+            legal_v4,
+            legal_v6,
+        ];
+
+        let retained: Vec<_> = dialable_cover_candidates(candidates).collect();
+        assert_eq!(retained, vec![legal_v4, legal_v6]);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn reality_classification_admission_refuses_overflow_sockets() {
-        let listener = test_reality_listener();
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = target.accept().await {
+                held.push(stream);
+            }
+        });
+        let listener = test_reality_listener_with(target_port, VlessRealityMimicSpec::default());
         // Saturate the classification slots externally: the permits are
         // the same semaphores the accept loop draws from, so every new
         // socket arriving now is by definition overflow.
@@ -1084,6 +1706,13 @@ mod tests {
             closed,
             "overflow REALITY socket was parked behind the classification semaphore instead of refused"
         );
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .close_total
+                .get(&("admission", "handshake_saturated")),
+            Some(&1)
+        );
 
         // Freeing one slot admits the next socket: it stays open, parked
         // inside the handshake exactly like a silent classified peer.
@@ -1101,6 +1730,180 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn off_mode_admission_saturation_does_not_count_v2_metrics() {
+        let listener = test_reality_listener();
+        let SecurityRuntime::Reality(reality) = &listener.security else {
+            panic!("test listener must be REALITY");
+        };
+        let held: Vec<_> = (0..REALITY_HANDSHAKE_SLOTS)
+            .map(|_| {
+                Arc::clone(&reality.handshake_slots)
+                    .try_acquire_owned()
+                    .unwrap()
+            })
+            .collect();
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+        let mut overflowed = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let rejected = matches!(
+            tokio::time::timeout(Duration::from_secs(2), overflowed.read(&mut byte)).await,
+            Ok(Ok(0)) | Ok(Err(_))
+        );
+        assert!(
+            rejected,
+            "off-mode overflow socket must be refused, not parked"
+        );
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .close_total
+                .get(&("admission", "handshake_saturated")),
+            None,
+            "off mode admission rejection is v1 behavior, not v2 accounting"
+        );
+        drop(held);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_first_run_on_deadline_counts_spawn_to_first_poll_delay() {
+        let listener = test_reality_listener_with(9, VlessRealityMimicSpec::default());
+        ADVANCE_AFTER_CONNECTION_SPAWN.with(|cell| {
+            *cell.borrow_mut() = Some(DEFAULT_HANDSHAKE_TIMEOUT + Duration::from_millis(1));
+        });
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+        let _client = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+
+        let mut snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        for _ in 0..20 {
+            if snapshot.close_total.get(&("read_and_dial", "deadline")) == Some(&1) {
+                break;
+            }
+            tokio::task::yield_now().await;
+            snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        }
+        assert_eq!(
+            snapshot.close_total.get(&("read_and_dial", "deadline")),
+            Some(&1),
+            "run_on admission deadline must include spawn-to-first-poll delay: {snapshot:?}"
+        );
+        assert_eq!(snapshot.tcp_connect_started_total, 0);
+        assert_eq!(CONNECTION_SPAWN_HOOKS.with(std::cell::Cell::get), 1);
+        task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dial_first_handshake_deadline_counts_executor_scheduling_delay() {
+        let listener = test_reality_listener_with(9, VlessRealityMimicSpec::default());
+        let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let probe_addr = probe.local_addr().unwrap();
+        let client = tokio::net::TcpStream::connect(probe_addr).await.unwrap();
+        let (server, peer) = probe.accept().await.unwrap();
+        drop(client);
+        let deadline = tokio::time::Instant::now() + DEFAULT_HANDSHAKE_TIMEOUT;
+        let fut = listener.handle_conn(server, peer, 443, None, deadline);
+
+        // The future exists but is never polled while the executor is
+        // congested.  Advancing the full 15 seconds before that first poll
+        // must expire d_hs because the deadline was fixed at admission.
+        tokio::time::advance(DEFAULT_HANDSHAKE_TIMEOUT).await;
+        fut.await;
+        let snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        assert_eq!(
+            snapshot.close_total.get(&("read_and_dial", "deadline")),
+            Some(&1),
+            "scheduling delay consumes d_hs: {snapshot:?}"
+        );
+        assert_eq!(snapshot.tcp_connect_started_total, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dial_first_cover_saturation_closes_without_cover_or_probe_counters() {
+        let target = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target_port = target.local_addr().unwrap().port();
+        let target_accepts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let target_accepts_task = Arc::clone(&target_accepts);
+        tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = target.accept().await {
+                target_accepts_task.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                held.push(stream);
+            }
+        });
+        let listener = test_reality_listener_with(target_port, VlessRealityMimicSpec::default());
+        let SecurityRuntime::Reality(reality) = &listener.security else {
+            panic!("test listener must be REALITY");
+        };
+        let mut held_permits = Vec::new();
+        for _ in 0..REALITY_COVER_SLOTS {
+            held_permits.push(
+                Arc::clone(&reality.cover_slots)
+                    .try_acquire_owned()
+                    .unwrap(),
+            );
+        }
+        let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = socket.local_addr().unwrap().port();
+        let task_listener = Arc::clone(&listener);
+        let task = tokio::spawn(async move {
+            let _ = task_listener.run_on(socket).await;
+        });
+
+        let tls = meow_transport::tls::TlsConfig {
+            skip_cert_verify: true,
+            ..meow_transport::tls::TlsConfig::new("localhost")
+        };
+        let layer = meow_transport::tls::TlsLayer::new(&tls).unwrap();
+        let raw: Box<dyn Stream> = Box::new(
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .unwrap(),
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(2), layer.connect(raw)).await;
+        let mut snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+        for _ in 0..100 {
+            snapshot = listener.reality_v2_metrics_snapshot().unwrap();
+            if snapshot.close_total.get(&("cover", "cover_saturated")) == Some(&1) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            snapshot.close_total.get(&("cover", "cover_saturated")),
+            Some(&1),
+            "C saturation is the only terminal counter: {snapshot:?}"
+        );
+        assert_eq!(snapshot.cover_total.values().sum::<usize>(), 0);
+        assert_eq!(snapshot.probe_started_total, 0);
+        assert_eq!(snapshot.committed_total, 0);
+        assert_eq!(snapshot.mimic_hit_total, 0);
+        assert_eq!(snapshot.close_total.values().sum::<usize>(), 1);
+        assert_eq!(snapshot.active_handshakes, 0);
+        assert_eq!(snapshot.active_probes, 0);
+        assert_eq!(
+            target_accepts.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "C saturation must close on the single already-started target connection"
+        );
+        drop(held_permits);
+        task.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn endpoint_registration_follows_the_listen_socket_lifetime() {
         let listener = test_reality_listener();
         let socket = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1114,7 +1917,7 @@ mod tests {
                 .bound_endpoints
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&addr)
+                .contains_key(&addr)
             {
                 break;
             }
@@ -1124,7 +1927,7 @@ mod tests {
             .bound_endpoints
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(&addr));
+            .contains_key(&addr));
         task.abort();
         let _ = task.await;
         for _ in 0..100 {
@@ -1132,7 +1935,7 @@ mod tests {
                 .bound_endpoints
                 .read()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .contains(&addr)
+                .contains_key(&addr)
             {
                 return;
             }
@@ -1142,12 +1945,163 @@ mod tests {
     }
 
     #[test]
-    fn self_loop_guard_matches_exact_loopback_and_wildcard_local_addresses() {
-        let mut endpoints = HashSet::new();
-        endpoints.insert(SocketAddr::new(
-            IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
-            8443,
+    fn self_loop_guard_wildcard_covers_unenumerated_loopback_aliases() {
+        let local = HashSet::from([
+            "192.0.2.10".parse::<IpAddr>().unwrap(),
+            "::1".parse::<IpAddr>().unwrap(),
+        ]);
+        let mut endpoints = EndpointSnapshot::new();
+        endpoints.insert(
+            "0.0.0.0:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
+
+        for alias in ["127.0.0.2", "127.255.0.1"] {
+            assert!(
+                endpoint_is_self(
+                    SocketAddr::new(alias.parse::<IpAddr>().unwrap(), 443),
+                    &endpoints,
+                    Some(&local),
+                ),
+                "{alias} is a 127/8 loopback alias even when unenumerated"
+            );
+        }
+        assert!(
+            endpoint_is_self(
+                "[::ffff:127.0.0.2]:443".parse().unwrap(),
+                &endpoints,
+                Some(&local),
+            ),
+            "canonicalization folds the v4-mapped loopback alias before matching"
+        );
+        assert!(
+            !endpoint_is_self("[::1]:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a v4 wildcard cannot be reached through IPv6 loopback"
+        );
+
+        endpoints.clear();
+        endpoints.insert(
+            "[::]:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage {
+                v6_wildcard_accepts_v4: true,
+            },
+        );
+        assert!(endpoint_is_self(
+            "[::1]:443".parse().unwrap(),
+            &endpoints,
+            Some(&local),
         ));
+        assert!(
+            endpoint_is_self("127.0.0.2:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a dual-stack v6 wildcard accepts v4 peers as mapped"
+        );
+        assert!(
+            endpoint_is_self("0.0.0.0:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a dual-stack v6 wildcard accepts v4 unspecified as mapped"
+        );
+        assert!(
+            endpoint_is_self("[::]:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v6 unspecified is the v6 wildcard itself regardless of v4 coverage"
+        );
+
+        endpoints.clear();
+        endpoints.insert(
+            "[::]:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage {
+                v6_wildcard_accepts_v4: false,
+            },
+        );
+        assert!(endpoint_is_self(
+            "[::1]:443".parse().unwrap(),
+            &endpoints,
+            Some(&local),
+        ));
+        assert!(
+            !endpoint_is_self("127.0.0.2:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a v6-only wildcard cannot be reached through v4 loopback"
+        );
+        assert!(
+            !endpoint_is_self("0.0.0.0:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a v6-only wildcard cannot be reached through v4 unspecified"
+        );
+        assert!(
+            endpoint_is_self("[::]:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v6 unspecified remains the exact v6 wildcard on a v6-only socket"
+        );
+
+        endpoints.clear();
+        endpoints.insert(
+            "[::1]:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
+        assert!(endpoint_is_self(
+            "[::1]:443".parse().unwrap(),
+            &endpoints,
+            Some(&local),
+        ));
+        assert!(
+            !endpoint_is_self("127.0.0.2:443".parse().unwrap(), &endpoints, Some(&local),),
+            "a specific v6 loopback bind has no v4 loopback pair"
+        );
+    }
+
+    #[test]
+    fn self_loop_guard_unspecified_candidates_follow_loopback_dial_semantics() {
+        let local = HashSet::new();
+        let mut endpoints = EndpointSnapshot::new();
+        endpoints.insert(
+            "127.0.0.1:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
+        assert!(
+            endpoint_is_self("0.0.0.0:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v4 unspecified reaches a same-port v4 loopback bind where the stack accepts it"
+        );
+        assert!(
+            endpoint_is_self(
+                "[::ffff:0.0.0.0]:443".parse().unwrap(),
+                &endpoints,
+                Some(&local),
+            ),
+            "canonicalization folds v4-mapped unspecified before the family check"
+        );
+        assert!(
+            !endpoint_is_self("[::]:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v6 unspecified cannot reach a v4 loopback bind"
+        );
+
+        endpoints.clear();
+        endpoints.insert(
+            "[::1]:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
+        assert!(
+            endpoint_is_self("[::]:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v6 unspecified reaches a same-port v6 loopback bind where the stack accepts it"
+        );
+        assert!(
+            !endpoint_is_self("0.0.0.0:443".parse().unwrap(), &endpoints, Some(&local),),
+            "v4 unspecified cannot reach a v6 loopback bind"
+        );
+
+        endpoints.clear();
+        endpoints.insert(
+            "192.0.2.10:443".parse::<SocketAddr>().unwrap(),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
+        assert!(
+            !endpoint_is_self("0.0.0.0:443".parse().unwrap(), &endpoints, Some(&local),),
+            "unspecified dial semantics select loopback, not a non-loopback bind"
+        );
+    }
+
+    #[test]
+    fn self_loop_guard_matches_exact_loopback_and_wildcard_local_addresses() {
+        let mut endpoints = EndpointSnapshot::new();
+        endpoints.insert(
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::LOCALHOST), 8443),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
         assert!(endpoint_is_self(
             SocketAddr::new("127.0.0.44".parse().unwrap(), 8443),
             &endpoints,
@@ -1160,10 +2114,10 @@ mod tests {
         ));
 
         endpoints.clear();
-        endpoints.insert(SocketAddr::new(
-            IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-            443,
-        ));
+        endpoints.insert(
+            SocketAddr::new(IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), 443),
+            BoundEndpointCoverage::CONSERVATIVE,
+        );
         let local = HashSet::from(["192.0.2.10".parse::<IpAddr>().unwrap()]);
         assert!(endpoint_is_self(
             SocketAddr::new("192.0.2.10".parse().unwrap(), 443),
