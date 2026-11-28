@@ -402,26 +402,55 @@ async fn t6a_empty_mimic_defaults_to_real_dial_first_runtime() {
     run_dial_first_case("      mimic: {}\n").await;
 }
 
-async fn start_counting_sink() -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+async fn start_counting_sink() -> (
+    SocketAddr,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+    Arc<AtomicUsize>,
+) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     let accepts = Arc::new(AtomicUsize::new(0));
     let bytes = Arc::new(AtomicUsize::new(0));
+    let preflight_parses = Arc::new(AtomicUsize::new(0));
     tokio::spawn({
         let accepts = Arc::clone(&accepts);
         let bytes = Arc::clone(&bytes);
+        let preflight_parses = Arc::clone(&preflight_parses);
         async move {
             while let Ok((mut stream, _)) = listener.accept().await {
                 accepts.fetch_add(1, Ordering::SeqCst);
                 tokio::spawn({
                     let bytes = Arc::clone(&bytes);
+                    let preflight_parses = Arc::clone(&preflight_parses);
                     async move {
                         let mut buf = [0u8; 1024];
+                        let mut first_record = Vec::new();
+                        let mut counted = false;
                         loop {
                             match stream.read(&mut buf).await {
                                 Ok(0) | Err(_) => break,
                                 Ok(n) => {
                                     bytes.fetch_add(n, Ordering::SeqCst);
+                                    if !counted {
+                                        first_record.extend_from_slice(&buf[..n]);
+                                        if first_record.len() >= 5 {
+                                            let len = usize::from(u16::from_be_bytes([
+                                                first_record[3],
+                                                first_record[4],
+                                            ]));
+                                            if first_record.len() >= 5 + len {
+                                                counted = true;
+                                                if first_record[0] == 0x16
+                                                    && first_record[1] == 3
+                                                    && len >= 4
+                                                    && first_record[5] == 1
+                                                {
+                                                    preflight_parses.fetch_add(1, Ordering::SeqCst);
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -430,7 +459,7 @@ async fn start_counting_sink() -> (SocketAddr, Arc<AtomicUsize>, Arc<AtomicUsize
             }
         }
     });
-    (addr, accepts, bytes)
+    (addr, accepts, bytes, preflight_parses)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -463,7 +492,7 @@ async fn t6b_mode_off_keeps_v1_auth_independent_and_cover_dialing_ordinary() {
     // same v1 selection: authentication performs no cover TCP connect or
     // prefix parse, while an unauthenticated TLS-shaped probe still uses
     // the ordinary cover branch.
-    let (target, accepts, bytes) = start_counting_sink().await;
+    let (target, accepts, bytes, preflight_parses) = start_counting_sink().await;
     let dir2 = tempfile::tempdir().unwrap();
     let listener_port2 = free_port();
     let api_port2 = free_port();
@@ -493,6 +522,11 @@ async fn t6b_mode_off_keeps_v1_auth_independent_and_cover_dialing_ordinary() {
         0,
         "auth must not upload a prefix"
     );
+    assert_eq!(
+        preflight_parses.load(Ordering::SeqCst),
+        0,
+        "auth must not reach target-side ClientHello preflight parsing"
+    );
 
     let mut probe = TcpStream::connect(("127.0.0.1", listener_port2))
         .await
@@ -515,7 +549,7 @@ async fn t6b_mode_off_keeps_v1_auth_independent_and_cover_dialing_ordinary() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn reality_mimic_config_test_never_dials_cover_target() {
-    let (target, accepts, _bytes) = start_counting_sink().await;
+    let (target, accepts, _bytes, _preflight_parses) = start_counting_sink().await;
     let dir = tempfile::tempdir().unwrap();
     let config = dir.path().join("config.yaml");
     std::fs::write(
