@@ -60,6 +60,11 @@ Use it as a pre-flight check.
 | `tun` | block | off | TUN inbound (Wintun on Windows) — [Transparent Proxy](./transparent-proxy) |
 | `geodata` | block | — | GeoIP / ASN / GeoSite databases — [Geodata](./geodata) |
 
+Internal HTTPS downloads (providers, subscriptions, geodata, `external-ui-url`)
+verify against bundled Mozilla roots. Set `MEOW_HTTP_SYSTEM_CA=true` to also
+trust the OS store; see [Providers](./providers#type-http). Outbound proxy
+TLS is not affected.
+
 ## Tunnel modes
 
 `mode` selects how connections are routed:

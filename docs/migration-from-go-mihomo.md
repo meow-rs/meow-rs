@@ -1047,6 +1047,13 @@ Most common format from public providers. Typical issues:
    provider does not auto-reload.
 3. **`use:` in proxy groups** — wired for proxy providers. Provider filters and
    `include-all` shorthands are applied when groups are resolved.
+4. **HTTPS trust store** — Go mihomo's HTTP client uses
+   `x509.SystemCertPool()` (disable with `DISABLE_SYSTEM_CA`). meow-rs
+   verifies provider, subscription, geodata and external-UI HTTPS against
+   bundled Mozilla roots only. A private CA trusted by the OS (and by
+   `curl`) is **not** trusted until `MEOW_HTTP_SYSTEM_CA=true`. There is no
+   `DISABLE_SYSTEM_CA` alias and no YAML/REST toggle; hostname verification
+   stays on. Outbound proxy TLS is always Mozilla-only.
 
 ---
 

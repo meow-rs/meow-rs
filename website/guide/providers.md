@@ -62,6 +62,18 @@ named dial error at 16 hops instead.
 The cached file is the offline fallback: startup always fetches first and
 writes the cache; the file is read only when that fetch fails.
 
+HTTPS fetches (this provider URL, rule-provider URLs, subscriptions,
+geodata, and `external-ui-url`) verify the server certificate against the
+bundled Mozilla roots and check the hostname. They do **not** read the OS
+trust store by default — a private CA that `curl`/`openssl` trusts will
+still fail with `CERTIFICATE_VERIFY_FAILED`. Set `MEOW_HTTP_SYSTEM_CA=true`
+(exact, case-sensitive) to also trust native anchors the process can see
+(Windows CryptoAPI, macOS Keychain, Linux `/etc/ssl/certs` via OpenSSL
+discovery). `false` or unset stays Mozilla-only; any other value warns once
+and is ignored. Restart to pick up an env or trust-store change. Hostname
+and chain checks stay on; there is no `skip-cert-verify` for these
+downloads, and outbound proxy TLS is unchanged.
+
 A `subscription-userinfo` header on the response (plan traffic and expiry)
 is reported as the provider's `subscriptionInfo` in
 [`GET /providers/proxies`](../reference/rest-api#providers) and kept in

@@ -119,6 +119,9 @@ tokio = { workspace = true, features = ["test-util"] }
 meow-common = { workspace = true, features = ["logbook"] }
 tempfile = "3"
 tracing-subscriber = { workspace = true }
+# Throwaway CAs for the internal-HTTPS system-CA tests. Already the
+# workspace TLS/crypto crate; not a new third-party dependency.
+boring = { workspace = true }
 
 [[test]]
 name = "vless_config_test"
