@@ -105,19 +105,22 @@ async fn handle_socks5_connection(
         dest_addr.addr,
         dest_addr.port
     );
-    let (proxy_stream, session) = match client
+    let pooled = match client
         .create_proxy_stream((dest_addr.addr.clone(), dest_addr.port))
         .await
     {
-        Ok((stream, sess)) => {
+        Ok(pooled) => {
             tracing::debug!(
                 "[SOCKS5] Proxy stream created successfully for {}:{}, stream_id={}",
                 dest_addr.addr,
                 dest_addr.port,
-                stream.id()
+                pooled.id()
             );
-            tracing::debug!("[SOCKS5] Session status: closed={}", sess.is_closed());
-            (stream, sess)
+            tracing::debug!(
+                "[SOCKS5] Session status: closed={}",
+                pooled.session().is_closed()
+            );
+            pooled
         }
         Err(e) => {
             tracing::error!(
@@ -144,6 +147,8 @@ async fn handle_socks5_connection(
             return Err(e);
         }
     };
+    let proxy_stream = Arc::clone(pooled.stream());
+    let session = Arc::clone(pooled.session());
     let stream_id = proxy_stream.id();
 
     // Step 4: Send success reply
@@ -344,6 +349,7 @@ async fn handle_socks5_connection(
         dest_addr.addr,
         dest_addr.port
     );
+    pooled.close().await;
     Ok(())
 }
 

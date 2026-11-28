@@ -1,8 +1,9 @@
 //! AnyTLS Client implementation
 
-use crate::client::{SessionPool, SessionPoolConfig};
+use crate::client::session_pool::{Checkout, CheckoutState, SessionPool, SessionPoolConfig};
 use crate::padding::{PaddingFactory, SharedPaddingFactory};
-use crate::session::{Session, SessionHeartbeatConfig};
+use crate::session::stream::OwnerEnd;
+use crate::session::{Session, SessionHeartbeatConfig, Stream};
 use crate::util::{
     AnyTlsError, Result, TlsConnect, TransportDialer, hash_password, send_authentication,
 };
@@ -33,6 +34,8 @@ pub struct Client {
     padding: SharedPaddingFactory,
     session_pool: Arc<SessionPool>,
     pool_config: SessionPoolConfig,
+    #[cfg(test)]
+    pre_publish: tokio::sync::Mutex<Option<PrePublishPark>>,
 }
 
 impl Client {
@@ -73,6 +76,8 @@ impl Client {
             padding: padding.into_shared(),
             session_pool,
             pool_config,
+            #[cfg(test)]
+            pre_publish: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -91,12 +96,12 @@ impl Client {
         self.transport_dialer = Some(dialer);
     }
 
-    /// Create a new stream by establishing or reusing a session
-    /// Returns (stream, session) so the caller can use session.write_data_frame for writing
-    pub async fn create_proxy_stream(
-        &self,
-        destination: (String, u16),
-    ) -> Result<(Arc<crate::session::Stream>, Arc<crate::session::Session>)> {
+    /// Create a new stream by establishing or reusing a session.
+    ///
+    /// The returned [`PooledStream`] exclusively holds one TLS session until
+    /// the stream ends and the session is returned to idle — or until the
+    /// handle is dropped without FIN cleanup, which closes the session.
+    pub async fn create_proxy_stream(&self, destination: (String, u16)) -> Result<PooledStream> {
         self.create_proxy_stream_with_payload(destination, None)
             .await
     }
@@ -113,19 +118,25 @@ impl Client {
         &self,
         destination: (String, u16),
         payload: Option<Bytes>,
-    ) -> Result<(Arc<crate::session::Stream>, Arc<crate::session::Session>)> {
+    ) -> Result<PooledStream> {
         tracing::debug!(
             "[Client] create_proxy_stream: {}:{}",
             destination.0,
             destination.1
         );
 
-        // Get or create a session
-        let session = self.create_stream().await?;
+        let checkout = self.create_stream().await?;
         tracing::debug!("[Client] Got session for proxy stream");
-
+        let state =
+            CheckoutState::from_checkout(Arc::downgrade(self.session_pool.inner()), checkout);
+        let mut open_guard = CheckoutGuard::new(Arc::clone(&state));
+        let session = Arc::clone(state.session());
         let stream = Self::open_proxy_stream(&session, destination, payload).await?;
-        Ok((stream, session))
+        if !self.install_owner_end(&state, &stream).await {
+            return Err(AnyTlsError::SessionClosed);
+        }
+        open_guard.disarm();
+        Ok(PooledStream::from_checkout(stream, session, state))
     }
 
     /// Open a proxy stream on an already-established session: open the
@@ -248,23 +259,45 @@ impl Client {
         Ok(stream)
     }
 
-    /// Create a new stream by establishing or reusing a session
-    pub async fn create_stream(&self) -> Result<Arc<Session>> {
-        // Try to get an idle session from pool
-        if let Some(session) = self.session_pool.get_idle_session().await {
-            tracing::debug!("[Client] Reusing idle session from pool");
-            return Ok(session);
-        }
-
-        tracing::debug!("[Client] No idle session found, creating new session");
-        // A pool reset landing mid-dial discards the new session (its socket
-        // may predate the host's new outbound binding); redial once.
-        for _ in 0..2 {
-            if let Some(session) = self.create_new_session().await? {
-                return Ok(session);
+    /// Create a new stream by establishing or reusing a session.
+    ///
+    /// At most one new dial per open: a reset that lands mid-dial closes the
+    /// unpublished session and fails this call rather than starting another.
+    pub async fn create_stream(&self) -> Result<Checkout> {
+        match self.session_pool.checkout() {
+            Ok(checkout) => {
+                tracing::debug!("[Client] Reusing idle session from pool");
+                Ok(checkout)
+            }
+            Err(generation) => {
+                tracing::debug!("[Client] No idle session found, creating new session");
+                self.create_new_session(generation)
+                    .await?
+                    .ok_or(AnyTlsError::SessionClosed)
             }
         }
-        Err(AnyTlsError::SessionClosed)
+    }
+
+    async fn install_owner_end(&self, state: &Arc<CheckoutState>, stream: &Arc<Stream>) -> bool {
+        let callback_state = Arc::clone(state);
+        let callback = Box::new(move |end: OwnerEnd| match end {
+            OwnerEnd::LocalFinCommitted | OwnerEnd::RemoteFin => {
+                if callback_state.session().is_closed() {
+                    callback_state.finish_discard();
+                } else {
+                    callback_state.finish_return();
+                }
+            }
+            OwnerEnd::Discard => callback_state.finish_discard(),
+        });
+        let confirm_state = Arc::clone(state);
+        state
+            .session()
+            .try_install_owner_end(stream, callback, move || {
+                confirm_state.checkout_is_current()
+            })
+            .await
+            .is_ok()
     }
 
     /// Close every pooled session so the next stream dials a fresh
@@ -275,9 +308,11 @@ impl Client {
 
     /// Create a new session with the server. `None` when a pool reset ran
     /// while it was being dialled: the session was closed, not pooled.
-    async fn create_new_session(&self) -> Result<Option<Arc<Session>>> {
+    async fn create_new_session(
+        &self,
+        generation: meow_common::atomic::Uint,
+    ) -> Result<Option<Checkout>> {
         tracing::debug!("[Client] Creating new session to {}", self.server_addr);
-        let generation = self.session_pool.generation();
 
         // Establish the transport to the server, then run TLS on it. Two
         // shapes produce the same `Box<dyn AsyncStream>` for
@@ -413,23 +448,27 @@ impl Client {
         let session = self.session_over_transport(tls_stream).await?;
 
         // The session's background tasks keep it alive on their own, so
-        // dropping this future while the pool-add is still pending would
+        // dropping this future while the session is unpublished would
         // orphan a running session that no reaper owns. Close it on drop.
         let mut guard = SessionCloseGuard::new(session.clone());
 
-        // Store in pool
-        if !self
+        #[cfg(test)]
+        if let Some(park) = self.pre_publish.lock().await.take() {
+            park.entered.wait().await;
+            let _ = park.release.await;
+        }
+
+        let Some(checkout) = self
             .session_pool
-            .add_idle_session_from(session.clone(), generation)
-            .await
-        {
+            .register_checked_out(session.clone(), generation)
+        else {
             tracing::debug!("[Client] Pool reset during dial; closing the new session");
             return Ok(None);
-        }
+        };
         guard.disarm();
-        tracing::debug!("[Client] Session added to pool");
+        tracing::debug!("[Client] Session registered as checked out");
 
-        Ok(Some(session))
+        Ok(Some(checkout))
     }
 
     /// Build and start a client session on an already-handshaken TLS
@@ -532,6 +571,133 @@ impl Client {
     pub async fn stop_session_pool_cleanup(&self) {
         self.session_pool.stop_cleanup_task().await;
     }
+
+    #[cfg(test)]
+    pub(crate) fn session_pool(&self) -> &Arc<SessionPool> {
+        &self.session_pool
+    }
+
+    #[cfg(test)]
+    async fn set_pre_publish_park(
+        &self,
+        entered: Arc<tokio::sync::Barrier>,
+        release: tokio::sync::oneshot::Receiver<()>,
+    ) {
+        *self.pre_publish.lock().await = Some(PrePublishPark { entered, release });
+    }
+}
+
+#[cfg(test)]
+struct PrePublishPark {
+    entered: Arc<tokio::sync::Barrier>,
+    release: tokio::sync::oneshot::Receiver<()>,
+}
+
+/// Pooled proxy stream: exclusive checkout plus a Drop fallback that closes
+/// the session if FIN cleanup never starts.
+pub struct PooledStream {
+    stream: Arc<Stream>,
+    session: Arc<Session>,
+    guard: Option<CheckoutGuard>,
+}
+
+impl PooledStream {
+    fn from_checkout(
+        stream: Arc<Stream>,
+        session: Arc<Session>,
+        state: Arc<CheckoutState>,
+    ) -> Self {
+        Self {
+            stream,
+            session,
+            guard: Some(CheckoutGuard::new(state)),
+        }
+    }
+
+    pub fn id(&self) -> u32 {
+        self.stream.id()
+    }
+
+    pub fn stream(&self) -> &Arc<Stream> {
+        &self.stream
+    }
+
+    pub fn session(&self) -> &Arc<Session> {
+        &self.session
+    }
+
+    /// Enqueue FIN and keep the checkout guard alive until owner-end.
+    /// A later Drop of this handle is then a no-op.
+    pub fn start_close(&mut self) {
+        self.stream.close();
+        let Some(guard) = self.guard.take() else {
+            return;
+        };
+        let Some(state) = guard.state_arc() else {
+            return;
+        };
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let notified = state.done().notified();
+                    tokio::pin!(notified);
+                    notified.as_mut().enable();
+                    if !state.is_completed() {
+                        tokio::select! {
+                            biased;
+                            () = notified => {}
+                            () = state.session().wait_closed() => {
+                                state.finish_discard();
+                            }
+                        }
+                    }
+                    drop(guard);
+                });
+            }
+            Err(_) => drop(guard),
+        }
+    }
+
+    /// FIN the stream and wait until the checkout is returned or discarded.
+    /// Cancelling this future discards the checkout (closes the session).
+    pub async fn close(self) {
+        let state = self.guard.as_ref().and_then(CheckoutGuard::state_arc);
+        self.stream.close();
+        if let Some(state) = state {
+            let notified = state.done().notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if !state.is_completed() {
+                notified.await;
+            }
+        }
+    }
+}
+
+/// Covers create_stream → successful open_proxy_stream. Drop discards the
+/// checkout and closes the session.
+struct CheckoutGuard(Option<Arc<CheckoutState>>);
+
+impl CheckoutGuard {
+    fn new(state: Arc<CheckoutState>) -> Self {
+        Self(Some(state))
+    }
+
+    fn state_arc(&self) -> Option<Arc<CheckoutState>> {
+        self.0.clone()
+    }
+
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for CheckoutGuard {
+    fn drop(&mut self) {
+        if let Some(state) = self.0.take() {
+            state.finish_discard();
+        }
+    }
 }
 
 /// Close a session whose ownership has not been handed off yet if the
@@ -588,7 +754,7 @@ mod tests {
     use super::*;
     use crate::util::{AnyTlsError, TlsConnectFuture};
     use std::future::Future;
-    use std::task::{Context, Waker};
+    use std::task::{Context, Poll, Waker};
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpStream;
     use tokio::time::Duration;
@@ -699,97 +865,620 @@ mod tests {
         );
     }
 
-    /// The injected [`crate::util::TransportDialer`] path (meow-rs
-    /// `dialer-proxy`): the client dials the supplied chained stream —
-    /// never a `TcpStream` — runs `TlsConnect::connect_stream` on it, and
-    /// pools the session exactly like a direct one: a second open reuses
-    /// it without redialling, `reset_sessions` flushes it, and the next
-    /// open dials a fresh chained transport.
-    #[tokio::test]
-    async fn transport_dialer_sessions_pool_and_reset() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::{AsyncRead, AsyncWrite, ReadBuf as IoReadBuf};
+    use tokio::sync::{Barrier, Mutex as TokioMutex};
 
-        /// Returns the client half of a duplex pair per dial and counts;
-        /// the peer half is retained so session writes never stall.
-        struct DuplexDialer {
-            dials: AtomicUsize,
-            peers: tokio::sync::Mutex<Vec<tokio::io::DuplexStream>>,
+    struct DialStats {
+        dials: AtomicUsize,
+        drops: AtomicUsize,
+        shutdowns: AtomicUsize,
+        /// Peer write halves: tests inject remote FINs here.
+        peers: TokioMutex<Vec<tokio::io::WriteHalf<tokio::io::DuplexStream>>>,
+        /// Drain tasks holding the matching read halves so session writes
+        /// cannot fill the 64 KiB duplex and trip CONTROL_WRITE_TIMEOUT.
+        drain_handles: TokioMutex<Vec<tokio::task::JoinHandle<()>>>,
+        /// Held unread peer read halves when [`Self::drain_reads`] is false.
+        undrained_reads: TokioMutex<Vec<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        /// Drain peer reads by default so sequential churn cannot stall.
+        drain_reads: AtomicBool,
+        /// 1-based dial index to park on, or 0.
+        block_on: AtomicUsize,
+        block_entered: TokioMutex<Option<Arc<Barrier>>>,
+        block_release: TokioMutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+        pause_writes: AtomicBool,
+        pause_waker: std::sync::Mutex<Option<Waker>>,
+        saw_pause: tokio::sync::Notify,
+    }
+
+    impl DialStats {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                dials: AtomicUsize::new(0),
+                drops: AtomicUsize::new(0),
+                shutdowns: AtomicUsize::new(0),
+                peers: TokioMutex::new(Vec::new()),
+                drain_handles: TokioMutex::new(Vec::new()),
+                undrained_reads: TokioMutex::new(Vec::new()),
+                drain_reads: AtomicBool::new(true),
+                block_on: AtomicUsize::new(0),
+                block_entered: TokioMutex::new(None),
+                block_release: TokioMutex::new(None),
+                pause_writes: AtomicBool::new(false),
+                pause_waker: std::sync::Mutex::new(None),
+                saw_pause: tokio::sync::Notify::new(),
+            })
+        }
+    }
+
+    struct CountedStream {
+        inner: tokio::io::DuplexStream,
+        stats: Arc<DialStats>,
+    }
+
+    impl Drop for CountedStream {
+        fn drop(&mut self) {
+            self.stats.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    impl AsyncRead for CountedStream {
+        fn poll_read(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &mut IoReadBuf<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            Pin::new(&mut self.inner).poll_read(cx, buf)
+        }
+    }
+
+    impl AsyncWrite for CountedStream {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+            buf: &[u8],
+        ) -> Poll<std::io::Result<usize>> {
+            if self.stats.pause_writes.load(Ordering::SeqCst) {
+                *self.stats.pause_waker.lock().unwrap() = Some(cx.waker().clone());
+                self.stats.saw_pause.notify_waiters();
+                return Poll::Pending;
+            }
+            Pin::new(&mut self.inner).poll_write(cx, buf)
         }
 
-        impl crate::util::TransportDialer for DuplexDialer {
-            fn dial<'a>(
-                &'a self,
-                host: &'a str,
-                port: u16,
-            ) -> crate::util::TransportDialFuture<'a> {
-                Box::pin(async move {
-                    assert_eq!((host, port), ("anytls.test", 443));
-                    self.dials.fetch_add(1, Ordering::SeqCst);
-                    let (client_half, peer_half) = tokio::io::duplex(64 * 1024);
-                    self.peers.lock().await.push(peer_half);
-                    Ok(Box::new(client_half) as Box<dyn crate::util::SyncStream>)
-                })
+        fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+            if self.stats.pause_writes.load(Ordering::SeqCst) {
+                *self.stats.pause_waker.lock().unwrap() = Some(cx.waker().clone());
+                self.stats.saw_pause.notify_waiters();
+                return Poll::Pending;
             }
+            Pin::new(&mut self.inner).poll_flush(cx)
         }
 
-        /// Passthrough TLS over the chained stream — reaching
-        /// `connect_stream` (rather than `connect`) is itself part of the
-        /// assertion.
-        struct PlainTls;
-        impl TlsConnect for PlainTls {
-            fn connect(&self, _tcp: TcpStream) -> TlsConnectFuture<'_> {
-                Box::pin(async {
-                    Err(AnyTlsError::Protocol(
-                        "PlainTls: TcpStream path must not be reached".into(),
-                    ))
-                })
-            }
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<std::io::Result<()>> {
+            self.stats.shutdowns.fetch_add(1, Ordering::SeqCst);
+            Pin::new(&mut self.inner).poll_shutdown(cx)
+        }
+    }
 
-            fn connect_stream(
-                &self,
-                stream: Box<dyn crate::util::SyncStream>,
-            ) -> TlsConnectFuture<'_> {
-                Box::pin(async move { Ok(Box::new(stream) as Box<dyn crate::util::AsyncStream>) })
-            }
+    struct DuplexDialer {
+        stats: Arc<DialStats>,
+    }
+
+    impl crate::util::TransportDialer for DuplexDialer {
+        fn dial<'a>(&'a self, host: &'a str, port: u16) -> crate::util::TransportDialFuture<'a> {
+            Box::pin(async move {
+                assert_eq!((host, port), ("anytls.test", 443));
+                let n = self.stats.dials.fetch_add(1, Ordering::SeqCst) + 1;
+                if n == self.stats.block_on.load(Ordering::SeqCst) {
+                    if let Some(entered) = self.stats.block_entered.lock().await.clone() {
+                        entered.wait().await;
+                    }
+                    if let Some(release) = self.stats.block_release.lock().await.take() {
+                        let _ = release.await;
+                    }
+                }
+                let (client_half, peer_half) = tokio::io::duplex(64 * 1024);
+                let (peer_read, peer_write) = tokio::io::split(peer_half);
+                if self.stats.drain_reads.load(Ordering::SeqCst) {
+                    let drain = tokio::spawn(async move {
+                        let mut peer_read = peer_read;
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            match tokio::io::AsyncReadExt::read(&mut peer_read, &mut buf).await {
+                                Ok(0) | Err(_) => break,
+                                Ok(_) => {}
+                            }
+                        }
+                    });
+                    self.stats.drain_handles.lock().await.push(drain);
+                } else {
+                    self.stats.undrained_reads.lock().await.push(peer_read);
+                }
+                self.stats.peers.lock().await.push(peer_write);
+                Ok(Box::new(CountedStream {
+                    inner: client_half,
+                    stats: Arc::clone(&self.stats),
+                }) as Box<dyn crate::util::SyncStream>)
+            })
+        }
+    }
+
+    /// Passthrough TLS over the chained stream — reaching
+    /// `connect_stream` (rather than `connect`) is itself part of the
+    /// assertion.
+    struct PlainTls;
+    impl TlsConnect for PlainTls {
+        fn connect(&self, _tcp: TcpStream) -> TlsConnectFuture<'_> {
+            Box::pin(async {
+                Err(AnyTlsError::Protocol(
+                    "PlainTls: TcpStream path must not be reached".into(),
+                ))
+            })
         }
 
-        let dialer = Arc::new(DuplexDialer {
-            dials: AtomicUsize::new(0),
-            peers: tokio::sync::Mutex::new(Vec::new()),
-        });
+        fn connect_stream(&self, stream: Box<dyn crate::util::SyncStream>) -> TlsConnectFuture<'_> {
+            Box::pin(async move { Ok(Box::new(stream) as Box<dyn crate::util::AsyncStream>) })
+        }
+    }
+
+    fn pooled_client(stats: &Arc<DialStats>) -> Client {
         let mut client = Client::new(
             "password",
             "anytls.test:443".to_string(),
             Arc::new(PlainTls),
             PaddingFactory::default(),
         );
-        client.set_transport_dialer(Arc::clone(&dialer) as Arc<dyn crate::util::TransportDialer>);
-
+        client.set_transport_dialer(Arc::new(DuplexDialer {
+            stats: Arc::clone(stats),
+        }) as Arc<dyn crate::util::TransportDialer>);
         client
-            .create_proxy_stream(("example.com".into(), 443))
-            .await
-            .expect("the first stream opens over the injected dialer");
-        assert_eq!(dialer.dials.load(Ordering::SeqCst), 1);
+    }
 
-        // The chained session is pooled: a second stream reuses it
-        // without consulting the dialer again.
-        client
-            .create_proxy_stream(("example.com".into(), 443))
-            .await
-            .expect("the second stream reuses the pooled chained session");
+    async fn wait_pool(client: &Client, live: usize, idle: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if client.session_pool().live_len() == live
+                    && client.session_pool().idle_len() == idle
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "pool did not reach live={live} idle={idle} (live={} idle={})",
+                client.session_pool().live_len(),
+                client.session_pool().idle_len()
+            )
+        });
+    }
+
+    /// The injected [`crate::util::TransportDialer`] path (meow-rs
+    /// `dialer-proxy`): concurrent streams each own a session; sequential
+    /// reuse skips the handshake; reset forces a new dial.
+    #[tokio::test]
+    async fn transport_dialer_sessions_pool_and_reset() {
+        let stats = DialStats::new();
+        let client = Arc::new(pooled_client(&stats));
+        const N: usize = 4;
+        let hold = Arc::new(Barrier::new(N + 1));
+        let mut handles = Vec::new();
+        for _ in 0..N {
+            let client = Arc::clone(&client);
+            let hold = Arc::clone(&hold);
+            handles.push(tokio::spawn(async move {
+                let stream = client
+                    .create_proxy_stream(("example.com".into(), 443))
+                    .await
+                    .expect("concurrent open");
+                hold.wait().await;
+                stream
+            }));
+        }
+        hold.wait().await;
+        assert_eq!(stats.dials.load(Ordering::SeqCst), N);
+        assert_eq!(client.session_pool().live_len(), N);
+        assert_eq!(client.session_pool().idle_len(), 0);
+        let mut session_ids = Vec::new();
+        let mut streams = Vec::new();
+        for handle in handles {
+            let stream = handle.await.unwrap();
+            session_ids.push(stream.session().id());
+            streams.push(stream);
+        }
+        session_ids.sort_unstable();
+        session_ids.dedup();
         assert_eq!(
-            dialer.dials.load(Ordering::SeqCst),
-            1,
-            "a pooled chained session must not redial the transport"
+            session_ids.len(),
+            N,
+            "concurrent streams use distinct sessions"
         );
 
-        // `reset_sessions` flushes the pool whichever transport class it
-        // holds; the next stream establishes a fresh chained session.
+        for stream in streams {
+            stream.close().await;
+        }
+        wait_pool(&client, N, N).await;
+        assert_eq!(
+            stats.dials.load(Ordering::SeqCst),
+            N,
+            "return must not redial"
+        );
+
+        let first = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .expect("serial open");
+        let first_id = first.session().id();
+        first.close().await;
+        wait_pool(&client, N, N).await;
+        let second = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .expect("serial reuse");
+        assert_eq!(second.session().id(), first_id);
+        assert_eq!(stats.dials.load(Ordering::SeqCst), N);
+        second.close().await;
+        wait_pool(&client, N, N).await;
+
         client.reset_sessions();
+        wait_pool(&client, 0, 0).await;
         client
             .create_proxy_stream(("example.com".into(), 443))
             .await
-            .expect("a post-reset stream opens a fresh session");
-        assert_eq!(dialer.dials.load(Ordering::SeqCst), 2);
+            .expect("a post-reset stream opens a fresh session")
+            .close()
+            .await;
+        assert_eq!(stats.dials.load(Ordering::SeqCst), N + 1);
+        wait_pool(&client, 1, 1).await;
+    }
+
+    #[tokio::test]
+    async fn bare_drop_closes_transport_without_pooling() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let stream = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        drop(stream);
+        wait_pool(&client, 0, 0).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.drops.load(Ordering::SeqCst) == 0
+                && stats.shutdowns.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bare drop must close the transport");
+    }
+
+    #[tokio::test]
+    async fn late_drop_after_return_does_not_close_next_checkout() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let mut first = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        first.start_close();
+        wait_pool(&client, 1, 1).await;
+        let second = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        let second_id = second.session().id();
+        drop(first);
+        assert_eq!(client.session_pool().live_len(), 1);
+        assert!(!second.session().is_closed());
+        assert_eq!(second.session().id(), second_id);
+        second.close().await;
+        wait_pool(&client, 1, 1).await;
+        assert_eq!(stats.dials.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn local_fin_does_not_idle_before_writer_commit() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let stream = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        wait_pool(&client, 1, 0).await;
+        stats.pause_writes.store(true, Ordering::SeqCst);
+        let mut stream = stream;
+        stream.start_close();
+        tokio::time::timeout(Duration::from_secs(5), stats.saw_pause.notified())
+            .await
+            .expect("FIN must reach the paused writer");
+        assert_eq!(
+            client.session_pool().idle_len(),
+            0,
+            "must not idle before FIN commit"
+        );
+        assert_eq!(client.session_pool().live_len(), 1);
+        stats.pause_writes.store(false, Ordering::SeqCst);
+        if let Some(waker) = stats.pause_waker.lock().unwrap().take() {
+            waker.wake();
+        }
+        wait_pool(&client, 1, 1).await;
+        assert_eq!(stats.dials.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn writer_fail_during_fin_unregisters() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let stream = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        {
+            let mut handles = stats.drain_handles.lock().await;
+            for handle in handles.drain(..) {
+                handle.abort();
+            }
+            stats.peers.lock().await.clear();
+        }
+        stream.close().await;
+        wait_pool(&client, 0, 0).await;
+    }
+
+    #[tokio::test]
+    async fn remote_fin_returns_healthy_session() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let stream = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        let sid = stream.id();
+        {
+            let mut peers = stats.peers.lock().await;
+            let peer = peers.last_mut().expect("peer");
+            let mut fin = [0u8; 7];
+            fin[0] = u8::from(crate::protocol::Command::Fin);
+            fin[1..5].copy_from_slice(&sid.to_be_bytes());
+            tokio::io::AsyncWriteExt::write_all(peer, &fin)
+                .await
+                .unwrap();
+        }
+        wait_pool(&client, 1, 1).await;
+        drop(stream);
+        wait_pool(&client, 1, 1).await;
+        assert_eq!(stats.dials.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn open_stream_failure_does_not_leak() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let checkout = client.create_stream().await.unwrap();
+        checkout.session.close().await.unwrap();
+        let err =
+            Client::open_proxy_stream(&checkout.session, ("example.com".into(), 443), None).await;
+        assert!(err.is_err());
+        client.session_pool().discard_checkout(&checkout);
+        wait_pool(&client, 0, 0).await;
+    }
+
+    #[tokio::test]
+    async fn open_proxy_stream_failure_discards_checkout() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let err = client.create_proxy_stream(("x".repeat(256), 443)).await;
+        assert!(err.is_err());
+        wait_pool(&client, 0, 0).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.drops.load(Ordering::SeqCst) == 0
+                && stats.shutdowns.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed open must close the transport");
+    }
+
+    #[tokio::test]
+    async fn unpublished_session_cancel_does_not_leak() {
+        let stats = DialStats::new();
+        let client = Arc::new(pooled_client(&stats));
+        let entered = Arc::new(Barrier::new(2));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        client
+            .set_pre_publish_park(Arc::clone(&entered), release_rx)
+            .await;
+        let task = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .create_proxy_stream(("example.com".into(), 443))
+                    .await
+            })
+        };
+        entered.wait().await;
+        task.abort();
+        drop(release_tx);
+        wait_pool(&client, 0, 0).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while stats.drops.load(Ordering::SeqCst) == 0
+                && stats.shutdowns.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("unpublished cancel must close the transport");
+    }
+
+    #[tokio::test]
+    async fn reset_closes_busy_idle_and_inflight_old_generation() {
+        let stats = DialStats::new();
+        let client = Arc::new(pooled_client(&stats));
+        let busy = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        wait_pool(&client, 1, 0).await;
+
+        // Park the old-generation dial while idle is still empty so checkout
+        // misses and the inflight future actually dials. Opening idle first
+        // would let inflight steal that session and never reach the barrier.
+        let entered = Arc::new(Barrier::new(2));
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        stats.block_on.store(2, Ordering::SeqCst);
+        *stats.block_entered.lock().await = Some(Arc::clone(&entered));
+        *stats.block_release.lock().await = Some(release_rx);
+
+        let inflight = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                client
+                    .create_proxy_stream(("example.com".into(), 443))
+                    .await
+            })
+        };
+        entered.wait().await;
+        assert_eq!(stats.dials.load(Ordering::SeqCst), 2);
+
+        let idle = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        idle.close().await;
+        wait_pool(&client, 2, 1).await;
+        assert_eq!(stats.dials.load(Ordering::SeqCst), 3);
+
+        client.reset_sessions();
+        wait_pool(&client, 0, 0).await;
+        tokio::time::timeout(Duration::from_secs(5), busy.session().wait_closed())
+            .await
+            .expect("reset closes the busy session");
+        drop(release_tx);
+        let result = inflight.await.expect("join");
+        assert!(
+            result.is_err(),
+            "old-generation dial must not deliver a stream"
+        );
+        wait_pool(&client, 0, 0).await;
+
+        let fresh = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .expect("new-generation dial works");
+        assert_eq!(client.session_pool().live_len(), 1);
+        drop(busy);
+        wait_pool(&client, 1, 0).await;
+        fresh.close().await;
+        wait_pool(&client, 1, 1).await;
+    }
+
+    #[tokio::test]
+    async fn ten_thousand_short_streams_reuse_one_session() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        for i in 0..10_000 {
+            let stream = client
+                .create_proxy_stream(("example.com".into(), 443))
+                .await
+                .unwrap_or_else(|e| panic!("stream {i}: {e}"));
+            assert!(
+                client.session_pool().live_len() <= 1,
+                "live grew to {} at {i}",
+                client.session_pool().live_len()
+            );
+            assert!(
+                client.session_pool().idle_len() <= 1,
+                "idle grew to {} at {i}",
+                client.session_pool().idle_len()
+            );
+            stream.close().await;
+            wait_pool(&client, 1, 1).await;
+        }
+        assert_eq!(stats.dials.load(Ordering::SeqCst), 1);
+        client.reset_sessions();
+        wait_pool(&client, 0, 0).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let dials = stats.dials.load(Ordering::SeqCst);
+                let drops = stats.drops.load(Ordering::SeqCst);
+                let shutdowns = stats.shutdowns.load(Ordering::SeqCst);
+                if drops >= dials || shutdowns >= dials {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("reset must close the remaining transport");
+        assert_eq!(client.session_pool().live_len(), 0);
+        assert_eq!(client.session_pool().idle_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn create_proxy_stream_on_tls_does_not_touch_the_pool() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let (tls_half, mut peer) = tokio::io::duplex(64 * 1024);
+        let (stream, session) = client
+            .create_proxy_stream_on_tls(tls_half, ("example.com".into(), 443))
+            .await
+            .unwrap();
+        assert_eq!(client.session_pool().live_len(), 0);
+        assert_eq!(client.session_pool().idle_len(), 0);
+        assert_eq!(stats.dials.load(Ordering::SeqCst), 0);
+        drop(stream);
+        session.close().await.unwrap();
+        let mut drained = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), peer.read_to_end(&mut drained))
+            .await
+            .expect("unpooled session close must shut the transport")
+            .unwrap();
+        assert_eq!(client.session_pool().live_len(), 0);
+        assert_eq!(client.session_pool().idle_len(), 0);
+    }
+
+    #[tokio::test]
+    async fn open_proxy_stream_cancel_discards_checkout() {
+        let stats = DialStats::new();
+        stats.drain_reads.store(false, Ordering::SeqCst);
+        let client = pooled_client(&stats);
+        let checkout = client.create_stream().await.unwrap();
+        let state = crate::client::session_pool::CheckoutState::from_checkout(
+            std::sync::Arc::downgrade(client.session_pool().inner()),
+            checkout.clone(),
+        );
+        let session = std::sync::Arc::clone(state.session());
+        session.enqueue_flush_marker().unwrap();
+        let (first_stream, _synack_rx) = session.open_stream().await.unwrap();
+        loop {
+            let r = tokio::time::timeout(
+                Duration::from_millis(100),
+                first_stream.send_data(Bytes::from_static(&[7u8; 256])),
+            )
+            .await;
+            match r {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => panic!("send_data failed while saturating: {e}"),
+                Err(_) => break,
+            }
+        }
+        {
+            let _open_guard = CheckoutGuard::new(std::sync::Arc::clone(&state));
+            let open = Client::open_proxy_stream(&session, ("example.com".into(), 443), None);
+            tokio::pin!(open);
+            let mut cx = Context::from_waker(Waker::noop());
+            assert!(matches!(open.as_mut().poll(&mut cx), Poll::Pending));
+        }
+        wait_pool(&client, 0, 0).await;
     }
 }

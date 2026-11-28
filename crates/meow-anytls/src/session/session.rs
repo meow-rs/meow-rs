@@ -3,6 +3,7 @@
 use crate::padding::{PaddingFactory, SharedPaddingFactory};
 use crate::protocol::{Command, Frame, FrameCodec, HEADER_OVERHEAD_SIZE};
 use crate::session::Stream;
+use crate::session::stream::{OwnerEnd, OwnerEndCallback};
 use crate::session::writer::{ControlTicket, StreamWriter, WriteRequest};
 use crate::util::{AnyTlsError, Result, StringMap};
 use bytes::{Bytes, BytesMut};
@@ -207,6 +208,10 @@ pub struct Session {
     // it is a protocol violation (upstream refuses the session), not a
     // stream to route.
     client_settings_received: std::sync::atomic::AtomicBool,
+
+    /// One-shot pool unregister, fired after `is_closed` is published.
+    /// Weak-referenced by the pool so this cannot keep the pool alive.
+    pool_close_notify: std::sync::Mutex<Option<Box<dyn FnOnce() + Send + 'static>>>,
 }
 
 impl Session {
@@ -282,6 +287,7 @@ impl Session {
             syn_watchdog: std::sync::Mutex::new(None),
             pending_in: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             client_settings_received: std::sync::atomic::AtomicBool::new(false),
+            pool_close_notify: std::sync::Mutex::new(None),
         }
     }
 
@@ -327,6 +333,7 @@ impl Session {
             syn_watchdog: std::sync::Mutex::new(None),
             pending_in: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             client_settings_received: std::sync::atomic::AtomicBool::new(false),
+            pool_close_notify: std::sync::Mutex::new(None),
         }
     }
 
@@ -357,14 +364,55 @@ impl Session {
             .store(true, std::sync::atomic::Ordering::Release);
         self.stream_data_tx.close();
         self.close_notify.notify_waiters();
+        // Publish termination before notifying the pool so a concurrent
+        // register observes `is_closed` under the pool lock.
+        self.fire_pool_close_notify();
+    }
+
+    pub(crate) fn set_pool_close_notify(&self, callback: Box<dyn FnOnce() + Send + 'static>) {
+        *self.pool_close_notify.lock().unwrap() = Some(callback);
+    }
+
+    fn fire_pool_close_notify(&self) {
+        if let Some(callback) = self.pool_close_notify.lock().unwrap().take() {
+            callback();
+        }
+    }
+
+    /// Wait until [`initiate_close`](Self::initiate_close) has published
+    /// `is_closed`. Used by pooled checkout waiters.
+    pub async fn wait_closed(&self) {
+        let notified = self.close_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_closed() {
+            return;
+        }
+        notified.await;
+    }
+
+    /// Install a one-shot owner-end callback while holding the stream map
+    /// lock. `confirm` runs under that lock (lock order: owner → pool).
+    /// Returns `Err(callback)` if the owner is already gone or `confirm`
+    /// fails — the caller must then treat open as failed.
+    pub(crate) async fn try_install_owner_end(
+        &self,
+        stream: &Arc<Stream>,
+        callback: OwnerEndCallback,
+        confirm: impl FnOnce() -> bool,
+    ) -> std::result::Result<(), OwnerEndCallback> {
+        let streams = self.streams.write().await;
+        let live = streams
+            .get(&stream.id())
+            .is_some_and(|cur| Arc::ptr_eq(cur, stream));
+        if !live || !confirm() {
+            return Err(callback);
+        }
+        stream.set_owner_end(callback);
+        Ok(())
     }
 
     /// Whether the session currently carries any open streams.
-    ///
-    /// Used by the session pool's cleanup task to avoid closing a pooled
-    /// session that is still serving traffic (e.g. a long-running download).
-    /// Accurate now that client streams are evicted on close (`Stream::close`
-    /// emits a FIN and removes the maps).
     pub async fn has_active_streams(&self) -> bool {
         !self.streams.read().await.is_empty()
     }
@@ -408,7 +456,9 @@ impl Session {
         // writes are the only awaits; `close_with_error`/`notify_synack`
         // are synchronous, so eviction + close + wakeup is one atomic
         // step — no cancellation point can orphan a waiter on an
-        // already-evicted stream (issue #621).
+        // already-evicted stream (issue #621). Owner-end callbacks run
+        // after the map lock is dropped.
+        let mut owner_ends = Vec::new();
         {
             let mut streams = self.streams.write().await;
             let mut receive_map = self.stream_receive_tx.write().await;
@@ -416,8 +466,12 @@ impl Session {
                 stream.close_with_error(AnyTlsError::SessionClosed);
                 stream.notify_synack(Err(AnyTlsError::SessionClosed));
                 receive_map.remove(&stream_id);
+                if let Some(callback) = stream.take_owner_end() {
+                    owner_ends.push((callback, OwnerEnd::Discard));
+                }
             }
         }
+        fire_owner_ends(owner_ends);
 
         // Attempt to shutdown writer gracefully
         {
@@ -923,6 +977,9 @@ impl Session {
                                 AnyTlsError::Protocol(format!("Server error: {}", error_msg));
                             stream.close_with_error(AnyTlsError::StreamClosed);
                             stream.notify_synack(Err(error));
+                            if let Some(callback) = stream.take_owner_end() {
+                                callback(OwnerEnd::Discard);
+                            }
                         } else {
                             tracing::warn!(
                                 session_id = session_id,
@@ -988,8 +1045,17 @@ impl Session {
                 // immediately (issue #543). `notify_synack` no-ops once
                 // the SynAck landed.
                 if let Some(stream) = removed {
+                    let pending_local_fin = stream.fin_sent();
                     stream.close_with_error(AnyTlsError::StreamClosed);
                     stream.notify_synack(Err(AnyTlsError::StreamClosed));
+                    if let Some(callback) = stream.take_owner_end() {
+                        let kind = if pending_local_fin {
+                            OwnerEnd::Discard
+                        } else {
+                            OwnerEnd::RemoteFin
+                        };
+                        callback(kind);
+                    }
                 }
             }
             Command::Settings => {
@@ -1182,6 +1248,9 @@ impl Session {
         if let Some(stream) = removed {
             stream.close_with_error(AnyTlsError::StreamClosed);
             stream.notify_synack(Err(err));
+            if let Some(callback) = stream.take_owner_end() {
+                callback(OwnerEnd::Discard);
+            }
         }
     }
 
@@ -2094,6 +2163,7 @@ impl Session {
             }
         };
 
+        let mut owner_ends = Vec::new();
         if !fin_streams.is_empty() {
             let mut streams = self.streams.write().await;
             let mut receive_map = self.stream_receive_tx.write().await;
@@ -2111,9 +2181,18 @@ impl Session {
                     receive_map.remove(&stream_id);
                     stream.close_with_error(AnyTlsError::StreamClosed);
                     stream.notify_synack(Err(AnyTlsError::StreamClosed));
+                    if let Some(callback) = stream.take_owner_end() {
+                        let kind = if result.is_ok() {
+                            OwnerEnd::LocalFinCommitted
+                        } else {
+                            OwnerEnd::Discard
+                        };
+                        owner_ends.push((callback, kind));
+                    }
                 }
             }
         }
+        fire_owner_ends(owner_ends);
 
         for mut frame in frames.drain(..) {
             if let Some(completion) = frame.completion().take() {
@@ -2293,6 +2372,12 @@ impl Session {
             .await?;
         }
         Ok(())
+    }
+}
+
+fn fire_owner_ends(ends: Vec<(OwnerEndCallback, OwnerEnd)>) {
+    for (callback, kind) in ends {
+        callback(kind);
     }
 }
 

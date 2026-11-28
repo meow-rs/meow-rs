@@ -67,13 +67,15 @@ async fn handle_http_proxy_connection(
     );
 
     let destination = (request.host.clone(), request.port);
-    let (proxy_stream, session) = match client.create_proxy_stream(destination.clone()).await {
+    let pooled = match client.create_proxy_stream(destination.clone()).await {
         Ok(res) => res,
         Err(err) => {
             send_http_error(&mut client_conn, 502, "Bad Gateway").await?;
             return Err(err);
         }
     };
+    let proxy_stream = Arc::clone(pooled.stream());
+    let session = Arc::clone(pooled.session());
 
     if request.is_connect {
         send_connect_success(&mut client_conn).await?;
@@ -144,6 +146,7 @@ async fn handle_http_proxy_connection(
     });
 
     let _ = tokio::join!(to_client, to_proxy);
+    pooled.close().await;
 
     tracing::debug!(
         "[HTTP] Connection to {}:{} closed (stream {})",

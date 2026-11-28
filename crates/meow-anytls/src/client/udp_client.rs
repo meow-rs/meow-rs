@@ -55,13 +55,13 @@ impl Client {
         // latency measure.
         let initial_request = encode_initial_request(target_addr)?;
         let magic_destination = (UDP_OVER_TCP_MAGIC_ADDR.to_string(), 0);
-        let (stream, _session) = self
+        let pooled = self
             .create_proxy_stream_with_payload(magic_destination, Some(initial_request))
             .await?;
 
         tracing::debug!(
             "[UDP Client] Created stream {} for UDP over TCP",
-            stream.id()
+            pooled.id()
         );
 
         // Step 2: Create local UDP socket via the socket-protect helper so a
@@ -79,12 +79,13 @@ impl Client {
         tracing::debug!("[UDP Client] Local UDP socket bound to {}", bound_addr);
 
         // Step 3: Start bidirectional forwarding
-        let stream_clone = stream.clone();
+        let stream_clone = Arc::clone(pooled.stream());
 
         tokio::spawn(async move {
             if let Err(e) = udp_proxy_loop(local_udp, stream_clone).await {
                 tracing::error!("[UDP Client] Proxy loop error: {}", e);
             }
+            pooled.close().await;
         });
 
         tracing::debug!(

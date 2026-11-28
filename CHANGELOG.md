@@ -40,6 +40,11 @@ the canonical, in-repo source a release is cut from.
 
 ### Fixed
 
+- AnyTLS outbound sessions are exclusively checked out per concurrent
+  stream (matching anytls-go/mihomo/sing-anytls). Concurrent streams
+  each use their own TLS session; a healthy session still returns to
+  idle for sequential reuse and skips the handshake. (#1015)
+
 - `proxy-providers.*.filter` / `exclude-filter` and the group-level fields
   of the same name now compile with `fancy-regex`, which supports the
   look-around assertions mihomo accepts. A config using the common airport

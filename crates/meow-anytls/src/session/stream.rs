@@ -21,6 +21,19 @@ struct WriteState {
     waker: Option<Waker>,
 }
 
+/// Why a pooled stream's owner left the session map (issue #1015).
+/// Fired outside the stream-map lock; the pool decides return vs close.
+pub(crate) enum OwnerEnd {
+    /// Local FIN was committed by the session writer (wire write succeeded).
+    LocalFinCommitted,
+    /// Remote FIN evicted the owner and no local FIN was pending.
+    RemoteFin,
+    /// Writer failed, session closed, error eviction, or other unsafe path.
+    Discard,
+}
+
+pub(crate) type OwnerEndCallback = Box<dyn FnOnce(OwnerEnd) + Send + 'static>;
+
 /// Retire a registered stream if opening it fails or its dial is cancelled.
 pub(crate) struct OpeningStreamGuard(Option<Arc<Stream>>);
 
@@ -81,6 +94,9 @@ pub struct Stream {
     /// exists only for `Stream: Sync` — `poll_read` reaches the value
     /// through `get_mut`, so no lock is ever taken.
     pending_read: Mutex<Option<PendingReadLock>>,
+    /// One-shot owner-death callback for a pooled checkout. Taken by the
+    /// session eviction path after the owner leaves the stream map.
+    owner_end: Mutex<Option<OwnerEndCallback>>,
 }
 
 impl Stream {
@@ -108,6 +124,7 @@ impl Stream {
                 synack_tx: Mutex::new(Some(synack_tx)),
                 close_error: Mutex::new(None),
                 pending_read: Mutex::new(None),
+                owner_end: Mutex::new(None),
             },
             synack_rx,
         )
@@ -155,6 +172,19 @@ impl Stream {
 
     pub fn is_closed(&self) -> bool {
         self.write_state.lock().unwrap().closed
+    }
+
+    /// Whether a local FIN has been enqueued (not necessarily committed).
+    pub(crate) fn fin_sent(&self) -> bool {
+        self.write_state.lock().unwrap().fin_sent
+    }
+
+    pub(crate) fn set_owner_end(&self, callback: OwnerEndCallback) {
+        *self.owner_end.lock().unwrap() = Some(callback);
+    }
+
+    pub(crate) fn take_owner_end(&self) -> Option<OwnerEndCallback> {
+        self.owner_end.lock().unwrap().take()
     }
 
     fn mark_closed(&self, send_fin: bool) {
