@@ -25,7 +25,7 @@ pub enum VlessRealityMimicMode {
     Off,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub struct VlessRealityMimicSpec {
     pub mode: VlessRealityMimicMode,
@@ -33,6 +33,44 @@ pub struct VlessRealityMimicSpec {
     pub quiescence_min_ms: u64,
     pub quiescence_max_ms: u64,
     pub max_concurrent_probes: usize,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
+struct VlessRealityMimicSpecWire {
+    mode: VlessRealityMimicMode,
+    probe_timeout_ms: u64,
+    quiescence_min_ms: u64,
+    quiescence_max_ms: u64,
+    max_concurrent_probes: usize,
+}
+
+impl Default for VlessRealityMimicSpecWire {
+    fn default() -> Self {
+        let spec = VlessRealityMimicSpec::default();
+        Self {
+            mode: spec.mode,
+            probe_timeout_ms: spec.probe_timeout_ms,
+            quiescence_min_ms: spec.quiescence_min_ms,
+            quiescence_max_ms: spec.quiescence_max_ms,
+            max_concurrent_probes: spec.max_concurrent_probes,
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for VlessRealityMimicSpec {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = VlessRealityMimicSpecWire::deserialize(deserializer)?;
+        let spec = Self {
+            mode: wire.mode,
+            probe_timeout_ms: wire.probe_timeout_ms,
+            quiescence_min_ms: wire.quiescence_min_ms,
+            quiescence_max_ms: wire.quiescence_max_ms,
+            max_concurrent_probes: wire.max_concurrent_probes,
+        };
+        spec.validate().map_err(serde::de::Error::custom)?;
+        Ok(spec)
+    }
 }
 
 impl Default for VlessRealityMimicSpec {
@@ -100,6 +138,31 @@ mod tests {
     }
 
     #[test]
+    fn serde_defaults_unknown_keys_and_validation_are_enforced() {
+        let empty: VlessRealityMimicSpec = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty, VlessRealityMimicSpec::default());
+
+        let partial: VlessRealityMimicSpec =
+            serde_json::from_str(r#"{"probe-timeout-ms":4000}"#).unwrap();
+        assert_eq!(partial.probe_timeout_ms, 4_000);
+        assert_eq!(partial.mode, VlessRealityMimicMode::DialFirst);
+
+        for (json, hint) in [
+            (r#"{"unknown":1}"#, "unknown"),
+            (r#"{"probe-timeout-ms":499}"#, "probe-timeout-ms"),
+            (
+                r#"{"probe-timeout-ms":500,"quiescence-max-ms":500}"#,
+                "quiescence-min <= quiescence-max < probe-timeout",
+            ),
+        ] {
+            let err = serde_json::from_str::<VlessRealityMimicSpec>(json)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains(hint), "expected {hint:?} in {err:?}");
+        }
+    }
+
+    #[test]
     fn boundary_values_validate_and_cross_field_order_is_strict() {
         for spec in [
             VlessRealityMimicSpec {
@@ -125,8 +188,8 @@ mod tests {
         };
         assert!(inverted.validate().is_err());
         let touching = VlessRealityMimicSpec {
-            probe_timeout_ms: 40,
-            quiescence_max_ms: 40,
+            probe_timeout_ms: 500,
+            quiescence_max_ms: 500,
             ..VlessRealityMimicSpec::default()
         };
         assert!(touching.validate().is_err());
