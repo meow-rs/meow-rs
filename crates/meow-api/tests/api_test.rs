@@ -728,7 +728,9 @@ fn put_configs_vless_mimic_equivalence_and_restart_warning() {
             .unwrap()
             .block_on(async {
                 let _globals_lane = process_globals_lane().await;
-                let state = test_state_default();
+                let mut state = test_state_default();
+                Arc::get_mut(&mut state).unwrap().listeners =
+                    vec![vless_reality_named_listener("running-vision", 18443, None)];
                 assert_eq!(
                     put_configs_payload(&state, vless_reality_document(), "")
                         .await
@@ -763,7 +765,9 @@ fn put_configs_vless_mimic_equivalence_and_restart_warning() {
                 // The committed running listener snapshot and its sockets are
                 // untouched by all three PUTs: this endpoint only ever reflects
                 // the startup snapshot owned by AppState.
-                assert!(state.listeners.is_empty());
+                assert_eq!(state.listeners.len(), 1);
+                assert_eq!(state.listeners[0].name, "running-vision");
+                assert_eq!(state.listeners[0].port, 18443);
             });
     });
 }
