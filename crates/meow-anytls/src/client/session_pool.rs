@@ -114,6 +114,10 @@ pub(crate) struct CheckoutState {
     taken: AtomicBool,
     settled: AtomicBool,
     done: Notify,
+    /// Test hook: park [`finish_return`](Self::finish_return) after `taken`
+    /// and before `return_checkout`.
+    #[cfg(test)]
+    return_hold: std::sync::Mutex<Option<(Arc<std::sync::Barrier>, std::sync::mpsc::Receiver<()>)>>,
 }
 
 impl CheckoutState {
@@ -128,7 +132,20 @@ impl CheckoutState {
             taken: AtomicBool::new(false),
             settled: AtomicBool::new(false),
             done: Notify::new(),
+            #[cfg(test)]
+            return_hold: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Park the next [`finish_return`](Self::finish_return) after `taken`
+    /// until `release` fires, after the `entered` barrier.
+    #[cfg(test)]
+    pub(crate) fn hold_finish_return(
+        &self,
+        entered: Arc<std::sync::Barrier>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        *self.return_hold.lock().unwrap() = Some((entered, release));
     }
 
     pub(crate) fn session(&self) -> &Arc<Session> {
@@ -152,6 +169,14 @@ impl CheckoutState {
     pub(crate) fn finish_return(&self) {
         if self.taken.swap(true, Ordering::SeqCst) {
             return;
+        }
+        #[cfg(test)]
+        {
+            let hold = self.return_hold.lock().unwrap().take();
+            if let Some((entered, release)) = hold {
+                entered.wait();
+                let _ = release.recv();
+            }
         }
         if let Some(pool) = self.pool.upgrade() {
             pool.return_checkout(

@@ -629,6 +629,26 @@ impl PooledStream {
         &self.session
     }
 
+    /// Checkout state for tests that park `finish_return`.
+    #[cfg(test)]
+    fn checkout_state(&self) -> Arc<CheckoutState> {
+        self.guard
+            .as_ref()
+            .and_then(CheckoutGuard::state_arc)
+            .expect("pooled stream still holds the checkout")
+    }
+
+    /// Park the next [`CheckoutState::finish_return`] after `taken` and
+    /// before idle insert.
+    #[cfg(test)]
+    fn hold_finish_return(
+        &self,
+        entered: Arc<std::sync::Barrier>,
+        release: std::sync::mpsc::Receiver<()>,
+    ) {
+        self.checkout_state().hold_finish_return(entered, release);
+    }
+
     /// Enqueue FIN and keep the checkout guard alive until owner-end.
     /// A later Drop of this handle is then a no-op.
     pub fn start_close(&mut self) {
@@ -1587,7 +1607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn off_runtime_drop_closes_transport() {
+    async fn off_runtime_start_close_returns_session_to_idle() {
         let stats = DialStats::new();
         let client = pooled_client(&stats);
         let stream = client
@@ -1596,23 +1616,66 @@ mod tests {
             .unwrap();
         wait_pool(&client, 1, 0).await;
         let joined = std::thread::spawn(move || {
-            drop(stream);
+            let mut stream = stream;
+            stream.start_close();
         })
         .join();
-        assert!(joined.is_ok(), "off-runtime Drop must not panic");
+        assert!(joined.is_ok(), "off-runtime start_close must not panic");
+        wait_pool(&client, 1, 1).await;
+        assert_eq!(
+            stats.dials.load(Ordering::SeqCst),
+            1,
+            "adapter Drop/start_close must return the session, not redial"
+        );
+        let reused = client
+            .create_proxy_stream(("example.com".into(), 443))
+            .await
+            .unwrap();
+        assert_eq!(stats.dials.load(Ordering::SeqCst), 1);
+        reused.close().await;
+        wait_pool(&client, 1, 1).await;
+    }
+
+    #[tokio::test]
+    async fn off_runtime_drop_without_recv_loop_shuts_writer() {
+        let stats = DialStats::new();
+        let client = pooled_client(&stats);
+        let (writer, _peer) = tokio::io::duplex(64 * 1024);
+        let session = Arc::new(Session::new_client(
+            tokio::io::empty(),
+            CountedStream {
+                inner: writer,
+                stats: Arc::clone(&stats),
+            },
+            PaddingFactory::default().into_shared(),
+            None,
+        ));
+        let checkout = client
+            .session_pool()
+            .register_checked_out(Arc::clone(&session), client.session_pool().generation())
+            .expect("register");
+        assert_eq!(client.session_pool().live_len(), 1);
+        assert_eq!(client.session_pool().idle_len(), 0);
+        let joined = std::thread::spawn(move || {
+            drop(checkout);
+        })
+        .join();
+        assert!(joined.is_ok(), "off-runtime Checkout Drop must not panic");
         wait_pool(&client, 0, 0).await;
         tokio::time::timeout(Duration::from_secs(5), async {
-            while stats.drops.load(Ordering::SeqCst) == 0
-                && stats.shutdowns.load(Ordering::SeqCst) == 0
-            {
+            while stats.shutdowns.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("off-runtime Drop must close the transport");
+        .expect("off-runtime Drop without recv_loop must poll_shutdown the writer");
+        assert!(
+            stats.shutdowns.load(Ordering::SeqCst) >= 1,
+            "initiate_close alone must not satisfy this pin"
+        );
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_await_then_immediate_open_reuses_session() {
         let stats = DialStats::new();
         let client = pooled_client(&stats);
@@ -1621,7 +1684,30 @@ mod tests {
             .await
             .unwrap();
         let first_id = first.session().id();
-        first.close().await;
+        let state = first.checkout_state();
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        first.hold_finish_return(Arc::clone(&entered), release_rx);
+
+        let close = tokio::spawn(async move {
+            first.close().await;
+        });
+        entered.wait();
+        assert!(
+            !state.is_completed(),
+            "finish_return must not settle before return_checkout"
+        );
+        assert_eq!(
+            client.session_pool().idle_len(),
+            0,
+            "idle must stay empty while finish_return is parked"
+        );
+        assert!(
+            !close.is_finished(),
+            "close().await must stay pending until return_checkout finishes"
+        );
+        drop(release_tx);
+        close.await.expect("close task");
         let second = client
             .create_proxy_stream(("example.com".into(), 443))
             .await
