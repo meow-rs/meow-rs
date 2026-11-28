@@ -2139,11 +2139,12 @@ fn warn_initial_load_failure(provider: &ProxyProvider, error: &str) {
 /// A body that is already a YAML proxy document keeps its YAML error:
 /// falling through to the share-link scanner would harvest incidental
 /// `ss://` lines out of a `preview:` block (or similar) and drop fields
-/// such as `dialer-proxy`. Share-link fallback is only for a payload that
-/// is not a proxy YAML document — a plain or base64 list of `scheme://`
-/// links, the shape airports serve to a `mihomo` User-Agent
-/// (`convert.ConvertsV2Ray`). When both paths fail the YAML diagnosis is
-/// the one reported — it is the format the feed most likely meant to serve.
+/// such as `dialer-proxy`. Share-link fallback runs only when the decoded
+/// payload is a share-link list: every non-empty non-comment line contains
+/// `://` (plain or base64 `scheme://` links, the shape airports serve to a
+/// `mihomo` User-Agent via `convert.ConvertsV2Ray`). When both paths fail
+/// the YAML diagnosis is the one reported — it is the format the feed most
+/// likely meant to serve.
 fn parse_payload_maps(
     content: &str,
 ) -> Result<Vec<HashMap<String, serde_json::Value>>, anyhow::Error> {
@@ -2157,14 +2158,11 @@ fn parse_payload_maps(
             }
             "provider content is not a proxy list: expected a sequence".to_string()
         }
-        Err(e) => {
-            let yaml_error = format!("provider YAML is malformed: {e}");
-            if looks_like_yaml_proxy_text(content) {
-                return Err(anyhow::anyhow!("{yaml_error}"));
-            }
-            yaml_error
-        }
+        Err(e) => format!("provider YAML is malformed: {e}"),
     };
+    if !crate::provider_payload::looks_like_share_link_list(content) {
+        return Err(anyhow::anyhow!("{yaml_error}"));
+    }
     match crate::provider_payload::parse_share_links(content) {
         Ok(maps) => Ok(maps),
         Err(link_error) => Err(anyhow::anyhow!(
@@ -2188,27 +2186,6 @@ fn yaml_proxy_list(
             "provider content is not a proxy list: expected a sequence"
         ))
     }
-}
-
-/// A `proxies:` key or a bare YAML sequence of proxy mappings — the feed
-/// meant YAML even when the parser rejected it (unresolved merge, bad alias).
-fn looks_like_yaml_proxy_text(content: &str) -> bool {
-    content.lines().any(|line| {
-        let trimmed = line.trim();
-        !trimmed.starts_with('#')
-            && (trimmed == "proxies:"
-                || trimmed.starts_with("proxies:")
-                || looks_like_yaml_proxy_sequence_item(trimmed))
-    })
-}
-
-/// `- name:` / `- type:` / `- {` — a sequence item that is a proxy mapping.
-fn looks_like_yaml_proxy_sequence_item(trimmed: &str) -> bool {
-    let Some(rest) = trimmed.strip_prefix('-') else {
-        return false;
-    };
-    let rest = rest.trim_start();
-    rest.starts_with('{') || rest.starts_with("name:") || rest.starts_with("type:")
 }
 
 fn compile_opt_regex(
@@ -3018,6 +2995,93 @@ header:
         );
     }
 
+    /// Quoted `'proxies':` plus an anchored item (`- &node`) is still YAML.
+    /// An unresolved merge must not fall through to harvesting the preview
+    /// `ss://` line (which would drop `dialer-proxy`).
+    #[test]
+    fn yaml_quoted_proxies_anchor_does_not_harvest_preview_share_link() {
+        let yaml = "'proxies':\n\
+                    - &node\n\
+                      name: real\n\
+                      type: ss\n\
+                      server: a.example.com\n\
+                      port: 8388\n\
+                      cipher: aes-128-gcm\n\
+                      password: pass\n\
+                      dialer-proxy: front\n\
+                      <<: *missing\n\
+                    preview: |\n\
+                      ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n";
+        let err = parse_payload_maps(yaml)
+            .expect_err("an unresolved merge under a quoted proxies: key must stay a YAML error");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("YAML")
+                || msg.contains("malformed")
+                || msg.contains("merge")
+                || msg.contains("alias"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            !msg.contains("share-link"),
+            "must not harvest incidental ss:// lines: {msg}"
+        );
+    }
+
+    /// Last-good node A keeps `dialer-proxy: front`; a quoted-key YAML
+    /// refresh with a preview `ss://#A` must not replace it with a hop-less A.
+    #[tokio::test]
+    async fn yaml_quoted_proxies_preview_refresh_keeps_last_good_dialer() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        std::fs::write(
+            &path,
+            "proxies:\n\
+             \x20 - {name: A, type: ss, server: a.example.com, port: 8388, \
+             cipher: aes-128-gcm, password: pass, dialer-proxy: front}\n",
+        )
+        .unwrap();
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(dir.path()),
+            true,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh().await.unwrap();
+        assert_eq!(slot_names(&p.slot), ["A"]);
+        assert_eq!(p.declared_dialer_names(), ["front"]);
+
+        std::fs::write(
+            &path,
+            "'proxies':\n\
+             - &node\n\
+               name: real\n\
+               type: ss\n\
+               server: a.example.com\n\
+               port: 8388\n\
+               cipher: aes-128-gcm\n\
+               password: pass\n\
+               dialer-proxy: front\n\
+               <<: *missing\n\
+             preview: |\n\
+               ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n",
+        )
+        .unwrap();
+        p.refresh()
+            .await
+            .expect_err("malformed quoted-key YAML with a preview share-link must fail");
+        assert_eq!(slot_names(&p.slot), ["A"]);
+        assert_eq!(
+            p.declared_dialer_names(),
+            ["front"],
+            "last-good must keep dialer-proxy; harvested ss://#A would drop the front hop"
+        );
+    }
+
     /// One broken SS share-link in a mixed feed must not empty a strict
     /// provider — the valid sibling is kept.
     #[tokio::test]
@@ -3043,6 +3107,34 @@ header:
         p.refresh()
             .await
             .expect("one broken SS line must not fail the whole payload");
+        assert_eq!(slot_names(&p.slot), ["A"]);
+    }
+
+    /// Empty-password trojan in a mixed share-link feed is skipped; the
+    /// valid SS sibling is kept even in strict mode.
+    #[tokio::test]
+    async fn strict_refresh_skips_empty_trojan_share_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nodes.yaml");
+        std::fs::write(
+            &path,
+            "ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n\
+             trojan://@b.example.com:443#Broken\n",
+        )
+        .unwrap();
+        let raw = raw_file_provider("nodes.yaml");
+        let p = ProxyProvider::new(
+            "airport",
+            &raw,
+            Some(dir.path()),
+            true,
+            true,
+            Default::default(),
+        )
+        .unwrap();
+        p.refresh()
+            .await
+            .expect("one empty-password trojan must not fail the whole payload");
         assert_eq!(slot_names(&p.slot), ["A"]);
     }
 

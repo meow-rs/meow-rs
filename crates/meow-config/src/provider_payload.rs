@@ -51,6 +51,26 @@ fn decode_body(content: &str) -> String {
     trimmed.to_string()
 }
 
+/// True when `content` (after the same decode as [`parse_share_links`]) is
+/// a share-link list: every non-empty non-comment line contains `://`.
+/// YAML keys, merge markers, anchors, and indented mappings fail this
+/// check, so a malformed YAML provider never falls through to harvesting
+/// incidental `ss://` lines.
+pub(crate) fn looks_like_share_link_list(content: &str) -> bool {
+    let mut saw_uri = false;
+    for line in decode_body(content).lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if !line.contains("://") {
+            return false;
+        }
+        saw_uri = true;
+    }
+    saw_uri
+}
+
 /// Parse a share-link payload into node maps.
 ///
 /// `Err` means the payload carried no usable link at all — the caller keeps
@@ -518,6 +538,9 @@ fn parse_vless(rest: &str) -> Result<HashMap<String, Value>, String> {
         .rsplit_once('@')
         .ok_or_else(|| "vless link has no '@'".to_string())?;
     let uuid = percent_decode(userinfo);
+    if uuid.is_empty() {
+        return Err("vless link has an empty uuid".to_string());
+    }
     let (server, port) = split_host_port(hostport)?;
     let mut map = node(
         "vless",
@@ -564,6 +587,9 @@ fn parse_trojan(rest: &str) -> Result<HashMap<String, Value>, String> {
         .rsplit_once('@')
         .ok_or_else(|| "trojan link has no '@'".to_string())?;
     let password = percent_decode(userinfo);
+    if password.is_empty() {
+        return Err("trojan link has an empty password".to_string());
+    }
     let (server, port) = split_host_port(hostport)?;
     let mut map = node(
         "trojan",
@@ -719,6 +745,9 @@ fn parse_anytls(rest: &str) -> Result<HashMap<String, Value>, String> {
         .rsplit_once('@')
         .ok_or_else(|| "anytls link has no '@'".to_string())?;
     let password = percent_decode(userinfo);
+    if password.is_empty() {
+        return Err("anytls link has an empty password".to_string());
+    }
     let (server, port) = split_host_port(hostport)?;
     let mut map = node(
         "anytls",
@@ -959,6 +988,34 @@ mod tests {
     fn empty_ss_credentials_are_not_a_node() {
         let err = parse_share_links("ss://:@b.example.com:443#Broken").unwrap_err();
         assert!(err.contains("no share link"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn empty_trojan_password_is_not_a_node() {
+        let err = parse_share_links("trojan://@b.example.com:443#Broken").unwrap_err();
+        assert!(err.contains("no share link"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn empty_vless_uuid_is_not_a_node() {
+        let err = parse_share_links("vless://@v.example.com:443#Broken").unwrap_err();
+        assert!(err.contains("no share link"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn empty_anytls_password_is_not_a_node() {
+        let err = parse_share_links("anytls://@a.example.com:443#Broken").unwrap_err();
+        assert!(err.contains("no share link"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn empty_trojan_link_is_skipped_in_a_mixed_feed() {
+        let body = "ss://YWVzLTEyOC1nY206cGFzcw==@a.example.com:8388#A\n\
+                    trojan://@b.example.com:443#Broken\n";
+        let nodes = parse_share_links(body).expect("valid SS line must survive");
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(string(&nodes[0], "name"), "A");
+        assert_eq!(string(&nodes[0], "cipher"), "aes-128-gcm");
     }
 
     /// SIP002 puts plugin options in the query; a leading `/` before `?`
